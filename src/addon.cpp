@@ -166,6 +166,21 @@ void on_reset_command_list(reshade::api::command_list *cmd_list)
 	reset_command_list_state(cmd_list);
 }
 
+void on_init_pipeline_layout(
+	reshade::api::device *device,
+	uint32_t count,
+	const reshade::api::pipeline_layout_param *params,
+	reshade::api::pipeline_layout layout)
+{
+	note_pipeline_layout(device, count, params, layout);
+}
+
+void on_destroy_pipeline_layout(reshade::api::device *device, reshade::api::pipeline_layout layout)
+{
+	(void)device;
+	forget_pipeline_layout(layout);
+}
+
 void on_init_pipeline(
 	reshade::api::device *device,
 	reshade::api::pipeline_layout layout,
@@ -442,6 +457,8 @@ void register_events()
 	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::register_event<reshade::addon_event::init_command_list>(on_init_command_list);
 	reshade::register_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
+	reshade::register_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
+	reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
 
 	bool hash_shaders = true;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "HashShaders", hash_shaders);
@@ -483,6 +500,8 @@ void unregister_events()
 		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
 		reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
 	}
+	reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
+	reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
 	reshade::unregister_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
 	reshade::unregister_event<reshade::addon_event::init_command_list>(on_init_command_list);
 	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);

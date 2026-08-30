@@ -6,6 +6,7 @@
 #include <state_tracking.hpp>
 
 #include <mutex>
+#include <vector>
 #include <unordered_map>
 
 namespace stray_dlss {
@@ -24,6 +25,14 @@ struct RootDescriptors
 
 std::mutex g_mutex;
 std::unordered_map<reshade::api::command_list *, RootDescriptors> g_root;
+
+// Deep copies of every pipeline layout's descriptor ranges, for both table variants.
+struct LayoutParam
+{
+	bool is_table = false;
+	std::vector<reshade::api::descriptor_range> ranges;
+};
+std::unordered_map<uint64_t, std::vector<LayoutParam>> g_layouts;
 
 void describe(reshade::api::device *device, reshade::api::resource_view view,
               uint32_t reg, std::vector<BoundTexture> &out)
@@ -59,6 +68,47 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 }
 
 } // namespace
+
+void note_pipeline_layout(
+	reshade::api::device *device,
+	uint32_t count,
+	const reshade::api::pipeline_layout_param *params,
+	reshade::api::pipeline_layout layout)
+{
+	(void)device;
+
+	std::vector<LayoutParam> copy(count);
+	for (uint32_t i = 0; i < count; ++i)
+	{
+		const auto &p = params[i];
+
+		if (p.type == reshade::api::pipeline_layout_param_type::descriptor_table)
+		{
+			copy[i].is_table = true;
+			copy[i].ranges.assign(p.descriptor_table.ranges,
+			                      p.descriptor_table.ranges + p.descriptor_table.count);
+		}
+		else if (p.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_flags)
+		{
+			// Slice the flags away: only the descriptor_range base is needed, and copying by
+			// value here is exactly what ReShade's utility fails to do.
+			copy[i].is_table = true;
+			copy[i].ranges.reserve(p.descriptor_table_with_flags.count);
+			for (uint32_t r = 0; r < p.descriptor_table_with_flags.count; ++r)
+				copy[i].ranges.push_back(
+					static_cast<const reshade::api::descriptor_range &>(p.descriptor_table_with_flags.ranges[r]));
+		}
+	}
+
+	std::lock_guard<std::mutex> lock(g_mutex);
+	g_layouts[layout.handle] = std::move(copy);
+}
+
+void forget_pipeline_layout(reshade::api::pipeline_layout layout)
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	g_layouts.erase(layout.handle);
+}
 
 // Defined further down, next to the resolve it explains.
 void dump_tracker_state(reshade::api::device *device, state_tracking *state, descriptor_tracking *desc);
@@ -192,36 +242,22 @@ void dump_tracker_state(reshade::api::device *device, state_tracking *state, des
 			if (table.handle == 0)
 				continue;
 
-			const auto info = desc->get_pipeline_layout_param(entry.second.first,
-				static_cast<uint32_t>(param));
-			STRAY_LOG_INFO("    param %zu: table=0x%016llx layout_param_type=%d",
-				param, static_cast<unsigned long long>(table.handle),
-				static_cast<int>(info.type));
+			STRAY_LOG_INFO("    param %zu: table=0x%016llx",
+				param, static_cast<unsigned long long>(table.handle));
 
-			uint32_t range_count = 0;
-			const reshade::api::descriptor_range *plain = nullptr;
-			const reshade::api::descriptor_range_with_flags *flagged = nullptr;
-			if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table)
+			std::vector<reshade::api::descriptor_range> ranges;
 			{
-				range_count = info.descriptor_table.count;
-				plain = info.descriptor_table.ranges;
+				std::lock_guard<std::mutex> lock(g_mutex);
+				const auto lit = g_layouts.find(entry.second.first.handle);
+				if (lit != g_layouts.end() && param < lit->second.size() && lit->second[param].is_table)
+					ranges = lit->second[param].ranges;
 			}
-			else if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_flags)
-			{
-				range_count = info.descriptor_table_with_flags.count;
-				flagged = info.descriptor_table_with_flags.ranges;
-			}
-			else
-			{
-				continue;
-			}
+			const uint32_t range_count = static_cast<uint32_t>(ranges.size());
 
 			STRAY_LOG_INFO("      ranges=%u", range_count);
 			for (uint32_t r = 0; r < range_count && r < 8; ++r)
 			{
-				const reshade::api::descriptor_range &range =
-					plain != nullptr ? plain[r]
-					                 : static_cast<const reshade::api::descriptor_range &>(flagged[r]);
+				const reshade::api::descriptor_range &range = ranges[r];
 				reshade::api::descriptor_heap heap = { 0 };
 				uint32_t offset = 0;
 				device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &offset);
@@ -278,36 +314,22 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 			if (tables[param].handle == 0)
 				continue;
 
-			const reshade::api::pipeline_layout_param info = desc->get_pipeline_layout_param(layout, param);
-
-			// UE4's root signature uses descriptor_table_with_flags (4), not the plain
-			// descriptor_table (0). Both describe the same thing — descriptor_range_with_flags
-			// derives from descriptor_range — but handling only the plain variant silently
-			// skips every table, which is what made every resolve come back empty.
-			uint32_t range_count = 0;
-			const reshade::api::descriptor_range *plain_ranges = nullptr;
-			const reshade::api::descriptor_range_with_flags *flagged_ranges = nullptr;
-
-			if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table)
+			// Our own deep copy, not descriptor_tracking's — see note_pipeline_layout.
+			std::vector<reshade::api::descriptor_range> ranges;
 			{
-				range_count = info.descriptor_table.count;
-				plain_ranges = info.descriptor_table.ranges;
+				std::lock_guard<std::mutex> lock(g_mutex);
+				const auto lit = g_layouts.find(layout.handle);
+				if (lit == g_layouts.end() || param >= lit->second.size())
+					continue;
+				if (!lit->second[param].is_table)
+					continue;
+				ranges = lit->second[param].ranges;
 			}
-			else if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_flags)
-			{
-				range_count = info.descriptor_table_with_flags.count;
-				flagged_ranges = info.descriptor_table_with_flags.ranges;
-			}
-			else
-			{
-				continue;
-			}
+			const uint32_t range_count = static_cast<uint32_t>(ranges.size());
 
 			for (uint32_t r = 0; r < range_count; ++r)
 			{
-				const reshade::api::descriptor_range &range =
-					plain_ranges != nullptr ? plain_ranges[r]
-					                        : static_cast<const reshade::api::descriptor_range &>(flagged_ranges[r]);
+				const reshade::api::descriptor_range &range = ranges[r];
 
 				for (uint32_t i = 0; i < range.count; ++i)
 				{

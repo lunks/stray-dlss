@@ -37,6 +37,20 @@ struct DispatchBindings
 // them), and merges in any root descriptors we captured ourselves.
 bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBindings &out);
 
+// Our own pipeline-layout tracking. ReShade's descriptor_tracking utility cannot be used for
+// this: its register_pipeline_layout only deep-copies the range array for
+// pipeline_layout_param_type::descriptor_table, and keeps the caller's POINTER for
+// descriptor_table_with_flags — which is the variant UE4 uses. That pointer dangles, and
+// get_pipeline_layout_param then returns ranges with garbage binding/count values, so the
+// descriptor walk silently visits nothing.
+void note_pipeline_layout(
+	reshade::api::device *device,
+	uint32_t count,
+	const reshade::api::pipeline_layout_param *params,
+	reshade::api::pipeline_layout layout);
+
+void forget_pipeline_layout(reshade::api::pipeline_layout layout);
+
 // Root-descriptor capture, fed from the push_descriptors event.
 void note_push_descriptors(
 	reshade::api::command_list *cmd_list,
