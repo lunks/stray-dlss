@@ -44,7 +44,9 @@ find_pad_node() {
         }' /proc/bus/input/devices
 }
 
-game_running() { [ "$(pgrep -xc Stray-Win64-Shi 2>/dev/null || echo 0)" -gt 0 ]; }
+# pgrep -c prints "0" AND exits non-zero when nothing matches, so a `|| echo 0`
+# fallback yields "0\n0" and breaks the test. Just use the exit status.
+game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 
 status_field() {
     [ -f "$STATUS" ] || { echo 0; return; }
