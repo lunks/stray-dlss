@@ -388,15 +388,11 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 			out.srvs.insert(out.srvs.end(), rd.srvs.begin(), rd.srvs.end());
 			out.uavs.insert(out.uavs.end(), rd.uavs.begin(), rd.uavs.end());
 			if (rd.view_cb_valid)
-			{
-				out.view_cb = rd.view_cb;
-				out.view_cb_valid = true;
-				out.view_cb_register = rd.view_cb_register;
-			}
+				out.constant_buffers.emplace_back(rd.view_cb_register, rd.view_cb);
 		}
 	}
 
-	return !out.srvs.empty() || !out.uavs.empty();
+	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();
 }
 
 void reset_command_list_state(reshade::api::command_list *cmd_list)

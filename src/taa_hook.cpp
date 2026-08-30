@@ -216,7 +216,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			st.gy = y;
 		}
 
-		if (g_reported[hash])
+		if (g_reported[hash] && hash != kTaaMainHash && hash != kKnownFalsePositiveHash)
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -270,10 +270,24 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	reshade::api::device *device = cmd_list->get_device();
 
+	// Try every bound constant buffer and keep the first that decodes to a plausible View.
+	// Guessing a register would be fragile: b3, b4 and b5 have all been observed carrying it
+	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
-	if (b.view_cb_valid)
-		view_ok = read_view_cb(device, b.view_cb, view) && ue4::view_params_plausible(view);
+	for (const auto &cb : b.constant_buffers)
+	{
+		ue4::ViewParams candidate{};
+		if (read_view_cb(device, cb.second, candidate) && ue4::view_params_plausible(candidate))
+		{
+			view = candidate;
+			view_ok = true;
+			b.view_cb = cb.second;
+			b.view_cb_valid = true;
+			b.view_cb_register = cb.first;
+			break;
+		}
+	}
 
 	// The signature matcher needs the render rect. Prefer the View buffer; fall back to the
 	// dispatch geometry so an unreadable CB does not blind the identification.
@@ -302,15 +316,19 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	// Report every large dispatch once, whatever the verdict. During Phase A the point is to
 	// see the whole field, not only what we already expect to find.
+	bool first_time = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		if (g_reported[hash])
-			return false;
-		g_reported[hash] = true;
-		++g_diag.candidates_reported;
+		if (!g_reported[hash])
+		{
+			g_reported[hash] = true;
+			first_time = true;
+			++g_diag.candidates_reported;
+		}
 	}
 
-	report(hash, b, m, view, view_ok, x, y, z);
+	if (first_time)
+		report(hash, b, m, view, view_ok, x, y, z);
 
 	if (view_ok)
 		g_diag.view_seen = true;
@@ -322,14 +340,28 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		g_diag.best_height = h;
 	}
 
-	// Remember this pass's output so the next frame can recognise it as the history.
-	for (const auto &t : b.uavs)
+	// The decisive test for which pass owns the temporal history: UE4 extracts a TAA pass's
+	// u0 and binds it back as an SRV on the NEXT frame. Only the real TAA does that.
+	// (CLAUDE.md §2.9)
 	{
-		if (t.slot == 0)
+		std::lock_guard<std::mutex> lock(g_mutex);
+		const auto prev = g_prev_output.find(hash);
+		if (prev != g_prev_output.end() && prev->second != 0)
 		{
-			std::lock_guard<std::mutex> lock(g_mutex);
-			g_prev_output[hash] = t.resource;
+			for (const auto &t : b.srvs)
+			{
+				if (t.resource == prev->second)
+				{
+					STRAY_LOG_INFO("  HISTORY ROUND-TRIP: 0x%016llx bound last frame's u0 back "
+						"at t%u — this pass owns the temporal history",
+						static_cast<unsigned long long>(hash), t.slot);
+					break;
+				}
+			}
 		}
+		for (const auto &t : b.uavs)
+			if (t.slot == 0)
+				g_prev_output[hash] = t.resource;
 	}
 
 	return false; // Phase A never suppresses the engine's dispatch.

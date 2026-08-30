@@ -15,6 +15,7 @@
 
 #include "reshade_all.hpp"
 
+#include <utility>
 #include <vector>
 
 namespace stray_dlss {
@@ -27,6 +28,10 @@ struct DispatchBindings
 {
 	std::vector<BoundTexture> srvs;
 	std::vector<BoundTexture> uavs;
+	// EVERY constant buffer bound, not just the first. Which register carries UE4's View
+	// uniform buffer varies between passes (b3, b4 and b5 all seen), so the only reliable
+	// way to find it is to try each and keep the one that parses plausibly.
+	std::vector<std::pair<uint32_t, reshade::api::buffer_range>> constant_buffers;
 	reshade::api::buffer_range view_cb{};
 	bool view_cb_valid = false;
 	uint32_t view_cb_register = 0;
