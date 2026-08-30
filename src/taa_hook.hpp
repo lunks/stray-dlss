@@ -20,8 +20,14 @@ void set_bound_pipeline(reshade::api::command_list *cmd_list, uint64_t pipeline_
 // Returns true to suppress the game's dispatch. Phase A always returns false.
 bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z);
 
+// Counters that localise WHY a dispatch was not reported. Each is a distinct early exit, so
+// one glance at the status file says which stage is failing instead of costing a round trip.
 struct Diagnostics
 {
+	std::uint64_t large_dispatches = 0;   // passed the size filter
+	std::uint64_t no_bound_pipeline = 0;  // no pipeline recorded for this command list
+	std::uint64_t no_hash = 0;            // bound pipeline was never hashed
+	std::uint64_t resolve_failed = 0;     // descriptor resolve produced nothing
 	std::uint64_t candidates_reported = 0;
 	std::uint64_t best_hash = 0;
 	std::uint32_t best_width = 0;

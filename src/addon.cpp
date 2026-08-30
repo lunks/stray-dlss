@@ -338,6 +338,12 @@ void on_present(
 			// The measured census is ~150 in the main menu and ~728 in gameplay, so a
 			// threshold in between separates them with wide margin either side.
 			std::fprintf(f, "in_game=%d\n", census >= 400 ? 1 : 0);
+			const auto &d = taa_hook::diagnostics();
+			std::fprintf(f, "large_dispatches=%llu\n", (unsigned long long)d.large_dispatches);
+			std::fprintf(f, "no_bound_pipeline=%llu\n", (unsigned long long)d.no_bound_pipeline);
+			std::fprintf(f, "no_hash=%llu\n", (unsigned long long)d.no_hash);
+			std::fprintf(f, "resolve_failed=%llu\n", (unsigned long long)d.resolve_failed);
+			std::fprintf(f, "reports=%llu\n", (unsigned long long)d.candidates_reported);
 			std::fclose(f);
 		}
 	}

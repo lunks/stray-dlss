@@ -154,12 +154,20 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	std::uint64_t hash = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_diag.large_dispatches;
+
 		const auto b = g_bound.find(cmd_list);
 		if (b == g_bound.end())
+		{
+			++g_diag.no_bound_pipeline;
 			return false;
+		}
 		const auto h = g_pipeline_hashes.find(b->second);
 		if (h == g_pipeline_hashes.end())
+		{
+			++g_diag.no_hash;
 			return false;
+		}
 		hash = h->second;
 
 		if (g_reported[hash])
@@ -178,6 +186,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// ran", and telling those apart is otherwise a whole extra round-trip on a machine
 		// the developer cannot iterate on quickly.
 		static bool warned = false;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			++g_diag.resolve_failed;
+		}
 		if (!warned)
 		{
 			warned = true;
