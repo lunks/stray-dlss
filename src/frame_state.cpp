@@ -60,6 +60,9 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 
 } // namespace
 
+// Defined further down, next to the resolve it explains.
+void dump_tracker_state(reshade::api::device *device, state_tracking *state, descriptor_tracking *desc);
+
 void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *why)
 {
 	reshade::api::device *device = cmd_list->get_device();
