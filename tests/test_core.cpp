@@ -4,7 +4,6 @@
 // The point is not coverage for its own sake: the developer cannot run the game, so every
 // convention that could silently produce a wrong image has to be pinned here instead.
 
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "core/fnv1a.hpp"

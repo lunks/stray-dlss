@@ -9,6 +9,7 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "shader_dump.hpp"
 
 #include <imgui.h> // MUST precede reshade.hpp — the version handshake is checked there
 #include <reshade.hpp>
@@ -52,6 +53,8 @@ struct State
 
 	// pipeline handle -> DXBC hash, for compute pipelines only.
 	std::unordered_map<uint64_t, std::uint64_t> compute_pipeline_hashes;
+	// command list -> the compute pipeline handle most recently bound on it.
+	std::unordered_map<reshade::api::command_list *, uint64_t> bound_compute_pipeline;
 
 	std::atomic<uint64_t> frame_index{ 0 };
 	std::atomic<uint32_t> compute_pipelines_seen{ 0 };
@@ -158,6 +161,10 @@ void on_init_pipeline(
 		}
 		g_state.compute_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
 
+		// Getting the real bytecode off the user's machine settles the binding layout
+		// offline, which is worth far more than any inference we could make here.
+		shader_dump::dump_compute_shader(hash, shader->code, shader->code_size);
+
 		if (hash == kTaaMainHash)
 		{
 			g_state.taa_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
@@ -192,12 +199,15 @@ void on_bind_pipeline(
 	reshade::api::pipeline_stage stages,
 	reshade::api::pipeline pipeline)
 {
-	(void)cmd_list;
-	(void)pipeline;
 	// NOTE: in D3D12 this fires with pipeline_stage::all, NOT compute_shader. Filtering on
 	// the compute stage here would silently miss every event. (docs/RESEARCH.md §2.3)
 	(void)stages;
 	g_state.saw_bind_pipeline.store(true, std::memory_order_relaxed);
+
+	// Remember the pipeline per command list so a dispatch can be attributed to a hash.
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	if (g_state.compute_pipeline_hashes.count(pipeline.handle) != 0)
+		g_state.bound_compute_pipeline[cmd_list] = pipeline.handle;
 }
 
 void on_push_descriptors(
@@ -217,11 +227,24 @@ void on_push_descriptors(
 
 bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
 {
-	(void)cmd_list;
-	(void)x;
-	(void)y;
-	(void)z;
 	g_state.dispatches_seen.fetch_add(1, std::memory_order_relaxed);
+
+	if (shader_dump::enabled())
+	{
+		std::uint64_t hash = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			const auto bound = g_state.bound_compute_pipeline.find(cmd_list);
+			if (bound != g_state.bound_compute_pipeline.end())
+			{
+				const auto it = g_state.compute_pipeline_hashes.find(bound->second);
+				if (it != g_state.compute_pipeline_hashes.end())
+					hash = it->second;
+			}
+		}
+		if (hash != 0)
+			shader_dump::note_dispatch(hash, x, y, z);
+	}
 	// Skeleton stage: observe only. Returning true here is what will eventually suppress the
 	// engine's TAA dispatch — it is the only skip-capable event on our path.
 	return false;
@@ -364,10 +387,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
 		log::enable_reshade_sink();
 		log::write(log::Level::info, "reshade::register_addon succeeded");
+		shader_dump::initialise();
 		register_events();
 		break;
 
 	case DLL_PROCESS_DETACH:
+		shader_dump::finish();
 		unregister_events();
 		reshade::unregister_addon(module);
 		log::write(log::Level::info, "stray-dlss detaching");

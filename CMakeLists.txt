@@ -30,7 +30,11 @@ endif()
 add_library(stray_dlss_core STATIC
     src/core/ue4_view.cpp
     src/core/ue4_view.hpp
-    src/core/fnv1a.hpp)
+    src/core/fnv1a.hpp
+    src/core/view_params.cpp
+    src/core/view_params.hpp
+    src/core/taa_signature.cpp
+    src/core/taa_signature.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -91,6 +95,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/log.hpp
         src/ngx_backend.cpp
         src/ngx_backend.hpp
+        src/shader_dump.cpp
+        src/shader_dump.hpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -141,7 +147,11 @@ if(STRAY_DLSS_BUILD_TESTS)
 
     enable_testing()
 
-    add_executable(stray_dlss_tests tests/test_core.cpp)
+    add_executable(stray_dlss_tests
+        tests/test_main.cpp
+        tests/test_core.cpp
+        tests/test_view_params.cpp
+        tests/test_taa_signature.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)
