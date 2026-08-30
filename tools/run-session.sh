@@ -29,18 +29,27 @@ done
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 
+# Anything from this app still alive, not just the game exe. Killing only
+# Stray-Win64-Shipping leaves the reaper and the Proton chain behind, and while the reaper
+# lives Steam silently ignores every further launch request. (CLAUDE.md 2.10)
+chain_alive() { pgrep -f "AppId=$APPID" >/dev/null 2>&1 || game_running; }
+
 close_game() {
-    game_running || return 0
+    chain_alive || return 0
     log "Closing the game"
     su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.TerminateApp(\"$APPID\", false)'" \
         >/dev/null 2>&1
-    for _ in $(seq 1 20); do game_running || break; sleep 1; done
-    if game_running; then
-        log "  Steam did not stop it; killing"
-        pkill -f Stray-Win64-Shipping
-        sleep 3
+    for _ in $(seq 1 20); do chain_alive || break; sleep 1; done
+
+    if chain_alive; then
+        log "  Steam did not stop it; tearing down the whole launch chain"
+        pkill -f "AppId=$APPID" 2>/dev/null
+        pkill -f "Stray.exe" 2>/dev/null
+        pkill -f Stray-Win64-Shipping 2>/dev/null
+        for _ in $(seq 1 15); do chain_alive || break; sleep 1; done
     fi
-    game_running && log "  STILL RUNNING" || log "  closed"
+
+    chain_alive && log "  STILL RUNNING" || log "  closed"
 }
 
 # Collect whatever exists even if we bail early — a failed session's logs are the point.

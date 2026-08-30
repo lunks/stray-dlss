@@ -48,6 +48,20 @@ find_pad_node() {
 # fallback yields "0\n0" and breaks the test. Just use the exit status.
 game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 
+# A reaper or half-started Proton chain from a previous session blocks every future launch
+# silently. Clear it before asking Steam for anything. (CLAUDE.md 2.10)
+clear_stale_chain() {
+    pgrep -f "AppId=$APPID" >/dev/null 2>&1 || return 0
+    log "Stale launch chain from a previous session; clearing it first"
+    pkill -f "AppId=$APPID" 2>/dev/null
+    pkill -f "Stray.exe" 2>/dev/null
+    pkill -f Stray-Win64-Shipping 2>/dev/null
+    for _ in $(seq 1 15); do
+        pgrep -f "AppId=$APPID" >/dev/null 2>&1 || break
+        sleep 1
+    done
+}
+
 status_field() {
     [ -f "$STATUS" ] || { echo 0; return; }
     awk -F= -v k="$1" '$1 == k { print $2; found = 1 } END { if (!found) print 0 }' "$STATUS"
@@ -58,6 +72,8 @@ status_field() {
 if game_running; then
     log "Stray is already running; leaving it alone."
 else
+    clear_stale_chain
+
     log "Clearing stale add-on output"
     rm -f "$STATUS" "$GAME_DIR/stray-dlss.log"
 
@@ -72,9 +88,15 @@ else
     done
 
     if ! game_running; then
-        log "FAILED: the process never appeared."
-        log "  A leftover 'reaper' from a previous session makes Steam silently ignore"
-        log "  further launch requests. Check: pgrep -af reaper"
+        log "FAILED: Stray-Win64-Shipping never appeared within 120s."
+        if pgrep -f "AppId=$APPID" >/dev/null 2>&1; then
+            log "  The Proton chain IS up but the game exe never spawned — usually an error"
+            log "  dialog inside the prefix. Chain:"
+            pgrep -af "AppId=$APPID" | head -3 | sed 's/^/    /'
+        else
+            log "  Steam never started anything. Check that no reaper is left over:"
+            log "    pgrep -af reaper"
+        fi
         exit 1
     fi
     log "Process up."
