@@ -150,11 +150,19 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 	if (state == nullptr || desc == nullptr)
 		return false;
 
-	const auto it = state->descriptor_tables.find(reshade::api::shader_stage::all_compute);
-	if (it != state->descriptor_tables.end())
+	// ReShade's D3D12 backend reports the compute root signature as
+	// `all_compute | all_ray_tracing`, NOT plain `all_compute`, so an exact-match lookup finds
+	// nothing and the whole resolve silently returns empty. Accept any key carrying the
+	// compute bit. (docs/RESEARCH.md §2.6)
+	constexpr auto kComputeBits = static_cast<uint32_t>(reshade::api::shader_stage::all_compute);
+
+	for (const auto &entry : state->descriptor_tables)
 	{
-		const reshade::api::pipeline_layout layout = it->second.first;
-		const std::vector<reshade::api::descriptor_table> &tables = it->second.second;
+		if ((static_cast<uint32_t>(entry.first) & kComputeBits) == 0)
+			continue;
+
+		const reshade::api::pipeline_layout layout = entry.second.first;
+		const std::vector<reshade::api::descriptor_table> &tables = entry.second.second;
 
 		for (uint32_t param = 0; param < tables.size(); ++param)
 		{

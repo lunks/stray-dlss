@@ -173,7 +173,21 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	DispatchBindings b;
 	if (!resolve_compute_bindings(cmd_list, b))
+	{
+		// Say so once. A resolve that fails silently looks exactly like "the TAA pass never
+		// ran", and telling those apart is otherwise a whole extra round-trip on a machine
+		// the developer cannot iterate on quickly.
+		static bool warned = false;
+		if (!warned)
+		{
+			warned = true;
+			STRAY_LOG_WARN("resolve_compute_bindings found nothing for a %ux%u dispatch of "
+				"0x%016llx. Descriptor/state tracking is registered but produced no compute "
+				"bindings — check the shader_stage mask and that both trackers registered "
+				"before the first frame.", x, y, static_cast<unsigned long long>(hash));
+		}
 		return false;
+	}
 
 	reshade::api::device *device = cmd_list->get_device();
 
