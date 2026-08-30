@@ -1,5 +1,7 @@
 #include "frame_state.hpp"
 
+#include "log.hpp"
+
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>
 
@@ -141,6 +143,53 @@ void note_push_descriptors(
 	}
 }
 
+// One-shot dump of what the trackers actually hold. Written the first time a resolve is
+// attempted, because "found nothing" has several possible causes and they need different
+// fixes: no tables tracked at all, tables whose layout params are push descriptors, or heap
+// offsets that do not resolve.
+void dump_tracker_state(reshade::api::device *device, state_tracking *state, descriptor_tracking *desc)
+{
+	STRAY_LOG_INFO("---- descriptor tracker state ----");
+	STRAY_LOG_INFO("  descriptor_tables entries: %zu", state->descriptor_tables.size());
+
+	for (const auto &entry : state->descriptor_tables)
+	{
+		STRAY_LOG_INFO("  stage_key=0x%08x layout=0x%016llx tables=%zu",
+			static_cast<uint32_t>(entry.first),
+			static_cast<unsigned long long>(entry.second.first.handle),
+			entry.second.second.size());
+
+		for (size_t param = 0; param < entry.second.second.size(); ++param)
+		{
+			const auto table = entry.second.second[param];
+			if (table.handle == 0)
+				continue;
+
+			const auto info = desc->get_pipeline_layout_param(entry.second.first,
+				static_cast<uint32_t>(param));
+			STRAY_LOG_INFO("    param %zu: table=0x%016llx layout_param_type=%d",
+				param, static_cast<unsigned long long>(table.handle),
+				static_cast<int>(info.type));
+
+			if (info.type != reshade::api::pipeline_layout_param_type::descriptor_table)
+				continue;
+
+			STRAY_LOG_INFO("      ranges=%u", info.descriptor_table.count);
+			for (uint32_t r = 0; r < info.descriptor_table.count && r < 8; ++r)
+			{
+				const auto &range = info.descriptor_table.ranges[r];
+				reshade::api::descriptor_heap heap = { 0 };
+				uint32_t offset = 0;
+				device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &offset);
+				STRAY_LOG_INFO("        r%u type=%d binding=%u reg=%u count=%u heap=0x%016llx off=%u",
+					r, static_cast<int>(range.type), range.binding, range.dx_register_index,
+					range.count, static_cast<unsigned long long>(heap.handle), offset);
+			}
+		}
+	}
+	STRAY_LOG_INFO("---------------------------------");
+}
+
 bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBindings &out)
 {
 	reshade::api::device *device = cmd_list->get_device();
@@ -148,7 +197,23 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 	auto *state = cmd_list->get_private_data<state_tracking>();
 	auto *desc = device->get_private_data<descriptor_tracking>();
 	if (state == nullptr || desc == nullptr)
+	{
+		static bool said = false;
+		if (!said)
+		{
+			said = true;
+			STRAY_LOG_ERROR("Tracker private data missing (state=%p desc=%p). The tracking "
+				"utilities did not register.", static_cast<void *>(state), static_cast<void *>(desc));
+		}
 		return false;
+	}
+
+	static bool dumped = false;
+	if (!dumped)
+	{
+		dumped = true;
+		dump_tracker_state(device, state, desc);
+	}
 
 	// ReShade's D3D12 backend reports the compute root signature as
 	// `all_compute | all_ray_tracing`, NOT plain `all_compute`, so an exact-match lookup finds

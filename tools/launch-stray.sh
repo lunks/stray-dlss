@@ -34,6 +34,28 @@ done
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+# Restarting Steam is cheap here and clears the states that no amount of process killing
+# fixes: a wedged launch chain, a stale app-running flag, or an error dialog left on screen.
+# The gamescope session respawns Steam automatically.
+restart_steam() {
+    log "Restarting Steam"
+    su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.User.StartRestart(false)'" \
+        >/dev/null 2>&1 || pkill -x steam 2>/dev/null
+
+    # Wait for it to go away and come back with its CEF console listening again.
+    sleep 5
+    for _ in $(seq 1 60); do
+        if curl -s --max-time 2 http://127.0.0.1:8080/json/list >/dev/null 2>&1; then
+            log "  Steam is back"
+            sleep 5
+            return 0
+        fi
+        sleep 2
+    done
+    log "  Steam did not come back within 120s"
+    return 1
+}
+
 find_pad_node() {
     # Steam tears this node down with the game, so its number is not stable and must be
     # resolved every run. (CLAUDE.md 2.11)
@@ -94,15 +116,29 @@ else
     done
 
     if ! game_running; then
-        log "FAILED: Stray-Win64-Shipping never appeared within 120s."
+        log "Stray-Win64-Shipping did not appear within 120s."
         if pgrep -f "AppId=$APPID" >/dev/null 2>&1; then
-            log "  The Proton chain IS up but the game exe never spawned — usually an error"
+            log "  The Proton chain is up but the game exe never spawned — usually an error"
             log "  dialog inside the prefix. Chain:"
             pgrep -af "AppId=$APPID" | head -3 | sed 's/^/    /'
-        else
-            log "  Steam never started anything. Check that no reaper is left over:"
-            log "    pgrep -af reaper"
         fi
+
+        # One automatic recovery attempt: tear the chain down, restart Steam, try once more.
+        if [ "${STRAY_NO_RETRY:-0}" != "1" ]; then
+            log "Attempting recovery: teardown + Steam restart + one retry"
+            clear_stale_chain
+            restart_steam
+            su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
+                >/dev/null 2>&1
+            for _ in $(seq 1 60); do
+                game_running && break
+                sleep 2
+            done
+        fi
+    fi
+
+    if ! game_running; then
+        log "FAILED: the game would not start even after a Steam restart."
         exit 1
     fi
     log "Process up."
