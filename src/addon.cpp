@@ -44,6 +44,9 @@ constexpr std::uint64_t kTaaMainHash = 0x1708ec956099e259ull;   // the pass we w
 constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull; // almost certainly motion blur — do NOT hook
 constexpr std::uint64_t kKnownFalsePositiveHash = 0x901e041a7cadc9dbull; // never select this
 
+// Far enough into the frame loop that device and swapchain creation have fully settled.
+constexpr int kNgxInitFrame = 120;
+
 struct State
 {
 	std::mutex mutex;
@@ -68,6 +71,12 @@ struct State
 	std::atomic<bool> saw_bind_pipeline{ false };
 	std::atomic<bool> saw_push_descriptors{ false };
 	std::atomic<bool> reported_capability_verdict{ false };
+
+	// NGX initialisation is deferred and opt-in. Doing it inside init_device deadlocks the
+	// game: NGX re-enters DXGI while ReShade and DXVK-NVAPI still hold their device-creation
+	// locks, and the process wedges before the first frame. (docs/RESEARCH.md §1.4)
+	std::atomic<bool> ngx_enabled{ false };
+	std::atomic<bool> ngx_attempted{ false };
 };
 
 State g_state;
@@ -96,7 +105,13 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_INFO("  adapter LUID = %08x:%08x", luid.HighPart, luid.LowPart);
 	}
 
-	ngx::initialise(native);
+	// Deliberately NOT initialising NGX here. See State::ngx_enabled.
+	bool enable_ngx = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "EnableNGX", enable_ngx);
+	g_state.ngx_enabled.store(enable_ngx, std::memory_order_relaxed);
+	STRAY_LOG_INFO("NGX is %s ([STRAYDLSS] EnableNGX). It initialises lazily on frame %d, "
+		"never during device init.",
+		enable_ngx ? "ENABLED" : "disabled", kNgxInitFrame);
 }
 
 void on_destroy_device(reshade::api::device *device)
@@ -105,7 +120,8 @@ void on_destroy_device(reshade::api::device *device)
 		return;
 
 	std::lock_guard<std::mutex> lock(g_state.mutex);
-	ngx::shutdown(g_state.native_device);
+	if (g_state.ngx_attempted.load(std::memory_order_relaxed))
+		ngx::shutdown(g_state.native_device);
 	g_state.native_device = nullptr;
 	g_state.compute_pipeline_hashes.clear();
 }
@@ -267,6 +283,20 @@ void on_present(
 
 	const uint64_t frame = g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
 
+	// Lazy NGX bring-up, well clear of device creation and on a frame boundary.
+	if (frame == kNgxInitFrame &&
+		g_state.ngx_enabled.load(std::memory_order_relaxed) &&
+		!g_state.ngx_attempted.exchange(true))
+	{
+		ID3D12Device *device = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			device = g_state.native_device;
+		}
+		STRAY_LOG_INFO("Initialising NGX (frame %llu)...", static_cast<unsigned long long>(frame));
+		ngx::initialise(device);
+	}
+
 	// Report the add-on-level capability verdict once, after enough frames that the game has
 	// certainly bound something.
 	if (frame == 300 && !g_state.reported_capability_verdict.exchange(true))
@@ -330,13 +360,36 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 		g_state.taa_pipelines_seen.load());
 }
 
+// Registering the pipeline events is not free: ReShade responds by routing every PSO creation
+// through ID3D12Device2::CreatePipelineState and dropping the cached-PSO blob. Under
+// vkd3d-proton that means every shader recompiles on each launch, which for a UE4 title is a
+// very long first load. Worth it while we need bytecode; wasteful otherwise, so it is a
+// switch. (docs/RESEARCH.md §2.5)
+bool g_pipeline_events_registered = false;
+
 void register_events()
 {
 	reshade::register_event<reshade::addon_event::init_device>(on_init_device);
 	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::register_event<reshade::addon_event::init_command_list>(on_init_command_list);
-	reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
-	reshade::register_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
+
+	bool hash_shaders = true;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "HashShaders", hash_shaders);
+	g_pipeline_events_registered = hash_shaders || shader_dump::enabled();
+
+	if (g_pipeline_events_registered)
+	{
+		STRAY_LOG_WARN("Pipeline events registered: ReShade will drop the D3D12 PSO cache, so "
+			"EXPECT A VERY SLOW FIRST LOAD while every shader recompiles.");
+		STRAY_LOG_WARN("  Set [STRAYDLSS] HashShaders=0 (and DumpShaders=0) to get normal load "
+			"times once the bytecode has been captured.");
+		reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+		reshade::register_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
+	}
+	else
+	{
+		STRAY_LOG_INFO("Pipeline hashing disabled; the TAA pass will be identified structurally.");
+	}
 	reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
 	reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
@@ -355,8 +408,11 @@ void unregister_events()
 	reshade::unregister_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::unregister_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
 	reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
-	reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
-	reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+	if (g_pipeline_events_registered)
+	{
+		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
+		reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+	}
 	reshade::unregister_event<reshade::addon_event::init_command_list>(on_init_command_list);
 	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
