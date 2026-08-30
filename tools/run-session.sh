@@ -34,6 +34,37 @@ game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 # lives Steam silently ignores every further launch request. (CLAUDE.md 2.10)
 chain_alive() { pgrep -f "AppId=$APPID" >/dev/null 2>&1 || game_running; }
 
+# Kill the game's process tree by descending from the reaper, NOT by pattern. The children
+# (srt-bwrap, pv-adverb, proton, wineserver) reparent to init when the reaper dies, so killing
+# the reaper alone strands them and the prefix stays up. Pattern-killing instead is worse: the
+# same binaries run Steam's own webhelper, so `pkill -f pv-adverb` takes Steam down with it.
+kill_app_tree() {
+    local roots
+    roots=$(pgrep -f "AppId=$APPID" 2>/dev/null)
+    [ -z "$roots" ] && roots=$(pgrep -x Stray-Win64-Shi 2>/dev/null)
+    [ -z "$roots" ] && return 0
+
+    local all="" frontier="$roots"
+    while [ -n "$frontier" ]; do
+        all="$all $frontier"
+        local next=""
+        for pid in $frontier; do
+            next="$next $(pgrep -P "$pid" 2>/dev/null)"
+        done
+        frontier=$(echo $next | tr ' ' '\n' | sort -u | tr '\n' ' ')
+        [ -z "$(echo $frontier | tr -d ' ')" ] && break
+    done
+
+    # Deepest first so parents cannot respawn them.
+    for pid in $(echo $all | tr ' ' '\n' | tac); do
+        kill -TERM "$pid" 2>/dev/null
+    done
+    sleep 3
+    for pid in $(echo $all | tr ' ' '\n' | tac); do
+        kill -9 "$pid" 2>/dev/null
+    done
+}
+
 close_game() {
     chain_alive || return 0
     log "Closing the game"
@@ -42,10 +73,8 @@ close_game() {
     for _ in $(seq 1 20); do chain_alive || break; sleep 1; done
 
     if chain_alive; then
-        log "  Steam did not stop it; tearing down the whole launch chain"
-        pkill -f "AppId=$APPID" 2>/dev/null
-        pkill -f "Stray.exe" 2>/dev/null
-        pkill -f Stray-Win64-Shipping 2>/dev/null
+        log "  Steam did not stop it; tearing down the launch chain by process tree"
+        kill_app_tree
         for _ in $(seq 1 15); do chain_alive || break; sleep 1; done
     fi
 

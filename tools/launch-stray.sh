@@ -53,9 +53,15 @@ game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 clear_stale_chain() {
     pgrep -f "AppId=$APPID" >/dev/null 2>&1 || return 0
     log "Stale launch chain from a previous session; clearing it first"
-    pkill -f "AppId=$APPID" 2>/dev/null
-    pkill -f "Stray.exe" 2>/dev/null
-    pkill -f Stray-Win64-Shipping 2>/dev/null
+    # Descend the tree rather than pattern-killing: pv-adverb and srt-bwrap also run Steam's
+    # own webhelper, so a pattern kill takes Steam down with the game.
+    for pid in $(pgrep -f "AppId=$APPID" 2>/dev/null); do
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            for g in $(pgrep -P "$child" 2>/dev/null); do kill -9 "$g" 2>/dev/null; done
+            kill -9 "$child" 2>/dev/null
+        done
+        kill -9 "$pid" 2>/dev/null
+    done
     for _ in $(seq 1 15); do
         pgrep -f "AppId=$APPID" >/dev/null 2>&1 || break
         sleep 1
