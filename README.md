@@ -23,14 +23,18 @@ be recovered from a running D3D12 process:
 - **Jitter, from a constant buffer.** DLSS needs the sub-pixel jitter the engine used. It lives in
   UE4's `View` uniform buffer, which we read at known row offsets.
 - **Dense motion vectors, which the game does not have.** UE 4.27 writes velocity *only for moving
-  objects*. Every static pixel — the whole world, whenever the camera moves — carries nothing. We
-  run our own compute pass that reconstructs camera motion from reversed-Z depth and the
-  `ClipToPrevClip` matrix, and composites the engine's sparse velocity on top.
+  objects*. Every static pixel — the whole world, whenever the camera moves — carries nothing. And
+  the format it does write, `R16G16B16A16_UNORM`, is not one DLSS accepts. So we run our own
+  compute pass that decodes the sparse velocity where it is valid, reconstructs camera motion from
+  reversed-Z depth and the `ClipToPrevClip` matrix everywhere else, and writes the dense
+  `RG16_FLOAT` field DLSS actually wants.
 - **Camera cuts.** DLSS has to be told to reset its history on a cut, or it smears across the
-  transition. UE4 leaks this: on a cut, `View.TemporalAAJitter.zw` becomes equal to `.xy`.
+  transition. UE4 leaks this three different ways, and we need all three.
 
 The engine-side facts this is built on were measured against the running game, not assumed. They
-are written down in [`docs/STRAY-RENDERING-FACTS.md`](docs/STRAY-RENDERING-FACTS.md).
+are written down in [`docs/STRAY-RENDERING-FACTS.md`](docs/STRAY-RENDERING-FACTS.md), and the
+external API and engine research that backs the design — each claim verified against primary
+sources and then adversarially rechecked — is in [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 ---
 
@@ -45,15 +49,27 @@ This is developed for **Linux / Proton**, which is where it will actually be use
 | OS | SteamOS / Linux, Proton `GE-Proton-dxvk301-ds5-clean-nowl` |
 | D3D12 | vkd3d-proton |
 | Display | gamescope, DRM backend, HDR enabled |
-| ReShade | 6.8.0.2155 or newer, **with add-on support** |
+| ReShade | **6.8.0 or newer** (hard requirement, see below), **with add-on support** |
 
 Windows is not currently a target. It may work; it is not tested.
 
-> **Open question, tracked as the project's main technical risk:** whether the **D3D12** NGX entry
-> points (`NVSDK_NGX_D3D12_*`) are usable under vkd3d-proton, where an `ID3D12Resource` is really
-> a `VkImage`. On Linux the well-trodden DLSS path is the Vulkan NGX API. If the D3D12 path turns
-> out to be blocked, the fallback is a Vulkan-interop or FSR-based evaluation behind the same
-> internal interface.
+### Does DLSS even work here? Yes.
+
+This was the project's main open risk and it is now settled. D3D12 DLSS under vkd3d-proton is an
+**NVIDIA-authored path**, present since vkd3d-proton 2.5: `nvngx_dlss.dll` runs as an ordinary
+Windows PE in the prefix, and its CUDA kernels reach the GPU through `NvAPI_D3D12_*` cubin entry
+points in DXVK-NVAPI, which forward into vkd3d-proton's `ID3D12DeviceExt` and on to
+`VK_NVX_binary_import`. `nvngx_dlss.dll` never touches native handles — it creates ordinary D3D12
+descriptors — so an `ID3D12Resource` really being a `VkImage` turns out not to matter.
+
+**ReShade 6.8.0 is a hard minimum.** ReShade-with-add-ons plus D3D12 DLSS under vkd3d used to
+crash: ReShade rewrites descriptor handles for add-on tracking, and vkd3d's own
+`GetCudaTextureObject` bypassed ReShade's hooks, so unconverted handles got through. crosire fixed
+it in two commits, both of which are in the v6.8.0 tag. 6.7.3 is still broken.
+
+The full chain, the runtime prerequisites (`nvngx.dll`/`_nvngx.dll` in the prefix, the `NGXCore`
+registry key, `nvidia_uvm` loaded) and the diagnostic environment variables are documented in
+[`docs/RESEARCH.md`](docs/RESEARCH.md) §1.
 
 ---
 
@@ -104,9 +120,12 @@ selection. The part that cannot — the actual NGX evaluation — is kept as thi
 - **v0.1 — DLAA.** Render resolution equals output resolution, so there is no screen-percentage
   problem to solve. This exists to answer one question: are colour, depth, motion vectors and
   jitter correct? If DLAA looks right, everything downstream is built on solid ground.
-- **v0.2 — DLSS Super Resolution.** Force UE4's internal render resolution down via `Engine.ini`,
-  handle the render subrect and the second TAA permutation that screen percentage may switch the
-  engine onto, and expose Quality / Balanced / Performance / Ultra Performance.
+- **v0.2 — DLSS Super Resolution.** Rather than fighting the engine, set `r.ScreenPercentage=<N>`
+  and `r.TemporalAA.Upsampling=1` in `Engine.ini`. UE4 then renders at N%, allocates a full-res
+  output, and *expects* its TAA pass to upscale — which is exactly DLSS's contract. It also
+  switches the jitter sequence to plain Halton (what DLSS was trained on), auto-scales the phase
+  count, and sets the correct texture mip bias, all for free. The cost is that this changes the
+  shader permutation and therefore the hash we hook.
 - **Later, maybe.** DLSS preset selection, sharpening, a Vulkan-interop path, an FSR fallback for
   non-NVIDIA hardware.
 

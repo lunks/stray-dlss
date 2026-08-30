@@ -7,68 +7,90 @@ compute dispatch and replacing it with an NGX evaluation.
 Read this file completely before touching anything. It is the contract for how this project is
 built, what is known versus assumed, and what will silently produce a wrong image.
 
+Depth lives in two companion documents, both of which are load-bearing:
+
+* **`docs/STRAY-RENDERING-FACTS.md`** — what was measured against the running game. Verbatim.
+* **`docs/RESEARCH.md`** — verified external research: the ReShade 6.8 API, the NGX D3D12 SDK, UE
+  4.27 internals, the Proton/vkd3d chain, and CI. 228 claims, each adversarially verified. **When
+  this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
+
 ---
 
 ## 0. Prime directives
 
 1. **You cannot test this yourself.** No game, no Windows box, no GPU. Every build happens in
    GitHub Actions with MSVC. The only feedback loop is the human running the artifact on their
-   Linux/Stray machine and pasting back a log. Design accordingly: a round-trip is expensive, so
-   each one must carry the maximum diagnostic payload.
-2. **Prefer a loud failure to a quiet wrong image.** A crash gets a stack trace. A subtly wrong
+   Linux/Stray machine and pasting back a log. A round-trip is expensive, so each one must carry
+   the maximum diagnostic payload.
+2. **Prefer a loud failure to a quiet wrong image.** A crash gets a stack trace. A wrong
    motion-vector sign gets "it looks smeary" three days later and costs a week. Every convention
-   (jitter sign, MV direction, MV scale, depth polarity, colour space) must be *asserted and
-   logged*, never assumed.
-3. **Never claim something works because it compiled.** Compiling proves the types line up. The
-   only evidence that DLSS is engaged is a log line from the user's machine or a screenshot.
-   Follow `superpowers:verification-before-completion`: evidence before assertions, always.
+   must be asserted and logged, never assumed. NVIDIA's guide is explicit that wrong resource usage
+   flags can produce *"the output may be black without further indication"* — that class of failure
+   is the enemy.
+3. **Never claim something works because it compiled.** The only evidence DLSS is engaged is a log
+   line from the user's machine, a screenshot, or the DLSS on-screen indicator. Follow
+   `superpowers:verification-before-completion`.
 4. **Everything provable in CI must be tested in CI.** DXBC hashing, matrix math, jitter
-   conversion, velocity decode, resolution/quality-mode selection — all pure functions, all
-   unit-tested on the runner. The un-testable part (the actual NGX call) must be as thin as
-   possible so the untested surface is small.
-5. **HARD / SOFT / UNCONFIRMED.** When you write down a technical claim in this repo, label its
-   provenance. "Read it in the header" is HARD. "A forum post said so" is SOFT. Anything else is
-   UNCONFIRMED and must be verified before code depends on it.
+   conversion, velocity decode, quality-mode selection — all pure functions. Keep the untestable
+   NGX surface as thin as possible.
+5. **HARD / SOFT / UNCONFIRMED.** Label the provenance of every technical claim you write down.
+   "Read it in the header" is HARD. A forum post is SOFT. Everything else is UNCONFIRMED and must
+   be verified before code depends on it.
 
 ---
 
-## 1. Target environment (the only one that matters)
+## 1. Target environment
 
-The human runs Stray on Linux. This is **not** a Windows-first project that happens to work on
-Proton; Proton is the target.
+The human runs Stray on Linux. Proton is the target, not an afterthought.
 
 | | |
 |---|---|
 | GPU | NVIDIA RTX 4090 |
 | Driver | 610.43.02, open kernel modules |
 | Host | Linux 6.17.13, SteamOS guest |
-| Proton | `GE-Proton-dxvk301-ds5-clean-nowl` |
-| D3D12 layer | **vkd3d-proton** (D3D12 → Vulkan) |
+| Proton | `GE-Proton-dxvk301-ds5-clean-nowl` (vkd3d 3.0.1-era) |
+| D3D12 layer | **vkd3d-proton** |
 | Compositor | gamescope, DRM backend, `--hdr-enabled --hdr-itm-enabled` |
-| ReShade | 6.8.0.2155, add-on support enabled |
+| ReShade | **6.8.0.2155**, add-on support enabled |
 | Game | Stray, Steam AppID **1332010** |
 
-**The single biggest open risk in this project** is whether `NVSDK_NGX_D3D12_*` works at all under
-vkd3d-proton. On Linux the NGX runtime is reached through Proton's `nvngx.dll` / `_nvngx.dll`
-shim and the Linux driver's `libnvidia-ngx.so`; the well-trodden path is the **Vulkan** NGX API,
-because DXVK and vkd3d-proton are Vulkan underneath. Whether the D3D12 NGX entry points are
-bridged, and how `ID3D12Resource` maps to the `VkImage` NGX actually needs, must be established
-before writing the evaluation path — not after. Relevant knobs: `PROTON_ENABLE_NVAPI=1`,
-`PROTON_HIDE_NVIDIA_GPU=0`, `VKD3D_CONFIG`, `dxvk-nvapi`, and vkd3d-proton's interop interfaces
-(`ID3D12DeviceExt`, `ID3D12DXVKInteropDevice::GetVulkanResourceInfo`).
+### Feasibility: resolved
 
-Data point in our favour: Luma-Framework ships ReShade add-ons that do DLSS and its release notes
-say "Proton should be fully compatible out of the box" (with `msvcrt40` + `vcrun2022` via
-protontricks). But Luma is **DX11/DXVK**, not DX12/vkd3d-proton. Do not generalise from it
-without evidence.
+**D3D12 NGX DLSS works under vkd3d-proton.** It is an NVIDIA-authored path present since
+vkd3d-proton 2.5, routed through `NvAPI_D3D12_*` cubin entry points in DXVK-NVAPI into
+`ID3D12DeviceExt` and `VK_NVX_binary_import`. `nvngx_dlss.dll` never touches native handles — it
+makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` underneath is a non-issue.
+
+**Consequences, and they are absolute:**
+
+* **Pass plain `ID3D12Resource*` to NGX and nothing else.** Never touch `ID3D12DXVKInteropDevice`,
+  `GetVulkanResourceInfo`, or any vkd3d interop API. Never write a D3D12→Vulkan bridge. Never use
+  the Vulkan NGX path.
+* **Initialise NGX with `device::get_native()`**, which is the *original* vkd3d `ID3D12Device`, not
+  ReShade's proxy. This bypasses ReShade's descriptor remapping, which is exactly what we want —
+  ReShade's `convert_to_original_cpu_descriptor_handle` has no release-build validation and would
+  corrupt any handle it did not mint. Never fetch ReShade's proxy device via `GetPrivateData`.
+* **ReShade ≥ 6.8.0 is a hard prerequisite.** ReShade-addon + D3D12-DLSS under vkd3d was a known
+  crash; crosire fixed it in two commits, both in tag v6.8.0. 6.7.3 is still broken. Log the
+  ReShade version at startup and warn below 6.8.0.
+* **`PROTON_ENABLE_NVAPI` does not exist.** NVAPI is on by default. Only `PROTON_DISABLE_NVAPI` and
+  `PROTON_FORCE_NVAPI` exist. Never set `PROTON_HIDE_NVIDIA_GPU=1`.
+* **Do not gate availability on `NVSDK_NGX_D3D12_GetFeatureRequirements`** — Proton's `_nvngx.dll`
+  does not implement it and reports unsupported even when DLSS works. Gate on `Init` succeeding
+  plus `NVSDK_NGX_Parameter_SuperSampling_Available`.
+* **Do not set `VKD3D_CONFIG=descriptor_heap`.** Leave `PROTON_ENABLE_NGX_UPDATER` off.
+* Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
+  77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
+
+Full chain, prerequisites and diagnostics: `docs/RESEARCH.md` §1.
 
 ---
 
 ## 2. Everything we know about Stray
 
-All of this was **measured on hardware, read out of the game's own DXBC, or read from the game's
-own files** — not inferred. The verbatim source document is `docs/STRAY-RENDERING-FACTS.md`;
-this section carries the load-bearing facts inline so they are always in context.
+Measured on hardware, read out of the game's own DXBC, or read from the game's own files — not
+inferred. Verbatim source: `docs/STRAY-RENDERING-FACTS.md`. Facts *derived* from these by verified
+research are marked **[derived]**.
 
 ### 2.1 Engine and process
 
@@ -78,108 +100,126 @@ this section carries the load-bearing facts inline so they are always in context
 | Executable | `Stray-Win64-Shipping.exe`, PE32+ (x86-64) |
 | Graphics API | **D3D12** |
 | UE project name | `Hk_project` |
-| Version string on title screen | `v1.54368 (Revision 26632)` |
+| Version string | `v1.54368 (Revision 26632)` |
 
-Observed swapchains, from `IDXGISwapChain::ResizeBuffers`:
+Observed swapchains from `IDXGISwapChain::ResizeBuffers`:
+`BufferCount = 3` at `3840×2160` and `2560×1440`, `NewFormat = 24` = `DXGI_FORMAT_R10G10B10A2_UNORM`.
 
-* `BufferCount = 3, Width = 3840, Height = 2160, NewFormat = 24`
-* `BufferCount = 3, Width = 2560, Height = 1440, NewFormat = 24`
-
-`NewFormat = 24` is `DXGI_FORMAT_R10G10B10A2_UNORM`.
+**[derived]** Each output-resolution change requires a full NGX `ReleaseFeature` + `CreateFeature`.
+Guard Evaluate to no-op when observed sizes differ from creation sizes.
 
 ### 2.2 Filesystem layout
-
-Game directory on this install:
 
 ```
 <SteamLibrary>/steamapps/common/Stray/Hk_project/Binaries/Win64/
 ```
 
-Config and saves live in the **Proton prefix**, not the game directory:
+Config and saves live in the **Proton prefix**:
 
 ```
 <compatdata>/1332010/pfx/drive_c/users/steamuser/AppData/Local/Hk_project/Saved/
     Config/WindowsNoEditor/Engine.ini
     SaveGames/
     Crashes/UE4CC-Windows-<GUID>_0000/     CrashContext.runtime-xml, UE4Minidump.dmp
-    Logs/                                   (observed empty on this install)
+    Logs/                                   (observed empty)
 ```
 
-Two configuration facts:
-
-* **`Engine.ini` settings take effect. Command-line arguments do not.** Anything we need to force
-  (screen percentage, TAA upsampling) must go through `Engine.ini`.
-* There are two `compatdata` trees for this title on this machine. The live one is
-  `/home/deck/.local/share/Steam/steamapps/compatdata/1332010`. The one on the secondary library
-  (`GamesLinux`) is a ~6.1 MB skeleton that is **not read**.
+* **`Engine.ini` settings take effect. Command-line arguments do not.** Everything we need the
+  engine to do goes through `[SystemSettings]` in that file — which **[derived]** is also the only
+  way to set `ECVF_ReadOnly` cvars like `r.UsePreExposure`.
+* Two `compatdata` trees exist on this machine. The live one is
+  `/home/deck/.local/share/Steam/steamapps/compatdata/1332010`. The one on `GamesLinux` is a
+  ~6.1 MB skeleton that is **not read**.
 
 ### 2.3 The TAA pass — our interception point
 
-Stray uses UE 4.27's standalone temporal AA compute shader, `FTAAStandaloneCS`.
+Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
+`/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
+not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
 
-**Primary pass, identified by fnv1a64 over its DXBC:**
+**Primary pass, fnv1a64 over its DXBC:**
 
 ```
 0x1708ec956099e259
 ```
 
-Measured binding signature — compute, shader model 5.0, all resources 1920×1080 at the resolution
-it was measured at:
+Measured bindings (compute, SM 5.0, resources 1920×1080 at measurement time):
 
-| Register | Role | Format |
-|---|---|---|
-| `t0` | depth | `r32_g8_typeless` |
-| `t2` | velocity | `r16g16b16a16_unorm` |
-| `t5`, `t6` | colour | `r16g16b16a16_float` |
-| `u0` | `OutComputeTex` — the TAA output | `r16g16b16a16_float` |
-| `u1` | `OutComputeTexDownsampled` (optional, declared by the shader) | — |
+| Register | Role | Format | **[derived]** identity |
+|---|---|---|---|
+| `t0` | depth | `r32_g8_typeless` | `SceneDepthTexture` |
+| `t1` | — | — | **`StencilTexture`** — same `ID3D12Resource` as t0 |
+| `t2` | velocity | `r16g16b16a16_unorm` | `GBufferVelocityTexture` |
+| `t3`/`t4` | — | — | one is `EyeAdaptationTexture` (1×1 `PF_A32B32G32R32F`) |
+| `t5`, `t6` | colour | `r16g16b16a16_float` | `InputSceneColor` + `HistoryBuffer_0`, **order unknown** |
+| `u0` | TAA output | `r16g16b16a16_float` | `OutComputeTex_0` |
+| `u1` | optional | — | `OutComputeTexDownsampled` |
 
-**A second TAA candidate exists in the same title:**
+**[derived]** For `ETAAPassConfig::Main` on deferred SM5 exactly six SRVs survive dead-code
+elimination — `InputSceneColor`, `SceneDepthTexture`, `GBufferVelocityTexture`, `StencilTexture`,
+`HistoryBuffer_0`, `EyeAdaptationTexture`. **No other SRV can be bound by this shader**, which is
+what pins t1/t3/t4.
 
-```
-0x52101a15e1a0c5cc     t0 depth, t3 velocity, t7 colour, t8 r16g16_float
-```
+**[derived] Depth vs stencil, bulletproof test**: they are two SRVs over the *same* resource. With
+`r.D3D12.Depth24Bit = 0` the resource is `R32G8X24_TYPELESS`; the depth view is
+`R32_FLOAT_X8X24_TYPELESS` (→ `pInDepth`) and the stencil view is `X32_TYPELESS_G8X24_UINT`
+(ignore).
 
-UE 4.27 compiles `FTAAStandaloneCS` in more than one permutation — `ETAAPassConfig::Main` and
-`ETAAPassConfig::MainUpsampling` produce different DXBC and therefore different hashes. **The
-existence of a second permutation is directly relevant to the SR phase**: if one of these is the
-upsampling permutation, forcing screen percentage may switch Stray onto it, changing the hash we
-must match and the binding layout we must read.
+**[derived] Which colour SRV is the history — DO NOT GUESS.** Register order is an fxc
+implementation detail and the "earlier one is the scene colour" reading was explicitly refuted.
+`HistoryBuffer[0]` is literally the texture that was `u0` in the *previous* frame's TAA dispatch:
 
-**A measured false positive**, recorded so it is not re-discovered:
-`0x901e041a7cadc9db` scores confidence 150 on a class-quorum test with colour=1, depth=2,
-velocity=0. Do not let a heuristic re-select it.
+> Cache the `ID3D12Resource*` bound to u0 each frame. Next frame, the `r16g16b16a16_float` SRV
+> whose resource equals that cached pointer is `HistoryBuffer_0`. **The other one is
+> `InputSceneColor`, and that is what goes to `pInColor`.**
 
-**Shader census on this install:** 728 distinct PS/CS shaders in gameplay, `not_dxbc=0`,
-`dxil=0` — every pixel/compute shader observed is **DXBC**, none DXIL. During the main menu the
-same census reads ~150; it rises to ~728 on entering gameplay. (PS and CS only; says nothing
-about DXR.)
+On a cut or first frame, history and velocity are swapped to `GSystemTextures.BlackDummy`, a **1×1**
+texture — a reliable reset signal.
+
+**[derived] Stray runs `r.PostProcessAAQuality == 3` (Medium).** Provable: u1 exists only under
+`TAA_DOWNSAMPLE`, which requires `bDownsample` → `bUseFast` → `Medium`. So `0x1708ec956099e259` is
+the Main / Fast / Downsample permutation. Two consequences:
+
+1. **The in-game AA quality setting changes the shader hash.** A hash-only hook breaks silently
+   when the user raises the setting. **Match on more than the hash** — bound-resource signature
+   plus dispatch size. The Main config has at most three legal permutations.
+2. **If we skip the dispatch we MUST still produce u1** — a half-res filter of our output — or
+   downstream bloom/DOF read garbage. This is a correctness requirement, not a nicety.
+
+**The second hash `0x52101a15e1a0c5cc`** (t0 depth, t3 velocity, t7 colour, t8 `r16g16_float`) is
+**[derived] almost certainly NOT TAA and must not be hooked**: `FTAAStandaloneCS` has no
+`R16G16_FLOAT` input in any main config. Most likely motion blur.
+
+**A measured false positive**, recorded so it is not re-discovered: `0x901e041a7cadc9db` scores
+confidence 150 on a class-quorum test with colour=1, depth=2, velocity=0. No heuristic may
+re-select it.
+
+**Shader census:** 728 distinct PS/CS shaders in gameplay, `not_dxbc=0`, `dxil=0` — every one is
+**DXBC**. ~150 in the main menu, rising to ~728 on entering gameplay.
 
 ### 2.4 Depth
 
-* The resource bound at `t0` is **`r32_g8_typeless`** — typeless, planar depth-stencil.
-* The SRV the game creates over it is **`r32_float_x8_uint`**.
-* UE 4.27 renders with **reversed-Z** → set `NVSDK_NGX_DLSS_Feature_Flags_DepthInverted`.
+* `t0` resource is `r32_g8_typeless`; the SRV is `r32_float_x8_uint`.
+* UE 4.27 uses **reversed-Z** → `NVSDK_NGX_DLSS_Feature_Flags_DepthInverted`. **[derived]** near =
+  1.0, far = 0.0, **infinite far plane**, `SceneDepth = Near / DeviceZ`. The TAA shader
+  hard-`#error`s on non-inverted Z. Read `View.NearPlane` (row 142.x) rather than assuming 10 uu.
 
-A depth statistic gathered during the main menu and loading screens reads
-`below 0.25: 3456000, above 0.75: 0, mean 0.00000` — **menu and load frames carry no usable depth
-range; gameplay frames do.** This is a usable gate: do not engage DLSS on a frame whose depth is
-degenerate, and use this as a cheap "are we actually in gameplay" test.
+Depth over menu and loading screens reads `below 0.25: 3456000, above 0.75: 0, mean 0.00000` —
+**menu and load frames carry no usable depth range; gameplay frames do.** Use this as a cheap
+"are we in gameplay" gate.
 
 ### 2.5 Velocity — and the sparse-velocity problem
 
-The velocity buffer at `t2` is `r16g16b16a16_unorm`, and it is **sparse**: UE 4.27 writes it only
-for pixels covered by **moving objects**. Static geometry carries no velocity and its motion must
-be **reconstructed from depth and the camera matrices**.
+`t2` is `r16g16b16a16_unorm` and **sparse**: UE 4.27 writes it only for **moving objects**. Static
+geometry carries nothing and its motion must be reconstructed from depth and the camera matrices.
 
-This is the highest-value piece of real work in the project. DLSS wants a dense, full-screen
-motion vector field. Feeding it UE4's sparse buffer directly means every static pixel reads as
-"did not move", which is wrong the instant the camera moves — and it produces smearing and
-ghosting rather than a crash. **We must write a compute pass that produces dense MVs**: take the
-sparse velocity where it is valid, and elsewhere reconstruct camera motion from reversed-Z depth
-and `ClipToPrevClip`.
+**[derived] A resolve pass is mandatory regardless**, because DLSS only accepts `RG16_FLOAT` or
+`RG32_FLOAT` motion vectors and `r16g16b16a16_unorm` is not an accepted format.
 
-**The encoding, from UE 4.27 `Engine/Shaders/Private/Common.ush:1537-1570`:**
+**[derived]** The velocity texture is at the full **scene-buffer** extent
+(`BufferSizeAndInvSize`, row 132), *not* the view size — index it with absolute buffer coords.
+
+**Encoding, from UE 4.27 `Common.ush:1537-1570`:**
 
 ```
 EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f          // encode
@@ -187,316 +227,315 @@ V.xy        = EncodedV.xy * InvDiv - 32767.0f / 65535.0f * InvDiv   // decode
 InvDiv      = 1.0f / (0.499f * 0.5f)
 ```
 
-**Both constants were located in Stray's own DXBC**, not merely taken from engine source:
+**Both constants located in Stray's own DXBC:**
 
 | Constant | Value | Bit pattern | Notes |
 |---|---|---|---|
-| `InvDiv` (decode scale) | `4.00801611f` | `0x408041AB` | bytes `AB 41 80 40` |
-| Folded MAD bias | `2.00397754f` | `0x4000412B` | appears **negated** in a `mad` as `0xC000412B`, bytes `2B 41 00 C0` |
-| Bias term | `32767/65535 = 0.49999237f` | `0x3EFFFF00` | the bias is **not** 0.5 |
+| `InvDiv` | `4.00801611f` | `0x408041AB` | bytes `AB 41 80 40` |
+| Folded MAD bias | `2.00397754f` | `0x4000412B` | appears **negated** as `0xC000412B` |
+| Bias term | `32767/65535 = 0.49999237f` | `0x3EFFFF00` | **not** 0.5 |
 
-`0.49999237f * 4.00801611f = 2.00397754f`. The decode's second term is folded into a MAD immediate
-by the compiler rather than appearing as a separate subtract.
+**[derived] Compute the bias in float as `(32767.0f/65535.0f) * InvDiv`; do not hardcode a rounded
+constant.** `DecodeVelocityFromTexture` takes a `float4` and returns a `float3`.
 
-The game's own decode helper is named `DecodeVelocityFromTexture`.
+**[derived] Validity test is `EncodedVelocity.x > 0.0`** — strict, red channel only, because the
+target is cleared to 0. Reproduce it exactly; never use a magnitude threshold.
+
+**[derived]** The stored value is `ScreenPos - PrevScreenPos` in NDC with **both** frames' jitter
+removed — directly comparable to the `ClipToPrevClip`-derived camera motion. Both branches are
+jitter-free and both are current-minus-previous.
 
 ### 2.6 The View constant buffer
 
-Stray's TAA shader carries the stock UE 4.27.2 `View` uniform buffer at register **`b1`**.
+Stray's TAA shader carries the stock UE 4.27.2 `View` uniform buffer at register **`b1`**. Observed
+total sizes vary (126 / 131 / 145 float4s) but **row offsets do not**. The layout was established
+twice independently from `VIEW_UNIFORM_BUFFER_MEMBER_TABLE` (`SceneView.h:582-774`), and **[derived]**
+a third time by a recomputation that reproduced all seven measured anchors exactly.
 
-Observed sizes across permutations in the same session — total size varies, **row offsets do not**:
+| Field | Row | Byte | |
+|---|---|---|---|
+| `ViewToClip` | 28 | 448 | measured |
+| `ViewToClipNoAA` | 32 | 512 | measured |
+| `InvDeviceZToWorldZTransform` | 65 | 1040 | [derived] |
+| `ClipToPrevClip` | 122 | 1952 | measured |
+| `TemporalAAJitter` | 126 | 2016 | measured |
+| `ViewRectMin` | 129 | 2064 | measured |
+| `ViewSizeAndInvSize` | 130 | 2080 | measured |
+| `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 | measured — **decoy**, reads `(1,1,1,1)` |
+| `BufferSizeAndInvSize` | 132 | 2112 | [derived] |
+| `PreExposure` | 135.y | 2164 | [derived] |
+| `OneOverPreExposure` | 135.z | 2168 | [derived] |
+| `NearPlane` | 142.x | 2272 | [derived] |
+| `DeltaTime` | 143.x | 2288 | [derived] |
+| `CameraCut` | 145.x | 2320 | [derived] |
+| `TemporalAAParams` | 152 | 2432 | measured |
 
-* `size = 126 float4s (2016 bytes)`
-* `size = 131 float4s (2096 bytes)`
-* `size = 145 float4s (2320 bytes)`
-
-Row offsets (float4 rows = byte offset / 16). The stock UE 4.27.2 layout was established twice
-independently — read out of `VIEW_UNIFORM_BUFFER_MEMBER_TABLE` (`SceneView.h:582-774`) and
-recomputed by a layout script over the same declaration list:
-
-| Field | Row | Byte offset |
-|---|---|---|
-| `ViewToClip` | 28 | 448 |
-| `ViewToClipNoAA` | 32 | 512 |
-| `ClipToPrevClip` | 122 | 1952 |
-| `TemporalAAJitter` | 126 | 2016 |
-| `ViewRectMin` | 129 | 2064 |
-| `ViewSizeAndInvSize` | 130 | 2080 |
-| `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 |
-| `TemporalAAParams` | 152 | 2432 |
-
-The six rows a jitter recovery needs — `proj=28 noaa=32 clip=122 jitter=126 size=130 params=152` —
-were located in Stray's running View buffer and reported at the strongest tier (`tier=full`).
+Everything we need is in a single **2448-byte prefix**. **Rows beyond 152 were not verified — do
+not use them.**
 
 `ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
-analysis**, with no reflection names involved.
+analysis**, no reflection names involved.
 
-Three traps when reading this buffer:
+Traps:
 
-* `LightProbeSizeRatioAndInvSizeRatio` at row 131 is `(1,1,1,1)` — a **decoy** for any naive search
-  that expects an identity-looking row.
-* The shader declares `dcl_constantbuffer cb1[131]`. That 131 is the **highest row the shader
-  indexes**, not the buffer's size — `ViewSizeAndInvSize` ends at byte 2096.
-* These offsets are fixed for a given engine build but are **not invariant across a licensee edit**
-  to the member table. They were checked rather than trusted; keep checking them at runtime.
+* Row 131 is `(1,1,1,1)` — a decoy for any search expecting an identity-looking row.
+* `dcl_constantbuffer cb1[131]` — that 131 is the **highest row indexed**, not the buffer size.
+* Offsets are fixed per engine build but not invariant across a licensee edit. Keep checking them.
+* **[derived] Never read b0.** UE4 strips the DXBC reflection chunk (`D3DCOMPILER_STRIP_REFLECTION_DATA`),
+  so `D3DReflect` is impossible; and loose params land in fxc's implicit `$Globals`, which fxc
+  **compacts by removing unused globals**, so b0 offsets are unpredictable from source. b1 is an
+  explicit `cbuffer View` with a layout fixed by `FShaderParametersMetadata`.
 
-**Jitter convention**, from engine source and consistent with the above:
+### 2.7 Jitter
 
 ```
 InJitterOffsetX = TemporalJitterPixels.X = TemporalAAParams.z = TemporalAAJitter.x * W *  0.5f
 InJitterOffsetY = TemporalJitterPixels.Y = TemporalAAParams.w = TemporalAAJitter.y * H * -0.5f
 ```
 
-**Note the Y term is negative.** This is exactly the kind of sign that silently ruins an image.
+The negative Y factor is real — **but only in the derivation**. **[derived] Do not derive anything:**
 
-### 2.7 Camera cuts
+> **`InJitterOffsetX = TemporalAAParams.z` (byte 2440), `InJitterOffsetY = TemporalAAParams.w`
+> (byte 2444). Read and assign straight across. No negation, no scaling.**
 
-UE 4.27 assigns `PrevViewMatrices = ViewMatrices` on any frame that is a camera cut. The
-observable consequence in the View buffer is that **`View.TemporalAAJitter.zw` becomes equal to
-`.xy`**. This was used as a live cut detector and confirmed working against the running game
-(reported as `detector=LIVE`). It maps directly onto NGX's `InReset`.
+`TemporalAAParams.zw` **is** `TemporalJitterPixels`, already in render-resolution pixels, in
+`[-0.5, +0.5]`, and NVIDIA's own UE plugin passes it to NGX unmodified.
 
-Observed cut counts: **3** across splash and main menu, **5** by the time gameplay is running —
-entering gameplay from the menu produces cuts.
+**[derived]** `TemporalAAParams` is `(JitterIndex, SequenceLength, JitterPixelsX, JitterPixelsY)`;
+`TemporalAAJitter` is `(CurX, CurY, PrevX, PrevY)` in clip/NDC units.
 
-### 2.8 TAA history
+**[derived]** In the shipped (non-upsampling) mode UE4 warps Halton through Box-Muller with
+`sigma = 0.47 * r.TemporalAAFilterSize` — a distribution DLSS was **not** trained on. Forcing
+`r.TemporalAA.Upsampling=1` switches to plain Halton in `[-0.5, 0.5]`, which is what DLSS *was*
+trained on. See §4.
 
-The resource written at `u0` (`OutComputeTex`) is extracted by UE 4.27 as the **next frame's
-`HistoryBuffer[0]`**. **Overwriting `u0` therefore feeds whatever we write into the next frame's
-temporal history** — which is precisely the hook that lets us replace TAA from outside the engine.
+### 2.8 Camera cuts
 
-The same resource can also appear bound as this frame's **scene-colour input** (at the colour SRV
-register) rather than as the history slot; the two cases are distinguishable **only by which
-register it turns up on at a given dispatch**. Track resources by register, never by identity
+UE 4.27 assigns `PrevViewMatrices = ViewMatrices` on a cut. The observable consequence is
+**`View.TemporalAAJitter.zw == .xy`**. Confirmed working as a live cut detector against the running
+game (`detector=LIVE`). Observed counts: **3** across splash and main menu, **5** once gameplay is
+running.
+
+**[derived] That signal alone is insufficient.** `bCameraCut = !InputHistory.IsValid() ||
+View.bCameraCut`, and the history-invalid case never reaches the View buffer. OR three signals for
+`InReset`:
+
+1. `View.CameraCut != 0` (row 145.x);
+2. `TemporalAAJitter.zw == .xy` (our measured heuristic);
+3. **the history or velocity SRV is a 1×1 texture** — most reliable, directly reflects
+   `!InputHistory.IsValid()`.
+
+### 2.9 TAA history
+
+The resource at `u0` is extracted by UE 4.27 as the **next frame's `HistoryBuffer[0]`**.
+**Overwriting `u0` feeds whatever we write into the next frame's temporal history** — the hook that
+lets us replace TAA from outside the engine.
+
+The same resource can also appear as this frame's **scene-colour input**; the two cases are
+distinguishable **only by which register it turns up on**. Track by register, never by identity
 alone.
 
-### 2.9 Stability observations on this install
+### 2.10 Stability observations
 
-Environment facts, independent of any add-on — useful when triaging a crash report so we do not
-chase our own tail:
+Environment facts, independent of any add-on — useful when triaging so we do not chase our own tail:
 
-* `gamescope-wl` segfaulted three times in one afternoon (11:40, 11:42, 14:03), and once the day
+* `gamescope-wl` segfaulted three times in one afternoon (11:40, 11:42, 14:03) and once the day
   prior. The nvidia driver was unloaded and reloaded at 11:43.
-* One GPU `Xid 109 (CTX SWITCH TIMEOUT)` was recorded against `Stray-Win64-Shi`, channel
-  `0x00000012`.
-* UE4 crash dumps exist **from sessions with no third-party add-on installed at all**, with
-  `ErrorMessage: Unhandled Exception: 0xe06d7363` (a C++ exception) and one
-  `EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000010`. **Stray crashes on its own.**
-  Do not assume a crash is ours.
-* Killing the game leaves a `reaper` process (`SteamLaunch AppId=1332010`) behind. While it
-  exists, Steam silently ignores further `steam://rungameid/1332010` launches.
+* One GPU `Xid 109 (CTX SWITCH TIMEOUT)` against `Stray-Win64-Shi`, channel `0x00000012`.
+* UE4 crash dumps exist **from sessions with no third-party add-on at all**:
+  `Unhandled Exception: 0xe06d7363` (a C++ exception) and one `EXCEPTION_ACCESS_VIOLATION reading
+  address 0x0000000000000010`. **Stray crashes on its own.** Do not assume a crash is ours.
+* Killing the game leaves a `reaper` process (`SteamLaunch AppId=1332010`) behind. While it exists,
+  Steam silently ignores further `steam://rungameid/1332010` launches.
 
-### 2.10 Driving the game unattended (host facts)
+### 2.11 Driving the game unattended
 
 * The physical DualSense is held by **Steam** via `/dev/hidraw0`. Nothing holds its evdev nodes.
-* Steam Input re-emits it as **"Microsoft X-Box 360 pad 0"**, and that node is what the game reads.
-  Its `eventN` number is **not stable** — Steam tears it down with the game.
-* Writing `input_event` structs directly to `/dev/input/eventN` reaches `input_inject_event()` in
-  the kernel and is seen by every reader of that node. No `uinput`, `ydotool` or `evemu` needed.
-  Neither the pad nor the keyboard node is `EVIOCGRAB`'d.
-* ReShade's screenshot bind is `KeyScreenshot=44` (`VK_SNAPSHOT`) = Linux `KEY_SYSRQ=99`.
-  Injecting it on the real keyboard node makes ReShade write a 4K PNG into the game directory.
-  **This is our screenshot channel for visual verification.**
+* Steam Input re-emits it as **"Microsoft X-Box 360 pad 0"** — that node is what the game reads. Its
+  `eventN` number is **not stable**; Steam tears it down with the game.
+* Writing `input_event` structs directly to `/dev/input/eventN` reaches `input_inject_event()` and
+  is seen by every reader. No `uinput`, `ydotool` or `evemu` needed. Neither the pad nor the
+  keyboard node is `EVIOCGRAB`'d.
+* ReShade's screenshot bind is `KeyScreenshot=44` (`VK_SNAPSHOT`) = Linux `KEY_SYSRQ=99`. Injecting
+  it on the real keyboard node makes ReShade write a 4K PNG into the game directory. **This is our
+  screenshot channel for visual verification.**
 * gamescope's `SIGUSR2` screenshot produced no file. `ffmpeg`'s `kmsgrab` cannot read its
-  framebuffer, which is `XB30` (`XBGR2101010`, 10-bit HDR).
+  framebuffer (`XB30`, 10-bit HDR).
 
 ---
 
 ## 3. How the add-on works
 
-The shape, end to end:
-
 ```
-                    ┌─────────────────── ReShade add-on events ───────────────────┐
- game frame  ──▶ init_pipeline ──▶ hash DXBC ──▶ is this 0x1708ec956099e259?
-                                                          │ yes
-                    bind_pipeline ─────────────────────────┘  remember "TAA is bound"
-                    push_descriptors ──▶ capture t0 depth, t2 velocity, t5/t6 colour,
-                                         u0 output, b1 View CB
-                    dispatch ──────────▶ INTERCEPT
-                                          │
-                                          ├─ read View CB rows 122/126/129/130/152
-                                          ├─ detect camera cut (jitter.zw == jitter.xy) → InReset
-                                          ├─ run our MV-resolve compute pass:
-                                          │     dense MV = sparse velocity where valid,
-                                          │     else camera motion from depth + ClipToPrevClip
-                                          ├─ NGX EvaluateFeature(colour, depth, denseMV, jitter) → u0
-                                          └─ return true  (skip the engine's TAA dispatch)
-                                          │
-                    u0 becomes next frame's HistoryBuffer[0] ──▶ engine continues
+                    ┌────────────────── ReShade add-on events ──────────────────┐
+ game frame ─▶ init_pipeline ──▶ fnv1a64 the DXBC ──▶ 0x1708ec956099e259?
+                                                      + binding signature + dispatch size
+                                                              │ yes
+               bind_pipeline ───────────────────────────────── ┘   (stage is `all`, NOT compute!)
+               push_descriptors / bind_descriptor_tables
+                          └─▶ capture by REGISTER: t0 depth, t2 velocity,
+                              t5/t6 colour, u0/u1 output, b1 View CB
+               dispatch ──▶ INTERCEPT
+                             ├─ map b1, copy the 2448-byte prefix, read rows
+                             │    122 ClipToPrevClip · 129/130 rect · 132 buffer size
+                             │    135.y PreExposure · 145.x CameraCut · 152 jitter
+                             ├─ identify history vs scene colour via last frame's u0 pointer
+                             ├─ InReset = CameraCut | jitter.zw==xy | 1x1 history/velocity
+                             ├─ our MV-resolve CS → dense RG16_FLOAT at render res:
+                             │     EncodedVelocity.x > 0 ? decode : camera motion from
+                             │     depth + ClipToPrevClip;  then * (0.5W, -0.5H), negated
+                             ├─ barrier inputs → NON_PIXEL_SHADER_RESOURCE, output → UAV
+                             ├─ NGX EvaluateFeature(colour, depth, denseMV, jitter) → u0
+                             ├─ RESTORE clobbered D3D12 state (heaps, root sig, PSO, ...)
+                             ├─ produce u1 (half-res filter of u0) — required!
+                             └─ return true  (skip the engine's dispatch)
+                             │
+               u0 becomes next frame's HistoryBuffer[0] ──▶ engine continues
 ```
 
-Four stages, each independently testable in isolation as far as CI allows:
+Four stages, each testable in isolation as far as CI allows:
 
-1. **Identify** — hash every compute shader's DXBC at `init_pipeline`, match the known TAA hash,
-   fall back to a binding-signature heuristic that must *never* select `0x901e041a7cadc9db`.
-2. **Capture** — record the bound SRVs/UAV/CB at `push_descriptors` / `bind_descriptor_tables`,
-   keyed **by register**, and read the View CB rows.
-3. **Resolve** — our own compute pass turning sparse velocity + depth + `ClipToPrevClip` into the
-   dense MV field DLSS needs, in DLSS's expected units and sign.
-4. **Evaluate** — NGX `CreateFeature` / `EvaluateFeature` into `u0`, then skip the engine dispatch.
+1. **Identify** — hash every compute shader's DXBC at `init_pipeline`; confirm with binding
+   signature and dispatch size; never select `0x901e041a7cadc9db`; never hook `0x52101a15e1a0c5cc`.
+2. **Capture** — record bound SRVs/UAVs/CB **by register** and read the View CB rows.
+3. **Resolve** — our compute pass turning sparse velocity + depth + `ClipToPrevClip` into the dense
+   `RG16_FLOAT` field DLSS requires, in DLSS's units and sign.
+4. **Evaluate** — NGX into `u0`, restore state, produce `u1`, skip the engine dispatch.
 
 ### Staging
 
-* **v0.1 — DLAA.** Render resolution == output resolution. No screen-percentage forcing, so the
-  whole "make UE4 render smaller" problem is out of scope. This isolates one question: *are
-  colour, depth, motion vectors and jitter correct?* If DLAA looks right, the plumbing is right.
-* **v0.2 — DLSS SR.** Force UE4's internal render resolution down via `Engine.ini`
-  (`r.ScreenPercentage` / `r.TemporalAA.Upsampling` / `r.SecondaryScreenPercentage.GameViewport`),
-  handle the resulting subrect semantics and the possible switch to the `MainUpsampling` TAA
-  permutation (hash `0x52101a15e1a0c5cc`?), and expose Quality/Balanced/Performance/UltraPerf.
-
-Do not start v0.2 before v0.1 is confirmed correct **on the user's machine**.
+* **v0.1 — DLAA.** Render resolution == output resolution. No screen-percentage forcing. Isolates
+  one question: *are colour, depth, motion vectors and jitter correct?*
+* **v0.2 — DLSS SR.** See §4. Do not start v0.2 before v0.1 is confirmed correct **on the user's
+  machine**.
 
 ---
 
-## 4. Reference material
+## 4. The super-resolution path
 
-### Luma-Framework — the primary architectural reference
+**[derived]** The correct way is not to fight the engine. Set in `Engine.ini [SystemSettings]`:
 
-`Filoppi/Luma-Framework` is a ReShade-add-on modding framework that injects DLSS into games that
-never shipped it (Prey 2017, Dishonored 2, Deus Ex MD, Metaphor, …). It is the closest existing
-thing to what we are building and its patterns should be followed unless we have a reason not to.
+```ini
+r.ScreenPercentage=<N>
+r.TemporalAA.Upsampling=1
+```
 
-**Study, in order:**
+Then `PrimaryScreenPercentageMethod` becomes `TemporalUpscale`, TemporalAA.cpp selects
+`ETAAPassConfig::MainUpsampling`, `InputViewRect` is render res while `OutputViewRect` is display
+res, and the engine allocates a **full-res output texture** and expects the TAA pass to upscale —
+**exactly DLSS's contract**. Every downstream pass already uses the upscaled rect.
 
-| Path in Luma | Why |
-|---|---|
-| `Source/Core/includes/super_resolution.h` | The `SR::SuperResolutionImpl` interface: `SettingsData`, `InstanceData`, `DrawData`. Clean separation of "what the upscaler needs" from "which upscaler". Copy this shape. |
-| `Source/Core/dlss/DLSS.cpp` | The full NGX lifecycle: init-with-ProjectID, capability query, quality-mode selection, feature create/release, evaluate. |
-| `Source/Core/fsr/FSR.cpp` | The same interface implemented for FSR — proof the abstraction holds, and our fallback if D3D12 NGX is blocked on Proton. |
-| `Source/Core/core.hpp` | The add-on event wiring, resource tracking and overlay. Large (~17k lines); read the parts you need. |
-| `Source/Games/_Template/main.cpp` | Minimal per-game integration. |
-| `Source/Games/Dishonored 2/` + `Shaders/Dishonored 2/Luma_PreDLSS_CS.hlsl` | A game with a pre-DLSS compute pass — the closest analogue to our MV-resolve pass. |
-| `.github/workflows/build_and_release.yml` | MSVC CI, per-addon packaging, NGX opt-in detection, GitHub release. |
+Three things come free: **plain Halton jitter** in `[-0.5, 0.5]` (what DLSS was trained on, versus
+the Box-Muller-warped sequence in the shipped mode); **auto-scaled phase count** reproducing
+NVIDIA's `Base × (Target/Render)²`; and the **correct texture mip bias**.
 
-**Concrete things Luma establishes** (all read directly from its source, HARD):
+**The cost: the permutation and therefore the DXBC hash change.** `0x1708ec956099e259` will no
+longer appear. Plan to re-derive it or match structurally.
 
-* **No NVIDIA app whitelist is needed.** Luma calls `NVSDK_NGX_D3D11_Init_with_ProjectID` with a
-  self-generated GUID and `NVSDK_NGX_ENGINE_TYPE_CUSTOM`. We do the D3D12 equivalent with our own
-  GUID.
-* **Feature flags it sets**: `MVLowRes` always (unless MVs are at output resolution),
-  `DepthInverted` when the game uses reversed-Z (Stray does), `MVJittered` if MVs carry jitter,
-  `AutoExposure`, `IsHDR` when colour is linear HDR.
-* **Quality mode is derived, not chosen.** It loops every `NVSDK_NGX_PerfQuality_Value`, calls
-  `NGX_DLSS_GET_OPTIMAL_SETTINGS`, and picks the mode whose optimal render resolution best matches
-  the resolution actually in use — rather than picking a mode and forcing a resolution.
-* **Feature creation can be rejected for a given `InPerfQualityValue`**; Luma retries with
-  `Balanced` + `Render_Preset_Default`. Do the same.
-* **Release the old feature and parameters before creating new ones** on any settings change, and
-  release all NGX handles *before* `Shutdown1`.
-* **Jitter phase count**: `8 * (output_h / render_h)^2`, Halton base 2/3 returning `[-0.5, 0.5]`.
-* **Mip LOD bias**: `log2(render_h / max(render_h, output_h)) - 1`.
-* **MV sign convention as Luma states it**: "MVs need to have positive values when moving towards
-  the top left of the screen." Treat this as SOFT until confirmed against the DLSS Programming
-  Guide — it is a load-bearing sign.
+Hard constraints:
 
-**Where we necessarily diverge from Luma:**
-
-| | Luma | stray-dlss |
-|---|---|---|
-| API | D3D11 (`ID3D11Device`, immediate context only) | **D3D12** (`ID3D12Device`, `ID3D12GraphicsCommandList`, explicit barriers, descriptor heaps) |
-| NGX entry points | `NVSDK_NGX_D3D11_*` | `NVSDK_NGX_D3D12_*` |
-| Resource state | implicit | **explicit `D3D12_RESOURCE_STATES` transitions around evaluate** |
-| Build | MSBuild `.sln` / `.vcxproj`, developed on Windows | **CMake + GitHub Actions only**, never built locally |
-| Platform | Windows-first, Proton works | **Proton-only target** |
-
-Other prior art worth reading, in decreasing relevance: `optiscaler/OptiScaler` (upscaler
-replacement across APIs, including D3D12, and the most likely source of Proton-specific
-knowledge), `clshortfuse/renodx`, NVIDIA's own UE4 DLSS plugin (`FDLSSUpscaler`, `NGXRHI`) for the
-canonical UE4 conventions, and `crosire/reshade` `include/` + `examples/` for the add-on API
-itself.
-
-Reference checkouts are kept **outside** this repo (scratchpad), never vendored wholesale.
+* **`r.TemporalAA.Algorithm` must stay 0.** Gen5 replaces the single dispatch with a chain of six
+  shaders and breaks the hook entirely.
+* `r.TemporalAA.HistoryScreenPercentage` must stay 100 — above that switches to `MainSuperSampling`.
+* Raise `r.TemporalAASamples` for SR modes; the default 8 is enough for DLAA but Performance needs
+  32.
+* **Never disable TAA via `r.DefaultFeature.AntiAliasing`.** NVIDIA's guide §8.1.3 is explicit:
+  replace the TAA pass, but everything the engine does *because* TAA is on — jitter, velocity
+  generation — must keep happening.
 
 ---
 
-## 5. Domain notes
+## 5. Domain quick-reference
 
-### ReShade add-on API
+The full detail is in `docs/RESEARCH.md`. These are the things that bite.
 
-We target **ReShade 6.8.x** (the user runs 6.8.0.2155). The add-on API changed meaningfully
-between 5.x and 6.x — **do not paste 5.x example code**. Ground truth is `crosire/reshade`
-`include/`: `reshade.hpp`, `reshade_api_device.hpp`, `reshade_api_pipeline.hpp`,
-`reshade_api_resource.hpp`, `reshade_events.hpp`, `reshade_overlay.hpp`.
+### ReShade 6.8 add-on API
 
-Rules:
-
-* Build a DLL named `*.addon64`. ReShade loads it and calls our `register_addon`.
-* Get to raw D3D12 through `device::get_native()` / `command_list::get_native()`; check
-  `device::get_api() == device_api::d3d12` and bail loudly otherwise.
-* Returning `true` from an event callback **skips** the underlying call. That is how we suppress
-  the engine's TAA dispatch.
-* imgui is **version-pinned** to what ReShade 6.8 ships. A mismatched `imgui.h` compiles fine and
-  then corrupts memory at runtime. Pin it exactly.
-* Track the game's resources **by descriptor register**, not by resource pointer — §2.8 shows the
-  same texture appears at different registers meaning different things.
-* Constant buffers the game binds may live in an overwritten ring buffer. Read the View CB at the
-  moment of the dispatch, and copy out only the rows we need.
+* **Pin headers to tag `v6.8.0`.** `RESHADE_API_VERSION` is **20**; ReShade rejects anything newer
+  than its own. Vendor the 8 headers; do not track `main`.
+* **Do not define `RESHADE_API_LIBRARY`** — header-only is the supported path.
+* **imgui is pinned to v1.92.5 (`IMGUI_VERSION_NUM == 19250`)**, enforced by `#error`. Headers only.
+  Include `imgui.h` *before* `reshade.hpp`. A mismatch makes `register_addon` return **false** and
+  the add-on never loads — log to a file *before* `register_addon` so this is diagnosable.
+* **`reshade::log_message` no longer exists.** Use
+  `reshade::log::message(reshade::log::level::info, buf)`. It takes no printf args.
+* **In D3D12 `bind_pipeline` fires with `pipeline_stage::all`, NOT `compute_shader`.** Filtering on
+  the compute stage silently misses every event.
+* **`dispatch` is the only skip-capable event on our path** — return `true` to suppress. Everything
+  else is `void`.
+* **`push_descriptors`, `bind_descriptor_tables`, `bind_pipeline`, `create_pipeline` require
+  `RESHADE_ADDON >= 2`** — the full add-on build. Assert at startup that we saw one in the first N
+  frames, or "wrong ReShade build" is indistinguishable from "UE4 binds differently".
+* **Registering the pipeline events has a side effect**: ReShade redirects all PSO creation through
+  `ID3D12Device2::CreatePipelineState` and **drops the cached-PSO blob**. Expect first-run hitching
+  under vkd3d. If it regresses, identify structurally and drop those events.
+* `get_native()` returns **`uint64_t`** — reinterpret_cast it. All handles are
+  `struct { uint64_t handle; }`.
+* Track the game's resources **by descriptor register**, never by pointer alone (§2.9).
+* Read the View CB **inside the `dispatch` callback**, never deferred — the upload ring has not
+  advanced yet at recording time. Use `map_buffer_region(..., map_access::read_only, ...)`.
+* **Copy `examples/utils/descriptor_tracking.{hpp,cpp}` and `state_tracking.cpp` verbatim.** Register
+  descriptor tracking from the very first frame — attach late and there is no retroactive recovery.
+* Register both a `nullptr` (settings) overlay and an `"OSD"` overlay. The OSD is the fastest remote
+  diagnostic when the user can only send a screenshot.
 
 ### DLSS / NGX
 
-Ground truth is `NVIDIA/DLSS` (`include/nvsdk_ngx*.h`) plus the DLSS Programming Guide in that
-repo. Luma vendors a copy at `Source/External/NGX/`.
+* **Feature flags for Stray: `IsHDR | MVLowRes | DepthInverted | AutoExposure` = `0x4B`.** Never set
+  `DoSharpening` (deprecated, does nothing).
+* **Motion vectors: `RG16_FLOAT`, render-resolution pixels, [0,0] upper-left, pointing BACKWARD.**
+  `MV_pixels = (PrevScreen - ThisScreen) * (0.5·W, -0.5·H)`, `InMVScaleX/Y = (1,1)`. Guard with
+  `PrevClipPos.w > 0`. This is NVIDIA's own `VelocityCombine.usf` math — copy it, don't invent it.
+* **Jitter: pass `TemporalAAParams.zw` straight through. No sign flip.**
+* **Presets: only `0, J=10, K=11, L=12, M=13` are valid** (A–D removed, E/F deprecated). Use **K**.
+  Set all five hint keys **before** `CreateFeature`; setting them after has no effect.
+* **NGX clobbers D3D12 command-list state.** We must save and restore descriptor heaps, root
+  signature, PSO, root params, topology, viewports and RTVs. ReShade does not do this for us. This
+  is the number-one corruption risk.
+* Inputs must be `NON_PIXEL_SHADER_RESOURCE`, output must be UAV with `ALLOW_UNORDERED_ACCESS`.
+  Missing that flag can produce a **black output with no error**.
+* Init with `Init_with_ProjectID` and our own GUID — **no NVIDIA whitelist needed**. Pass a
+  `LoggingCallback` that forwards into `reshade::log::message`.
+* Derive the quality mode from `NGX_DLSS_GET_OPTIMAL_SETTINGS` rather than choosing one; retry a
+  rejected create with `Balanced` + `Preset_Default`.
+* Results are a **bitmask** over `0xBAD00000` — use `NVSDK_NGX_SUCCEED`/`NVSDK_NGX_FAILED`, never
+  `== Success`.
+* Teardown on one thread, GPU idle first: `ReleaseFeature` → `DestroyParameters` → `Shutdown1`.
+  **NGX is not thread-safe.** It holds no references to our resources — we must.
 
-The conventions that silently ruin an image, all of which we must pin down and log:
+### UE 4.27
 
-* `InJitterOffsetX` / `InJitterOffsetY` — units and **sign**. UE4 gives us
-  `TemporalAAParams.zw`, with a **negative Y factor** (§2.6).
-* `InMVScaleX` / `InMVScaleY` — what these must be given UE4 stores velocity as an **NDC delta**,
-  not a pixel delta, and given `MVLowRes`.
-* MV **direction** — current→previous, and Luma's "positive toward top-left" note.
-* `DepthInverted` — Stray is reversed-Z, so this is set.
-* `IsHDR` + `AutoExposure` / `InPreExposure` — UE4 applies a pre-exposure to scene colour; DLSS
-  needs to know.
-* `InReset` — driven by the camera-cut detector of §2.7.
-* D3D12 **resource states** at evaluate time, and whether NGX clobbers our descriptor heaps and
-  root signature. In D3D12 this is our responsibility, unlike D3D11.
-
-`nvngx_dlss.dll` redistribution is governed by the NVIDIA RTX SDKs licence. Prefer having CI
-download it from the NVIDIA/DLSS release rather than committing a large binary.
-
-### Unreal Engine 4.27
-
-Ground truth is the UE 4.27 branch: `PostProcess/TemporalAA.cpp`,
-`Shaders/Private/PostProcessTemporalAA.usf`, `TemporalAACommon.ush`, `Common.ush`, `SceneView.h`,
-`VelocityRendering.cpp`.
-
-Things to keep straight:
-
-* `FTAAStandaloneCS` has **multiple permutations** (`ETAAPassConfig`, `TAA_UPSAMPLE`,
-  `TAA_DOWNSAMPLE`, `TAA_RESPONSIVE`, quality dims). Binding layout differs per permutation —
-  that is why Stray has two hashes (§2.3).
-* Of the two colour SRVs at `t5`/`t6`, one is this frame's scene colour and one is the previous
-  frame's history. **Feed DLSS the scene colour, never the history.** Getting this backwards
-  produces a plausible-looking but progressively degrading image.
-* Velocity is sparse; UE4's own TAA tests validity and falls back to camera motion. Find the exact
-  test in `PostProcessTemporalAA.usf` and mirror it rather than inventing a threshold.
-* `ClipToPrevClip` (row 122): confirm row-major vs column-major in the CB and whether it includes
-  jitter, before doing any matrix math with it.
-* `View.ViewRectMin` (129) and `View.ViewSizeAndInvSize` (130) give us the true render subrect —
-  needed for `InRenderSubrectDimensions` and the `*SubrectBase` fields.
-* Screen percentage is settable from `Engine.ini` `[SystemSettings]`; command-line is not (§2.2).
+* The shader is `TAAStandalone.usf` / `MainCS`.
+* `ClipToPrevClip` is built from **jitter-free (NoAA)** matrices, is **row-major**, and needs the
+  **row-vector** convention (`mul(v, M)`). Transpose if you rebuild it in a column-vector library.
+* Scene colour entering TAA **carries pre-exposure**; write our output back **still pre-exposed**.
+* `View.ViewRectMin` is almost always (0,0) after UE4 shifts view rects to the buffer top-left —
+  **but read it, do not assume it**.
 
 ---
 
 ## 6. Build, CI and testing
 
-* **CMake + GitHub Actions, Windows runner, MSVC, x64 only.** There is no local build. If it does
-  not build in CI it does not build.
-* Static-link the CRT (`/MT`) so the add-on does not drag a UCRT dependency into the Proton
-  prefix. NGX ships `_s` (static) and `_d` (dynamic) import libs — pick the one matching.
-* Warnings are errors. `/W4`.
-* **Unit tests run in CI** for every pure function: fnv1a64 over DXBC, the UE4 velocity decode
-  (assert against the measured constants `4.00801611f` / `2.00397754f` / `0.49999237f`), jitter
-  conversion including the negative Y, `ClipToPrevClip` reconstruction math, quality-mode
-  selection, Halton, mip bias. Prefer building these for Linux too so they run fast.
-* Ship PDBs as artifacts so a crash from the user's machine can be symbolised.
-* **Logging is the product's second output.** Version banner, device API, ReShade version, every
-  detected shader hash, the chosen TAA hash and why, the View CB rows read (raw floats), the
-  computed jitter, MV scale, feature flags, NGX result codes by name, and every state transition.
-  The user pastes this back; it must be enough to diagnose without a second round-trip.
-* Package a release zip: `.addon64` + `nvngx_dlss.dll` + README + a default `Engine.ini` snippet.
+* **CMake + GitHub Actions, MSVC, x64 only.** No local build. `windows-latest` is now Windows Server
+  2025 + VS 2026; MSVC v143 (14.44) is still available via `-T v143,version=14.44`.
+* **Build Release `/MD` and link `nvsdk_ngx_d.lib`.** The NGX libs are real static libraries that
+  expose C++ std types across the ABI — a mismatched `_ITERATOR_DEBUG_LEVEL` produces link errors.
+* Warnings are errors, `/W4`.
+* **Precompile every HLSL shader to DXBC at build time. Never call `D3DCompile` at runtime** —
+  `d3dcompiler_47` is frequently absent from a Proton prefix, and this is OptiScaler's single most
+  common Linux failure.
+* **Unit-test every pure function in CI**: fnv1a64 over DXBC; the UE4 velocity decode against the
+  measured constants; the jitter path; `ClipToPrevClip` reconstruction; quality-mode selection;
+  Halton; mip bias. Build them for Linux too so they run fast.
+* Ship PDBs as artifacts (`/Zi /DEBUG /OPT:REF /OPT:ICF`).
+* **Logging is the product's second output.** Version banner, ReShade version, vkd3d detection,
+  device API, every detected shader hash, the chosen TAA hash *and why*, the raw View CB rows, the
+  computed jitter and MV scale, feature flags, NGX result codes by name, every state transition.
+  The user pastes this back; it must diagnose without a second round-trip.
+* Give the user one copy-pasteable launch line for bug reports:
+  `DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%`, plus
+  `DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024` for visual proof DLSS is running (**1024,
+  not 1** — 1 only works for develop builds).
 
 ---
 
@@ -506,10 +545,9 @@ Things to keep straight:
   `systematic-debugging` before proposing a fix, `test-driven-development` for anything with a
   testable core, `verification-before-completion` before any claim of doneness.
 * No speculative features. Ship DLAA correctly before anything else exists.
-* Keep files focused. When a file grows past a few hundred lines it is doing too much — Luma's
-  17k-line `core.hpp` is a thing to learn from, not to imitate.
-* Every constant taken from the measured facts above gets a **named symbol with a comment citing
-  §2.x**, never a bare literal.
-* When a fact in §2 is contradicted by observation on the user's machine, **update §2 and
-  `docs/STRAY-RENDERING-FACTS.md`** in the same change that reacts to it.
-* Never commit `nvngx_dlss.dll` or game assets.
+* Keep files focused. Luma's 17k-line `core.hpp` is a thing to learn from, not imitate.
+* Every constant from §2 gets a **named symbol with a comment citing §2.x**, never a bare literal.
+* When observation on the user's machine contradicts §2, **update §2 and
+  `docs/STRAY-RENDERING-FACTS.md` in the same change** that reacts to it.
+* Never commit `nvngx_dlss.dll` or game assets. Redistribution is permitted only as part of an
+  application with material additional functionality, never stand-alone — CI fetches it.
