@@ -44,7 +44,11 @@ endif()
 # Vendored third-party headers, all version-pinned. See docs/RESEARCH.md for why each pin
 # matters — a drift in any of the three silently breaks loading rather than the build.
 #   ReShade  v6.8.0   RESHADE_API_VERSION 20; ReShade refuses anything newer than its own
-#   Dear ImGui v1.92.5 IMGUI_VERSION_NUM 19250; enforced by #error in reshade_overlay.hpp
+#   Dear ImGui v1.92.5-docking  IMGUI_VERSION_NUM 19250, enforced by #error in
+#            reshade_overlay.hpp. It MUST be the docking branch: ReShade's imgui function
+#            table references ImGuiDockNodeFlags and ImGuiWindowClass, which exist only
+#            there. The plain v1.92.5 tag reports the same version number and then fails to
+#            compile, so the #error is not enough to catch this.
 #   NGX      v310.7.0
 # ---------------------------------------------------------------------------------------
 add_library(reshade_sdk INTERFACE)
@@ -141,7 +145,9 @@ if(STRAY_DLSS_BUILD_TESTS)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)
-        target_compile_options(stray_dlss_tests PRIVATE /W4 $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
+        # C5285: doctest specialises std::tuple, which N5014 forbids. It is third-party
+        # header noise, not something we can fix, so silence it rather than dropping /WX.
+        target_compile_options(stray_dlss_tests PRIVATE /W4 /wd5285 $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
     else()
         target_compile_options(stray_dlss_tests PRIVATE -Wall -Wextra $<$<BOOL:${STRAY_DLSS_WERROR}>:-Werror>)
     endif()
