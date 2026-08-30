@@ -1,0 +1,79 @@
+name: Disassemble shader dumps
+
+# Takes DXBC captured from the running game and disassembles it on a Windows runner, where
+# fxc lives. This is how the binding layout of Stray's TAA pass gets read directly rather
+# than inferred: the dcl_resource_* declarations name every register the shader uses.
+#
+# Usage: commit the .dxbc files under dumps/ and run this workflow.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'dumps/**.dxbc'
+
+jobs:
+  disassemble:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Locate fxc
+        id: fxc
+        shell: pwsh
+        run: |
+          $candidates = Get-ChildItem -Path "C:/Program Files (x86)/Windows Kits/10/bin" `
+              -Filter fxc.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'x64' } |
+              Sort-Object FullName -Descending
+          if ($candidates.Count -eq 0) { throw "fxc.exe not found" }
+          $fxc = $candidates[0].FullName
+          Write-Host "Using $fxc"
+          "path=$fxc" >> $env:GITHUB_OUTPUT
+
+      - name: Disassemble
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path dumps -Filter *.dxbc -Recurse -ErrorAction SilentlyContinue
+          if ($null -eq $files -or $files.Count -eq 0) {
+            Write-Host "::warning::no .dxbc files found under dumps/"
+            New-Item -ItemType Directory -Force -Path disasm | Out-Null
+            "no input files" | Out-File disasm/EMPTY.txt
+            exit 0
+          }
+
+          New-Item -ItemType Directory -Force -Path disasm | Out-Null
+          foreach ($f in $files) {
+            $out = "disasm/$($f.BaseName).asm"
+            Write-Host "=== $($f.Name) -> $out"
+            & "${{ steps.fxc.outputs.path }}" /nologo /dumpbin $f.FullName /Fc $out
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::fxc failed on $($f.Name)"
+              continue
+            }
+          }
+
+          # The declaration block is the part that answers the binding-layout questions, so
+          # pull it into one summary file rather than making a human open every listing.
+          $summary = "disasm/SUMMARY.txt"
+          "Declaration summary for all dumped shaders" | Out-File $summary
+          "" | Out-File $summary -Append
+          foreach ($asm in Get-ChildItem disasm -Filter *.asm) {
+            "===== $($asm.Name) =====" | Out-File $summary -Append
+            Get-Content $asm.FullName |
+              Where-Object { $_ -match '^\s*(dcl_|cs_|ps_|//\s*Resource Bindings|//\s+\w+\s+texture)' } |
+              Out-File $summary -Append
+            "" | Out-File $summary -Append
+          }
+          Get-Content $summary
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shader-disassembly
+          path: disasm/
+          if-no-files-found: warn
