@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 extern "C" __declspec(dllexport) const char *NAME = "Stray DLSS";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -56,6 +57,11 @@ struct State
 
 	// pipeline handle -> DXBC hash, for compute pipelines only.
 	std::unordered_map<uint64_t, std::uint64_t> compute_pipeline_hashes;
+	// Distinct PS+CS shader hashes, which is the census the measured facts are stated in:
+	// ~150 during the main menu, rising to ~728 once gameplay is running. That step is the
+	// most reliable "are we actually in game" signal available without a GPU readback.
+	// (CLAUDE.md §2.3)
+	std::unordered_set<std::uint64_t> distinct_shader_hashes;
 	// command list -> the compute pipeline handle most recently bound on it.
 	std::unordered_map<reshade::api::command_list *, uint64_t> bound_compute_pipeline;
 
@@ -77,6 +83,7 @@ struct State
 	// locks, and the process wedges before the first frame. (docs/RESEARCH.md §1.4)
 	std::atomic<bool> ngx_enabled{ false };
 	std::atomic<bool> ngx_attempted{ false };
+	std::atomic<uint32_t> shader_census{ 0 };
 };
 
 State g_state;
@@ -162,7 +169,11 @@ void on_init_pipeline(
 
 	for (uint32_t i = 0; i < subobject_count; ++i)
 	{
-		if (subobjects[i].type != reshade::api::pipeline_subobject_type::compute_shader)
+		const bool is_compute =
+			subobjects[i].type == reshade::api::pipeline_subobject_type::compute_shader;
+		const bool is_pixel =
+			subobjects[i].type == reshade::api::pipeline_subobject_type::pixel_shader;
+		if (!is_compute && !is_pixel)
 			continue;
 
 		const auto *shader = static_cast<const reshade::api::shader_desc *>(subobjects[i].data);
@@ -170,6 +181,14 @@ void on_init_pipeline(
 			continue;
 
 		const std::uint64_t hash = fnv1a64(shader->code, shader->code_size);
+
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			g_state.distinct_shader_hashes.insert(hash);
+		}
+
+		if (!is_compute)
+			continue; // the census counts PS too, but only CS is hashed for identification
 
 		{
 			std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -282,6 +301,35 @@ void on_present(
 	(void)dirty_rects;
 
 	const uint64_t frame = g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
+
+	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
+	// looking at the screen. Rewritten in place every 30 frames; cheap and always current.
+	if ((frame % 30) == 0)
+	{
+		uint32_t census = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			census = static_cast<uint32_t>(g_state.distinct_shader_hashes.size());
+		}
+		g_state.shader_census.store(census, std::memory_order_relaxed);
+
+		std::FILE *f = nullptr;
+		if (fopen_s(&f, "stray-dlss-status.txt", "w") == 0 && f != nullptr)
+		{
+			std::fprintf(f, "frame=%llu\n", static_cast<unsigned long long>(frame));
+			std::fprintf(f, "shader_census=%u\n", census);
+			std::fprintf(f, "compute_pipelines=%u\n", g_state.compute_pipelines_seen.load());
+			std::fprintf(f, "taa_pipelines=%u\n", g_state.taa_pipelines_seen.load());
+			std::fprintf(f, "dispatches=%u\n", g_state.dispatches_seen.load());
+			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
+			std::fprintf(f, "ngx_attempted=%d\n",
+				g_state.ngx_attempted.load(std::memory_order_relaxed) ? 1 : 0);
+			// The measured census is ~150 in the main menu and ~728 in gameplay, so a
+			// threshold in between separates them with wide margin either side.
+			std::fprintf(f, "in_game=%d\n", census >= 400 ? 1 : 0);
+			std::fclose(f);
+		}
+	}
 
 	// Lazy NGX bring-up, well clear of device creation and on a frame boundary.
 	if (frame == kNgxInitFrame &&
