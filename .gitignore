@@ -20,3 +20,6 @@ refs/
 .vs/
 .idea/
 .DS_Store
+build-local/
+build*/
+third_party/ngx/lib/
