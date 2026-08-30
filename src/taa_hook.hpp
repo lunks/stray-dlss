@@ -7,7 +7,7 @@
 #include "core/taa_signature.hpp"
 #include "core/view_params.hpp"
 
-#include <reshade.hpp>
+#include "reshade_all.hpp"
 
 #include <cstdint>
 

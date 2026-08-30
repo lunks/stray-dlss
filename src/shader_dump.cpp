@@ -2,8 +2,7 @@
 
 #include "log.hpp"
 
-#include <imgui.h>
-#include <reshade.hpp>
+#include "reshade_all.hpp"
 
 #include <windows.h>
 

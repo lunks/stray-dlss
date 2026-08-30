@@ -13,8 +13,7 @@
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
 
-#include <imgui.h> // MUST precede reshade.hpp — the version handshake is checked there
-#include <reshade.hpp>
+#include "reshade_all.hpp"
 
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>

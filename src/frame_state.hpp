@@ -13,7 +13,7 @@
 
 #include "core/taa_signature.hpp"
 
-#include <reshade.hpp>
+#include "reshade_all.hpp"
 
 #include <vector>
 
