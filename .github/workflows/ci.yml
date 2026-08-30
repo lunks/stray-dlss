@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # Version-pinned so a silent upstream bump cannot change what we link against.
+  # See docs/RESEARCH.md §3 for why each pin is load-bearing.
+  DLSS_SDK_TAG: v310.7.0
+
+jobs:
+  # The pure-logic tests carry every convention that could silently produce a wrong image,
+  # so they run first and fast. If these fail, nothing else is worth building.
+  tests-linux:
+    name: Unit tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DSTRAY_DLSS_BUILD_ADDON=OFF
+          -DSTRAY_DLSS_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  build-windows:
+    name: Add-on (Windows, MSVC)
+    runs-on: windows-latest
+    needs: tests-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # The NGX import library is ~5 MB, so it is fetched rather than committed. The DLSS
+      # SDK's redistribution terms also make fetching the cleaner posture than vendoring.
+      - name: Fetch NGX import library
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path third_party/ngx/lib | Out-Null
+          $url = "https://github.com/NVIDIA/DLSS/raw/$env:DLSS_SDK_TAG/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile third_party/ngx/lib/nvsdk_ngx_d.lib
+          $size = (Get-Item third_party/ngx/lib/nvsdk_ngx_d.lib).Length
+          Write-Host "nvsdk_ngx_d.lib = $size bytes"
+          if ($size -lt 1000000) { throw "nvsdk_ngx_d.lib looks truncated ($size bytes)" }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSTRAY_DLSS_BUILD_ADDON=ON `
+            -DSTRAY_DLSS_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # A .addon64 that does not export what ReShade looks for loads and then does nothing,
+      # with no error anyone can see. Check it here instead of discovering it in the game.
+      - name: Verify add-on exports
+        shell: pwsh
+        run: |
+          $addon = "build/stray-dlss.addon64"
+          if (-not (Test-Path $addon)) { throw "stray-dlss.addon64 was not produced" }
+          Write-Host "Size: $((Get-Item $addon).Length) bytes"
+
+          $dumpbin = (Get-Command dumpbin -ErrorAction SilentlyContinue)
+          if ($null -eq $dumpbin) { Write-Host "::warning::dumpbin unavailable, skipping export check"; exit 0 }
+
+          $exports = & dumpbin /EXPORTS $addon | Out-String
+          Write-Host $exports
+          foreach ($sym in @('NAME', 'DESCRIPTION', 'WEBSITE')) {
+            if ($exports -notmatch "\b$sym\b") { throw "missing required export: $sym" }
+          }
+          Write-Host "All required ReShade add-on exports present."
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/stray-dlss.addon64 dist/
+          if (Test-Path build/stray-dlss.pdb) { Copy-Item build/stray-dlss.pdb dist/ }
+          Copy-Item README.md dist/
+          Copy-Item docs/STRAY-RENDERING-FACTS.md dist/
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stray-dlss-addon
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: build-windows
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: stray-dlss-addon
+          path: dist
+
+      - name: Package
+        run: cd dist && zip -r ../stray-dlss-${{ github.ref_name }}.zip .
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: stray-dlss-*.zip
+          body: |
+            ## Requirements
+
+            - **ReShade 6.8.0 or newer, with add-on support.** Earlier versions crash with
+              D3D12 DLSS under vkd3d-proton; the fix landed in 6.8.0.
+            - An NVIDIA RTX GPU and a driver providing `nvngx.dll` / `_nvngx.dll` to the
+              Proton prefix.
+            - `nvngx_dlss.dll` beside the game executable. It is not redistributed here —
+              take it from https://github.com/NVIDIA/DLSS (`lib/Windows_x86_64/rel/`).
+
+            ## Install
+
+            Extract into
+            `<SteamLibrary>/steamapps/common/Stray/Hk_project/Binaries/Win64/`.
+            On Linux also install `msvcrt40` and `vcrun2022` into the prefix with
+            protontricks.
+
+            ## Reporting a problem
+
+            Attach `stray-dlss.log` and `ReShade.log` from the game directory. Launch with:
+
+            ```
+            DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%
+            ```
