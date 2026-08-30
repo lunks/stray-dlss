@@ -16,6 +16,21 @@ std::unordered_map<reshade::api::command_list *, uint64_t> g_bound;             
 std::unordered_map<std::uint64_t, std::uint64_t> g_prev_output;                 // hash -> its u0 last frame
 std::unordered_map<std::uint64_t, bool> g_reported;                             // hash -> already logged
 
+// Per-shader outcome census. One dispatch report shows one shader; this shows the whole
+// field, which is what actually answers "does the TAA pass ever reach the resolver".
+struct HashStats
+{
+	std::uint64_t resolved = 0;
+	std::uint64_t failed = 0;
+	std::uint32_t gx = 0;
+	std::uint32_t gy = 0;
+	std::uint32_t srvs = 0;
+	std::uint32_t uavs = 0;
+	MatchVerdict verdict = MatchVerdict::no_match;
+};
+std::unordered_map<std::uint64_t, HashStats> g_stats;
+bool g_summary_dumped = false;
+
 Diagnostics g_diag;
 
 const char *verdict_name(MatchVerdict v)
@@ -125,6 +140,28 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 
 const Diagnostics &diagnostics() { return g_diag; }
 
+void dump_summary()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (g_summary_dumped)
+		return;
+	g_summary_dumped = true;
+
+	STRAY_LOG_INFO("======== PER-SHADER DISPATCH CENSUS ========");
+	STRAY_LOG_INFO("  %-18s %-11s %5s %5s %8s %8s  %s",
+		"hash", "dispatch", "srv", "uav", "resolved", "failed", "verdict");
+	for (const auto &e : g_stats)
+	{
+		STRAY_LOG_INFO("  0x%016llx %4ux%-6u %5u %5u %8llu %8llu  %s",
+			static_cast<unsigned long long>(e.first), e.second.gx, e.second.gy,
+			e.second.srvs, e.second.uavs,
+			static_cast<unsigned long long>(e.second.resolved),
+			static_cast<unsigned long long>(e.second.failed),
+			verdict_name(e.second.verdict));
+	}
+	STRAY_LOG_INFO("===========================================");
+}
+
 void set_pipeline_hash(uint64_t pipeline_handle, std::uint64_t hash)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
@@ -170,6 +207,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		}
 		hash = h->second;
 
+		{
+			HashStats &st = g_stats[hash];
+			st.gx = x;
+			st.gy = y;
+		}
+
 		if (g_reported[hash])
 		{
 			// Still track the output resource each frame: the history round-trip (this
@@ -189,6 +232,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
 			++g_diag.resolve_failed;
+			++g_stats[hash].failed;
 		}
 		if (!warned)
 		{
@@ -223,6 +267,15 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	sig.shader_hash = hash;
 
 	const MatchResult m = match_taa_dispatch(sig, w, h);
+
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		HashStats &st = g_stats[hash];
+		++st.resolved;
+		st.srvs = static_cast<std::uint32_t>(b.srvs.size());
+		st.uavs = static_cast<std::uint32_t>(b.uavs.size());
+		st.verdict = m.verdict;
+	}
 
 	// Report every large dispatch once, whatever the verdict. During Phase A the point is to
 	// see the whole field, not only what we already expect to find.

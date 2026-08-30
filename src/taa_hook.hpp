@@ -37,4 +37,7 @@ struct Diagnostics
 
 const Diagnostics &diagnostics();
 
+// Dumps the per-shader outcome census. Call once, after gameplay has been running a while.
+void dump_summary();
+
 } // namespace stray_dlss::taa_hook

@@ -364,6 +364,10 @@ void on_present(
 
 	// Report the add-on-level capability verdict once, after enough frames that the game has
 	// certainly bound something.
+	// Well after gameplay has started, so every steady-state pass has had a chance to run.
+	if (frame == 2400)
+		taa_hook::dump_summary();
+
 	if (frame == 300 && !g_state.reported_capability_verdict.exchange(true))
 	{
 		const bool full_addon_build =
