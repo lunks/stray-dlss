@@ -226,6 +226,10 @@ void note_push_descriptors(
 // offsets that do not resolve.
 void dump_tracker_state(reshade::api::device *device, state_tracking *state, descriptor_tracking *desc)
 {
+	// desc is no longer consulted for layout params — we keep our own deep copies — but the
+	// signature is kept so the dump can grow back into it if needed.
+	(void)desc;
+
 	STRAY_LOG_INFO("---- descriptor tracker state ----");
 	STRAY_LOG_INFO("  descriptor_tables entries: %zu", state->descriptor_tables.size());
 
