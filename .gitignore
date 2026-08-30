@@ -1,0 +1,22 @@
+# Build
+build/
+out/
+cmake-build-*/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.addon
+*.addon64
+
+# Vendored binaries — never commit
+nvngx_dlss.dll
+third_party/dlss/lib/**/*.dll
+
+# Reference checkouts (kept outside the repo; this is a safety net)
+refs/
+.vs/
+.idea/
+.DS_Store
