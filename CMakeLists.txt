@@ -78,6 +78,21 @@ target_include_directories(imgui_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/t
 add_library(reshade_utils_headers INTERFACE)
 target_include_directories(reshade_utils_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade_utils)
 
+# ReShade's own descriptor and state tracking, copied verbatim from its examples/utils at tag
+# v6.8.0. Reimplementing these is how people get descriptor tracking subtly wrong, so they are
+# kept pristine — which means they cannot be held to our /W4 /WX (they have unreferenced
+# parameters). Isolating them in their own target keeps our code strict without touching theirs.
+if(WIN32)
+    add_library(reshade_utils STATIC
+        third_party/reshade_utils/descriptor_tracking.cpp
+        third_party/reshade_utils/state_tracking.cpp)
+    target_link_libraries(reshade_utils PUBLIC reshade_sdk reshade_utils_headers imgui_headers)
+    target_compile_definitions(reshade_utils PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+        target_compile_options(reshade_utils PRIVATE /W3 /wd4100)
+    endif()
+endif()
+
 add_library(ngx_sdk INTERFACE)
 target_include_directories(ngx_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/include)
 
@@ -124,8 +139,6 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/frame_state.hpp
         src/taa_hook.cpp
         src/taa_hook.hpp
-        third_party/reshade_utils/descriptor_tracking.cpp
-        third_party/reshade_utils/state_tracking.cpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -137,6 +150,7 @@ if(STRAY_DLSS_BUILD_ADDON)
     target_link_libraries(stray-dlss PRIVATE
         stray_dlss_core
         reshade_sdk
+        reshade_utils
         reshade_utils_headers
         imgui_headers
         ngx_sdk
