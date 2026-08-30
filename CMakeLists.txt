@@ -75,6 +75,9 @@ target_include_directories(reshade_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/thi
 add_library(imgui_headers INTERFACE)
 target_include_directories(imgui_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
 
+add_library(reshade_utils_headers INTERFACE)
+target_include_directories(reshade_utils_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade_utils)
+
 add_library(ngx_sdk INTERFACE)
 target_include_directories(ngx_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/include)
 
@@ -117,6 +120,12 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/ngx_backend.hpp
         src/shader_dump.cpp
         src/shader_dump.hpp
+        src/frame_state.cpp
+        src/frame_state.hpp
+        src/taa_hook.cpp
+        src/taa_hook.hpp
+        third_party/reshade_utils/descriptor_tracking.cpp
+        third_party/reshade_utils/state_tracking.cpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -128,6 +137,7 @@ if(STRAY_DLSS_BUILD_ADDON)
     target_link_libraries(stray-dlss PRIVATE
         stray_dlss_core
         reshade_sdk
+        reshade_utils_headers
         imgui_headers
         ngx_sdk
         ${NGX_LIBRARY}

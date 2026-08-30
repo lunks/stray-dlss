@@ -9,10 +9,15 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "frame_state.hpp"
 #include "shader_dump.hpp"
+#include "taa_hook.hpp"
 
 #include <imgui.h> // MUST precede reshade.hpp — the version handshake is checked there
 #include <reshade.hpp>
+
+#include <descriptor_tracking.hpp>
+#include <state_tracking.hpp>
 
 #include <d3d12.h>
 
@@ -157,6 +162,11 @@ void on_init_command_list(reshade::api::command_list *cmd_list)
 	}
 }
 
+void on_reset_command_list(reshade::api::command_list *cmd_list)
+{
+	reset_command_list_state(cmd_list);
+}
+
 void on_init_pipeline(
 	reshade::api::device *device,
 	reshade::api::pipeline_layout layout,
@@ -199,6 +209,7 @@ void on_init_pipeline(
 		// Getting the real bytecode off the user's machine settles the binding layout
 		// offline, which is worth far more than any inference we could make here.
 		shader_dump::dump_compute_shader(hash, shader->code, shader->code_size);
+		taa_hook::set_pipeline_hash(pipeline.handle, hash);
 
 		if (hash == kTaaMainHash)
 		{
@@ -225,6 +236,7 @@ void on_destroy_pipeline(reshade::api::device *device, reshade::api::pipeline pi
 {
 	(void)device;
 	// ID3D12PipelineState pointers get recycled, so eviction is not optional.
+	taa_hook::forget_pipeline(pipeline.handle);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	g_state.compute_pipeline_hashes.erase(pipeline.handle);
 }
@@ -240,6 +252,7 @@ void on_bind_pipeline(
 	g_state.saw_bind_pipeline.store(true, std::memory_order_relaxed);
 
 	// Remember the pipeline per command list so a dispatch can be attributed to a hash.
+	taa_hook::set_bound_pipeline(cmd_list, pipeline.handle);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	if (g_state.compute_pipeline_hashes.count(pipeline.handle) != 0)
 		g_state.bound_compute_pipeline[cmd_list] = pipeline.handle;
@@ -252,17 +265,16 @@ void on_push_descriptors(
 	uint32_t layout_param,
 	const reshade::api::descriptor_table_update &update)
 {
-	(void)cmd_list;
-	(void)stages;
-	(void)layout;
-	(void)layout_param;
-	(void)update;
 	g_state.saw_push_descriptors.store(true, std::memory_order_relaxed);
+	note_push_descriptors(cmd_list, stages, layout, layout_param, update);
 }
 
 bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
 {
 	g_state.dispatches_seen.fetch_add(1, std::memory_order_relaxed);
+
+	if (taa_hook::intercept_dispatch(cmd_list, x, y, z))
+		return true;
 
 	if (shader_dump::enabled())
 	{
@@ -420,6 +432,7 @@ void register_events()
 	reshade::register_event<reshade::addon_event::init_device>(on_init_device);
 	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::register_event<reshade::addon_event::init_command_list>(on_init_command_list);
+	reshade::register_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
 
 	bool hash_shaders = true;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "HashShaders", hash_shaders);
@@ -461,6 +474,7 @@ void unregister_events()
 		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
 		reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
 	}
+	reshade::unregister_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
 	reshade::unregister_event<reshade::addon_event::init_command_list>(on_init_command_list);
 	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
 	reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
@@ -492,12 +506,20 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		log::enable_reshade_sink();
 		log::write(log::Level::info, "reshade::register_addon succeeded");
 		shader_dump::initialise();
+		// These must come first: they populate the descriptor and command-list state our own
+		// callbacks read, and there is no retroactive recovery of a heap we attached late to.
+		// (docs/RESEARCH.md §2.6)
+		descriptor_tracking::register_events();
+		state_tracking::register_events();
 		register_events();
 		break;
 
 	case DLL_PROCESS_DETACH:
 		shader_dump::finish();
 		unregister_events();
+		state_tracking::unregister_events();
+		descriptor_tracking::unregister_events();
+		forget_all_command_lists();
 		reshade::unregister_addon(module);
 		log::write(log::Level::info, "stray-dlss detaching");
 		log::shutdown_file_sink();
