@@ -4,6 +4,35 @@
 
 #include <d3d12.h>
 
+#if !defined(STRAY_DLSS_ENABLE_NGX)
+#define STRAY_DLSS_ENABLE_NGX 1
+#endif
+
+#if !STRAY_DLSS_ENABLE_NGX
+
+// Diagnostic build: NGX is not linked at all. Everything else in the add-on is identical, so
+// if this variant loads and the NGX one does not, the static NGX library's global
+// constructors are what fault at DLL entry.
+namespace stray_dlss::ngx {
+
+namespace { Status g_status; }
+
+const char *result_name(unsigned int) { return "<ngx disabled>"; }
+const Status &status() { return g_status; }
+
+Status initialise(ID3D12Device *)
+{
+	g_status = Status{};
+	STRAY_LOG_WARN("NGX is NOT linked in this build (diagnostic variant).");
+	return g_status;
+}
+
+void shutdown(ID3D12Device *) { g_status = Status{}; }
+
+} // namespace stray_dlss::ngx
+
+#else
+
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
@@ -162,3 +191,5 @@ void shutdown(ID3D12Device *device)
 }
 
 } // namespace stray_dlss::ngx
+
+#endif // STRAY_DLSS_ENABLE_NGX

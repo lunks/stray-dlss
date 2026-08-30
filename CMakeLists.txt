@@ -11,6 +11,12 @@ project(stray-dlss
 option(STRAY_DLSS_BUILD_ADDON "Build the ReShade add-on (requires Windows + MSVC)" ${WIN32})
 option(STRAY_DLSS_BUILD_TESTS "Build the unit tests" ON)
 option(STRAY_DLSS_WERROR "Treat warnings as errors" ON)
+# Linking NVIDIA's static NGX library runs its global constructors during
+# _DllMainCRTStartup, before our DllMain body. If that faults, Wine reports the whole
+# LoadLibraryEx as error 998 (ERROR_NOACCESS) and nothing of ours ever runs — not even the
+# first log line. Turning this OFF builds an otherwise identical add-on with NGX stubbed, to
+# isolate that.
+option(STRAY_DLSS_ENABLE_NGX "Link NVIDIA NGX (DLSS)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,16 +83,21 @@ if(STRAY_DLSS_BUILD_ADDON)
         message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires Windows.")
     endif()
 
-    find_library(NGX_LIBRARY
-        NAMES nvsdk_ngx_d
-        PATHS ${STRAY_DLSS_NGX_LIB_DIR}
-        NO_DEFAULT_PATH)
+    if(STRAY_DLSS_ENABLE_NGX)
+        find_library(NGX_LIBRARY
+            NAMES nvsdk_ngx_d
+            PATHS ${STRAY_DLSS_NGX_LIB_DIR}
+            NO_DEFAULT_PATH)
 
-    if(NOT NGX_LIBRARY)
-        message(FATAL_ERROR
-            "nvsdk_ngx_d.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
-            "Fetch it from https://github.com/NVIDIA/DLSS (lib/Windows_x86_64/x64/) or set "
-            "-DSTRAY_DLSS_NGX_LIB_DIR=<dir>.")
+        if(NOT NGX_LIBRARY)
+            message(FATAL_ERROR
+                "nvsdk_ngx_d.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
+                "Fetch it from https://github.com/NVIDIA/DLSS (lib/Windows_x86_64/x64/) or set "
+                "-DSTRAY_DLSS_NGX_LIB_DIR=<dir>.")
+        endif()
+    else()
+        set(NGX_LIBRARY "")
+        message(STATUS "NGX disabled: building a no-DLSS diagnostic add-on")
     endif()
 
     add_library(stray-dlss SHARED
@@ -113,6 +124,9 @@ if(STRAY_DLSS_BUILD_ADDON)
         ${NGX_LIBRARY}
         d3d12
         dxgi)
+
+    target_compile_definitions(stray-dlss PRIVATE
+        STRAY_DLSS_ENABLE_NGX=$<BOOL:${STRAY_DLSS_ENABLE_NGX}>)
 
     target_compile_definitions(stray-dlss PRIVATE
         WIN32_LEAN_AND_MEAN

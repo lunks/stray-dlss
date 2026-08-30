@@ -36,9 +36,17 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   build-windows:
-    name: Add-on (Windows, MSVC)
+    name: Add-on (Windows, MSVC, NGX=${{ matrix.ngx }})
     runs-on: windows-latest
     needs: tests-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        # NGX ON is the real add-on. NGX OFF is an otherwise identical diagnostic build used
+        # to isolate DLL-load failures: linking NVIDIA's static NGX library runs its global
+        # constructors at DLL entry, before our DllMain body, and a fault there surfaces as
+        # LoadLibraryEx error 998 with none of our code having run.
+        ngx: [ON, OFF]
     steps:
       - uses: actions/checkout@v4
 
@@ -66,7 +74,8 @@ jobs:
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DSTRAY_DLSS_BUILD_ADDON=ON `
-            -DSTRAY_DLSS_BUILD_TESTS=ON
+            -DSTRAY_DLSS_BUILD_TESTS=ON `
+            -DSTRAY_DLSS_ENABLE_NGX=${{ matrix.ngx }}
 
       - name: Build
         run: cmake --build build --parallel
@@ -97,15 +106,16 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/stray-dlss.addon64 dist/
-          if (Test-Path build/stray-dlss.pdb) { Copy-Item build/stray-dlss.pdb dist/ }
+          $suffix = if ("${{ matrix.ngx }}" -eq "ON") { "" } else { "-nongx" }
+          Copy-Item build/stray-dlss.addon64 "dist/stray-dlss$suffix.addon64"
+          if (Test-Path build/stray-dlss.pdb) { Copy-Item build/stray-dlss.pdb "dist/stray-dlss$suffix.pdb" }
           Copy-Item README.md dist/
           Copy-Item docs/STRAY-RENDERING-FACTS.md dist/
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: stray-dlss-addon
+          name: stray-dlss-addon-ngx-${{ matrix.ngx }}
           path: dist/
           if-no-files-found: error
 
@@ -119,7 +129,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: stray-dlss-addon
+          name: stray-dlss-addon-ngx-ON
           path: dist
 
       - name: Package
