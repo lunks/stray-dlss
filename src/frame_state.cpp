@@ -171,13 +171,30 @@ void dump_tracker_state(reshade::api::device *device, state_tracking *state, des
 				param, static_cast<unsigned long long>(table.handle),
 				static_cast<int>(info.type));
 
-			if (info.type != reshade::api::pipeline_layout_param_type::descriptor_table)
-				continue;
-
-			STRAY_LOG_INFO("      ranges=%u", info.descriptor_table.count);
-			for (uint32_t r = 0; r < info.descriptor_table.count && r < 8; ++r)
+			uint32_t range_count = 0;
+			const reshade::api::descriptor_range *plain = nullptr;
+			const reshade::api::descriptor_range_with_flags *flagged = nullptr;
+			if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table)
 			{
-				const auto &range = info.descriptor_table.ranges[r];
+				range_count = info.descriptor_table.count;
+				plain = info.descriptor_table.ranges;
+			}
+			else if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_flags)
+			{
+				range_count = info.descriptor_table_with_flags.count;
+				flagged = info.descriptor_table_with_flags.ranges;
+			}
+			else
+			{
+				continue;
+			}
+
+			STRAY_LOG_INFO("      ranges=%u", range_count);
+			for (uint32_t r = 0; r < range_count && r < 8; ++r)
+			{
+				const reshade::api::descriptor_range &range =
+					plain != nullptr ? plain[r]
+					                 : static_cast<const reshade::api::descriptor_range &>(flagged[r]);
 				reshade::api::descriptor_heap heap = { 0 };
 				uint32_t offset = 0;
 				device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &offset);
@@ -235,12 +252,35 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 				continue;
 
 			const reshade::api::pipeline_layout_param info = desc->get_pipeline_layout_param(layout, param);
-			if (info.type != reshade::api::pipeline_layout_param_type::descriptor_table)
-				continue;
 
-			for (uint32_t r = 0; r < info.descriptor_table.count; ++r)
+			// UE4's root signature uses descriptor_table_with_flags (4), not the plain
+			// descriptor_table (0). Both describe the same thing — descriptor_range_with_flags
+			// derives from descriptor_range — but handling only the plain variant silently
+			// skips every table, which is what made every resolve come back empty.
+			uint32_t range_count = 0;
+			const reshade::api::descriptor_range *plain_ranges = nullptr;
+			const reshade::api::descriptor_range_with_flags *flagged_ranges = nullptr;
+
+			if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table)
 			{
-				const reshade::api::descriptor_range &range = info.descriptor_table.ranges[r];
+				range_count = info.descriptor_table.count;
+				plain_ranges = info.descriptor_table.ranges;
+			}
+			else if (info.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_flags)
+			{
+				range_count = info.descriptor_table_with_flags.count;
+				flagged_ranges = info.descriptor_table_with_flags.ranges;
+			}
+			else
+			{
+				continue;
+			}
+
+			for (uint32_t r = 0; r < range_count; ++r)
+			{
+				const reshade::api::descriptor_range &range =
+					plain_ranges != nullptr ? plain_ranges[r]
+					                        : static_cast<const reshade::api::descriptor_range &>(flagged_ranges[r]);
 
 				for (uint32_t i = 0; i < range.count; ++i)
 				{
