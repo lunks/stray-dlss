@@ -45,6 +45,11 @@ void note_push_descriptors(
 	uint32_t layout_param,
 	const reshade::api::descriptor_table_update &update);
 
+// Dumps what the trackers hold for this command list. Callable on demand so a FAILED resolve
+// can explain itself for a specific shader, rather than only dumping whichever dispatch
+// happened to be first.
+void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *why);
+
 void reset_command_list_state(reshade::api::command_list *cmd_list);
 void forget_all_command_lists();
 

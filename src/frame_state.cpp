@@ -60,6 +60,21 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 
 } // namespace
 
+void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *why)
+{
+	reshade::api::device *device = cmd_list->get_device();
+	auto *state = cmd_list->get_private_data<state_tracking>();
+	auto *desc = device->get_private_data<descriptor_tracking>();
+	STRAY_LOG_INFO("tracker dump (%s):", why);
+	if (state == nullptr || desc == nullptr)
+	{
+		STRAY_LOG_ERROR("  tracker private data missing (state=%p desc=%p)",
+			static_cast<void *>(state), static_cast<void *>(desc));
+		return;
+	}
+	dump_tracker_state(device, state, desc);
+}
+
 TexFormat to_tex_format(reshade::api::format f)
 {
 	using reshade::api::format;

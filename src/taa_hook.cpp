@@ -3,6 +3,7 @@
 #include "frame_state.hpp"
 #include "log.hpp"
 
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -29,6 +30,8 @@ struct HashStats
 	MatchVerdict verdict = MatchVerdict::no_match;
 };
 std::unordered_map<std::uint64_t, HashStats> g_stats;
+std::unordered_map<std::uint64_t, bool> g_failure_dumped;
+int g_failure_dumps = 0;
 bool g_summary_dumped = false;
 
 Diagnostics g_diag;
@@ -228,12 +231,32 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// Say so once. A resolve that fails silently looks exactly like "the TAA pass never
 		// ran", and telling those apart is otherwise a whole extra round-trip on a machine
 		// the developer cannot iterate on quickly.
-		static bool warned = false;
+		bool dump_this = false;
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
 			++g_diag.resolve_failed;
 			++g_stats[hash].failed;
+			// Explain the failure for the shaders that actually matter, once each, rather
+			// than only for whichever dispatch happened to be first overall.
+			if (!g_failure_dumped[hash] && g_failure_dumps < 4 &&
+				(hash == kTaaMainHash || hash == kSecondCandidateHash ||
+				 hash == kKnownFalsePositiveHash || y >= 200))
+			{
+				g_failure_dumped[hash] = true;
+				++g_failure_dumps;
+				dump_this = true;
+			}
 		}
+
+		if (dump_this)
+		{
+			char why[128];
+			std::snprintf(why, sizeof(why), "resolve FAILED for 0x%016llx at %ux%u",
+				static_cast<unsigned long long>(hash), x, y);
+			dump_tracker_state_for(cmd_list, why);
+		}
+
+		static bool warned = false;
 		if (!warned)
 		{
 			warned = true;
