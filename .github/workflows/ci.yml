@@ -61,12 +61,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path third_party/ngx/lib | Out-Null
-          $url = "https://github.com/NVIDIA/DLSS/raw/$env:DLSS_SDK_TAG/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+          # _s = static CRT, matching the /MT build. See CMakeLists for why /MT is mandatory.
+          $url = "https://github.com/NVIDIA/DLSS/raw/$env:DLSS_SDK_TAG/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
           Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile third_party/ngx/lib/nvsdk_ngx_d.lib
-          $size = (Get-Item third_party/ngx/lib/nvsdk_ngx_d.lib).Length
-          Write-Host "nvsdk_ngx_d.lib = $size bytes"
-          if ($size -lt 1000000) { throw "nvsdk_ngx_d.lib looks truncated ($size bytes)" }
+          Invoke-WebRequest -Uri $url -OutFile third_party/ngx/lib/nvsdk_ngx_s.lib
+          $size = (Get-Item third_party/ngx/lib/nvsdk_ngx_s.lib).Length
+          Write-Host "nvsdk_ngx_s.lib = $size bytes"
+          if ($size -lt 1000000) { throw "nvsdk_ngx_s.lib looks truncated ($size bytes)" }
 
       - name: Configure
         shell: pwsh
@@ -101,6 +102,23 @@ jobs:
             if ($exports -notmatch "\b$sym\b") { throw "missing required export: $sym" }
           }
           Write-Host "All required ReShade add-on exports present."
+
+      # The add-on must not depend on the CRT that happens to be in the user's Proton prefix.
+      # A /MD build links msvcp140.dll, and an old one (Stray's prefix ships a Nov 2020 copy)
+      # faults inside _Mtx_lock the moment a std::mutex built by MSVC 17.10+ is locked. That
+      # surfaces as LoadLibraryEx error 998 with no log at all, so guard it here where the
+      # failure is legible.
+      - name: Verify no dynamic CRT dependency
+        shell: pwsh
+        run: |
+          $deps = & dumpbin /DEPENDENTS build/stray-dlss.addon64 | Out-String
+          Write-Host $deps
+          foreach ($bad in @('MSVCP140', 'VCRUNTIME140')) {
+            if ($deps -match $bad) {
+              throw "$bad is imported - the add-on must be built with the static CRT (/MT)"
+            }
+          }
+          Write-Host "No dynamic CRT dependency. Add-on is self-contained."
 
       - name: Stage artifact
         shell: pwsh

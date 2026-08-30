@@ -22,12 +22,20 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# NGX ships a static lib that exposes C++ std types across the ABI, so the CRT choice is not
-# free: /MD pairs with nvsdk_ngx_d.lib, /MT with nvsdk_ngx_s.lib, and a mismatched
-# _ITERATOR_DEBUG_LEVEL is a link error. We use /MD + nvsdk_ngx_d.lib, which is also the
-# ReShade add-on convention. (docs/RESEARCH.md §3.9)
+# STATIC CRT (/MT), deliberately, and it is not a style preference.
+#
+# A /MD build links the prefix's msvcp140.dll, and Proton prefixes routinely carry an ancient
+# one (Stray's is dated Nov 2020, VS2019-era). Since MSVC 17.10 the STL gives std::mutex a
+# constexpr constructor that merely zero-initialises it; the older msvcp140's _Mtx_lock then
+# dereferences a field that was never set up. The result is an access violation at DLL entry,
+# which Wine reports as LoadLibraryEx error 998 with none of our code having run — no log, no
+# clue. This cost a full debugging round; see docs/RESEARCH.md §5.
+#
+# /MT makes the add-on self-contained and independent of whatever redist the user's prefix
+# happens to have. It pairs with nvsdk_ngx_s.lib (the _s suffix means static CRT); mixing that
+# up is an _ITERATOR_DEBUG_LEVEL link error, which is at least loud.
 if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -84,14 +92,15 @@ if(STRAY_DLSS_BUILD_ADDON)
     endif()
 
     if(STRAY_DLSS_ENABLE_NGX)
+        # _s = static CRT, to match /MT above.
         find_library(NGX_LIBRARY
-            NAMES nvsdk_ngx_d
+            NAMES nvsdk_ngx_s
             PATHS ${STRAY_DLSS_NGX_LIB_DIR}
             NO_DEFAULT_PATH)
 
         if(NOT NGX_LIBRARY)
             message(FATAL_ERROR
-                "nvsdk_ngx_d.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
+                "nvsdk_ngx_s.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
                 "Fetch it from https://github.com/NVIDIA/DLSS (lib/Windows_x86_64/x64/) or set "
                 "-DSTRAY_DLSS_NGX_LIB_DIR=<dir>.")
         endif()
@@ -135,7 +144,10 @@ if(STRAY_DLSS_BUILD_ADDON)
         _UNICODE
         # ReShade's add-on API is header-only. Defining RESHADE_API_LIBRARY would ask for an
         # import lib that does not exist. (docs/RESEARCH.md §2.1)
-        STRAY_DLSS_VERSION="${PROJECT_VERSION}")
+        STRAY_DLSS_VERSION="${PROJECT_VERSION}"
+        # Belt and braces alongside /MT: keeps std::mutex on the pre-17.10 layout so even an
+        # accidental /MD build stays loadable against an old msvcp140.dll.
+        _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
     target_compile_options(stray-dlss PRIVATE
         /W4 /permissive- /Zi
