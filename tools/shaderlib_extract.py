@@ -6,15 +6,28 @@ the compiled permutation changes with screen-percentage configuration, so every 
 needs a new hash measured against the running game. The shipped pak already contains every
 cooked permutation; walking it offline yields all their hashes at once, with no game running.
 
-The pak (v11, unencrypted -- CLAUDE.md 2.3.1) is not read directly; pull the two files first:
+The pak (v11, unencrypted -- CLAUDE.md 2.3.1) is not read directly; pull the file(s) first with
+tools/pakextract.py. Two modes, decided by the cache's own per-section bShareCode flag (the
+argument count only determines whether the shared-code branch CAN be taken):
 
-  python3 tools/pakextract.py <...>/Hk_project-WindowsNoEditor.pak /tmp/shaderlib \\
-      'GlobalShaderCache-PCD3D_SM5\\.bin$|ShaderArchive-Global-PCD3D_SM5\\.ushaderbytecode$'
-  python3 tools/shaderlib_extract.py \\
-      /tmp/shaderlib/Engine_GlobalShaderCache-PCD3D_SM5.bin \\
-      /tmp/shaderlib/Hk_project_Content_ShaderArchive-Global-PCD3D_SM5.ushaderbytecode
+  cache-only -- STRAY'S ACTUAL LAYOUT [HARD, measured 2026-08-31: all 225 sections of the
+  shipped GlobalShaderCache-PCD3D_SM5.bin carry bShareCode=0, the pak contains no
+  .ushaderbytecode, and the DXBC is inline in the cache itself]:
 
-pakextract names outputs by flattening the pak path ('/' -> '_'); use whatever names it printed.
+    python3 tools/pakextract.py <...>/Hk_project-WindowsNoEditor.pak /tmp/shaderlib \\
+        'GlobalShaderCache-PCD3D_SM5\\.bin$'
+    python3 tools/shaderlib_extract.py /tmp/shaderlib/Engine_GlobalShaderCache-PCD3D_SM5.bin
+
+  cache+archive -- a title cooked WITH shared shader code (bShareCode=1), where the section
+  stores only a 20-byte ResourceHash and the bytes live in the archive:
+
+    python3 tools/shaderlib_extract.py \\
+        /tmp/shaderlib/Engine_GlobalShaderCache-PCD3D_SM5.bin \\
+        /tmp/shaderlib/Hk_project_Content_ShaderArchive-Global-PCD3D_SM5.ushaderbytecode
+
+A shared-code section without the archive argument fails loudly; an inline section never
+consults the archive. pakextract names outputs by flattening the pak path ('/' -> '_'); use
+whatever names it printed.
 Optional: --dump-dir DIR writes each permutation as <freq>_<fnv1a64>.dxbc (the shader_dump
 naming), --self-test runs the synthetic format tests and touches no files.
 
@@ -52,6 +65,15 @@ Format provenance -- each claim read from UE 4.27.2 source, not inferred:
     Archive.cpp:487-502); if true a 20B FSHAHash ResourceHash that equals the shadermap's
     hash in the archive (ShaderMap.cpp bShareCode branch), else the code is inline as
     FShaderMapResourceCode (ShaderResource.cpp:238-243, entries per Shader.h:314-327).
+  * Inline FShaderMapResourceCode is: 20B ResourceHash, TArray<FSHAHash> ShaderHashes,
+    TArray<FShaderEntry> ShaderEntries where each entry is TArray<uint8> Code +
+    int32 UncompressedSize + uint8 Frequency (Shader.h:314-326). ShaderHashes and
+    ShaderEntries are PARALLEL, index-aligned arrays: Serialize writes them back to back and
+    the engine itself checks Num()==Num() (ShaderResource.cpp:242), and ToString pairs
+    ShaderHashes[i] with ShaderEntries[i] (ShaderResource.cpp:226-236) -- so entry i's
+    FSHAHash names entry i's bytes. [HARD, read from the 4.27 source]. Per-entry compression
+    is LZ4 (ShaderCompressionFormat = NAME_LZ4, ShaderResource.cpp:32), applied exactly when
+    Code.Num() != UncompressedSize (the loader's own gate, ShaderResource.cpp:403-406).
   * FHashedName("FTAAStandaloneCS") = CityHash64WithSeed over the uppercased name
     = 0x2a83f8d4225ef8c5 -- confirmed twice: recomputed from UE's own CityHash sources, and
     present in CUE4Parse's shipped ShaderHashedNames.json.
@@ -70,9 +92,19 @@ FNV_PRIME = 0x100000001b3
 TAA_TYPE_HASHED_NAME = 0x2a83f8d4225ef8c5  # FHashedName("FTAAStandaloneCS"), see docstring
 
 EXPECT_PRESENT = {
-    0xd2e4d8c23c362ed1,  # Main perm, measured live 2026-08-31 @ 2560x1440 / 100%SP: suppressing
-                         # this dispatch freezes the image -- ground truth independent of this tool
-    0x901e041a7cadc9db,  # MainUpsampling perm @ 3840x2160 / 50%SP -- CLAUDE.md 2.3
+    0xd2e4d8c23c362ed1,  # measured live 2026-08-31 @ 2560x1440 / 100%SP. CLAUDE.md argues from
+                         # its live UAV set that the DISPATCH wearing it is a composite, not the
+                         # TAA -- but the DXBC itself is cooked inside the FTAAStandaloneCS
+                         # section (this tool's own walk), so its presence here is expected
+                         # either way and remains a hard reproduction check
+    0x901e041a7cadc9db,  # MainUpsampling perm @ 3840x2160 / 50%SP -- CLAUDE.md 2.3. THE
+                         # acceptance hash: if this one is missing, the parse is wrong
+}
+# Informational only -- printed, never affects the verdict. Live-measured hashes whose absence
+# would be a finding to report, not proof of a broken walk (CLAUDE.md 2.3: structural candidate
+# measured @ 2560x1440 alongside 0xd2e4...).
+EXPECT_NOTE = {
+    0xe14e7fc8d0db9b0f,
 }
 EXPECT_ABSENT = {
     0x1708ec956099e259,  # reprojecting denoiser look-alike, NOT TAA -- CLAUDE.md 2.3
@@ -207,6 +239,7 @@ def parse_archive(buf, name):
     if len(shader_hashes) != len(shader_entries):
         die(f"{name}: {len(shader_hashes)} ShaderHashes vs {len(shader_entries)} ShaderEntries")
     return {'map_hashes': map_hashes, 'map_entries': map_entries,
+            'shader_hashes': shader_hashes,
             'shader_entries': shader_entries, 'indices': indices,
             'code_off': r.off,  # blob begins right here (ShaderCodeArchive.cpp:704-709)
             'buf': buf, 'name': name}
@@ -246,7 +279,7 @@ def extract_shader(arch, index):
     raw = arch['buf'][lo:lo + size]
     # Size == UncompressedSize means stored raw (ShaderCodeArchive.cpp:957-963).
     blob = raw if size == usize else lz4_block_decompress(raw, usize, what)
-    return freq, size, usize, slice_dxbc(blob, what)
+    return arch['shader_hashes'][index], freq, size, usize, slice_dxbc(blob, what)
 
 
 # --- the global shader cache (.bin) ------------------------------------------------------------
@@ -290,14 +323,23 @@ def parse_global_cache(buf, name):
             resource_hash = r.take(SHA_LEN, "ResourceHash")
         else:
             # Inline FShaderMapResourceCode (ShaderResource.cpp:238-243; Shader.h:314-327).
+            # ShaderHashes[] and ShaderEntries[] are parallel, index-aligned arrays: the
+            # engine's own Serialize checks the counts match (ShaderResource.cpp:242) and
+            # its ToString pairs hash i with entry i (ShaderResource.cpp:226-236). [HARD]
             r.take(SHA_LEN, "inline ResourceHash")
-            r.take(SHA_LEN * r.count("inline ShaderHashes"), "inline ShaderHashes[]")
+            n_hashes = r.count("inline ShaderHashes")
+            inline_hashes = [r.take(SHA_LEN, "inline ShaderHashes[]")
+                             for _ in range(n_hashes)]
+            n_entries = r.count("inline ShaderEntries")
+            if n_entries != n_hashes:
+                die(f"{what}: {n_hashes} inline ShaderHashes vs {n_entries} ShaderEntries -- "
+                    "parallel by contract (ShaderResource.cpp:242); the walk has desynchronized")
             inline_shaders = []
-            for _ in range(r.count("inline ShaderEntries")):
+            for i in range(n_entries):
                 code = r.take(r.count("inline Code"), "inline Code[]")
                 iusize = r.i32("inline UncompressedSize")
                 ifreq = r.u8("inline Frequency")
-                inline_shaders.append((code, iusize, ifreq))
+                inline_shaders.append((inline_hashes[i], code, iusize, ifreq))
         sections.append({'index': s, 'span': (begin, r.off), 'frozen': (frozen_at, frozen_size),
                          'type_hashes': type_hashes, 'vf_hashes': vf_hashes,
                          'share': share, 'resource_hash': resource_hash,
@@ -338,8 +380,8 @@ def find_taa_section(sections, buf, name):
 
 # --- putting it together -----------------------------------------------------------------------
 
-def run(cache_path, archive_path, dump_dir=None,
-        expect_present=EXPECT_PRESENT, expect_absent=EXPECT_ABSENT):
+def run(cache_path, archive_path=None, dump_dir=None,
+        expect_present=EXPECT_PRESENT, expect_absent=EXPECT_ABSENT, expect_note=EXPECT_NOTE):
     cache = open(cache_path, 'rb').read()
     sections = parse_global_cache(cache, os.path.basename(cache_path))
     print(f"[cache] {len(sections)} sections walked cleanly to EOF ({len(cache)} bytes)",
@@ -350,8 +392,13 @@ def run(cache_path, archive_path, dump_dir=None,
           f"({', '.join(f'0x{h:016x}' for h in taa['type_hashes'])}), "
           f"bShareCode={taa['share']}", file=sys.stderr)
 
-    results = []  # (freq, stored, usize, dxbc)
+    results = []  # (sha20, freq, stored, usize, dxbc)
     if taa['share']:
+        if archive_path is None:
+            die(f"section #{taa['index']} has bShareCode=1: its code lives in the shared "
+                "archive, which was not given. Pass ShaderArchive-Global-PCD3D_SM5"
+                ".ushaderbytecode as the second argument (extract it from the pak first; "
+                "see this file's docstring)")
         arch = parse_archive(open(archive_path, 'rb').read(), os.path.basename(archive_path))
         print(f"[archive] version=2, {len(arch['map_entries'])} shadermaps, "
               f"{len(arch['shader_entries'])} shaders, code blob at 0x{arch['code_off']:x}",
@@ -375,20 +422,23 @@ def run(cache_path, archive_path, dump_dir=None,
             results.append(extract_shader(arch, i))
     else:
         # bShareCode=false: the code never went to an archive; it is inline in the cache.
-        print("[cache] bShareCode=0 -- taking the inline-code branch, archive not consulted",
-              file=sys.stderr)
-        for code, usize, freq in taa['inline_shaders']:
-            blob = code if len(code) == usize else \
-                lz4_block_decompress(code, usize, "inline shader")
-            results.append((freq, len(code), usize, slice_dxbc(blob, "inline shader")))
+        print("[cache] bShareCode=0 -- taking the inline-code branch"
+              + (", ignoring the archive argument" if archive_path else
+                 " (single-file mode, correct for Stray)"), file=sys.stderr)
+        for i, (sha, code, usize, freq) in enumerate(taa['inline_shaders']):
+            what = f"inline shader #{i}"
+            blob = code if len(code) == usize else lz4_block_decompress(code, usize, what)
+            results.append((sha, freq, len(code), usize, slice_dxbc(blob, what)))
 
-    print(f"{'freq':>4}  {'stored':>8}  {'raw':>8}  {'dxbc':>8}  fnv1a64")
+    print(f"{'perm':>4}  {'sha1(shader)':<40}  {'freq':>4}  {'stored':>8}  {'raw':>8}  "
+          f"{'dxbc':>8}  fnv1a64")
     hashes = set()
-    for freq, stored, usize, dxbc in results:
+    for idx, (sha, freq, stored, usize, dxbc) in enumerate(results):
         h = fnv1a64(dxbc)
         hashes.add(h)
         fname = FREQ_NAMES.get(freq, f"f{freq}")
-        print(f"{fname:>4}  {stored:>8}  {usize:>8}  {len(dxbc):>8}  0x{h:016x}")
+        print(f"{idx:>4}  {sha.hex():<40}  {fname:>4}  {stored:>8}  {usize:>8}  "
+              f"{len(dxbc):>8}  0x{h:016x}")
         if dump_dir is not None:
             os.makedirs(dump_dir, exist_ok=True)
             with open(os.path.join(dump_dir, f"{fname}_{h:016x}.dxbc"), 'wb') as f:
@@ -405,6 +455,10 @@ def run(cache_path, archive_path, dump_dir=None,
         ok &= got
         print(f"{'PASS' if got else 'FAIL'}: 0x{h:016x} (known non-TAA) "
               f"{'absent' if got else 'PRESENT -- section resolution is wrong'}")
+    for h in sorted(expect_note):
+        # Informational: a live-measured hash whose absence is a finding, not a parse failure.
+        print(f"NOTE: 0x{h:016x} (live-measured candidate) "
+              f"{'present' if h in hashes else 'ABSENT -- report this, it does not fail the run'}")
     print("VERDICT: " + ("the offline walk reproduces the live TAA identity" if ok
                          else "FALSIFIED -- do not trust these hashes"))
     return 0 if ok else 3
@@ -456,7 +510,7 @@ def _fake_archive(stored_list, maps):
     out += struct.pack('<i', len(idx)) + struct.pack(f'<{len(idx)}I', *idx)
     return out + blob
 
-def _fake_section(type_hashes, resource_hash, frozen_extra=b''):
+def _fake_section(type_hashes, resource_hash, frozen_extra=b'', inline=None):
     frozen = b'\x11' * 48 + frozen_extra + b'\x22' * 16
     out = struct.pack('<I', len(frozen)) + frozen
     out += struct.pack('<III', 1, 1, 1)
@@ -466,7 +520,15 @@ def _fake_section(type_hashes, resource_hash, frozen_extra=b''):
     out += struct.pack('<ii', len(type_hashes), 0)
     out += b''.join(struct.pack('<Q', h) for h in type_hashes)
     out += struct.pack('<i', 1) + struct.pack('<QI', 0xFEED, 128) + b'\x33' * SHA_LEN
-    out += struct.pack('<I', 1) + resource_hash
+    if inline is None:
+        out += struct.pack('<I', 1) + resource_hash
+    else:
+        # bShareCode=0: inline FShaderMapResourceCode, `inline` = [(sha20, stored, usize, freq)].
+        out += struct.pack('<I', 0) + resource_hash
+        out += struct.pack('<i', len(inline)) + b''.join(sha for sha, _, _, _ in inline)
+        out += struct.pack('<i', len(inline))
+        for _, stored, usize, freq in inline:
+            out += struct.pack('<i', len(stored)) + stored + struct.pack('<iB', usize, freq)
     return out
 
 def self_test():
@@ -511,8 +573,8 @@ def self_test():
     mi = {h: i for i, h in enumerate(arch['map_hashes'])}[taa['resource_hash']]
     idx_off, num, _, _ = arch['map_entries'][mi]
     got = [extract_shader(arch, i) for i in arch['indices'][idx_off:idx_off + num]]
-    assert [(f, d) for f, _, _, d in got] == [(SF_COMPUTE, dxbc_a), (SF_COMPUTE, dxbc_b)]
-    assert fnv1a64(dxbc_c) not in {fnv1a64(d) for _, _, _, d in got}
+    assert [(f, d) for _, f, _, _, d in got] == [(SF_COMPUTE, dxbc_a), (SF_COMPUTE, dxbc_b)]
+    assert fnv1a64(dxbc_c) not in {fnv1a64(d) for _, _, _, _, d in got}
 
     # A desynchronized walk must fail loudly, not return garbage: corrupt bShareCode.
     bad = cache.replace(struct.pack('<I', 1) + hash_decoy, struct.pack('<I', 7) + hash_decoy)
@@ -531,15 +593,65 @@ def self_test():
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             rc = run(cp, ap, dump_dir=os.path.join(td, 'dump'),
                      expect_present={fnv1a64(dxbc_a), fnv1a64(dxbc_b)},
-                     expect_absent={fnv1a64(dxbc_c)})
+                     expect_absent={fnv1a64(dxbc_c)}, expect_note=set())
         assert rc == 0, "verdict failed on a correct synthetic library"
         assert sorted(os.listdir(os.path.join(td, 'dump'))) == \
             sorted([f"cs_{fnv1a64(dxbc_a):016x}.dxbc", f"cs_{fnv1a64(dxbc_b):016x}.dxbc"])
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            rc = run(cp, ap, expect_present={fnv1a64(dxbc_a)}, expect_absent={fnv1a64(dxbc_b)})
+            rc = run(cp, ap, expect_present={fnv1a64(dxbc_a)}, expect_absent={fnv1a64(dxbc_b)},
+                     expect_note=set())
         assert rc == 3, "verdict passed although a forbidden hash was present"
+
+        # A bShareCode=1 section without the archive must fail loudly, never guess.
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                run(cp, None, expect_note=set())
+            assert False, "shared-code cache accepted without the archive"
+        except SystemExit:
+            pass
+
+    # Cache-only mode: bShareCode=0 puts the code inline in the cache (Stray's actual layout).
+    # One LZ4-compressed entry, one stored raw; the decoy section stays bShareCode=1, so one
+    # file exercises both parse branches side by side.
+    blob_d, dxbc_d = _fake_shader(b'TAAINLIN', 500)
+    sha_a, sha_d = b'\x0d' * SHA_LEN, b'\x0e' * SHA_LEN
+    inline_cache = struct.pack('<i', 2)
+    inline_cache += _fake_section([0xBADD1E], hash_decoy)
+    inline_cache += _fake_section(
+        [TAA_TYPE_HASHED_NAME], b'\x0c' * SHA_LEN,
+        frozen_extra=struct.pack('<Q', TAA_TYPE_HASHED_NAME),
+        inline=[(sha_a, _lz4_literals(blob_a), len(blob_a), SF_COMPUTE),
+                (sha_d, blob_d, len(blob_d), SF_COMPUTE)])
+    isecs = parse_global_cache(inline_cache, 'synthetic-inline-cache')
+    itaa = find_taa_section(isecs, inline_cache, 'synthetic-inline-cache')
+    assert itaa['share'] == 0 and itaa['resource_hash'] is None
+    # Hash i must name entry i (the parallel-array contract, ShaderResource.cpp:242).
+    assert [(s, u, f) for s, _, u, f in itaa['inline_shaders']] == \
+        [(sha_a, len(blob_a), SF_COMPUTE), (sha_d, len(blob_d), SF_COMPUTE)]
+    with tempfile.TemporaryDirectory() as td:
+        cp = os.path.join(td, 'inline-cache.bin')
+        open(cp, 'wb').write(inline_cache)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = run(cp, None, dump_dir=os.path.join(td, 'dump'),
+                     expect_present={fnv1a64(dxbc_a), fnv1a64(dxbc_d)},
+                     expect_absent={fnv1a64(dxbc_c)}, expect_note=set())
+        assert rc == 0, "cache-only verdict failed on a correct synthetic inline cache"
+        assert sorted(os.listdir(os.path.join(td, 'dump'))) == \
+            sorted([f"cs_{fnv1a64(dxbc_a):016x}.dxbc", f"cs_{fnv1a64(dxbc_d):016x}.dxbc"])
+        # A count mismatch between the parallel arrays must fail loudly: drop one hash so the
+        # stream stays aligned (1 hash read cleanly, then 2 entries) and the mismatch check
+        # itself -- not a downstream bounds check -- is what fires.
+        bad = inline_cache.replace(struct.pack('<i', 2) + sha_a + sha_d,
+                                   struct.pack('<i', 1) + sha_a, 1)
+        try:
+            parse_global_cache(bad, 'corrupt-inline-cache')
+            assert False, "accepted mismatched inline ShaderHashes/ShaderEntries"
+        except SystemExit:
+            pass
     print("SELF-TEST OK: fnv1a64 vectors, LZ4 decode (+corruption), section walk (+corruption), "
-          "archive walk, DXBC slicing, verdict logic")
+          "archive walk, inline cache-only walk (+corruption, +missing-archive), DXBC slicing, "
+          "verdict logic")
 
 
 def main(argv):
@@ -554,14 +666,15 @@ def main(argv):
         except IndexError:
             die("--dump-dir needs a directory argument")
         del argv[i:i + 2]
-    if len(argv) != 2:
+    if len(argv) not in (1, 2):
         print("usage: shaderlib_extract.py <GlobalShaderCache-PCD3D_SM5.bin> "
-              "<ShaderArchive-Global-PCD3D_SM5.ushaderbytecode> [--dump-dir DIR] | --self-test\n"
-              "(extract both files from the pak with tools/pakextract.py first; "
-              "see this file's docstring)", file=sys.stderr)
+              "[<ShaderArchive-Global-PCD3D_SM5.ushaderbytecode>] [--dump-dir DIR] | --self-test\n"
+              "(the archive is only needed for a cache cooked with shared shader code; Stray's "
+              "is all-inline, so the single-file form is the normal one -- see the docstring)",
+              file=sys.stderr)
         return 2
     try:
-        return run(argv[0], argv[1], dump_dir)
+        return run(argv[0], argv[1] if len(argv) == 2 else None, dump_dir)
     except OSError as ex:
         die(f"cannot read input: {ex}")
 
