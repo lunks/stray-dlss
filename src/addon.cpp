@@ -262,6 +262,11 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_WARN("NgxRR=2 (FULL): Ray Reconstruction replaces the SR evaluate when "
 			"the G-buffer identification is stable; SR is the per-frame fallback. Grep for "
 			"'DLSS RR' and 'RR:' lines.");
+	else if (ngx_rr == 3)
+		STRAY_LOG_WARN("NgxRR=3 (RR-1): Ray Reconstruction PLUS suppression of the SSD "
+			"temporal-accumulation family, so RR denoises the raw screen-space signal. "
+			"Suppression ARMS only after RR runs reliably (~30 frames) and disarms on any SR "
+			"fallback; warm-up runs as RR-0. Grep for 'RR-1' lines. EXPERIMENTAL.");
 
 	// [STRAYDLSS] GBufferResolveAt: "ssd" (default) records the guide resolve at the first
 	// SSD temporal-accumulation dispatch each frame — the content-alive point (measured:
@@ -278,6 +283,9 @@ void on_init_device(reshade::api::device *device)
 			"GBufferResolveAt=%s).",
 			resolve_at_ssd ? "SSD-dispatch (content-alive)" : "TAA-hook (A/B mode)",
 			resolve_at_ssd ? "ssd" : "taa");
+	else if (ngx_rr == 3)
+		STRAY_LOG_INFO("RR-1 guide resolve records at the SSD-dispatch trigger, hoisted "
+			"ABOVE suppression (content alive; GBufferResolveAt is forced to ssd for RR-1).");
 
 	// [STRAYDLSS] NgxExposure: "auto" (default — today's behaviour, DLSS estimates
 	// exposure itself via the AutoExposure create flag) | "texture" (the flag is dropped
@@ -885,6 +893,15 @@ void on_present(
 					off += std::snprintf(line + off, sizeof(line) - off, " %s=%u",
 						taa_hook::kRrRefusalNames[i], r[i]);
 			STRAY_LOG_INFO("%s", line);
+
+			// RR-1 suppression telemetry: armed state + how much SSD work was skipped.
+			bool rr1_armed = false;
+			std::uint64_t rr1_total = 0;
+			std::uint32_t rr1_last = 0;
+			taa_hook::rr1_counters(rr1_armed, rr1_total, rr1_last);
+			STRAY_LOG_INFO("[%s] RR-1 SSD suppression: armed=%d last-frame=%u total=%llu",
+				when, rr1_armed ? 1 : 0, rr1_last,
+				static_cast<unsigned long long>(rr1_total));
 		}
 	}
 
@@ -1184,10 +1201,10 @@ void register_events()
 		// well as in on_init_device because event registration happens first.
 		int ngx_rr_for_finder = 0;
 		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxRR", ngx_rr_for_finder);
-		if (ngx_rr_for_finder == 2 && !gbuffer_finder_enabled)
+		if ((ngx_rr_for_finder == 2 || ngx_rr_for_finder == 3) && !gbuffer_finder_enabled)
 		{
 			gbuffer_finder_enabled = true;
-			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2 needs the G-buffer "
+			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2/3 needs the G-buffer "
 				"identification it produces.");
 		}
 	}

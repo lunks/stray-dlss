@@ -60,6 +60,10 @@ void set_ngx_rr(int mode);
 // How often the RR path actually evaluated versus fell back to SR — the one number that
 // says whether RR is carrying frames. Reported periodically by the add-on.
 void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks);
+// RR-1 ([STRAYDLSS] NgxRR=3) telemetry: whether SSD suppression is currently armed, the
+// session total of suppressed SSD dispatches, and how many the last frame suppressed.
+void rr1_counters(bool &armed, std::uint64_t &suppressed_total,
+                  std::uint32_t &suppressed_last_frame);
 
 // WHY the fallbacks happened, per reason — the starvation run (2026-08-31, 0% RR with a
 // reasonless log) proved totals alone cost a whole round-trip. Indexed; order matches

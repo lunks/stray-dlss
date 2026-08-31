@@ -66,6 +66,23 @@ std::atomic<std::uint32_t> g_rr_refusals[kRrRefusalCount] = {};
 // the shared evaluate-attempt counter: a session where create/evaluate fails still
 // resolves guides, and they must still dump (the whole point of the offline B/C check).
 std::atomic<std::uint64_t> g_rr_records{ 0 };
+
+// RR-1 ([STRAYDLSS] NgxRR=3): SSD temporal-accumulation suppression, COUPLED to RR success.
+// The SSD dispatch we suppress runs BEFORE the TAA-point RR evaluate, so we cannot know at
+// suppression time whether RR will succeed THIS frame. Resolution: an ARMED latch, set only
+// after RR has evaluated successfully for kRr1ArmFrames consecutive frames and cleared on any
+// RR failure/fallback (updated at each TAA evaluate). The SSD suppression reads that latch —
+// i.e. it acts on the PREVIOUS frame's RR outcome, an excellent predictor since armed RR is
+// ~100% stable. A rare post-arm failure costs a single frame of noisy SR and self-corrects
+// (the failure disarms, so the next frame's SSD is not suppressed). Suppression additionally
+// requires the guides to have been captured THIS frame (the frame RR will consume), so a
+// frame RR cannot carry never loses its denoiser. Warm-up (before arming) runs as RR-0.
+constexpr std::uint32_t kRr1ArmFrames = 30;
+std::atomic<bool> g_rr1_armed{ false };
+std::atomic<std::uint32_t> g_rr_success_streak{ 0 };
+std::atomic<std::uint64_t> g_rr1_suppressed_total{ 0 };
+std::atomic<std::uint32_t> g_rr1_suppressed_this_frame{ 0 };
+std::atomic<std::uint32_t> g_rr1_last_frame_suppressed{ 0 };
 // [STRAYDLSS] NgxDryRun. Suppresses the pinned pass's engine dispatch WITHOUT running DLSS, so
 // nothing writes u0 at all.
 //
@@ -511,10 +528,58 @@ bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *nati
 // bind), or (b) the deferred-lighting pass's first draw — both sit between base-pass
 // completion and the pool's content reuse. Alternatively, hoist this call above the
 // dry-run suppression so a suppressed SSD dispatch still donates its bindings.
+// RR-1: update the suppression arm latch from an RR evaluate outcome. Called at the TAA
+// evaluate point every frame; only mode 3 arms. Arming needs kRr1ArmFrames consecutive
+// successes; any failure disarms immediately so the denoiser comes straight back.
+void update_rr1_arm(bool ok)
+{
+	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 3)
+		return;
+	if (ok)
+	{
+		const std::uint32_t streak =
+			g_rr_success_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (streak >= kRr1ArmFrames &&
+			!g_rr1_armed.exchange(true, std::memory_order_relaxed))
+			STRAY_LOG_WARN("RR-1 suppression ARMED after %u consecutive RR evaluates: the "
+				"SSD temporal-accumulation family will now be SUPPRESSED so RR denoises the "
+				"raw screen-space signal reaching scene colour. SR stays the per-frame "
+				"safety net; a fallback disarms this.", kRr1ArmFrames);
+	}
+	else
+	{
+		g_rr_success_streak.store(0, std::memory_order_relaxed);
+		if (g_rr1_armed.exchange(false, std::memory_order_relaxed))
+			STRAY_LOG_WARN("RR-1 suppression DISARMED: RR fell back to SR, so the denoiser is "
+				"re-enabled to avoid noisy SR. Re-arms after %u more consecutive RR "
+				"evaluates.", kRr1ArmFrames);
+	}
+}
+
+// RR-1: whether this SSD temporal-accumulation dispatch should be skipped so its noise
+// reaches scene colour raw. Coupled to (a) the armed latch (RR reliably running) and (b)
+// guides captured THIS frame — if either is false the SSD runs, so a frame RR cannot carry
+// keeps its denoiser (never noisy SR by our choice).
+bool should_suppress_ssd_for_rr1(std::uint64_t hash)
+{
+	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 3 || !is_ssd_temporal_hash(hash))
+		return false;
+	if (!g_rr1_armed.load(std::memory_order_relaxed))
+		return false;
+	const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+	return g_guides_frame == frame && g_guides_ready;
+}
+
 void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint64_t hash)
 {
-	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 2 ||
-		!g_resolve_at_ssd.load(std::memory_order_relaxed))
+	// Mode 2 captures at the SSD trigger only when GBufferResolveAt=ssd; mode 3 (RR-1)
+	// ALWAYS captures here — the TAA-hook alternative reads dead content (measured), which
+	// is fatal when we are about to suppress the very passes that keep it alive.
+	const int mode = g_ngx_rr_mode.load(std::memory_order_relaxed);
+	const bool want = (mode == 2 && g_resolve_at_ssd.load(std::memory_order_relaxed)) ||
+		mode == 3;
+	if (!want)
 		return;
 	if (!is_ssd_temporal_hash(hash))
 		return;
@@ -849,6 +914,13 @@ void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
 	sr_fallbacks = g_rr_fallbacks.load(std::memory_order_relaxed);
 }
+void rr1_counters(bool &armed, std::uint64_t &suppressed_total,
+                  std::uint32_t &suppressed_last_frame)
+{
+	armed = g_rr1_armed.load(std::memory_order_relaxed);
+	suppressed_total = g_rr1_suppressed_total.load(std::memory_order_relaxed);
+	suppressed_last_frame = g_rr1_last_frame_suppressed.load(std::memory_order_relaxed);
+}
 const char *const kRrRefusalNames[kRrRefusalCount] = {
 	"not-armed", "no-candidate", "stale-bind", "roles-missing", "liveness",
 	"rows-implausible", "resolve-failed", "create-failed", "evaluate-failed",
@@ -884,6 +956,10 @@ bool dry_run_phase_active()
 void note_present(std::uint64_t frame)
 {
 	g_present_frame.store(frame, std::memory_order_relaxed);
+	// Snapshot and clear the per-frame RR-1 suppression tally for the periodic report.
+	g_rr1_last_frame_suppressed.store(
+		g_rr1_suppressed_this_frame.exchange(0, std::memory_order_relaxed),
+		std::memory_order_relaxed);
 	if (g_dry_run_alternate == 0)
 		return;
 	const bool suppressing = ((frame / g_dry_run_alternate) & 1ull) != 0;
@@ -1029,6 +1105,22 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	// (RR-0 never suppresses it; the throttle above cannot eat this call because every RR
 	// session sets NgxEvaluate, which disables the throttle entirely).
 	maybe_record_guides_at_ssd(cmd_list, hash);
+
+	// RR-1 ([STRAYDLSS] NgxRR=3): the guides were just captured at this content-alive point
+	// AND the game's compute state restored, so skipping the SSD dispatch here is clean.
+	// Suppressing it makes the screen-space SSR/SSGI noise reach scene colour uncleaned and
+	// thus TAA t1, which RR then denoises. Gated on RR reliably running + guides-this-frame.
+	if (should_suppress_ssd_for_rr1(hash))
+	{
+		g_rr1_suppressed_total.fetch_add(1, std::memory_order_relaxed);
+		g_rr1_suppressed_this_frame.fetch_add(1, std::memory_order_relaxed);
+		static std::atomic<int> s_rr1_supp_logged{ 0 };
+		if (s_rr1_supp_logged.fetch_add(1, std::memory_order_relaxed) < 4)
+			STRAY_LOG_WARN("RR-1: suppressing SSD 0x%016llx (guides captured, RR armed); its "
+				"noise reaches scene colour raw for RR to denoise. Logged 4x.",
+				static_cast<unsigned long long>(hash));
+		return true;
+	}
 
 	DispatchBindings b;
 	if (!resolve_compute_bindings(cmd_list, b))
@@ -1748,7 +1840,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								// RR-first when [STRAYDLSS] NgxRR=2; SR is the safety net
 								// for ANY missing precondition, every frame.
 								ok = false;
-								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)
+								const int rrm =
+									g_ngx_rr_mode.load(std::memory_order_relaxed);
+								if (rrm == 2 || rrm == 3)
 								{
 									ok = try_evaluate_rr(device, native, ei, fd, view);
 									if (ok)
@@ -1757,6 +1851,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									else
 										g_rr_fallbacks.fetch_add(1,
 											std::memory_order_relaxed);
+									// RR-1: arm/disarm SSD suppression from this outcome.
+									update_rr1_arm(ok);
 								}
 								if (!ok)
 									ok = ngx::evaluate(native, ei);
