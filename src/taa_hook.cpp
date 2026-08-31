@@ -25,6 +25,7 @@ std::unordered_map<std::uint64_t, bool> g_steady_reported;                      
 std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     // hash -> round-trip already noted
 bool g_resolve_ran = false;
 bool g_resolve_failed_logged = false;
+bool g_stale_resource_logged = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
@@ -444,7 +445,24 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 		// On a camera-cut frame velocity is the 1x1 dummy, so there is nothing to resolve.
 		// That is the pass resetting, not an error.
-		if (view_ok && depth_resource != 0 && velocity_resource != 0 && !m.camera_cut_dummies)
+		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
+		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
+		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it.
+		const bool resources_live = is_resource_live(depth_resource) &&
+			is_resource_live(velocity_resource);
+		if (!resources_live && depth_resource != 0 && velocity_resource != 0 &&
+			!g_stale_resource_logged)
+		{
+			g_stale_resource_logged = true;
+			STRAY_LOG_WARN("Skipping the resolve: ReShade reported a resource that is no longer "
+				"live (depth=%p live=%d, velocity=%p live=%d). Its view->resource map outlives "
+				"the resource on D3D12.",
+				reinterpret_cast<void *>(depth_resource), is_resource_live(depth_resource) ? 1 : 0,
+				reinterpret_cast<void *>(velocity_resource),
+				is_resource_live(velocity_resource) ? 1 : 0);
+		}
+
+		if (view_ok && resources_live && !m.camera_cut_dummies)
 		{
 			mark(2, "descriptors-found");
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());

@@ -107,4 +107,23 @@ void restore_game_compute_state(reshade::api::command_list *cmd_list);
 void reset_command_list_state(reshade::api::command_list *cmd_list);
 void forget_all_command_lists();
 
+// --- resource liveness ---
+//
+// ReShade never calls destroy_resource_view on D3D12, so its view->resource map keeps entries
+// for views whose descriptor slot UE4 has since recycled for a different resource. Asking it
+// for the resource behind such a view hands back a POINTER TO A DESTROYED RESOURCE.
+//
+// That is not a theoretical hazard. Building an SRV from one faults inside the driver:
+// GetDesc reads freed-but-still-mapped memory and returns entirely plausible values
+// (2560x1440, R32G8X24_TYPELESS), and then vkd3d dereferences the destroyed VkImage —
+// "err:vulkan:vkCreateImageView Exception 0xc0000005" in the Proton log, taking the game with
+// it. UE4 rotates these buffers constantly, so it happens within seconds of gameplay.
+//
+// So track lifetime ourselves from ReShade's init_resource/destroy_resource events and refuse
+// to touch anything not known to be alive.
+void note_resource_created(reshade::api::resource res);
+void note_resource_destroyed(reshade::api::resource res);
+bool is_resource_live(std::uint64_t handle);
+void forget_all_resources();
+
 } // namespace stray_dlss

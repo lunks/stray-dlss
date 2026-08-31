@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace stray_dlss {
 namespace {
@@ -663,6 +664,44 @@ void reset_command_list_state(reshade::api::command_list *cmd_list)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 	g_root.erase(cmd_list);
+}
+
+// Every resource ReShade has told us about and not yet told us was destroyed.
+//
+// A set of LIVE resources rather than of dead ones, deliberately: D3D12 reuses addresses, so a
+// freed pointer can come back as a different, valid resource. Keyed on the handle because that
+// is all we may safely hold — dereferencing is exactly what we are protecting against.
+std::mutex g_live_mutex;
+std::unordered_set<std::uint64_t> g_live_resources;
+
+void note_resource_created(reshade::api::resource res)
+{
+	if (res.handle == 0)
+		return;
+	std::lock_guard<std::mutex> lock(g_live_mutex);
+	g_live_resources.insert(res.handle);
+}
+
+void note_resource_destroyed(reshade::api::resource res)
+{
+	if (res.handle == 0)
+		return;
+	std::lock_guard<std::mutex> lock(g_live_mutex);
+	g_live_resources.erase(res.handle);
+}
+
+bool is_resource_live(std::uint64_t handle)
+{
+	if (handle == 0)
+		return false;
+	std::lock_guard<std::mutex> lock(g_live_mutex);
+	return g_live_resources.find(handle) != g_live_resources.end();
+}
+
+void forget_all_resources()
+{
+	std::lock_guard<std::mutex> lock(g_live_mutex);
+	g_live_resources.clear();
 }
 
 void forget_all_command_lists()

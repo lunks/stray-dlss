@@ -642,6 +642,16 @@ void register_events()
 {
 	reshade::register_event<reshade::addon_event::init_device>(on_init_device);
 	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
+	// Resource lifetime. ReShade never calls destroy_resource_view on D3D12, so its
+	// view->resource map hands back destroyed resources for recycled descriptor slots; viewing
+	// one faults inside vkd3d. Track liveness ourselves. (frame_state.hpp)
+	reshade::register_event<reshade::addon_event::init_resource>(
+		[](reshade::api::device *, const reshade::api::resource_desc &,
+		   const reshade::api::subresource_data *, reshade::api::resource_usage,
+		   reshade::api::resource res) { note_resource_created(res); });
+	reshade::register_event<reshade::addon_event::destroy_resource>(
+		[](reshade::api::device *, reshade::api::resource res) { note_resource_destroyed(res); });
+
 	reshade::register_event<reshade::addon_event::init_command_list>(on_init_command_list);
 	reshade::register_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
 	reshade::register_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
@@ -751,6 +761,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		state_tracking::unregister_events();
 		descriptor_tracking::unregister_events();
 		forget_all_command_lists();
+		forget_all_resources();
 		reshade::unregister_addon(module);
 		log::write(log::Level::info, "stray-dlss detaching");
 		log::shutdown_file_sink();
