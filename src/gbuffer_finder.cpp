@@ -113,8 +113,16 @@ std::unordered_map<std::string, std::uint64_t> g_window_rejects;
 bool g_first_wide_logged = false;
 bool g_first_candidate_logged = false;
 
-// Cross-frame stability. Identity is (slot, resource, format) per member — by register
-// first, never by pointer alone (CLAUDE.md §2.9).
+// Cross-frame stability. Identity is the SHAPE — (slot, format, extent) per member —
+// deliberately WITHOUT resource pointers: the 2026-08-31 run held the same 8-target shape
+// through minutes of menu and gameplay yet "STABLE" never fired and no CHANGED line ever
+// appeared, which is what per-frame identity flapping looks like (CHANGED only logs after
+// a first report). UE4's pool can hand a different element for the same spec on any frame
+// (FindFreeElement; RESEARCH-RR-GBUFFER.md §1.1 describes the per-frame release/reacquire),
+// so pointer identity was the wrong key. Pointers are still REPORTED — the table shows the
+// current frame's, and rotation is counted so the run measures how stable they really are,
+// which phase 3's capture design needs to know.
+std::uint64_t g_pointer_rotation_frames = 0; // stable-shape frames where any pointer changed
 GBufferClassification g_current;
 bool g_have_current = false;
 std::uint64_t g_consecutive = 0;
@@ -130,7 +138,9 @@ bool g_failed_in_this_drought = false;
 int g_reports_logged = 0;
 int g_fail_reports_logged = 0;
 
-bool same_targets(const GBufferClassification &a, const GBufferClassification &b)
+// The stability identity: same slot layout, formats and extents. Resource pointers are
+// deliberately excluded (see the g_pointer_rotation_frames comment).
+bool same_shape(const GBufferClassification &a, const GBufferClassification &b)
 {
 	if (a.targets.size() != b.targets.size())
 		return false;
@@ -138,9 +148,18 @@ bool same_targets(const GBufferClassification &a, const GBufferClassification &b
 	{
 		const BoundTexture &x = a.targets[i].tex;
 		const BoundTexture &y = b.targets[i].tex;
-		if (x.slot != y.slot || x.resource != y.resource || x.format != y.format)
+		if (x.slot != y.slot || x.format != y.format ||
+			x.width != y.width || x.height != y.height)
 			return false;
 	}
+	return true;
+}
+
+bool same_resources(const GBufferClassification &a, const GBufferClassification &b)
+{
+	for (std::size_t i = 0; i < a.targets.size() && i < b.targets.size(); ++i)
+		if (a.targets[i].tex.resource != b.targets[i].tex.resource)
+			return false;
 	return true;
 }
 
@@ -153,7 +172,7 @@ void flush_pending_locked(ListRecord &lr)
 		return;
 	for (auto &c : g_frame_candidates)
 	{
-		if (same_targets(c.cls, lr.pending))
+		if (same_shape(c.cls, lr.pending))
 		{
 			c.draws += lr.pending_draws;
 			++c.binds;
@@ -435,6 +454,7 @@ void on_present(std::uint64_t frame)
 	GBufferClassification snap;
 	std::vector<char> corro;
 	std::uint64_t consecutive = 0;
+	std::uint64_t pointer_rotations = 0;
 	std::uint32_t draws = 0;
 	bool denoiser_run = false;
 	std::uint64_t old_stable = 0;
@@ -502,9 +522,16 @@ void on_present(std::uint64_t frame)
 			}
 			g_frames_without_candidate = 0;
 
-			if (g_have_current && same_targets(best->cls, g_current))
+			if (g_have_current && same_shape(best->cls, g_current))
 			{
 				++g_consecutive;
+				// The measured answer to "does the pool rotate the pointers": count the
+				// stable-shape frames whose resources differ from the previous frame's.
+				if (!same_resources(best->cls, g_current))
+					++g_pointer_rotation_frames;
+				// Keep the CURRENT frame's pointers for the report and the corroboration
+				// lookups (indices align: same shape implies same target count).
+				g_current = best->cls;
 			}
 			else
 			{
@@ -519,6 +546,7 @@ void on_present(std::uint64_t frame)
 				g_reported_current = false;
 				g_corroborated.assign(g_current.targets.size(), 0);
 				g_denoiser_seen_in_run = false;
+				g_pointer_rotation_frames = 0;
 			}
 
 			// Sticky corroboration: one denoiser read of a target's resource at any point
@@ -544,6 +572,7 @@ void on_present(std::uint64_t frame)
 				consecutive = g_consecutive;
 				draws = g_last_draws;
 				denoiser_run = g_denoiser_seen_in_run;
+				pointer_rotations = g_pointer_rotation_frames;
 			}
 		}
 
@@ -597,6 +626,12 @@ void on_present(std::uint64_t frame)
 			denoiser_run ? "yes" : "no",
 			denoiser_run ? "" :
 			" (its hash is configuration-specific, CLAUDE.md §2.3; absence proves nothing)");
+		STRAY_LOG_INFO("GBUF   pointer stability: resources rotated on %llu of %llu stable "
+			"frames (identity keys on slot+format+extent; the table shows THIS frame's "
+			"pointers - 0 rotations means the pool reuses the same textures, high counts "
+			"mean phase 3 must re-capture pointers every frame)",
+			static_cast<unsigned long long>(pointer_rotations),
+			static_cast<unsigned long long>(consecutive));
 		STRAY_LOG_INFO("GBUF   log-only: nothing acts on this identification yet (DLSS-RR "
 			"phase 1)");
 		STRAY_LOG_INFO("GBUF ===============================================");

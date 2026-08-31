@@ -18,10 +18,15 @@
 // works. The one expensive thing here, the SSR-denoiser cross-check, resolves compute
 // bindings only for dispatches of the one known denoiser hash.
 //
-// Cross-frame identity is (slot, resource, format) per member — by REGISTER first, never
-// by pointer alone (CLAUDE.md §2.9) — and every view is liveness-checked before it is
-// described, via the same describe_bound_view every other recorder uses (CLAUDE.md §5,
-// "Two descriptor hazards"). No descriptor is ever copied out of the game's heap.
+// Cross-frame identity is the SHAPE — (slot, format, extent) per member — never resource
+// pointers: measured 2026-08-31, the same 8-target shape held for minutes while "STABLE"
+// never fired, the signature of the render-target pool rotating pointers under a
+// pointer-keyed identity (by register, never by pointer alone — CLAUDE.md §2.9, now
+// applied fully). Pointers are still reported per frame, and their rotation rate is
+// counted in the stable report — phase 3's capture design needs that number. Every view
+// is liveness-checked before it is described, via the same describe_bound_view every
+// other recorder uses (CLAUDE.md §5, "Two descriptor hazards"). No descriptor is ever
+// copied out of the game's heap.
 #pragma once
 
 #include "core/gbuffer_classify.hpp"
