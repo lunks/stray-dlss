@@ -571,7 +571,7 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	g_state.frame++;
 
 	{
-		LiveInput li;
+		State::LiveInput li;
 		li.a = reinterpret_cast<ID3D12Resource *>(in.depth_resource);
 		li.b = reinterpret_cast<ID3D12Resource *>(in.velocity_resource);
 		li.frame = g_state.frame;
