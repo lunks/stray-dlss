@@ -31,6 +31,15 @@ bool wants(std::uint64_t evaluate_count);
 bool capture(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *resource,
              unsigned int state_before, const char *name, std::uint64_t evaluate_count);
 
+// Capture a 1x1 texel and LOG its four RGBA32F floats to the ReShade log a few presents
+// later (instead of writing a file). For the eye-adaptation exposure diagnosis: shape says
+// nothing about whether the VALUE is one DLSS will accept, and only a readback tells us.
+// `state_before` is the D3D12_RESOURCE_STATES the resource is in at the call (restored
+// after the copy). `label` tags the log line. Copies subresource 0.
+bool capture_texel(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+                   ID3D12Resource *resource, unsigned int state_before, const char *label,
+                   std::uint64_t evaluate_count);
+
 // Call once per present: writes out any capture recorded >= 5 presents ago and frees it.
 void on_present();
 

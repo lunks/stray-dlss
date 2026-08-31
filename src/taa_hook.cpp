@@ -1680,6 +1680,56 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "depth",
 									eval_no);
 							}
+
+							// EXPOSURE DIAGNOSIS (NgxExposure=texture + NgxDumpInputs=1): DLSS
+							// silently reverts to auto-exposure in the live run, which means it
+							// received our texture and REJECTED it — likeliest an invalid
+							// VALUE (0/negative/NaN => DLSS auto-exposes). The API side is
+							// confirmed (flags 0x0b, one feature, no fallback warnings), so the
+							// missing evidence is the texel itself. Capture it at the first
+							// exposure evaluate and at eval 300/600, and log what we pass NGX
+							// and the state we ASSUME t0 is in (we do NOT barrier it — it is
+							// already NON_PIXEL_SHADER_RESOURCE from the game's own compute
+							// dispatch, which is exactly what NGX needs to read it).
+							if (ngx::exposure_from_texture() && input_dump::enabled())
+							{
+								static bool s_first_done = false;
+								const bool at_point = !s_first_done || eval_no == 300 ||
+									eval_no == 600;
+								if (at_point)
+								{
+									s_first_done = true;
+									STRAY_LOG_INFO("EXPOSURE eval %llu: exposure=%p (colour=%p "
+										"depth=%p) InPreExposure=%.6f InExposureScale=1.000000 "
+										"(0 in struct -> helper maps to 1.0) assumedState="
+										"NON_PIXEL_SHADER_RESOURCE barriered=no createFlags=0x0b",
+										static_cast<unsigned long long>(eval_no),
+										static_cast<void *>(ei.exposure),
+										static_cast<void *>(ei.color),
+										static_cast<void *>(ei.depth), ei.pre_exposure);
+									if (ei.exposure != nullptr)
+									{
+										char label[32];
+										std::snprintf(label, sizeof(label), "exposure_%llu",
+											static_cast<unsigned long long>(eval_no));
+										// Same state we hand NGX: the game bound t0 as a
+										// compute SRV, so NON_PIXEL_SHADER_RESOURCE.
+										input_dump::capture_texel(
+											reinterpret_cast<ID3D12Device *>(
+												device->get_native()), native, ei.exposure,
+											D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+											label, eval_no);
+									}
+									else
+									{
+										STRAY_LOG_WARN("EXPOSURE eval %llu: ei.exposure is NULL "
+											"despite NgxExposure=texture — the finder returned "
+											"nothing live this frame (see any 'no live 1x1' "
+											"warning above).",
+											static_cast<unsigned long long>(eval_no));
+									}
+								}
+							}
 							bool ok;
 							if (g_ngx_paint)
 							{
