@@ -397,6 +397,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				inputs.render_height = m.render_height;
 				inputs.view = &view;
 
+				// Capture the game's heaps BEFORE our pass swaps in ours.
+				ID3D12DescriptorHeap *game_heaps[2] = {};
+				unsigned int heap_count = 0;
+				collect_bound_heaps(cmd_list, game_heaps, &heap_count);
+
 				if (mv::record(native, inputs))
 				{
 					if (!g_resolve_ran)
@@ -408,9 +413,15 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					}
 
 					// Our pass replaced the root signature, PSO and descriptor heaps on the
-					// game's own command list. D3D12 has no state getters, so the state has to
-					// be re-applied from what ReShade tracked; the game will not re-set it and
-					// its next draw would use ours. (docs/RESEARCH.md §3.5)
+					// game's own command list. D3D12 has no state getters, so the state is
+					// re-applied from what ReShade tracked. ORDER MATTERS: the heaps must go
+					// back first, because the tracked descriptor TABLES are GPU handles into
+					// the game's heap and re-binding them while our heap is current is an
+					// invalid binding — UE4 dies with LowLevelFatalError, not an error you can
+					// read. (docs/RESEARCH.md §3.5)
+					if (heap_count > 0)
+						native->SetDescriptorHeaps(heap_count, game_heaps);
+
 					if (auto *tracked = cmd_list->get_private_data<state_tracking>())
 						tracked->apply(cmd_list);
 				}

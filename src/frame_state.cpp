@@ -2,6 +2,8 @@
 
 #include "log.hpp"
 
+#include <d3d12.h>
+
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>
 
@@ -399,6 +401,53 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 	}
 
 	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();
+}
+
+void collect_bound_heaps(reshade::api::command_list *cmd_list,
+                         ID3D12DescriptorHeap **out,
+                         unsigned int *count)
+{
+	*count = 0;
+
+	reshade::api::device *device = cmd_list->get_device();
+	auto *state = cmd_list->get_private_data<state_tracking>();
+	if (state == nullptr)
+		return;
+
+	ID3D12DescriptorHeap *cbv_srv_uav = nullptr;
+	ID3D12DescriptorHeap *sampler = nullptr;
+
+	for (const auto &entry : state->descriptor_tables)
+	{
+		for (const auto &table : entry.second.second)
+		{
+			if (table.handle == 0)
+				continue;
+
+			reshade::api::descriptor_heap heap = { 0 };
+			uint32_t offset = 0;
+			device->get_descriptor_heap_offset(table, 0, 0, &heap, &offset);
+			if (heap.handle == 0)
+				continue;
+
+			auto *native = reinterpret_cast<ID3D12DescriptorHeap *>(heap.handle);
+			const D3D12_DESCRIPTOR_HEAP_DESC desc = native->GetDesc();
+
+			// Only shader-visible heaps can be bound, and only one of each type at a time.
+			if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0)
+				continue;
+
+			if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && cbv_srv_uav == nullptr)
+				cbv_srv_uav = native;
+			else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && sampler == nullptr)
+				sampler = native;
+		}
+	}
+
+	if (cbv_srv_uav != nullptr)
+		out[(*count)++] = cbv_srv_uav;
+	if (sampler != nullptr)
+		out[(*count)++] = sampler;
 }
 
 void reset_command_list_state(reshade::api::command_list *cmd_list)
