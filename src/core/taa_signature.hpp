@@ -129,12 +129,14 @@ bool is_known_taa_hash(std::uint64_t hash);
 // beside the add-on — no rebuild). Replaces any previous extra set; capped at 64 entries.
 void set_extra_taa_hashes(const std::uint64_t *hashes, std::size_t count);
 
-// A reprojecting denoiser (SSR/SSGI/AO family), not TAA: cb1[126], eight float SRVs, no
-// uint2 stencil view. It reads depth and velocity and reprojects with ClipToPrevClip, which
-// is why its bindings look convincing and why it was mistaken for the TAA pass.
+// NAMED offline 2026-08-31 (shaderlib_extract.py --find-hash): FSSDTemporalAccumulationCS
+// permutation #5 — UE 4.27's Screen-Space Denoiser temporal accumulation. It reads depth and
+// velocity and reprojects with ClipToPrevClip, which is why its bindings look convincing and
+// why it was mistaken for the TAA pass. cb1[126], eight float SRVs, no uint2 stencil view.
 constexpr std::uint64_t kDenoiserLookalikeHash = 0x1708ec956099e259ull;
 
-// Also not TAA. Eleven SRVs, two UAVs, cb1[131].
+// FSSDTemporalAccumulationCS permutation #0 (same shader type as the above; the family has 9
+// cooked permutations). Eleven SRVs, two UAVs, cb1[131].
 constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull;
 
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)

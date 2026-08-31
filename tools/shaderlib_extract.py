@@ -29,7 +29,11 @@ A shared-code section without the archive argument fails loudly; an inline secti
 consults the archive. pakextract names outputs by flattening the pak path ('/' -> '_'); use
 whatever names it printed.
 Optional: --dump-dir DIR writes each permutation as <freq>_<fnv1a64>.dxbc (the shader_dump
-naming), --emit-header FILE writes the verified permutation hashes as a C++ header, and
+naming), --find-hash HEX[,HEX...] locates live-measured fnv1a64 hashes anywhere in the cache
+(any section, not only TAA), names the owning shader type via tools/data/ShaderHashedNames.json
+(CUE4Parse, MIT) and prints the owner's full permutation family -- the offline way to turn "an
+unknown pass we measured live" into "a named engine shader plus every hash it can appear as".
+--emit-header FILE writes the verified permutation hashes as a C++ header, and
 --emit-hashes FILE writes them as plain text for the add-on's stray-dlss-hashes.txt override
 (both refused when the verdict fails), --self-test runs the synthetic tests, no files touched.
 
@@ -380,6 +384,78 @@ def find_taa_section(sections, buf, name):
         "which contradicts one-section-per-source-file (GlobalShader.cpp:460-470)")
 
 
+def load_type_names():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data',
+                        'ShaderHashedNames.json')
+    try:
+        import json
+        with open(path) as f:
+            return {int(k): v for k, v in json.load(f).items()}
+    except OSError:
+        return {}
+
+
+def find_hashes(cache_path, targets):
+    """Scan EVERY inline-code section for the target fnv1a64s. For each hit, name the owning
+    shader type and print the section's entire permutation family. Sections still marked
+    bShareCode=1 cannot be scanned without the archive and are counted, not fatal."""
+    cache = open(cache_path, 'rb').read()
+    sections = parse_global_cache(cache, os.path.basename(cache_path))
+    names = load_type_names()
+    remaining = set(targets)
+    shared_skipped = 0
+    for sec in sections:
+        if sec['share'] or not sec['inline_shaders']:
+            shared_skipped += 1 if sec['share'] else 0
+            continue
+        fam = []  # (perm, freq, fnv)
+        unsliceable = 0
+        for i, (sha, code, usize, freq) in enumerate(sec['inline_shaders']):
+            what = f"section #{sec['index']} inline shader #{i}"
+            blob = code if len(code) == usize else lz4_block_decompress(code, usize, what)
+            try:
+                dxbc = slice_dxbc(blob, what)
+            except SystemExit:
+                # Not every shader type carries the exact FD3D12ShaderResourceTable prefix the
+                # strict slicer models. Fall back to locating the container by its own header:
+                # the fourcc plus the total-size field at +24, which must fit in the blob.
+                # That byte range is what D3D12 receives and therefore what ReShade hashes.
+                dxbc = None
+                off = blob.find(b'DXBC')
+                while off >= 0:
+                    if off + 28 <= len(blob):
+                        (size,) = struct.unpack_from('<I', blob, off + 24)
+                        if 32 <= size <= len(blob) - off:
+                            dxbc = blob[off:off + size]
+                            break
+                    off = blob.find(b'DXBC', off + 1)
+                if dxbc is None:
+                    unsliceable += 1
+                    continue
+            fam.append((i, freq, fnv1a64(dxbc)))
+        if unsliceable:
+            print(f"[note] section #{sec['index']}: {unsliceable} shaders had no locatable "
+                  f"DXBC container", file=sys.stderr)
+        hits = [(i, freq, h) for (i, freq, h) in fam if h in remaining]
+        if not hits:
+            continue
+        tnames = [names.get(t, f'<unknown 0x{t:016x}>') for t in sec['type_hashes']]
+        print(f"section #{sec['index']}: types = {', '.join(tnames)}")
+        for i, freq, h in hits:
+            print(f"  MATCH 0x{h:016x} = permutation #{i} ({FREQ_NAMES.get(freq, freq)})")
+            remaining.discard(h)
+        print(f"  full family ({len(fam)} permutations):")
+        for i, freq, h in fam:
+            print(f"    {i:>3}  0x{h:016x}")
+    if shared_skipped:
+        print(f"[note] {shared_skipped} bShareCode sections not scannable without the archive",
+              file=sys.stderr)
+    for h in sorted(remaining):
+        print(f"NOT FOUND: 0x{h:016x} -- not a global shader in this cache (material shader, "
+              "or from a plugin pak)")
+    return 0 if not remaining else 4
+
+
 # --- putting it together -----------------------------------------------------------------------
 
 def emit_header(path, hashes, cache_path, cache_bytes, section_index):
@@ -709,6 +785,16 @@ def main(argv):
     if '--self-test' in argv:
         self_test()
         return 0
+    if '--find-hash' in argv:
+        i = argv.index('--find-hash')
+        try:
+            targets = [int(x, 16) for x in argv[i + 1].split(',')]
+        except (IndexError, ValueError):
+            die("--find-hash needs HEX[,HEX...]")
+        del argv[i:i + 2]
+        if len(argv) != 1:
+            die("--find-hash mode takes exactly the cache file")
+        return find_hashes(argv[0], targets)
     emit_hashes_path = None
     if '--emit-hashes' in argv:
         i = argv.index('--emit-hashes')
