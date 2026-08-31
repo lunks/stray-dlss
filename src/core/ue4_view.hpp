@@ -22,14 +22,18 @@ namespace stray_dlss::ue4 {
 // ---------------------------------------------------------------------------------------
 struct ViewRow
 {
-	// DERIVED, not a measured anchor: row 8 is TranslatedWorldToView in the stock
-	// VIEW_UNIFORM_BUFFER_MEMBER_TABLE layout (rows 0-27 are the matrix block:
-	// TranslatedWorldToClip 0, WorldToClip 4, TranslatedWorldToView 8, ...). The layout as
-	// a whole reproduced all seven measured anchors (CLAUDE.md §2.6), but THIS row was
-	// never individually verified — consumers must sanity-check what they read
-	// (world_to_view_rotation_plausible) and fail loudly, never silently. Used by the RR
-	// path for NoV and the DLSSD WorldToView matrix.
-	static constexpr std::uint32_t kTranslatedWorldToView = 8;       // derived, 4 rows
+	// The seven-FMatrix block occupying rows 0-27, in member-table order — HARD-via-mirror
+	// (SceneView.h VIEW_UNIFORM_BUFFER_MEMBER_TABLE, ~:1078, AlexMercer-MA 4.27.2 mirror,
+	// fetched 2026-08-31): TranslatedWorldToClip 0, WorldToClip 4, CLIPTOWORLD 8,
+	// TranslatedWorldToView 12, ViewToTranslatedWorld 16, TranslatedWorldToCameraView 20,
+	// CameraViewToTranslatedWorld 24 — then ViewToClip at 28, which is the MEASURED anchor
+	// that pins the count. The first shipped guess put TranslatedWorldToView at row 8
+	// (forgetting ClipToWorld) and the live run refused every frame with rows-implausible:
+	// an inverse view-projection is never orthonormal, so the plausibility gate caught the
+	// wrong-row read exactly as designed. Consumers still sanity-check what they read
+	// (world_to_view_rotation_plausible) — a licensee edit here stays survivable.
+	static constexpr std::uint32_t kViewMatrixBlock = 0;             // 7 matrices, 28 rows
+	static constexpr std::uint32_t kTranslatedWorldToView = 12;      // mirror-verified, 4 rows
 	static constexpr std::uint32_t kViewToClip = 28;                 // measured
 	static constexpr std::uint32_t kViewToClipNoAA = 32;             // measured
 	static constexpr std::uint32_t kInvDeviceZToWorldZTransform = 65; // derived

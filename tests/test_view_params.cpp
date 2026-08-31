@@ -26,8 +26,16 @@ std::vector<unsigned char> make_view_buffer()
 			static_cast<float>(r * 4 + 0), static_cast<float>(r * 4 + 1),
 			static_cast<float>(r * 4 + 2), static_cast<float>(r * 4 + 3));
 
-	// TranslatedWorldToView (rows 8-11, derived): a real rotation (90 degrees about Z)
-	// with a translation row, so both the parse and the plausibility gate are exercised.
+	// ClipToWorld (rows 8-11 — the block slot the first shipped guess misread as
+	// TranslatedWorldToView): inverse-projection-shaped, never orthonormal. Distinct
+	// values so the block parse is checkable and the plausibility gate provably rejects it.
+	put4(ue4::ViewRow::kViewMatrixBlock + 2 * 4 + 0, 0.83f, 0.0f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewMatrixBlock + 2 * 4 + 1, 0.0f, 0.48f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewMatrixBlock + 2 * 4 + 2, 0.0f, 0.0f, 0.0f, 0.1f);
+	put4(ue4::ViewRow::kViewMatrixBlock + 2 * 4 + 3, 0.0f, 0.0f, 1.0f, 0.0f);
+	// TranslatedWorldToView (rows 12-15, mirror-verified): a real rotation (90 degrees
+	// about Z) with a translation row, so both the parse and the plausibility gate are
+	// exercised.
 	put4(ue4::ViewRow::kTranslatedWorldToView + 0, 0.0f, 1.0f, 0.0f, 0.0f);
 	put4(ue4::ViewRow::kTranslatedWorldToView + 1, -1.0f, 0.0f, 0.0f, 0.0f);
 	put4(ue4::ViewRow::kTranslatedWorldToView + 2, 0.0f, 0.0f, 1.0f, 0.0f);
@@ -198,4 +206,91 @@ TEST_CASE("world_to_view_rotation_plausible gates the derived rows loudly")
 
 	// A projection matrix at the wrong row fails: its rows are nothing like unit length.
 	CHECK_FALSE(ue4::world_to_view_rotation_plausible(p.view_to_clip));
+}
+
+TEST_CASE("the seven-matrix block layout is pinned to the mirror-verified order")
+{
+	// SceneView.h VIEW_UNIFORM_BUFFER_MEMBER_TABLE (~:1078, 4.27.2 mirror, fetched
+	// 2026-08-31): TranslatedWorldToClip, WorldToClip, ClipToWorld, TranslatedWorldToView,
+	// ViewToTranslatedWorld, TranslatedWorldToCameraView, CameraViewToTranslatedWorld,
+	// then ViewToClip — whose MEASURED row-28 anchor is what pins the count at seven.
+	// The first shipped guess put TranslatedWorldToView at row 8 (forgetting ClipToWorld)
+	// and the live run refused every frame; this case makes that regression impossible.
+	CHECK(ue4::ViewRow::kTranslatedWorldToView == 12);
+	CHECK(ue4::ViewRow::kViewMatrixBlock + 7 * 4 == ue4::ViewRow::kViewToClip);
+	CHECK(std::strcmp(ue4::view_matrix_block_name(2), "ClipToWorld") == 0);
+	CHECK(std::strcmp(ue4::view_matrix_block_name(3), "TranslatedWorldToView") == 0);
+
+	const auto buf = make_view_buffer();
+	ue4::ViewParams p;
+	REQUIRE(ue4::parse_view_params(buf.data(), buf.size(), p));
+
+	// Block slot 2 reads rows 8-11 (the inverse-projection shape) and slot 3 IS the named
+	// TranslatedWorldToView.
+	CHECK(p.view_matrix_block[2].m[0] == doctest::Approx(0.83f));
+	CHECK(p.view_matrix_block[2].m[11] == doctest::Approx(0.1f));
+	CHECK(p.view_matrix_block[3].m[1] == doctest::Approx(p.translated_world_to_view.m[1]));
+
+	// And the gate's verdicts across the block: ClipToWorld rejected, the rigid transform
+	// at slot 3 accepted — the "no,no,no,YES..." pattern the diagnostics line prints.
+	CHECK_FALSE(ue4::world_to_view_rotation_plausible(p.view_matrix_block[2]));
+	CHECK(ue4::world_to_view_rotation_plausible(p.view_matrix_block[3]));
+}
+
+TEST_CASE("the plausibility check accepts a rotation under BOTH matrix conventions")
+{
+	// A 3x3 is orthogonal iff its transpose is, so the check cannot distinguish row-vector
+	// from column-vector storage — and must not try. This case PROVES both pass, so the
+	// convention question is settled by layout knowledge (UE stores row-vector, RESEARCH.md
+	// §4.7), never by this gate.
+	ue4::Matrix4 rot{}; // 90 degrees about Z, row-vector convention, translation in row 3
+	rot.m[0 * 4 + 1] = 1.0f;
+	rot.m[1 * 4 + 0] = -1.0f;
+	rot.m[2 * 4 + 2] = 1.0f;
+	rot.m[3 * 4 + 0] = 5.0f;
+	rot.m[3 * 4 + 3] = 1.0f;
+	CHECK(ue4::world_to_view_rotation_plausible(rot));
+
+	ue4::Matrix4 transposed{}; // the same rotation, column-vector convention (translation column)
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c)
+			transposed.m[r * 4 + c] = rot.m[c * 4 + r];
+	CHECK(ue4::world_to_view_rotation_plausible(transposed));
+}
+
+TEST_CASE("nov_rotation_rows applies the row-vector convention, provably")
+{
+	// The stored matrix rotates 90 degrees about Z in the row-vector convention:
+	// n_view = n_world * M, so world +X must land on view +Y.
+	ue4::Matrix4 rot{};
+	rot.m[0 * 4 + 1] = 1.0f;
+	rot.m[1 * 4 + 0] = -1.0f;
+	rot.m[2 * 4 + 2] = 1.0f;
+	rot.m[3 * 4 + 3] = 1.0f;
+
+	float rows[3][3] = {};
+	ue4::nov_rotation_rows(rot, rows);
+
+	const float n_world[3] = { 1.0f, 0.0f, 0.0f };
+	float n_view[3] = {};
+	for (int i = 0; i < 3; ++i)
+		n_view[i] = rows[i][0] * n_world[0] + rows[i][1] * n_world[1] +
+			rows[i][2] * n_world[2];
+
+	// The reference: direct row-vector multiplication (n * M)[j] = sum_i n[i] * M[i][j].
+	float reference[3] = {};
+	for (int j = 0; j < 3; ++j)
+		reference[j] = n_world[0] * rot.m[0 * 4 + j] + n_world[1] * rot.m[1 * 4 + j] +
+			n_world[2] * rot.m[2 * 4 + j];
+
+	for (int i = 0; i < 3; ++i)
+		CHECK(n_view[i] == doctest::Approx(reference[i]));
+	CHECK(n_view[1] == doctest::Approx(1.0f)); // +X -> +Y
+
+	// The bug this helper exists to prevent: the UNtransposed rows apply the inverse
+	// rotation (+X -> -Y here). If someone inlines the extraction again, this shows what
+	// goes wrong.
+	float wrong = rot.m[1 * 4 + 0] * n_world[0] + rot.m[1 * 4 + 1] * n_world[1] +
+		rot.m[1 * 4 + 2] * n_world[2];
+	CHECK(wrong == doctest::Approx(-1.0f));
 }

@@ -51,7 +51,10 @@ bool parse_view_params(const void *data, std::size_t size, ViewParams &out)
 			m.m[r * 4 + 3] = row.w;
 		}
 	};
-	read_matrix(ViewRow::kTranslatedWorldToView, out.translated_world_to_view);
+	for (std::uint32_t i = 0; i < 7; ++i)
+		read_matrix(ViewRow::kViewMatrixBlock + i * 4, out.view_matrix_block[i]);
+	// TranslatedWorldToView is block index 3 (rows 12-15, mirror-verified — ue4_view.hpp).
+	out.translated_world_to_view = out.view_matrix_block[3];
 	read_matrix(ViewRow::kViewToClip, out.view_to_clip);
 	read_matrix(ViewRow::kViewToClipNoAA, out.view_to_clip_no_aa);
 
@@ -121,6 +124,30 @@ bool world_to_view_rotation_plausible(const Matrix4 &m)
 				return false;
 		}
 	return true;
+}
+
+void nov_rotation_rows(const Matrix4 &m, float out[3][3])
+{
+	// Transposed upper 3x3: out[i][j] = M[j][i]. See the header for why (row-vector
+	// storage vs the shader's dot(row, n) form).
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 3; ++j)
+			out[i][j] = m.m[j * 4 + i];
+}
+
+const char *view_matrix_block_name(int index)
+{
+	switch (index)
+	{
+	case 0: return "TranslatedWorldToClip";
+	case 1: return "WorldToClip";
+	case 2: return "ClipToWorld";
+	case 3: return "TranslatedWorldToView";
+	case 4: return "ViewToTranslatedWorld";
+	case 5: return "TranslatedWorldToCameraView";
+	case 6: return "CameraViewToTranslatedWorld";
+	}
+	return "?";
 }
 
 bool is_camera_cut(const ViewParams &p, bool history_or_velocity_is_1x1)

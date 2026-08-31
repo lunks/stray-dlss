@@ -329,21 +329,36 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		return false;
 	}
 
-	// The DERIVED View rows 8-10 must actually hold a rotation before anything trusts
-	// them (gbuffer_resolve.hpp). A wrong matrix biases specular albedo silently — the
-	// §0.2 class of failure — so implausible rows mean SR, loudly, once.
+	// View rows 12-15 (TranslatedWorldToView, mirror-verified after the first guess of
+	// row 8 turned out to be ClipToWorld — ue4_view.hpp) must actually hold a rotation
+	// before anything trusts them. A wrong matrix biases specular albedo silently — the
+	// §0.2 class of failure — so implausible rows mean SR, loudly, once. Every diagnostic
+	// line below carries the RR token: the previous version's value line started with bare
+	// spaces and a filtered log lost it, which cost the round-trip this comment memorialises.
 	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
 	{
 		if (refuse(kRrRowsImplausible))
 		{
+			STRAY_LOG_ERROR("RR: View rows 12-15 (TranslatedWorldToView) do not hold a "
+				"rotation - SR carries the frames while this holds. All 16 floats follow.");
 			const float *m = view.translated_world_to_view.m;
-			STRAY_LOG_ERROR("RR: View rows 8-10 (TranslatedWorldToView, DERIVED layout) do "
-				"not hold a rotation - SR carries the frames while this holds. Rows:");
-			STRAY_LOG_ERROR("  [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] "
-				"[%.4f %.4f %.4f %.4f]",
-				m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
-			STRAY_LOG_ERROR("  If these look like another row's data, the derived row-8 "
-				"claim is wrong and needs re-deriving before RR can work.");
+			for (int r = 0; r < 4; ++r)
+				STRAY_LOG_ERROR("RR: row %d: [%.6f %.6f %.6f %.6f]", 12 + r,
+					m[r * 4 + 0], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
+			// The member-order measurement: orthonormality verdict for every slice of the
+			// seven-matrix block. Expected pattern for the mirror-verified order is
+			// no,no,no,YES,YES,YES,YES (the four view<->world transforms are rigid; the
+			// three clip-involved ones never are). Any other pattern names the licensee's
+			// actual member order in one line.
+			char verdicts[256];
+			int off = std::snprintf(verdicts, sizeof(verdicts), "RR: block verdicts:");
+			for (int i = 0; i < 7; ++i)
+				if (off > 0 && off < static_cast<int>(sizeof(verdicts)))
+					off += std::snprintf(verdicts + off, sizeof(verdicts) - off,
+						" %s=%s", ue4::view_matrix_block_name(i),
+						ue4::world_to_view_rotation_plausible(view.view_matrix_block[i])
+							? "YES" : "no");
+			STRAY_LOG_ERROR("%s", verdicts);
 		}
 		return false;
 	}
@@ -369,9 +384,10 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	// NoV ray math needs. Row-major m[r*4+c].
 	gi.proj00 = view.view_to_clip_no_aa.m[0];
 	gi.proj11 = view.view_to_clip_no_aa.m[5];
-	for (int r = 0; r < 3; ++r)
-		for (int c = 0; c < 3; ++c)
-			gi.world_to_view[r][c] = view.translated_world_to_view.m[r * 4 + c];
+	// The TRANSPOSED upper 3x3: UE stores row-vector matrices while the resolve shader
+	// computes dot(row, n). The untransposed rows apply the INVERSE rotation — silently
+	// wrong NoV — which is why the extraction is a tested core helper, not inline math.
+	ue4::nov_rotation_rows(view.translated_world_to_view, gi.world_to_view);
 
 	if (!gbr::record(native, gi, /*dispatch_mode=*/2))
 	{
@@ -417,7 +433,7 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		er.specular_albedo = gbr::specular_albedo();
 		er.normals_roughness = gbr::normals_roughness();
 		er.roughness = gbr::roughness();
-		// WorldToView = rows 8-11 (derived, rotation-checked above); ViewToClip =
+		// WorldToView = rows 12-15 (mirror-verified, rotation-checked above); ViewToClip =
 		// ViewToClipNoAA rows 32-35 (measured) — jitter reaches NGX separately, so the
 		// unjittered projection is the consistent pairing. Both row-major, as stored.
 		std::memcpy(er.world_to_view, view.translated_world_to_view.m,

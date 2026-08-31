@@ -29,8 +29,12 @@ struct Matrix4
 struct ViewParams
 {
 	Matrix4 clip_to_prev_clip{};
-	// TranslatedWorldToView (rows 8-11) — DERIVED layout, not a measured anchor
-	// (ue4_view.hpp). The RR path needs its upper 3x3 (a rotation) for NoV and passes the
+	// The full seven-matrix block at rows 0-27 (order in ue4_view.hpp, HARD-via-mirror).
+	// Kept whole so a plausibility failure can print every slice's orthonormality verdict
+	// and turn a refusal into a member-order measurement in one log line.
+	Matrix4 view_matrix_block[7]{};
+	// TranslatedWorldToView (rows 12-15 — mirror-verified; equals view_matrix_block[3]).
+	// The RR path derives the NoV rotation from it (nov_rotation_rows) and passes the
 	// whole matrix as DLSSD's WorldToView; both consumers gate on
 	// world_to_view_rotation_plausible first.
 	Matrix4 translated_world_to_view{};
@@ -73,6 +77,22 @@ bool is_camera_cut(const ViewParams &p, bool history_or_velocity_is_1x1);
 // matrix, garbage — this returns false and the RR path must fall back rather than feed NGX
 // a silently wrong NoV. Tolerance is loose (1e-2) because the buffer carries float32 of a
 // double-precision engine transform.
+// Convention note, provable in the tests: a 3x3 is orthogonal iff its transpose is, so
+// this check passes a genuine rotation stored under EITHER matrix convention — it cannot
+// distinguish them and does not try. The convention itself is settled by layout knowledge,
+// not by this check: UE stores FMatrix row-major with the ROW-VECTOR convention
+// (v' = v * M; docs/RESEARCH.md §4.7, proven live by the ClipToPrevClip path).
 bool world_to_view_rotation_plausible(const Matrix4 &translated_world_to_view);
+
+// The 3x3 the G-buffer resolve's NoV math needs, extracted with the convention made
+// explicit. The shader computes n_view[i] = dot(row_i, n_world) — the COLUMN-vector form —
+// while UE's stored matrix wants the row-vector form n_view = n_world * M, so this returns
+// the TRANSPOSED upper 3x3 (the stored matrix's columns as rows). Handing the resolve the
+// untransposed rows applies the inverse rotation: NoV goes wrong silently, which is why
+// this lives here with a test instead of inline at the call site.
+void nov_rotation_rows(const Matrix4 &translated_world_to_view, float out[3][3]);
+
+// Member name for a view_matrix_block index (0-6), for the diagnostics line.
+const char *view_matrix_block_name(int index);
 
 } // namespace stray_dlss::ue4

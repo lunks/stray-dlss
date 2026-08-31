@@ -129,8 +129,10 @@ struct EvaluateInputsRR
 	ID3D12Resource *roughness = nullptr;         // R16F (Roughness_Mode_Unpacked reads this)
 
 	// Row-major matrices for the DLSSD helper's void-pointer parameters. WorldToView is
-	// View.TranslatedWorldToView (rows 8-11 — DERIVED layout, caller must have passed
-	// world_to_view_rotation_plausible); ViewToClip is ViewToClipNoAA (row 32, measured —
+	// View.TranslatedWorldToView as stored (rows 12-15, mirror-verified; caller must have
+	// passed world_to_view_rotation_plausible — NGX's expected convention is undocumented,
+	// so the matrix goes through unmodified and only affects the specular-MV path we do
+	// not feed); ViewToClip is ViewToClipNoAA (row 32, measured —
 	// jitter reaches NGX separately, so the unjittered projection is the consistent one).
 	// Optional: the official UE plugin ships NEITHER matrix, so absence only degrades
 	// reflection reprojection, never the evaluate.

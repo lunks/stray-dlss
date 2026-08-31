@@ -43,9 +43,10 @@ struct ResolveInputs
 
 	// NoV geometry. proj00/proj11 are ViewToClipNoAA[0][0] and [1][1] (View CB row 32 — a
 	// measured anchor, CLAUDE.md §2.6; NoAA on purpose, jitter-free). world_to_view is the
-	// upper 3x3 of View.TranslatedWorldToView, rows 8-10 of the [derived] View layout —
-	// NOT a measured anchor: phase 3 must log it and sanity-check orthonormality before
-	// the guides are trusted (a wrong rotation biases specular albedo, silently).
+	// TRANSPOSED upper 3x3 of View.TranslatedWorldToView (rows 12-15, mirror-verified) —
+	// fill it with ue4::nov_rotation_rows, which owns the row-vector-to-dot(row,n)
+	// convention flip, and gate on world_to_view_rotation_plausible first (a wrong
+	// rotation biases specular albedo, silently).
 	float proj00 = 1.0f;
 	float proj11 = 1.0f;
 	float world_to_view[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
