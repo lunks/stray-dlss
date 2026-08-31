@@ -582,7 +582,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.jitter_y = view.temporal_aa_params.w;
 							ei.render_width = render_w;
 							ei.render_height = render_h;
-							ei.reset = ue4::is_camera_cut(view) || m.camera_cut_dummies;
+							// The three signals ORed inside is_camera_cut: View.CameraCut,
+							// TemporalAAJitter.zw == .xy, and a 1x1 history/velocity dummy.
+							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
 
 							const bool ok = ngx::evaluate(native, ei);
