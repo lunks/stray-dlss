@@ -13,6 +13,11 @@
 #include "core/ring.hpp"
 #include "core/view_params.hpp"
 #include "d3d12_restore.hpp"
+#include "frame_state.hpp"
+
+#include "fake_reshade_command_list.hpp"
+
+#include <state_tracking.hpp>
 #include "mv_resolve.hpp"
 
 #include <d3d12.h>
@@ -635,6 +640,105 @@ bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
 	return true;
 }
 
+// Exercises the ReShade-facing half of restore_game_compute_state.
+//
+// The native half has a golden-output test; this half only had comments. It is also where the
+// suspected on-screen corruption lives, so the rules it claims to follow are asserted here:
+//
+//   1. the FIRST call must be count==0, which is what forces ReShade to re-issue the game's
+//      descriptor heaps and compute root signature and to re-sync its own caches;
+//   2. every later call binds exactly ONE table, never a whole vector — binding the vector is
+//      what ReShade's own state_block does, and it passes zero handles through for parameters
+//      that are not descriptor tables at all;
+//   3. a parameter whose tracked handle is zero is never bound;
+//   4. graphics tables are restored too, after the compute ones.
+//
+// get_native() hands the restore the harness's real WARP command list, so the native calls it
+// emits genuinely execute and the debug layer judges them.
+bool test_reshade_restore_call_pattern(Gpu &gpu)
+{
+	std::printf("\n[test] the ReShade half of restore issues the right calls, in order\n");
+
+	Probe p;
+	if (!build_probe(gpu, p))
+		return false;
+	drain_validation(gpu, "reshade-restore-setup");
+
+	stray_dlss::test::FakeCommandList fake;
+	fake.native = reinterpret_cast<std::uint64_t>(gpu.list.Get());
+
+	// A layout whose parameter 1 is NOT a descriptor table. state_tracking represents that as
+	// a zero handle, and the restore must skip it rather than bind a table there.
+	state_tracking st;
+	const reshade::api::pipeline_layout layout = {
+		reinterpret_cast<std::uint64_t>(p.rs.Get()) };
+	st.descriptor_tables[reshade::api::shader_stage::all_compute] = { layout,
+		{ reshade::api::descriptor_table{ p.table.ptr },
+		  reshade::api::descriptor_table{ 0 },
+		  reshade::api::descriptor_table{ p.table.ptr } } };
+	st.descriptor_tables[reshade::api::shader_stage::all_graphics] = { layout,
+		{ reshade::api::descriptor_table{ p.table.ptr } } };
+	st.pipelines[reshade::api::pipeline_stage::all] = reshade::api::pipeline{
+		reinterpret_cast<std::uint64_t>(p.pso.Get()) };
+	fake.put_private_data(&st);
+
+	stray_dlss::restore_game_compute_state(&fake);
+
+	const auto &b = fake.binds;
+	check(!b.empty(), "the restore called into ReShade at all");
+	if (b.empty())
+		return false;
+
+	check(b[0].count == 0 && b[0].first == 0,
+		"the first call is the count==0 resync that re-issues heaps and root signature");
+	check(b[0].layout.handle == layout.handle, "the resync names the game's own layout");
+
+	bool all_single = true, bound_zero_handle = false;
+	for (std::size_t i = 1; i < b.size(); ++i)
+	{
+		if (b[i].count != 1)
+			all_single = false;
+		for (const auto t : b[i].tables)
+			if (t.handle == 0)
+				bound_zero_handle = true;
+	}
+	check(all_single, "every later call binds exactly one table, never a whole vector");
+	check(!bound_zero_handle, "no zero handle is ever bound (that would hit a root CBV)");
+
+	// Parameter 1 is not a table, so only 0 and 2 may be restored for compute.
+	int compute_binds = 0, graphics_binds = 0;
+	bool touched_param_1 = false;
+	for (std::size_t i = 1; i < b.size(); ++i)
+	{
+		const bool is_compute = (static_cast<std::uint32_t>(b[i].stages) &
+			static_cast<std::uint32_t>(reshade::api::shader_stage::all_compute)) != 0;
+		if (is_compute)
+		{
+			++compute_binds;
+			if (b[i].first == 1)
+				touched_param_1 = true;
+		}
+		else
+		{
+			++graphics_binds;
+		}
+	}
+	check(compute_binds == 2, "exactly the two compute parameters that are tables were bound");
+	check(!touched_param_1, "the non-table parameter was skipped");
+	check(graphics_binds == 1, "the graphics table was restored as well");
+
+	// The native calls really ran on the WARP list; the debug layer gets the final word.
+	const int errors = drain_validation(gpu, "reshade-restore");
+	check(errors == 0, "no D3D12 validation errors from the native half of the restore");
+
+	gpu.list->Close();
+	gpu.allocator->Reset();
+	gpu.list->Reset(gpu.allocator.Get(), nullptr);
+	stray_dlss::forget_all_command_lists();
+	drain_validation(gpu, "reshade-restore-teardown");
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -656,6 +760,7 @@ int main(int argc, char **argv)
 	test_dispatch_is_valid(gpu);
 	test_no_allocation_churn(gpu);
 	test_restore_preserves_game_state(gpu);
+	test_reshade_restore_call_pattern(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");

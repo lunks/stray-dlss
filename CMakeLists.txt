@@ -213,15 +213,25 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         tests/warp/warp_mv_resolve.cpp
         tests/warp/log_stub.cpp
         src/mv_resolve.cpp
-        src/d3d12_restore.cpp)
+        src/d3d12_restore.cpp
+        # The real frame_state, so the ReShade-facing half of the restore is the code under
+        # test rather than a reimplementation of it.
+        src/frame_state.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/warp_probe.hlsl"
                    main cs_5_0 g_warp_probe_dxbc)
 
-    target_include_directories(stray_dlss_warp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(stray_dlss_warp PRIVATE stray_dlss_core d3d12 dxgi d3dcompiler)
+    target_include_directories(stray_dlss_warp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/warp)
+    target_link_libraries(stray_dlss_warp PRIVATE
+        stray_dlss_core
+        reshade_sdk
+        reshade_utils
+        reshade_utils_headers
+        d3d12 dxgi d3dcompiler)
     target_compile_definitions(stray_dlss_warp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(stray_dlss_warp PRIVATE /W4 $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
 
