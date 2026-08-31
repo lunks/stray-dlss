@@ -183,7 +183,7 @@ void on_push_constants(
 	uint32_t layout_param,
 	uint32_t first,
 	uint32_t count,
-	const uint32_t *values)
+	const void *values) // const void*, not const uint32_t* — see reshade_events.hpp:1896
 {
 	note_push_constants(cmd_list, stages, layout, layout_param, first, count, values);
 }
