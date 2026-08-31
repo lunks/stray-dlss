@@ -742,10 +742,16 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				reinterpret_cast<void *>(velocity_resource));
 		}
 
-		if (tracing && view_ok && resources_live && !m.camera_cut_dummies)
+		if (tracing && view_ok && resources_live)
 			g_named_live.fetch_add(1, std::memory_order_relaxed);
 
-		if (view_ok && resources_live && !m.camera_cut_dummies)
+		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set
+		// via is_camera_cut — so the engine's TAA never runs once DLSS engages. Skipping them
+		// let the engine's TAA blend against DLSS-written history, which flickered. The dummy
+		// velocity is harmless: its out-of-bounds loads return zero, the decode's validity test
+		// fails, the camera-motion branch yields ~zero vectors, and a reset frame ignores
+		// motion vectors regardless.
+		if (view_ok && resources_live)
 		{
 			mark(2, "descriptors-found");
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());

@@ -154,8 +154,8 @@ bool report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
 			when, path[0] ? path : "<unknown>");
 		STRAY_LOG_ERROR("  NGX descriptors minted on the native device will be run through "
 			"convert_to_original_cpu_descriptor_handle and CORRUPTED.");
-		STRAY_LOG_ERROR("  Expect a wrong-looking image rather than an error. See CLAUDE.md "
-			"\"The native-device rule has a trap\".");
+		STRAY_LOG_ERROR("  ext_unhook restores the pristine pointers before every NGX call "
+			"(disable with ExtUnhook=0). See CLAUDE.md \"The native-device rule has a trap\".");
 	}
 	else
 	{
