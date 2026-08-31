@@ -84,6 +84,34 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### CONFIRMED WORKING ON THE TARGET, 2026-08-31
+
+NGX initialises and reports DLSS available, in Stray, under vkd3d-proton, through ReShade:
+
+```
+[pre-NGX] vkd3d ID3D12DeviceExt slot 8 is HOOKED BY RESHADE (dxgi.dll)
+NGX will use ReShade's PROXY device (…6968B50): the ext hook is installed, so
+  descriptors must be ReShade-minted for its conversion to be correct.
+Initialising NGX (frame 120)...
+NVSDK_NGX_D3D12_Init_with_ProjectID succeeded
+DLSS SR available=1 needs_updated_driver=0 min_driver=470.0 feature_init=0x00000001 (Success)
+[DLSSCubinKernelMap::InitCubins:303] Setting DLTSS Engine Cubins
+Add-on event check OK: bind_pipeline and push_descriptors both observed
+```
+
+Three things this settles, each previously inference:
+
+* **The cubin path works.** `nvngx_dlss.dll` loaded its DLTSS engine cubins through DXVK-NVAPI
+  into vkd3d — the mechanism §1 describes, now observed rather than argued.
+* **`Init_with_ProjectID` needs no whitelist**, and `Available=1` comes back without ever calling
+  `GetFeatureRequirements` (which Proton does not implement).
+* **The ext hook is installed by frame 120**, earlier than the frame-300 figure measured before.
+  The device choice must therefore be made from the live vtable state, never from a fixed rule —
+  which is exactly what the add-on now does, and it picked the proxy.
+
+Still not done: `CreateFeature` and `EvaluateFeature` do not exist yet. NGX is initialised and
+interrogated, nothing more, so none of this yet proves an image.
+
 ### The native-device rule has a trap, measured 2026-08-31
 
 **Two configurations are self-consistent. The one we currently ship is only safe by luck.**
