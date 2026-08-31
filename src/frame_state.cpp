@@ -6,6 +6,7 @@
 #include <state_tracking.hpp>
 
 #include <mutex>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -18,9 +19,9 @@ struct RootDescriptors
 {
 	std::vector<BoundTexture> srvs;
 	std::vector<BoundTexture> uavs;
-	reshade::api::buffer_range view_cb{};
-	bool view_cb_valid = false;
-	uint32_t view_cb_register = 0;
+	// Every root constant buffer, not just the last. UE4 binds several, and which one carries
+	// the View uniform buffer is not fixed — keeping only one loses it on most frames.
+	std::vector<std::pair<uint32_t, reshade::api::buffer_range>> constant_buffers;
 };
 
 std::mutex g_mutex;
@@ -200,12 +201,11 @@ void note_push_descriptors(
 		case reshade::api::descriptor_type::constant_buffer:
 		{
 			const auto *ranges = static_cast<const reshade::api::buffer_range *>(update.descriptors);
-			// The View uniform buffer is the large one. b0 ($Globals) is small and its layout
-			// is unknowable because fxc compacts it, so it is deliberately ignored.
-			// (CLAUDE.md §2.6)
-			rd.view_cb = ranges[i];
-			rd.view_cb_valid = ranges[i].buffer.handle != 0;
-			rd.view_cb_register = layout_param;
+			// Keep EVERY root constant buffer. UE4 binds several and which one carries the
+			// View uniform buffer is not fixed, so overwriting a single slot loses it on most
+			// frames — which is why the CB read intermittently failed.
+			if (ranges[i].buffer.handle != 0)
+				rd.constant_buffers.emplace_back(layout_param, ranges[i]);
 			break;
 		}
 		case reshade::api::descriptor_type::shader_resource_view:
@@ -393,8 +393,8 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 			const RootDescriptors &rd = rit->second;
 			out.srvs.insert(out.srvs.end(), rd.srvs.begin(), rd.srvs.end());
 			out.uavs.insert(out.uavs.end(), rd.uavs.begin(), rd.uavs.end());
-			if (rd.view_cb_valid)
-				out.constant_buffers.emplace_back(rd.view_cb_register, rd.view_cb);
+			out.constant_buffers.insert(out.constant_buffers.end(),
+				rd.constant_buffers.begin(), rd.constant_buffers.end());
 		}
 	}
 

@@ -112,7 +112,14 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 	r.output_uav = output->slot;
 	r.output_width = output->width;
 	r.output_height = output->height;
-	r.is_upsampling = output->width > view_width || output->height > view_height;
+	// Compare against the DEPTH SRV's extent, which is the true render resolution, rather than
+	// the passed-in view rect: that comes from the View constant buffer, which is not always
+	// readable, and falling back to the dispatch size makes every pass look 1:1.
+	(void)view_width;
+	(void)view_height;
+	r.is_upsampling = output->width > depth->width || output->height > depth->height;
+	r.render_width = depth->width;
+	r.render_height = depth->height;
 
 	// On a camera cut UE4 swaps velocity and the history colour for the 1x1 BlackDummy.
 	// EyeAdaptationTexture is ALSO 1x1 and is present on every frame, so a blanket "any 1x1

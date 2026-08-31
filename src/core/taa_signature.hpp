@@ -79,6 +79,10 @@ struct MatchResult
 	// game runs temporal upsampling, so these differ from the input extent.
 	std::uint32_t output_width = 0;
 	std::uint32_t output_height = 0;
+	// The render resolution, taken from the depth SRV rather than the View buffer, so it is
+	// available even on frames where the constant buffer cannot be read.
+	std::uint32_t render_width = 0;
+	std::uint32_t render_height = 0;
 	bool is_upsampling = false;
 
 	// True when velocity or the history colour is the 1x1 GSystemTextures::BlackDummy, which
