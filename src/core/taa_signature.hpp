@@ -41,12 +41,13 @@ struct BoundTexture
 	// dereference it: ReShade does not call destroy_resource_view on D3D12, so its view->
 	// resource map can hand back a pointer to a destroyed resource. (docs/RESEARCH.md §2.7)
 	std::uint64_t resource = 0;
-	// The game's own CPU descriptor handle for this binding. Copying this into our heap is the
-	// safe way to read the resource: it needs no resource pointer and no format guessing.
-	std::uint64_t descriptor = 0;
 	TexFormat format = TexFormat::unknown;
 	std::uint32_t width = 0;
 	std::uint32_t height = 0;
+	// The game's own CPU descriptor handle for this binding. Copying this into our heap is the
+	// safe way to read the resource: it needs no resource pointer and no format guessing.
+	// Last so the positional initialisers in the tests stay meaningful.
+	std::uint64_t descriptor = 0;
 };
 
 struct DispatchSignature
