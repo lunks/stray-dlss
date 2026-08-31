@@ -68,6 +68,8 @@ struct State
 	};
 	std::vector<Retired> retired;
 
+	Stats stats;
+
 	char error[256] = {};
 };
 
@@ -244,6 +246,7 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 
 	g_state.width = width;
 	g_state.height = height;
+	++g_state.stats.resource_sets_created;
 	return true;
 }
 
@@ -288,12 +291,28 @@ void retire_expired()
 		release(it->constants);
 		release(it->out_mv);
 		it = g_state.retired.erase(it);
+		++g_state.stats.resource_sets_released;
+		g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
 	}
 }
 
 } // namespace
 
 const char *last_error() { return g_state.error; }
+
+const Stats &stats()
+{
+	// Recomputed on read so it stays honest even if a release path is added later.
+	g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
+	std::uint64_t bytes = 0;
+	if (g_state.out_mv != nullptr)
+		bytes += static_cast<std::uint64_t>(g_state.width) * g_state.height * 4;
+	for (const auto &r : g_state.retired)
+		if (r.out_mv != nullptr)
+			bytes += static_cast<std::uint64_t>(g_state.width) * g_state.height * 4;
+	g_state.stats.bytes_live = bytes;
+	return g_state.stats;
+}
 bool is_ready() { return g_state.pso != nullptr && g_state.out_mv != nullptr; }
 ID3D12Resource *output() { return g_state.out_mv; }
 
@@ -324,6 +343,8 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 		r.out_mv = g_state.out_mv;
 		r.retire_frame = g_state.frame;
 		g_state.retired.push_back(r);
+		++g_state.stats.resource_sets_retired;
+		g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
 
 		g_state.heap = nullptr;
 		g_state.constants = nullptr;

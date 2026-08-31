@@ -48,6 +48,21 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 // R16G16_FLOAT at render resolution. Valid after a successful record().
 ID3D12Resource *output();
 
+// Allocation accounting. The GPU ran out of memory during a real run, and resource churn in
+// initialise() is the prime suspect: the render resolution is taken from whichever dispatch
+// matched, so a flapping size reallocates the heap, constant buffer and output texture. These
+// counters make that measurable rather than theoretical, and are asserted in the WARP test.
+struct Stats
+{
+	std::uint64_t resource_sets_created = 0;  // times create_resources() ran
+	std::uint64_t resource_sets_retired = 0;  // times a set was handed to the retirement list
+	std::uint64_t resource_sets_released = 0; // times a retired set was actually freed
+	std::uint32_t live_retired = 0;           // retired sets still holding GPU memory
+	std::uint64_t bytes_live = 0;             // approximate output-texture bytes currently held
+};
+
+const Stats &stats();
+
 const char *last_error();
 
 } // namespace stray_dlss::mv

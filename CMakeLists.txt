@@ -194,6 +194,36 @@ if(STRAY_DLSS_BUILD_ADDON)
 endif()
 
 # ---------------------------------------------------------------------------------------
+# WARP harness
+#
+# Runs the real resolve pass against Microsoft's software D3D12 device with the debug layer on,
+# so our D3D12 usage is judged on a CI machine with no GPU. This matters because the failures
+# on the target machine are silent: vkd3d-proton validates root parameters by assert only in a
+# release build, so illegal usage yields a wrong image or an unresponsive GPU rather than an
+# error. It cannot cover vkd3d-specific behaviour, only correctness of what we ask for.
+# ---------------------------------------------------------------------------------------
+option(STRAY_DLSS_BUILD_WARP_TESTS "Build the WARP D3D12 harness (Windows only)" ${WIN32})
+
+if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
+
+    add_executable(stray_dlss_warp
+        tests/warp/warp_mv_resolve.cpp
+        tests/warp/log_stub.cpp
+        src/mv_resolve.cpp)
+
+    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
+                   main cs_5_0 g_mv_resolve_dxbc)
+
+    target_include_directories(stray_dlss_warp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(stray_dlss_warp PRIVATE stray_dlss_core d3d12 dxgi d3dcompiler)
+    target_compile_definitions(stray_dlss_warp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(stray_dlss_warp PRIVATE /W4 $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
+
+    add_test(NAME warp COMMAND stray_dlss_warp)
+endif()
+
+# ---------------------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------------------
 if(STRAY_DLSS_BUILD_TESTS)

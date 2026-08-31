@@ -84,6 +84,19 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # WARP is Microsoft's software D3D12 device, so this runs on a GPU-less runner. It
+      # judges our own D3D12 usage with the debug layer, which the target machine cannot do:
+      # vkd3d-proton in a release build validates root parameters by assert only, so illegal
+      # usage there is silent and shows up as a wrong image or an unresponsive GPU.
+      - name: WARP harness (NGX=ON only)
+        if: matrix.ngx == 'ON'
+        shell: pwsh
+        run: |
+          $exe = "build/stray_dlss_warp.exe"
+          if (-not (Test-Path $exe)) { throw "WARP harness was not built" }
+          & $exe
+          if ($LASTEXITCODE -ne 0) { throw "WARP harness reported failures" }
+
       # A .addon64 that does not export what ReShade looks for loads and then does nothing,
       # with no error anyone can see. Check it here instead of discovering it in the game.
       - name: Verify add-on exports
