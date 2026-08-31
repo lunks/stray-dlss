@@ -91,6 +91,71 @@ struct State
 
 State g_state;
 
+// Reports whether ReShade's vkd3d extension hook is installed on the ID3D12DeviceExt vtable.
+//
+// ReShade 6.8.0 patches vtable slots 7/8 of that interface so GetCudaTextureObject /
+// GetCudaSurfaceObject -- the entry points nvngx_dlss.dll uses under vkd3d -- run their handles
+// through convert_to_original_cpu_descriptor_handle. That assumes ReShade minted the handle; a
+// real vkd3d handle gives a garbage heap index and an out-of-bounds read, with no error and a
+// wrong texture sampled.
+//
+// We hand NGX the native device (§1), so our handles are real, which is safe only while the
+// patch is absent. vkd3d uses ONE STATIC VTABLE here, so any component querying ReShade's proxy
+// installs it for everyone. Measured reachable on the target hardware, 2026-08-31.
+//
+// `when` names the call site, because the answer can CHANGE over a session: whoever installs the
+// patch may do so long after init_device. Checking once at startup would report "safe" and be
+// wrong later, so this runs again immediately before NGX is initialised.
+//
+// Querying the NATIVE device installs nothing: it goes through vkd3d's own QueryInterface,
+// never ReShade's proxy.
+void report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
+{
+	// {11EA7A1A-0F6A-49BF-B612-3E30F8E201DD}
+	constexpr GUID kDeviceExt = { 0x11ea7a1a, 0x0f6a, 0x49bf,
+		{ 0xb6, 0x12, 0x3e, 0x30, 0xf8, 0xe2, 0x01, 0xdd } };
+
+	IUnknown *ext = nullptr;
+	if (native == nullptr ||
+		FAILED(native->QueryInterface(kDeviceExt, reinterpret_cast<void **>(&ext))) ||
+		ext == nullptr)
+	{
+		STRAY_LOG_INFO("[%s] No ID3D12DeviceExt on this device (not vkd3d-proton, or too old).",
+			when);
+		return;
+	}
+
+	void *const slot = (*reinterpret_cast<void ***>(ext))[8]; // GetCudaSurfaceObject
+	HMODULE owner = nullptr;
+	::GetModuleHandleExW(
+		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(slot), &owner);
+
+	// ReShade is whichever module exports the add-on entry points.
+	const bool owned_by_reshade = owner != nullptr &&
+		::GetProcAddress(owner, "ReShadeRegisterAddon") != nullptr;
+
+	char path[MAX_PATH] = {};
+	if (owner != nullptr)
+		::GetModuleFileNameA(owner, path, MAX_PATH);
+
+	if (owned_by_reshade)
+	{
+		STRAY_LOG_ERROR("[%s] vkd3d ID3D12DeviceExt slot 8 is HOOKED BY RESHADE (%s).",
+			when, path[0] ? path : "<unknown>");
+		STRAY_LOG_ERROR("  NGX descriptors minted on the native device will be run through "
+			"convert_to_original_cpu_descriptor_handle and CORRUPTED.");
+		STRAY_LOG_ERROR("  Expect a wrong-looking image rather than an error. See CLAUDE.md "
+			"\"The native-device rule has a trap\".");
+	}
+	else
+	{
+		STRAY_LOG_INFO("[%s] vkd3d ID3D12DeviceExt present, slot 8 unhooked (owner=%s) - the "
+			"native-device NGX path is safe.", when, path[0] ? path : "<unknown>");
+	}
+	ext->Release();
+}
+
 void on_init_device(reshade::api::device *device)
 {
 	if (device->get_api() != reshade::api::device_api::d3d12)
@@ -109,65 +174,7 @@ void on_init_device(reshade::api::device *device)
 
 	STRAY_LOG_INFO("init_device: ID3D12Device=%p", static_cast<void *>(native));
 
-	// Is ReShade's vkd3d extension hook installed?
-	//
-	// ReShade 6.8.0 patches vtable slots 7/8 of vkd3d's ID3D12DeviceExt so that
-	// GetCudaTextureObject / GetCudaSurfaceObject -- the entry points nvngx_dlss.dll uses under
-	// vkd3d -- run their handles through convert_to_original_cpu_descriptor_handle. That
-	// conversion assumes ReShade minted the handle; a real vkd3d handle gives a garbage heap
-	// index and an out-of-bounds read, with no error and a wrong texture sampled.
-	//
-	// We hand NGX the native device (§1), so our handles are real. That is safe only while the
-	// patch is absent -- and vkd3d uses ONE STATIC VTABLE for this interface, so any component
-	// in the process querying ReShade's proxy installs it for everyone, us included. Measured
-	// reachable on the target hardware, 2026-08-31.
-	//
-	// Querying the NATIVE device here does not install anything: this goes through vkd3d's own
-	// QueryInterface, never ReShade's proxy.
-	{
-		// {11EA7A1A-0F6A-49BF-B612-3E30F8E201DD}
-		constexpr GUID kDeviceExt = { 0x11ea7a1a, 0x0f6a, 0x49bf,
-			{ 0xb6, 0x12, 0x3e, 0x30, 0xf8, 0xe2, 0x01, 0xdd } };
-
-		IUnknown *ext = nullptr;
-		if (SUCCEEDED(native->QueryInterface(kDeviceExt, reinterpret_cast<void **>(&ext))) &&
-			ext != nullptr)
-		{
-			void *const slot = (*reinterpret_cast<void ***>(ext))[8]; // GetCudaSurfaceObject
-			HMODULE owner = nullptr;
-			::GetModuleHandleExW(
-				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-				reinterpret_cast<LPCWSTR>(slot), &owner);
-
-			// ReShade is whichever module exports the add-on entry points.
-			const bool owned_by_reshade = owner != nullptr &&
-				::GetProcAddress(owner, "ReShadeRegisterAddon") != nullptr;
-
-			char path[MAX_PATH] = {};
-			if (owner != nullptr)
-				::GetModuleFileNameA(owner, path, MAX_PATH);
-
-			if (owned_by_reshade)
-			{
-				STRAY_LOG_ERROR("vkd3d ID3D12DeviceExt vtable slot 8 is HOOKED BY RESHADE (%s).",
-					path[0] ? path : "<unknown>");
-				STRAY_LOG_ERROR("  NGX descriptors minted on the native device will be run "
-					"through convert_to_original_cpu_descriptor_handle and CORRUPTED.");
-				STRAY_LOG_ERROR("  Expect a wrong-looking image rather than an error. See "
-					"CLAUDE.md \"The native-device rule has a trap\".");
-			}
-			else
-			{
-				STRAY_LOG_INFO("vkd3d ID3D12DeviceExt present, slot 8 unhooked (owner=%s) - "
-					"the native-device NGX path is safe here.",
-					path[0] ? path : "<unknown>");
-			}
-			ext->Release();
-		}
-		else
-		{
-			STRAY_LOG_INFO("No ID3D12DeviceExt on this device (not vkd3d-proton, or too old).");
-		}
+	report_vkd3d_ext_hook(native, "init_device");
 	}
 
 	if (native != nullptr)
@@ -458,6 +465,10 @@ void on_present(
 			device = g_state.native_device;
 		}
 		STRAY_LOG_INFO("Initialising NGX (frame %llu)...", static_cast<unsigned long long>(frame));
+		// Re-check here, not just at init_device: whoever installs the patch may do so at any
+		// point, and this is the moment our descriptors start mattering.
+		report_vkd3d_ext_hook(
+			reinterpret_cast<ID3D12Device *>(device->get_native()), "pre-NGX");
 		ngx::initialise(device);
 	}
 
