@@ -40,6 +40,17 @@ constexpr std::size_t descriptor_offset_in_slot(std::uint32_t slot,
 	return (static_cast<std::size_t>(slot) * kDescriptorsPerFrame + index) * descriptor_size;
 }
 
+// The generic form, for modules whose frame slice holds a different number of descriptors
+// than the MV resolve's kDescriptorsPerFrame (the G-buffer resolve packs 7: three SRVs and
+// four UAVs). Same arithmetic, slice width as a parameter.
+constexpr std::size_t descriptor_offset_n(std::uint32_t slot,
+                                          std::uint32_t descriptors_per_frame,
+                                          std::uint32_t index,
+                                          std::uint32_t descriptor_size) noexcept
+{
+	return (static_cast<std::size_t>(slot) * descriptors_per_frame + index) * descriptor_size;
+}
+
 // Constant buffers must be bound at 256-byte aligned offsets.
 constexpr std::uint32_t kConstantAlignment = 256;
 

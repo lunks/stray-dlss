@@ -53,6 +53,8 @@ add_library(stray_dlss_core STATIC
     src/core/pass_walk.hpp
     src/core/gbuffer_classify.cpp
     src/core/gbuffer_classify.hpp
+    src/core/envbrdf.cpp
+    src/core/envbrdf.hpp
     src/core/ring.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -148,6 +150,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/pass_finder.hpp
         src/gbuffer_finder.cpp
         src/gbuffer_finder.hpp
+        src/gbuffer_resolve.cpp
+        src/gbuffer_resolve.hpp
         src/ext_unhook.cpp
         src/input_dump.cpp
         src/mv_resolve.cpp
@@ -200,6 +204,8 @@ if(STRAY_DLSS_BUILD_ADDON)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
     compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
+    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
+                   main cs_5_0 g_gbuffer_resolve_dxbc)
 
     install(TARGETS stray-dlss RUNTIME DESTINATION .)
     install(FILES $<TARGET_PDB_FILE:stray-dlss> DESTINATION . OPTIONAL)
@@ -268,6 +274,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_taa_signature.cpp
         tests/test_pass_walk.cpp
         tests/test_gbuffer_classify.cpp
+        tests/test_envbrdf.cpp
         tests/test_ring.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
