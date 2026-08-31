@@ -982,6 +982,75 @@ pointer ReShade cannot be trusted for. Only liveness-checked view creation satis
 
 ---
 
+### Gotchas ledger — hard-won, 2026-08-31, all measured
+
+**Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
+order, each step decisive where the previous was blind:
+
+1. **`NgxPaint=1`** clears the captured output to magenta instead of evaluating. Magenta on
+   screen proves the output handle, the suppression and the downstream chain in one shot —
+   and isolates the fault to the evaluate itself. (It did: the screen went purple.)
+2. **`NgxDumpInputs=1`** copies the exact colour/depth inputs (pre-evaluate) and the output
+   (post-evaluate) to `straydlss_*.bin` at evaluates 600 and 900. Compare md5s across the two
+   samples: changing inputs with a byte-identical output = NGX is not writing. The all-zero
+   output proved it had *never* written. Convert with `tools/rawdump2png.py` to see what DLSS
+   sees. Readback pattern (copy on the game's list, map 5 presents later) works under vkd3d.
+3. **`NVSDK_NGX_D3D12_EvaluateFeature` returning success proves nothing.** The cubin layer
+   logs its own failures through the LoggingCallback — grep the ReShade log for
+   `NGXCubinD3D12` and `nvapi status`. Status -5 on `GetCudaMergedTextureSamplerObject` /
+   `GetCudaIndependentDescriptorObject` is the ReShade ext-vtable patch (§1); the repair is
+   `ext_unhook` (default ON).
+
+**Camera-cut frames must be evaluated with `InReset`, never skipped.** Skipping let the
+engine's TAA run against DLSS-written history on ~4% of frames — that is the "flicker between
+a frozen image and fog" symptom. Post-fix, evaluates track dispatches at 99.7%.
+
+**The menu runs the TAA pass too**, at uncapped fps, and its scene colour is
+`R11G11B10_FLOAT` where gameplay's is `R16G16B16A16_FLOAT` — the colour format is NOT an
+invariant; trust the §2.3 register map, not a format check. Menu depth reads ~0 everywhere
+(the §2.4 gameplay gate), which is how a dump run that never left the menu was identified
+after the fact.
+
+**DLSS presets J, K and M are visually indistinguishable here** (user-judged, same scene,
+2026-08-31): the white specular sparkle is denoiser residual, not preset-sensitive.
+`NgxPreset` (10=J 11=K 12=L 13=M) stays for future models. Next levers for the sparkle: feed
+the engine's real exposure instead of the AutoExposure flag; ultimately DLSS Ray
+Reconstruction (a separate project: needs albedo/normal/roughness capture and nvngx_dlssd).
+
+**The DLSS on-screen indicator under `PROTON_NVIDIA_LIBS=1`:**
+`DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS` is a DXVK-NVAPI feature and does nothing when NVIDIA's own
+wine NGX libs provide the NGX core (measured: env var present in the game process, no
+indicator drawn). Set the Windows registry key in the prefix instead:
+`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator = dword 0x400`, with the
+wineserver down.
+
+**Steam launch options can be set programmatically** through steamwebhelper's CEF debugger
+(`tools/steam_cef_launchopts.py`: port 8080, `SharedJSContext` target,
+`SteamClient.Apps.SetAppLaunchOptions`). The debugger is live when
+`~/.steam/steam/.cef-enable-remote-debugging` exists (Decky installs it). **Always read the
+existing options from `userdata/<id>/config/localconfig.vdf` first and merge** — Stray's
+`WINEDLLOVERRIDES="dxgi=n,b" %command% -dx12` is what loads ReShade; clobbering it silently
+removes the add-on.
+
+**Box operational traps:** the games mount moved from `/mnt/GamesLinux` to
+`/run/media/deck/GamesLinux` between sessions — a path that worked yesterday can be an empty
+stub today; `deploy.sh` writes only the keys it is passed, so stale `[STRAYDLSS]` keys
+persist across deploys (pass every key, every time); always `pkill -x Stray-Win64-Shi`
+before deploying (`pgrep -f` self-matches its own ssh command line — use `-x`); after a log
+check, confirm the timestamps are from the NEW session — greps happily match the previous
+session's lines.
+
+**The pak's shader library:** Stray ships **no** `.ushaderbytecode` — shader code libraries
+are disabled and all global shaders (every TAA permutation included) live inside
+`Engine/GlobalShaderCache-PCD3D_SM5.bin`, which is **Oodle-compressed at the pak level**
+(method 2; footer names: 1=Zlib 2=Oodle). Pure Python cannot decode it: use
+`tools/pakextract.py --raw` (dumps compressed blocks + JSON map) then
+`tools/oodle_unblock.py` with an `ooz` build. **Pak entry field-order trap:** when the
+block-size code in the encoded-entry flags word is 0x3F, the explicit CompressionBlockSize
+uint32 sits IMMEDIATELY after the flags word, before Offset — decoding it late shifts every
+later field, and only bites on large-block entries (small zlib entries decode fine either
+way, which is why the bug survived).
+
 ## 6. Build, CI and testing
 
 * **CMake + GitHub Actions, MSVC, x64 only.** No local build. `windows-latest` is now Windows Server
@@ -1044,9 +1113,9 @@ They are complementary and none of them replaces seeing the game render.
   `bind_descriptor_tables2` — so overriding one records both. `get_native()` returns the
   harness's *real* command list, so the native calls execute and are validated for free.
 * Give the user one copy-pasteable launch line for bug reports:
-  `DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%`, plus
-  `DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024` for visual proof DLSS is running (**1024,
-  not 1** — 1 only works for develop builds).
+  `DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%`. For visual proof DLSS
+  is running, the env-var indicator does NOT work under `PROTON_NVIDIA_LIBS=1` — set the
+  `NGXCore\ShowDlssIndicator = 0x400` registry key in the prefix instead (Gotchas ledger, §5).
 
 ---
 
