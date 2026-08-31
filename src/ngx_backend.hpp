@@ -65,6 +65,17 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
 void set_exposure_from_texture(bool use_texture);
 bool exposure_from_texture();
 
+// [STRAYDLSS] NgxExposureScale (default 1.0): the InExposureScale passed to the SR
+// evaluate under NgxExposure=texture — DLSS multiplies the exposure-texture value by this
+// (nvsdk_ngx_helpers.h:508). The DEFINITIVE consume test: the on-screen indicator's
+// "Auto Exposure" text is ambiguous, so feed a deliberately wrong scale (0.25 / 4.0) and
+// watch the image — a brightness/bright-region response proves DLSS reads our exposure;
+// no response at either extreme proves the texture never reaches DLSS's math. 1.0 is
+// behaviourally identical to today (the helper maps our previous 0 to 1.0 anyway). Read
+// once at init; only meaningful under NgxExposure=texture.
+void set_exposure_scale(float scale);
+float exposure_scale();
+
 struct EvaluateInputs
 {
 	ID3D12Resource *color = nullptr;           // render-res scene colour, still pre-exposed

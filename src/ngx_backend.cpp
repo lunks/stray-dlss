@@ -47,6 +47,8 @@ void set_rr_mode(int) {}
 int rr_mode() { return 0; }
 void set_exposure_from_texture(bool) {}
 bool exposure_from_texture() { return false; }
+void set_exposure_scale(float) {}
+float exposure_scale() { return 1.0f; }
 const RRStatus &rr_status() { return g_rr_status; }
 bool ensure_feature_rr(ID3D12GraphicsCommandList *, const FeatureDesc &) { return false; }
 bool evaluate_rr(ID3D12GraphicsCommandList *, const EvaluateInputsRR &) { return false; }
@@ -100,6 +102,8 @@ char g_last_error[256] = "";
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
 bool g_exposure_from_texture = false;
+// [STRAYDLSS] NgxExposureScale (ngx_backend.hpp): InExposureScale under texture mode.
+float g_exposure_scale = 1.0f;
 
 // --- Ray Reconstruction state ([STRAYDLSS] NgxRR) ---
 int g_rr_mode = 0;
@@ -474,6 +478,8 @@ const RRStatus &rr_status() { return g_rr_status; }
 
 void set_exposure_from_texture(bool use_texture) { g_exposure_from_texture = use_texture; }
 bool exposure_from_texture() { return g_exposure_from_texture; }
+void set_exposure_scale(float scale) { g_exposure_scale = scale; }
+float exposure_scale() { return g_exposure_scale; }
 
 void release_feature_rr()
 {
@@ -786,10 +792,15 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	eval.InMVScaleY = 1.0f;
 	eval.InPreExposure = in.pre_exposure;
 	// NgxExposure=texture: the eye-adaptation texture via NVSDK_NGX_Parameter_ExposureTexture
-	// (helpers.h:466); InExposureScale stays 0 -> the helper maps it to 1.0 (:508). NGX
-	// reads channel 0 of the 1x1 RGBA32F with a formatted read — the plugin ships UE's
-	// RGBA32F eye-adaptation texture unconverted, which is the existence proof.
+	// (helpers.h:466). NGX reads channel 0 of the 1x1 RGBA32F with a formatted read — the
+	// plugin ships UE's RGBA32F eye-adaptation texture unconverted, the existence proof.
+	// InExposureScale carries [STRAYDLSS] NgxExposureScale (default 1.0, behaviourally the
+	// old 0->1.0 mapping): DLSS multiplies the texture value by it (:508). The scale is the
+	// functional consume test — a wrong value must move the image if the texture is read.
+	// Only when a texture is actually present; with none, leave 0 so the auto path is
+	// byte-identical to before.
 	eval.pInExposureTexture = in.exposure;
+	eval.InExposureScale = in.exposure != nullptr ? g_exposure_scale : 0.0f;
 
 	const NVSDK_NGX_Result result =
 		NGX_D3D12_EVALUATE_DLSS_EXT(cmd, g_feature, g_feature_params, &eval);

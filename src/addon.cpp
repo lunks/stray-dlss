@@ -296,6 +296,19 @@ void on_init_device(reshade::api::device *device)
 			? "engine eye-adaptation TEXTURE (AutoExposure flag dropped at create)"
 			: "DLSS AUTO-exposure (the AutoExposure create flag, today's behaviour)");
 
+	// [STRAYDLSS] NgxExposureScale (default 1.0): the InExposureScale passed to the SR
+	// evaluate under NgxExposure=texture. The DEFINITIVE consume test — the DLSS on-screen
+	// indicator's "Exposure level" field echoes this exact value, and a wrong scale
+	// (0.25 / 4.0) must move the image if the exposure texture reaches DLSS's math. Only
+	// meaningful under NgxExposure=texture; 1.0 is behaviourally identical to before.
+	float exposure_scale = 1.0f;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxExposureScale", exposure_scale);
+	ngx::set_exposure_scale(exposure_scale);
+	if (exposure_texture)
+		STRAY_LOG_INFO("DLSS InExposureScale = %.4f ([STRAYDLSS] NgxExposureScale). The "
+			"indicator's 'Exposure level' should read this; a 0.25/1.0/4.0 sweep that moves "
+			"the image proves DLSS consumes our exposure texture.", exposure_scale);
+
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
 	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
 	bool resolve_only = false;

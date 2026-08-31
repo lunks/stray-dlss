@@ -1700,13 +1700,17 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								{
 									s_first_done = true;
 									STRAY_LOG_INFO("EXPOSURE eval %llu: exposure=%p (colour=%p "
-										"depth=%p) InPreExposure=%.6f InExposureScale=1.000000 "
-										"(0 in struct -> helper maps to 1.0) assumedState="
-										"NON_PIXEL_SHADER_RESOURCE barriered=no createFlags=0x0b",
+										"depth=%p) InPreExposure=%.6f InExposureScale=%.6f "
+										"([STRAYDLSS] NgxExposureScale; DLSS indicator's "
+										"'Exposure level' should echo this) assumedState="
+										"NON_PIXEL_SHADER_RESOURCE barriered=no (same state and "
+										"discipline as colour/depth, which NGX consumes fine) "
+										"createFlags=0x0b",
 										static_cast<unsigned long long>(eval_no),
 										static_cast<void *>(ei.exposure),
 										static_cast<void *>(ei.color),
-										static_cast<void *>(ei.depth), ei.pre_exposure);
+										static_cast<void *>(ei.depth), ei.pre_exposure,
+										ngx::exposure_scale());
 									if (ei.exposure != nullptr)
 									{
 										char label[32];
