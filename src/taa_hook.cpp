@@ -725,14 +725,6 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					m.render_width, m.render_height);
 			}
 
-			if (tracing && !g_ngx_gate2_logged)
-			{
-				g_ngx_gate2_logged = true;
-				STRAY_LOG_WARN("GATE2 0x%016llx: passed the live/cut gate; render=%ux%u "
-					"mv_init=%d", static_cast<unsigned long long>(hash), render_w, render_h,
-					mv::initialise(native_device, render_w, render_h) ? 1 : 0);
-			}
-
 			if (mv::initialise(native_device, render_w, render_h))
 			{
 				mv::ResolveInputs inputs;
@@ -747,7 +739,17 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 				mark(4, "heaps-collected");
 
-				if (mv::record(native, inputs, g_mv_dispatch_mode))
+				const bool recorded = mv::record(native, inputs, g_mv_dispatch_mode);
+				if (tracing && !g_ngx_gate2_logged)
+				{
+					g_ngx_gate2_logged = true;
+					STRAY_LOG_WARN("GATE2 0x%016llx: render=%ux%u depth=%p velocity=%p "
+						"record=%d (%s)", static_cast<unsigned long long>(hash),
+						render_w, render_h, reinterpret_cast<void *>(depth_resource),
+						reinterpret_cast<void *>(velocity_resource), recorded ? 1 : 0,
+						recorded ? "ok" : mv::last_error());
+				}
+				if (recorded)
 				{
 					mark(5, "recorded");
 
