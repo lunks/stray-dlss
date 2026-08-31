@@ -54,6 +54,10 @@ void set_ngx_evaluate(bool enabled);
 // 0 = off, 1 = suppress only the pinned pass, 2 = suppress every structurally matched pass.
 void set_ngx_dry_run(int mode);
 
+// Suppress exactly one named pass and write nothing, regardless of the matcher's verdict. The
+// pass that drives the picture is the one whose suppression changes the image.
+void set_dry_run_hash(std::uint64_t hash);
+
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 
 } // namespace stray_dlss::taa_hook

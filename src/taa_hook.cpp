@@ -50,6 +50,12 @@ bool g_ngx_evaluate = false;
 // leaves the image unchanged, the matcher never sees the pass that draws the picture, and
 // bisecting candidates one at a time would be wasted effort.
 int g_ngx_dry_run = 0;
+// [STRAYDLSS] DryRunHash=0x... — suppress exactly ONE named pass and write nothing.
+//
+// This is how a candidate is tested: the pass that drives the picture is the one whose
+// suppression CHANGES the image. Independent of the matcher, so a pass the strict signature
+// rejects can still be tested.
+std::uint64_t g_dry_run_hash = 0;
 bool g_ngx_logged_once = false;      // the evaluate result
 bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE flag, because
                                      // sharing one meant the skip warning consumed the budget
@@ -69,6 +75,7 @@ std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
+bool g_dry_run_hash_logged = false;
 bool g_ngx_waiting_logged = false;
 
 bool owns_temporal_history(std::uint64_t hash)
@@ -270,6 +277,7 @@ const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
+void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
 
 void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
@@ -491,6 +499,19 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		g_diag.best_hash = hash;
 		g_diag.best_width = w;
 		g_diag.best_height = h;
+	}
+
+	// A named pass can be suppressed regardless of what the matcher thinks of it, because the
+	// whole point is to test passes the strict signature rejects.
+	if (g_dry_run_hash != 0 && hash == g_dry_run_hash)
+	{
+		if (!g_dry_run_hash_logged)
+		{
+			g_dry_run_hash_logged = true;
+			STRAY_LOG_WARN("DRY RUN (hash): suppressing 0x%016llx and writing nothing.",
+				static_cast<unsigned long long>(hash));
+		}
+		return true;
 	}
 
 	// ---- Relaxed candidate report ----

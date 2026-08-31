@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -235,6 +236,15 @@ void on_init_device(reshade::api::device *device)
 	int ngx_dry_run = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
 	taa_hook::set_ngx_dry_run(ngx_dry_run);
+
+	char dry_hash[32] = "";
+	size_t dry_hash_size = sizeof(dry_hash);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
+	const std::uint64_t dry_hash_value = std::strtoull(dry_hash, nullptr, 0);
+	taa_hook::set_dry_run_hash(dry_hash_value);
+	if (dry_hash_value != 0)
+		STRAY_LOG_WARN("DryRunHash=0x%016llx: that pass will be suppressed and nothing written.",
+			static_cast<unsigned long long>(dry_hash_value));
 	if (ngx_dry_run)
 		STRAY_LOG_WARN("NgxDryRun is ON: the pinned pass will be suppressed and NOTHING written "
 			"in its place. This is a diagnostic, not a rendering mode.");
