@@ -1,49 +1,60 @@
 // Classifying one draw's render-target set as UE 4.27's deferred base pass and naming its
-// G-buffer members. Phase 1 of DLSS Ray Reconstruction: IDENTIFICATION ONLY — nothing acts
-// on the result; the runtime recorder (src/gbuffer_finder.hpp) logs it and a later
-// observation run on the target machine judges it.
+// G-buffer members — identification for DLSS Ray Reconstruction's guide inputs. Log-only;
+// the runtime recorder (src/gbuffer_finder.hpp) reports it and observation runs on the
+// target machine judge it.
 //
-// The anchor is the velocity target. Stray ships r.BasePassOutputsVelocity=True
-// (HARD — the game's own DefaultEngine.ini:59, CLAUDE.md §2.3.1), so the base pass's MRT
-// set contains the R16G16B16A16_UNORM velocity target (HARD — measured live, CLAUDE.md
-// §2.5) alongside scene colour and the G-buffers. No other pass in a deferred UE4 frame
-// renders to a wide MRT set containing that format, which makes it a strong base-pass
-// signature; the sibling render targets, in slot order, are then the G-buffers.
+// SECOND ITERATION. The first anchored on an in-set velocity target and failed in live
+// observation (2026-08-31): the game binds 6-RTV base-pass sets with NO velocity member.
+// docs/RESEARCH-RR-GBUFFER.md §1.2-1.5 explains why the anchor was wrong twice over:
 //
-// The slot order and the per-slot formats below are EXPECTED values, not gates on the set
-// as a whole: a slot whose format does not fit its stock role classifies as `unknown` and
-// is reported, never silently misclassified (CLAUDE.md §0.2 — prefer a loud failure to a
-// quiet wrong answer). Only the velocity signature itself decides whether the set is a
-// base-pass candidate at all.
+//   * `R16G16B16A16_UNORM` is the velocity format on every ray-tracing-capable shader
+//     platform REGARDLESS of which pass writes it (HARD-via-mirror —
+//     FVelocityRendering::GetFormat, VelocityRendering.cpp:354-358). The measured TAA
+//     input format was evidence of the platform, never of base-pass velocity.
+//   * Stray ships r.SelectiveBasePassOutputs=True (DefaultEngine.ini:85, HARD), which
+//     forces the SEPARATE opaque velocity pass to run — one RTV plus depth, early-outs
+//     when nothing moves (VelocityRendering.cpp:275-315, HARD-via-mirror) — and the live
+//     game demonstrably runs a 6-RTV base pass with no velocity slot at all (HARD,
+//     measured; a stock-vs-licensee delta §1.4 leaves unresolved).
 //
-// Provenance of the stock layout, and an honest caveat: every claim marked SOFT below is
-// from prior reading of the UE 4.27 renderer source
-// (Engine/Source/Runtime/Renderer/Private/SceneRenderTargets.cpp) — that source is not on
-// this machine to re-read, so functions are cited but line numbers are not. A licensee
-// build can differ in any of them. The observation run is what hardens or overturns each:
+// The corrected signature is velocity-FREE (§1.5). All provenance below is HARD-via-mirror
+// from the UE 4.27.2 source (github.com/AlexMercer-MA/UnrealEngine-4.27, Build.version
+// 4.27.2) unless marked otherwise; the two game settings are HARD from the game's own
+// shipped config (docs/game-config/):
 //
-//   * MRT order (SOFT — FSceneRenderTargets::GetGBufferRenderTargets):
-//       MRT0 scene colour, MRT1 GBufferA, MRT2 GBufferB, MRT3 GBufferC, then the velocity
-//       target inserted when using base-pass velocity, then GBufferD / GBufferE.
-//   * scene colour  (SOFT — GetSceneColorFormat / r.SceneColorFormat, default 4):
-//       PF_FloatRGBA = RGBA16F, or PF_FloatR11G11B10 under r.SceneColorFormat=3.
-//   * GBufferA      (SOFT — GetGBufferAFormat): PF_A2B10G10R10 = RGB10A2 world normal +
-//       per-object data in A; PF_FloatRGBA under high-precision G-buffers.
-//   * GBufferB      (SOFT — GetGBufferBFormat): PF_B8G8R8A8 — metallic, specular,
-//       roughness, shading-model ID.
-//   * GBufferC      (SOFT — GetGBufferCFormat): PF_B8G8R8A8 — base colour + AO.
-//   * velocity      (HARD for Stray — measured R16G16B16A16_UNORM, CLAUDE.md §2.5;
-//       consistent with SOFT FVelocityRendering::GetFormat returning PF_A16B16G16R16
-//       when base-pass velocity is enabled).
-//   * depth         (HARD — R32G8X24 family, CLAUDE.md §2.4).
+//   * MRT order (SceneRenderTargets.cpp:734-779, GetGBufferRenderTargets):
+//       MRT0 SceneColor, MRT1 GBufferA, MRT2 GBufferB, MRT3 GBufferC, then SceneVelocity
+//       at slot 4 ONLY when base-pass velocity is in effect — `check(OutVelocityRTIndex
+//       == 4)` (:754) — then GBufferD, then GBufferE (bAllowStaticLighting; Stray ships
+//       r.AllowStaticLighting=True, DefaultEngine.ini:38).
+//   * scene colour: PF_FloatR11G11B10 — Stray ships r.SceneColorFormat=3
+//     (WindowsEngine.ini:69, HARD). RGBA16F (the stock default 4) is accepted too.
+//   * GBufferA: PF_A2B10G10R10 = RGB10A2 world normal (GetGBufferAFormat,
+//     SceneRenderTargets.cpp:1026-1034). THE anchor: the only RGB10A2 render target in a
+//     stock deferred frame — the swapchain is RGB10A2 as well, but at output extent and
+//     never bound with 5 siblings (§1.5).
+//   * GBufferB: PF_B8G8R8A8 (:1048-1056) — metallic, specular, roughness, shading model.
+//   * GBufferC: PF_B8G8R8A8 with TexCreate_SRGB (:1058-1070, :1137) — base colour; the
+//     recorder maps the sRGB view onto the same 8-bit class (frame_state.cpp).
+//   * depth: the R32G8X24 family (HARD — measured, CLAUDE.md §2.4).
 //
-// Pure logic: no Windows, no D3D, no ReShade. The runtime recorder translates real RTV/DSV
-// bindings into BoundTexture and the tests prove every discrimination in CI
+// B/C slot order (B=2, C=3) is HARD-via-mirror in stock source — but the two are
+// format-indistinguishable and a licensee reorder is conceivable, so the ambiguity is
+// still surfaced and the consumption cross-check (RESEARCH-RR-GBUFFER.md §4.3) or a
+// visual guide dump must confirm it before anything trusts the values.
+//
+// A velocity-format member, when present, is CORROBORATION, not a requirement: at the
+// stock slot 4 it upgrades confidence and shifts D/E one slot; anywhere else the layout
+// is not assignable and the set is refused loudly.
+//
+// Pure logic: no Windows, no D3D, no ReShade. The runtime recorder translates real
+// RTV/DSV bindings into BoundTexture and CI proves every discrimination
 // (tests/test_gbuffer_classify.cpp) — the developer cannot run the game.
 #pragma once
 
 #include "taa_signature.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -54,7 +65,7 @@ enum class GBufferRole
 	scene_colour,
 	gbuffer_a, // world normal + per-object data
 	gbuffer_b, // metallic / specular / roughness / shading-model ID
-	gbuffer_c, // base colour + AO
+	gbuffer_c, // base colour (sRGB view; .a is NOT AO under static lighting — §2.4/§5.5)
 	velocity,
 	depth,     // the DSV, when the recorder captured one
 	unknown,   // present in the set but not confidently nameable — reported, never guessed
@@ -82,22 +93,27 @@ struct GBufferTarget
 
 struct GBufferClassification
 {
-	// True when the set carries the base-pass signature: exactly one full-extent velocity
-	// target, at the stock slot, with the four stock G-buffer slots ahead of it at the same
-	// extent. Individual slots may still be `unknown` (a licensee format) — the flag is
-	// about the SET, the roles are per-slot.
+	// True when the set carries the base-pass signature (header comment): at least
+	// kMinBasePassColourTargets colour targets at one shared extent, slots 0-3 all
+	// populated, RGB10A2 at slot 1 (the anchor), and any velocity member sitting at the
+	// stock slot 4. Individual slots may still be `unknown` (an off-format licensee
+	// variant) — the flag is about the SET, the roles are per-slot.
 	bool is_base_pass = false;
 	// Why the set was accepted or rejected. Always a static string; always set.
 	const char *reason = "";
 	// Every non-dummy member, in slot order, dummies (1x1) dropped. Populated even for
 	// rejected sets, because the members ARE the diagnostic when the verdict is "no".
 	std::vector<GBufferTarget> targets;
-	// GBufferB and GBufferC are format-indistinguishable (both 8-bit RGBA), so when both
-	// classify, the B-before-C assignment rests on the SOFT stock slot order ALONE. The
-	// report must say so: nothing measured on this machine can tell them apart.
+	// GBufferB and GBufferC are format-indistinguishable (both 8-bit RGBA), so the
+	// B-before-C assignment rests on the stock slot order alone (HARD-via-mirror in stock
+	// source, but a licensee reorder is conceivable). The report must say so: nothing
+	// measured on this machine can tell them apart. (RESEARCH-RR-GBUFFER.md §1.5, §5.4)
 	bool bc_order_by_slot_only = false;
-	// The velocity target's extent — the scene-buffer extent (CLAUDE.md §2.5). 0 until a
-	// velocity target is found.
+	// True when a velocity-format target sits at the stock slot 4 — the CORROBORATION
+	// case: the set then matches stock-with-base-pass-velocity exactly, and GBufferD/E
+	// shift one slot. False in the velocity-free layout the live game shows.
+	bool velocity_corroborated = false;
+	// The shared colour-target extent — the scene-buffer extent. 0 until established.
 	std::uint32_t extent_width = 0;
 	std::uint32_t extent_height = 0;
 	// How many of the four named colour roles (scene colour, A, B, C) matched their stock
@@ -105,10 +121,17 @@ struct GBufferClassification
 	int stock_roles_matched = 0;
 };
 
-// The stock MRT slot of the velocity target when base-pass velocity is enabled: after
-// scene colour + GBufferA/B/C, before GBufferD/E. (SOFT — GetGBufferRenderTargets, see the
-// header comment; Stray ships base-pass velocity, HARD §2.3.1.)
+// The stock MRT slot of the velocity target WHEN base-pass velocity is in effect:
+// `check(OutVelocityRTIndex == 4)`, SceneRenderTargets.cpp:754 (HARD-via-mirror). The
+// live game binds no velocity member at all (§1.4) — this slot only matters for the
+// corroboration case.
 constexpr std::uint32_t kStockVelocitySlot = 4;
+
+// The minimum colour-target count of a base-pass MRT set: SceneColor + GBufferA/B/C +
+// GBufferD = 5 (GBufferD is unconditional under bUseGBuffer; velocity and GBufferE add
+// more). The live game binds 6 (SC,A,B,C,D,E); stock-with-velocity predicts 7.
+// (RESEARCH-RR-GBUFFER.md §1.2, §1.4)
+constexpr std::size_t kMinBasePassColourTargets = 5;
 
 // Classifies one render-target set (RTVs in slot order, optionally the DSV appended after
 // them) as recorded at draw time. Never throws, never guesses: every rejection carries a

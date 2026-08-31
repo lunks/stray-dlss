@@ -20,20 +20,22 @@ bool is_depth_or_stencil(TexFormat f)
 }
 
 // The 8-bit-RGBA family covering stock GBufferB/C. UE4 creates them as PF_B8G8R8A8
-// (SOFT — GetGBufferBFormat/GetGBufferCFormat), which is DXGI B8G8R8A8; the channel-swapped
-// R8G8B8A8 is accepted too so a licensee (or a driver-level swizzle) does not silently
-// demote a correct slot to unknown.
+// (HARD-via-mirror — SceneRenderTargets.cpp:1048-1070); GBufferC's view is sRGB
+// (TexCreate_SRGB, :1137) and the recorder collapses unorm/srgb/typeless onto one class
+// (frame_state.cpp). The channel-swapped R8G8B8A8 is accepted too so a licensee (or a
+// driver-level swizzle) does not silently demote a correct slot to unknown.
 bool is_rgba8_class(TexFormat f)
 {
 	return f == TexFormat::r8g8b8a8_unorm || f == TexFormat::b8g8r8a8_unorm;
 }
 
-// Stock scene-colour formats (SOFT — r.SceneColorFormat: default PF_FloatRGBA, option
-// PF_FloatR11G11B10). Deliberately the same set is_hdr_colour accepts — scene colour is
-// the one target DLSS itself will read.
-bool is_stock_scene_colour(TexFormat f)
+// Scene-colour formats: Stray ships r.SceneColorFormat=3 = PF_FloatR11G11B10
+// (WindowsEngine.ini:69, HARD); the stock default 4 = RGBA16F is accepted so a config
+// change does not silently break identification. Deliberately the same set is_hdr_colour
+// accepts — scene colour is the one target DLSS itself reads.
+bool is_scene_colour_format(TexFormat f)
 {
-	return f == TexFormat::r16g16b16a16_float || f == TexFormat::r11g11b10_float;
+	return f == TexFormat::r11g11b10_float || f == TexFormat::r16g16b16a16_float;
 }
 
 } // namespace
@@ -116,8 +118,54 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 				return r;
 			}
 
-	// The anchor: exactly one velocity-format target. (HARD — R16G16B16A16_UNORM, §2.5;
-	// present in the base pass because r.BasePassOutputsVelocity ships True, §2.3.1.)
+	// The G-buffer bind is WIDE: SceneColor + A/B/C + D at minimum (§1.2). Nothing else
+	// in a stock deferred frame binds this many colour targets, which is what lets the
+	// signature drop the velocity requirement.
+	if (colour.size() < kMinBasePassColourTargets)
+	{
+		r.reason = "fewer than 5 colour targets: not a G-buffer MRT set "
+		           "(RESEARCH-RR-GBUFFER.md §1.2)";
+		return r;
+	}
+
+	// One MRT set = one extent. Every base-pass colour target is allocated at the
+	// scene-buffer extent; a mismatch means this is not one coherent set.
+	const BoundTexture *first = colour[0];
+	for (const BoundTexture *t : colour)
+		if (t->width != first->width || t->height != first->height)
+		{
+			r.reason = "colour-target extents differ: not one base-pass MRT set";
+			return r;
+		}
+	r.extent_width = first->width;
+	r.extent_height = first->height;
+
+	// Slots 0..3 must all be present. D3D12 MRT arrays are dense in practice, but a null
+	// RTV in the middle is legal and would shift every positional claim.
+	const BoundTexture *slot_tex[4] = {};
+	for (const BoundTexture *t : colour)
+		if (t->slot < 4)
+			slot_tex[t->slot] = t;
+	for (std::uint32_t s = 0; s < 4; ++s)
+		if (slot_tex[s] == nullptr)
+		{
+			r.reason = "slots 0-3 are not all populated: not the stock G-buffer layout";
+			return r;
+		}
+
+	// THE anchor: GBufferA's RGB10A2 at slot 1 — the only RGB10A2 render target in a
+	// stock deferred frame (§1.5). An off-format slot 1 is the licensee-delta tripwire
+	// and must fail loudly, not classify quietly.
+	if (slot_tex[1]->format != TexFormat::r10g10b10a2_unorm)
+	{
+		r.reason = "slot 1 is not RGB10A2 (the GBufferA anchor): not the stock G-buffer "
+		           "layout, or a licensee format delta - re-derive before trusting";
+		return r;
+	}
+
+	// Velocity is CORROBORATION, never a requirement (§1.3-1.5): the live game binds a
+	// velocity-free 6-RTV set. If a velocity-format member exists it must be exactly one,
+	// at the stock slot 4 (`check(OutVelocityRTIndex == 4)`, SceneRenderTargets.cpp:754).
 	const BoundTexture *velocity = nullptr;
 	int velocity_count = 0;
 	for (const BoundTexture *t : colour)
@@ -126,63 +174,31 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 			velocity = t;
 			++velocity_count;
 		}
-
-	if (velocity_count == 0)
-	{
-		r.reason = "no R16G16B16A16_UNORM velocity target: not the base pass "
-		           "(r.BasePassOutputsVelocity signature, CLAUDE.md §2.3.1/§2.5)";
-		return r;
-	}
 	if (velocity_count > 1)
 	{
-		r.reason = "several R16G16B16A16_UNORM targets: ambiguous, refusing to classify";
+		r.reason = "several velocity-format targets: ambiguous, refusing to classify";
 		return r;
 	}
-
-	r.extent_width = velocity->width;
-	r.extent_height = velocity->height;
-
-	// Every colour target of one base-pass MRT set is allocated at the scene-buffer extent
-	// (§2.5: velocity is at BufferSizeAndInvSize; the G-buffers share it). A mismatch means
-	// this is not one coherent MRT set, whatever the formats say.
-	for (const BoundTexture *t : colour)
-		if (t->width != velocity->width || t->height != velocity->height)
-		{
-			r.reason = "colour-target extents differ from the velocity target: not one "
-			           "base-pass MRT set";
-			return r;
-		}
-
-	if (velocity->slot != kStockVelocitySlot)
+	if (velocity != nullptr && velocity->slot != kStockVelocitySlot)
 	{
-		// The velocity anchor holds but the SOFT slot order does not, so no positional role
-		// can be trusted. Report the members (the recorder logs slot+format for each) and
-		// say exactly what failed instead of guessing a licensee layout.
-		r.reason = "velocity target is not at stock slot 4 (GetGBufferRenderTargets order, "
-		           "SOFT): slot roles are not assignable, layout must be re-derived";
+		r.reason = "a velocity-format target sits away from stock slot 4 "
+		           "(SceneRenderTargets.cpp:754): layout not assignable, re-derive";
 		return r;
 	}
 
-	// Slots 0..3 must all be present ahead of the velocity target. D3D12 MRT arrays are
-	// dense in practice, but a null RTV in the middle is legal and would shift every claim.
-	const BoundTexture *slot_tex[kStockVelocitySlot] = {};
-	for (const BoundTexture *t : colour)
-		if (t->slot < kStockVelocitySlot)
-			slot_tex[t->slot] = t;
-	for (std::uint32_t s = 0; s < kStockVelocitySlot; ++s)
-		if (slot_tex[s] == nullptr)
-		{
-			r.reason = "slots 0-3 are not all populated ahead of the velocity target: not "
-			           "the stock base-pass layout";
-			return r;
-		}
-
-	// The set IS a base-pass candidate. Now name the slots — each only when its format
-	// fits the stock expectation, otherwise `unknown` with a note. (Header comment carries
-	// the SOFT provenance for every expectation.)
+	// The set IS a base-pass candidate. Name the slots — each earns its role only when
+	// its format fits the stock expectation, otherwise `unknown` with a note.
 	r.is_base_pass = true;
-	r.reason = "ok: single full-extent velocity target at stock slot 4 with 4 colour "
-	           "targets ahead of it";
+	r.velocity_corroborated = velocity != nullptr;
+	r.reason = r.velocity_corroborated
+		? "ok: G-buffer MRT set with velocity at stock slot 4 (stock-with-base-pass-"
+		  "velocity shape - corroborated)"
+		: "ok: velocity-free G-buffer MRT set (RGB10A2 anchor at slot 1; the shape the "
+		  "live game binds, RESEARCH-RR-GBUFFER.md §1.4-1.5)";
+
+	// GBufferD/E sit right after the last named slot; velocity, when present, shifts
+	// them one up (§1.2 table).
+	const std::uint32_t slot_d = r.velocity_corroborated ? 5 : 4;
 
 	bool has_b = false, has_c = false;
 	for (auto &g : r.targets)
@@ -191,30 +207,25 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 			continue;
 
 		const TexFormat f = g.tex.format;
-		switch (g.tex.slot)
+		if (g.tex.slot == 0)
 		{
-		case 0:
-			if (is_stock_scene_colour(f))
+			if (is_scene_colour_format(f))
 			{
 				g.role = GBufferRole::scene_colour;
 				g.stock_format = true;
 			}
 			else
-				g.note = "expected RGBA16F or R11G11B10F scene colour (r.SceneColorFormat)";
-			break;
-		case 1:
-			if (f == TexFormat::r10g10b10a2_unorm)
-			{
-				g.role = GBufferRole::gbuffer_a;
-				g.stock_format = true;
-			}
-			else if (f == TexFormat::r16g16b16a16_float)
-				g.note = "RGBA16F where stock GBufferA is RGB10A2 - high-precision "
-				         "G-buffer variant? report, do not assume";
-			else
-				g.note = "expected RGB10A2 world-normal GBufferA";
-			break;
-		case 2:
+				g.note = "expected R11G11B10F (r.SceneColorFormat=3) or RGBA16F scene "
+				         "colour";
+		}
+		else if (g.tex.slot == 1)
+		{
+			// By construction: the anchor check above already proved the format.
+			g.role = GBufferRole::gbuffer_a;
+			g.stock_format = true;
+		}
+		else if (g.tex.slot == 2)
+		{
 			if (is_rgba8_class(f))
 			{
 				g.role = GBufferRole::gbuffer_b;
@@ -224,8 +235,9 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 			else
 				g.note = "expected 8-bit RGBA GBufferB (metallic/specular/roughness/"
 				         "shading-model)";
-			break;
-		case 3:
+		}
+		else if (g.tex.slot == 3)
+		{
 			if (is_rgba8_class(f))
 			{
 				g.role = GBufferRole::gbuffer_c;
@@ -233,17 +245,27 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 				has_c = true;
 			}
 			else
-				g.note = "expected 8-bit RGBA GBufferC (base colour + AO) - licensee "
-				         "variant? unknown, not misclassified";
-			break;
-		case kStockVelocitySlot:
+				g.note = "expected 8-bit RGBA GBufferC (base colour) - licensee variant? "
+				         "unknown, not misclassified";
+		}
+		else if (velocity != nullptr && g.tex.slot == kStockVelocitySlot)
+		{
 			g.role = GBufferRole::velocity;
-			g.stock_format = true; // by construction: the anchor IS the format match
-			break;
-		default:
-			g.note = "stock slot for GBufferD/E (custom data / precomputed shadows) - "
+			g.stock_format = true; // by construction: the format IS the match
+		}
+		else if (g.tex.slot == slot_d)
+		{
+			g.note = "stock GBufferD position (custom data; 8-bit RGBA expected) - "
 			         "reported for completeness";
-			break;
+		}
+		else if (g.tex.slot == slot_d + 1)
+		{
+			g.note = "stock GBufferE position (precomputed shadows, "
+			         "r.AllowStaticLighting=True) - reported for completeness";
+		}
+		else
+		{
+			g.note = "past the stock G-buffer layout - reported for completeness";
 		}
 
 		if (g.stock_format && g.role != GBufferRole::velocity &&
@@ -251,8 +273,8 @@ GBufferClassification classify_render_target_set(const std::vector<BoundTexture>
 			++r.stock_roles_matched;
 	}
 
-	// B and C carry the same format, so their order is the SOFT slot order and nothing
-	// else. Surface that, always, whenever both were assigned.
+	// B and C carry the same format, so their order is the stock slot order and nothing
+	// else. Surface that, always, whenever both were assigned. (§1.5, §5.4)
 	r.bc_order_by_slot_only = has_b && has_c;
 
 	return r;

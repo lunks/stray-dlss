@@ -10,10 +10,10 @@
 // A separate module rather than an extension of pass_finder, deliberately: pass_finder
 // records two consecutive frames out of every thirty because its dataflow walk needs
 // descriptor-table resolves per dispatch and per full-screen draw, which are expensive.
-// This finder needs none of that — its per-frame cost is describing the RTVs of the rare
-// binds with >= 4 render targets (the base-pass MRT width; everything else in the frame
-// binds 0-2) — so it observes EVERY frame, which is what makes "the identification held
-// for N consecutive frames" a meaningful stability claim. Welding the two recorders
+// This finder needs none of that — its per-frame cost is describing RTVs at bind time
+// (a couple per bind; classification itself only runs for the rare >= 4-RTV sets) — so it
+// observes EVERY frame, which is what makes "the identification held for N consecutive
+// frames" a meaningful stability claim. Welding the two recorders
 // together would force one cadence onto both and destabilise a diagnostic that already
 // works. The one expensive thing here, the SSR-denoiser cross-check, resolves compute
 // bindings only for dispatches of the one known denoiser hash.
