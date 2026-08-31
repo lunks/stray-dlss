@@ -68,6 +68,7 @@ std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 // evaluate", which is how DLSS previously chose and which picked 0xda289b0ddfa934c6, neither of
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
+std::unordered_map<std::uint64_t, bool> g_candidate_logged;
 bool g_ngx_waiting_logged = false;
 
 bool owns_temporal_history(std::uint64_t hash)
@@ -490,6 +491,51 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		g_diag.best_hash = hash;
 		g_diag.best_width = w;
 		g_diag.best_height = h;
+	}
+
+	// ---- Relaxed candidate report ----
+	//
+	// §2.3's signature demands a depth+stencil SRV pair over one resource, which was measured on
+	// ETAAPassConfig::MainUpsampling at 4K/50%. At 1:1 the engine picks ETAAPassConfig::Main, a
+	// permutation whose bindings were never characterised — and suppressing every pass the
+	// strict signature finds changes nothing on screen, so it is not finding the real TAA.
+	//
+	// Report anything with the TAA's ESSENTIAL shape regardless of permutation: a depth SRV, a
+	// velocity SRV, and an HDR colour UAV. Log-only, once per hash, so the candidate list for
+	// this configuration is explicit instead of inferred.
+	{
+		const BoundTexture *cand_depth = nullptr;
+		const BoundTexture *cand_velocity = nullptr;
+		for (const auto &t : b.srvs)
+		{
+			if (t.format == TexFormat::r32_float_x8x24_typeless && cand_depth == nullptr)
+				cand_depth = &t;
+			if (t.format == TexFormat::r16g16b16a16_unorm && cand_velocity == nullptr)
+				cand_velocity = &t;
+		}
+		const BoundTexture *cand_out = nullptr;
+		for (const auto &u : b.uavs)
+		{
+			if ((u.format == TexFormat::r16g16b16a16_float ||
+			     u.format == TexFormat::r11g11b10_float) && u.width > 64 && cand_out == nullptr)
+				cand_out = &u;
+		}
+
+		if (cand_depth != nullptr && cand_velocity != nullptr && cand_out != nullptr)
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			if (!g_candidate_logged[hash])
+			{
+				g_candidate_logged[hash] = true;
+				STRAY_LOG_INFO("TAA CANDIDATE 0x%016llx: depth=t%u %ux%u velocity=t%u %ux%u "
+					"out=u%u %ux%u srvs=%zu uavs=%zu verdict=%s",
+					static_cast<unsigned long long>(hash),
+					cand_depth->slot, cand_depth->width, cand_depth->height,
+					cand_velocity->slot, cand_velocity->width, cand_velocity->height,
+					cand_out->slot, cand_out->width, cand_out->height,
+					b.srvs.size(), b.uavs.size(), m.reason);
+			}
+		}
 	}
 
 	// ---- Phase B: our motion-vector resolve, and DLSS, on the game's command list ----
