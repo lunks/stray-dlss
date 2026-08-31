@@ -28,6 +28,9 @@ bool g_resolve_failed_logged = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
+// [STRAYDLSS] MvRestoreHeaps, default on. A switch so the heap restore can be A/B'd against
+// the crash without another build-and-deploy cycle.
+bool g_restore_heaps = true;
 
 // A crash-survivable breadcrumb. The Phase B path dies with an access violation after
 // surviving many frames, so the trigger is something that CHANGES rather than the first call.
@@ -178,11 +181,13 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 
 const Diagnostics &diagnostics() { return g_diag; }
 
-void configure(bool mv_resolve_enabled)
+void configure(bool mv_resolve_enabled, bool restore_heaps)
 {
 	g_mv_resolve_enabled = mv_resolve_enabled;
-	STRAY_LOG_INFO("MV resolve pass is %s ([STRAYDLSS] MvResolve)",
-		mv_resolve_enabled ? "ENABLED" : "disabled");
+	g_restore_heaps = restore_heaps;
+	STRAY_LOG_INFO("MV resolve pass is %s ([STRAYDLSS] MvResolve); heap restore is %s "
+		"([STRAYDLSS] MvRestoreHeaps)",
+		mv_resolve_enabled ? "ENABLED" : "disabled", restore_heaps ? "ENABLED" : "disabled");
 }
 
 void dump_summary()
@@ -426,10 +431,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 				mark(3, "mv-initialised");
 
-				// Capture the game's heaps BEFORE our pass swaps in ours.
-				::ID3D12DescriptorHeap *game_heaps[2] = {};
-				unsigned int heap_count = 0;
-				collect_bound_heaps(cmd_list, game_heaps, &heap_count);
+				// The heaps that owned this dispatch's own descriptors — precisely what the
+				// game had bound here.
+				::ID3D12DescriptorHeap *const *game_heaps = b.heaps;
+				const unsigned int heap_count = g_restore_heaps ? b.heap_count : 0u;
 
 				mark(4, "heaps-collected");
 

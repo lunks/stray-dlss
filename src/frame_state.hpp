@@ -39,6 +39,12 @@ struct DispatchBindings
 	reshade::api::buffer_range view_cb{};
 	bool view_cb_valid = false;
 	uint32_t view_cb_register = 0;
+
+	// The descriptor heaps that owned THIS dispatch's descriptors — i.e. exactly what the game
+	// had bound at this moment. Restoring these is precise, where picking the first heap found
+	// across every tracked table is a guess that can restore the wrong one.
+	::ID3D12DescriptorHeap *heaps[2] = {};
+	unsigned int heap_count = 0;
 };
 
 // Resolves the bindings for the compute pipeline currently bound on `cmd_list`, using

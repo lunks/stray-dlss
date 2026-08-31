@@ -356,6 +356,18 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 					if (heap.handle == 0)
 						continue;
 
+					// Remember the heap this dispatch actually used, so it can be restored
+					// exactly rather than guessed at afterwards.
+					if (out.heap_count < 2)
+					{
+						auto *native_heap = reinterpret_cast<::ID3D12DescriptorHeap *>(heap.handle);
+						bool known = false;
+						for (unsigned int h = 0; h < out.heap_count; ++h)
+							known = known || out.heaps[h] == native_heap;
+						if (!known)
+							out.heaps[out.heap_count++] = native_heap;
+					}
+
 					// The shader register, which is what every fact in CLAUDE.md §2.3 is
 					// expressed in — not the descriptor's index in the table.
 					const uint32_t reg = range.dx_register_index + i;

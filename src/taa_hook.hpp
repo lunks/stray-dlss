@@ -35,7 +35,7 @@ struct Diagnostics
 	bool view_seen = false;
 };
 
-void configure(bool mv_resolve_enabled);
+void configure(bool mv_resolve_enabled, bool restore_heaps);
 
 const Diagnostics &diagnostics();
 
