@@ -49,6 +49,20 @@ bool g_ngx_dims_logged = false;
 // several of the engine's dispatches, not just its TAA. Pin to the first pass we successfully
 // evaluate and refuse every other from then on.
 std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
+// Hashes that have demonstrated the history round-trip, i.e. UE4 bound their previous u0 back
+// as an SRV the following frame. CLAUDE.md §2.9 calls this the decisive test for which pass
+// owns the temporal history — and it is a far better gate than "the first pass that happens to
+// evaluate", which is how DLSS previously chose and which picked 0xda289b0ddfa934c6, neither of
+// the structural TAA candidates measured at this resolution.
+std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
+bool g_ngx_waiting_logged = false;
+
+bool owns_temporal_history(std::uint64_t hash)
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	const auto it = g_roundtrip_seen.find(hash);
+	return it != g_roundtrip_seen.end() && it->second;
+}
 // Traces the first few evaluate cycles step by step. The crash follows a SUCCESSFUL evaluate
 // within about a second, the UE4 dump carries an empty callstack, and the add-on's last line is
 // simply whatever it logged before dying — so the only way to localise it is to say what we are
@@ -567,10 +581,21 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// Everything here is looked up by REGISTER and liveness-checked, for the
 					// same reason the resolve is: ReShade's view->resource map outlives the
 					// resource, and a dead pointer here would fault inside the driver.
+					// Only ever replace a pass that has proved it owns the temporal history.
+					// Waiting a few frames for that proof costs nothing; picking the wrong pass
+					// means DLSS's output goes somewhere the frame never reads.
 					const std::uint64_t pinned =
 						g_ngx_pass_hash.load(std::memory_order_relaxed);
-					if (g_ngx_evaluate && ngx::status().super_sampling_available &&
-						(pinned == 0 || pinned == hash))
+					const bool eligible = pinned != 0 ? (pinned == hash)
+					                                  : owns_temporal_history(hash);
+					if (g_ngx_evaluate && ngx::status().super_sampling_available && !eligible &&
+						pinned == 0 && !g_ngx_waiting_logged)
+					{
+						g_ngx_waiting_logged = true;
+						STRAY_LOG_INFO("DLSS is waiting for a pass to prove it owns the temporal "
+							"history before replacing anything.");
+					}
+					if (g_ngx_evaluate && ngx::status().super_sampling_available && eligible)
 					{
 						// Decide WHICH of the two colour slots is scene colour.
 						//
@@ -799,6 +824,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				if (t.resource == prev->second)
 				{
 					g_roundtrip_logged[hash] = true;
+					g_roundtrip_seen[hash] = true;
 					STRAY_LOG_INFO("  HISTORY ROUND-TRIP: 0x%016llx bound last frame's u0 back "
 						"at t%u — this pass owns the temporal history",
 						static_cast<unsigned long long>(hash), t.slot);
