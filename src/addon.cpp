@@ -242,6 +242,13 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
 	const std::uint64_t dry_hash_value = std::strtoull(dry_hash, nullptr, 0);
 	taa_hook::set_dry_run_hash(dry_hash_value);
+
+	int dry_alternate = 0;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
+	taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));
+	if (dry_alternate > 0)
+		STRAY_LOG_WARN("DryRunAlternate=%d: the named pass alternates suppressed/normal every "
+			"%d frames, so both states appear in one session.", dry_alternate, dry_alternate);
 	if (dry_hash_value != 0)
 		STRAY_LOG_WARN("DryRunHash=0x%016llx: that pass will be suppressed and nothing written.",
 			static_cast<unsigned long long>(dry_hash_value));
@@ -469,6 +476,10 @@ void on_present(
 	(void)dirty_rects;
 
 	const uint64_t frame = g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
+
+	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
+	// identifies which state produced it.
+	taa_hook::note_present(frame);
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every 30 frames; cheap and always current.

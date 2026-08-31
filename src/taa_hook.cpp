@@ -56,6 +56,15 @@ int g_ngx_dry_run = 0;
 // suppression CHANGES the image. Independent of the matcher, so a pass the strict signature
 // rejects can still be tested.
 std::uint64_t g_dry_run_hash = 0;
+// [STRAYDLSS] DryRunAlternate=<frames> — suppress the named pass for N frames, then let it run
+// for N frames, forever.
+//
+// Comparing runs is hopeless once the camera moves, because the scene changes too. Alternating
+// inside ONE session puts both states in front of similar content, and the add-on logs each
+// transition so a screenshot's timestamp identifies which state produced it.
+std::uint32_t g_dry_run_alternate = 0;
+std::atomic<std::uint64_t> g_present_frame{ 0 };
+std::atomic<bool> g_alt_phase_suppressing{ false };
 bool g_ngx_logged_once = false;      // the evaluate result
 bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE flag, because
                                      // sharing one meant the skip warning consumed the budget
@@ -278,6 +287,19 @@ const Diagnostics &diagnostics() { return g_diag; }
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
+void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
+
+void note_present(std::uint64_t frame)
+{
+	g_present_frame.store(frame, std::memory_order_relaxed);
+	if (g_dry_run_alternate == 0)
+		return;
+	const bool suppressing = ((frame / g_dry_run_alternate) & 1ull) != 0;
+	const bool was = g_alt_phase_suppressing.exchange(suppressing, std::memory_order_relaxed);
+	if (was != suppressing)
+		STRAY_LOG_INFO("ALT PHASE %s at frame %llu", suppressing ? "SUPPRESSING" : "normal",
+			static_cast<unsigned long long>(frame));
+}
 
 void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
@@ -503,7 +525,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	// A named pass can be suppressed regardless of what the matcher thinks of it, because the
 	// whole point is to test passes the strict signature rejects.
-	if (g_dry_run_hash != 0 && hash == g_dry_run_hash)
+	const bool alt_active = g_dry_run_alternate == 0 ||
+		g_alt_phase_suppressing.load(std::memory_order_relaxed);
+	if (g_dry_run_hash != 0 && hash == g_dry_run_hash && alt_active)
 	{
 		if (!g_dry_run_hash_logged)
 		{

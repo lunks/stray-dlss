@@ -58,6 +58,11 @@ void set_ngx_dry_run(int mode);
 // pass that drives the picture is the one whose suppression changes the image.
 void set_dry_run_hash(std::uint64_t hash);
 
+// Alternate the named pass between suppressed and normal every N frames, so both states occur
+// within one session and are seen against similar scene content. Transitions are logged.
+void set_dry_run_alternate(std::uint32_t frames);
+void note_present(std::uint64_t frame);
+
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 
 } // namespace stray_dlss::taa_hook
