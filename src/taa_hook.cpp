@@ -2,6 +2,11 @@
 
 #include "frame_state.hpp"
 #include "log.hpp"
+#include "mv_resolve.hpp"
+
+#include <state_tracking.hpp>
+
+#include <d3d12.h>
 
 #include <cstdio>
 #include <cstring>
@@ -18,6 +23,8 @@ std::unordered_map<std::uint64_t, std::uint64_t> g_prev_output;                 
 std::unordered_map<std::uint64_t, std::uint32_t> g_report_count;                // hash -> reports emitted
 std::unordered_map<std::uint64_t, bool> g_steady_reported;                      // hash -> saw a non-cut frame
 std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     // hash -> round-trip already noted
+bool g_resolve_ran = false;
+bool g_resolve_failed_logged = false;
 
 // Per-shader outcome census. One dispatch report shows one shader; this shows the whole
 // field, which is what actually answers "does the TAA pass ever reach the resolver".
@@ -355,6 +362,70 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		g_diag.best_hash = hash;
 		g_diag.best_width = w;
 		g_diag.best_height = h;
+	}
+
+	// ---- Phase B: run our own motion-vector resolve on the game's command list ----
+	//
+	// Still returns false at the end, so the engine's TAA runs as normal and the image is
+	// unchanged. This exists to get the resolve executing and provably correct before anything
+	// depends on its output.
+	if (m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only)
+	{
+		ID3D12Resource *depth_res = nullptr;
+		ID3D12Resource *velocity_res = nullptr;
+		for (const auto &t : b.srvs)
+		{
+			if (t.slot == m.depth_srv)
+				depth_res = reinterpret_cast<ID3D12Resource *>(t.resource);
+			if (t.slot == m.velocity_srv && t.format == TexFormat::r16g16b16a16_unorm)
+				velocity_res = reinterpret_cast<ID3D12Resource *>(t.resource);
+		}
+
+		// On a camera-cut frame velocity is the 1x1 dummy, so there is nothing to resolve.
+		// That is the pass resetting, not an error.
+		if (view_ok && depth_res != nullptr && velocity_res != nullptr && !m.camera_cut_dummies)
+		{
+			auto *device = reinterpret_cast<ID3D12Device *>(cmd_list->get_device()->get_native());
+			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+
+			if (mv::initialise(device, m.render_width, m.render_height))
+			{
+				mv::ResolveInputs inputs;
+				inputs.depth = depth_res;
+				inputs.velocity = velocity_res;
+				inputs.render_width = m.render_width;
+				inputs.render_height = m.render_height;
+				inputs.view = &view;
+
+				if (mv::record(native, inputs))
+				{
+					if (!g_resolve_ran)
+					{
+						g_resolve_ran = true;
+						STRAY_LOG_INFO("MV resolve ran: %ux%u R16G16_FLOAT from depth=t%u "
+							"velocity=t%u", m.render_width, m.render_height,
+							m.depth_srv, m.velocity_srv);
+					}
+
+					// Our pass replaced the root signature, PSO and descriptor heaps on the
+					// game's own command list. D3D12 has no state getters, so the state has to
+					// be re-applied from what ReShade tracked; the game will not re-set it and
+					// its next draw would use ours. (docs/RESEARCH.md §3.5)
+					if (auto *tracked = cmd_list->get_private_data<state_tracking>())
+						tracked->apply(cmd_list);
+				}
+				else if (!g_resolve_failed_logged)
+				{
+					g_resolve_failed_logged = true;
+					STRAY_LOG_ERROR("MV resolve record failed: %s", mv::last_error());
+				}
+			}
+			else if (!g_resolve_failed_logged)
+			{
+				g_resolve_failed_logged = true;
+				STRAY_LOG_ERROR("MV resolve init failed: %s", mv::last_error());
+			}
+		}
 	}
 
 	// The decisive test for which pass owns the temporal history: UE4 extracts a TAA pass's
