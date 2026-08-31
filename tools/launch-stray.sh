@@ -1,77 +1,204 @@
-#!/usr/bin/env bash
-# Launch Stray unattended inside CT113 and drive it past the main menu into gameplay.
+#!/bin/bash
+# Launch Stray and drive it to gameplay, unattended.
 #
-# Runs as root under `pct exec 113`. Steam runs as user deck; the URL is handed to the running
-# client. Two traps this script exists to handle (CLAUDE.md §2.10 / gotchas ledger):
-#   * a leftover `reaper SteamLaunch AppId=1332010` makes Steam silently ignore launches;
-#   * the Steam Input pad node ("Microsoft X-Box 360 pad 0") only exists while the game runs,
-#     and its eventN number is not stable — discover it, never hardcode it.
-# Menu driving: BTN_SOUTH presses on the pad node; extra presses are harmless (in-game they
-# jump, in load screens they do nothing).
+# Runs on the SteamOS host (CT113). Steam is asked to start the game through its own CEF
+# console, then X (BTN_SOUTH on the "Microsoft X-Box 360 pad 0" node Steam Input synthesises)
+# is tapped twice a second to get through the splash and menu.
 #
-# Usage: launch-stray.sh [--timeout N]   (N seconds to babysit the process; default 700)
-set -u
-TIMEOUT=700
-[ "${1:-}" = "--timeout" ] && TIMEOUT="${2:-700}"
+# Stopping is driven by evidence rather than a timer: the add-on writes a shader census to
+# stray-dlss-status.txt, and the measured census is ~150 in the main menu against ~728 in
+# gameplay (CLAUDE.md 2.3). The threshold sits between them with wide margin either side.
+#
+#   ./launch-stray.sh [--no-input] [--timeout SECONDS]
 
-pkill -f 'reaper SteamLaunch AppId=1332010' 2>/dev/null && sleep 3
+set -uo pipefail
 
-sudo -u deck env HOME=/home/deck steam "steam://rungameid/1332010" >/dev/null 2>&1 &
-sleep 1
+GAME_DIR=/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64
+STAGE_DIR=/run/media/deck/GamesLinux/dlss5-stage
+STATUS="$GAME_DIR/stray-dlss-status.txt"
+APPID=1332010
 
-for i in $(seq 1 60); do pgrep -x Stray-Win64-Shi >/dev/null && break; sleep 2; done
-if ! pgrep -x Stray-Win64-Shi >/dev/null; then
-	# Fallback: the client's URL pipe, which needs no environment at all.
-	sudo -u deck bash -c 'echo "steam://rungameid/1332010" > /home/deck/.steam/steam.pipe' 2>/dev/null
-	for i in $(seq 1 45); do pgrep -x Stray-Win64-Shi >/dev/null && break; sleep 2; done
-fi
-pgrep -x Stray-Win64-Shi >/dev/null || { echo "LAUNCH FAILED: no game process"; exit 1; }
-echo "game process up"
+BTN_SOUTH=304          # X on a DualSense, A in X360 mapping — "confirm"
+PAD_NAME="Microsoft X-Box 360 pad 0"
 
-pad=""
-for i in $(seq 1 45); do
-	pad=$(python3 - <<'PY'
-name = None
-try:
-    for line in open('/proc/bus/input/devices'):
-        line = line.strip()
-        if line.startswith('N: Name='):
-            name = line.split('=', 1)[1].strip('"')
-        elif line.startswith('H: Handlers=') and name == 'Microsoft X-Box 360 pad 0':
-            for tok in line.split():
-                if tok.startswith('event'):
-                    print('/dev/input/' + tok)
-except OSError:
-    pass
-PY
-)
-	[ -n "$pad" ] && break
-	sleep 2
+PRESS_INPUT=1
+TIMEOUT=420
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-input) PRESS_INPUT=0; shift ;;
+        --timeout)  TIMEOUT="$2"; shift 2 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
 done
-echo "pad=${pad:-NOT FOUND}"
 
-press() {
-	python3 - "$1" <<'PY'
-import struct, sys, time
-f = open(sys.argv[1], 'wb', buffering=0)
-def ev(t, c, v):
-    f.write(struct.pack('llHHi', 0, 0, t, c, v))
-ev(1, 304, 1); ev(0, 0, 0)
-time.sleep(0.12)
-ev(1, 304, 0); ev(0, 0, 0)
-PY
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# Restarting Steam is cheap here and clears the states that no amount of process killing
+# fixes: a wedged launch chain, a stale app-running flag, or an error dialog left on screen.
+# The gamescope session respawns Steam automatically.
+restart_steam() {
+    log "Restarting Steam"
+    su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.User.StartRestart(false)'" \
+        >/dev/null 2>&1 || pkill -x steam 2>/dev/null
+
+    # Wait for it to go away and come back with its CEF console listening again.
+    sleep 5
+    for _ in $(seq 1 60); do
+        if curl -s --max-time 2 http://127.0.0.1:8080/json/list >/dev/null 2>&1; then
+            log "  Steam is back"
+            sleep 5
+            return 0
+        fi
+        sleep 2
+    done
+    log "  Steam did not come back within 120s"
+    return 1
 }
 
-if [ -n "$pad" ]; then
-	sleep 18
-	for gap in 4 4 12 4; do press "$pad"; sleep "$gap"; done
-	press "$pad"
-	echo "menu presses sent"
+find_pad_node() {
+    # Steam tears this node down with the game, so its number is not stable and must be
+    # resolved every run. (CLAUDE.md 2.11)
+    awk -v want="$PAD_NAME" '
+        /^N: Name=/ { name = $0; sub(/^N: Name="/, "", name); sub(/"$/, "", name) }
+        /^H: Handlers=/ && name == want {
+            if (match($0, /event[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit }
+        }' /proc/bus/input/devices
+}
+
+# pgrep -c prints "0" AND exits non-zero when nothing matches, so a `|| echo 0`
+# fallback yields "0\n0" and breaks the test. Just use the exit status.
+game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
+
+# A reaper or half-started Proton chain from a previous session blocks every future launch
+# silently. Clear it before asking Steam for anything. (CLAUDE.md 2.10)
+clear_stale_chain() {
+    pgrep -f "AppId=$APPID" >/dev/null 2>&1 || return 0
+    log "Stale launch chain from a previous session; clearing it first"
+    # Descend the tree rather than pattern-killing: pv-adverb and srt-bwrap also run Steam's
+    # own webhelper, so a pattern kill takes Steam down with the game.
+    for pid in $(pgrep -f "AppId=$APPID" 2>/dev/null); do
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            for g in $(pgrep -P "$child" 2>/dev/null); do kill -9 "$g" 2>/dev/null; done
+            kill -9 "$child" 2>/dev/null
+        done
+        kill -9 "$pid" 2>/dev/null
+    done
+    for _ in $(seq 1 15); do
+        pgrep -f "AppId=$APPID" >/dev/null 2>&1 || break
+        sleep 1
+    done
+}
+
+status_field() {
+    [ -f "$STATUS" ] || { echo 0; return; }
+    awk -F= -v k="$1" '$1 == k { print $2; found = 1 } END { if (!found) print 0 }' "$STATUS"
+}
+
+# ---------------------------------------------------------------------------------------
+
+if game_running; then
+    log "Stray is already running; leaving it alone."
+else
+    clear_stale_chain
+
+    log "Clearing stale add-on output"
+    rm -f "$STATUS" "$GAME_DIR/stray-dlss.log"
+
+    log "Asking Steam to launch $APPID"
+    su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
+        >/dev/null 2>&1
+
+    log "Waiting for the process"
+    for _ in $(seq 1 60); do
+        game_running && break
+        sleep 2
+    done
+
+    if ! game_running; then
+        log "Stray-Win64-Shipping did not appear within 120s."
+        if pgrep -f "AppId=$APPID" >/dev/null 2>&1; then
+            log "  The Proton chain is up but the game exe never spawned — usually an error"
+            log "  dialog inside the prefix. Chain:"
+            pgrep -af "AppId=$APPID" | head -3 | sed 's/^/    /'
+        fi
+
+        # One automatic recovery attempt: tear the chain down, restart Steam, try once more.
+        if [ "${STRAY_NO_RETRY:-0}" != "1" ]; then
+            log "Attempting recovery: teardown + Steam restart + one retry"
+            clear_stale_chain
+            restart_steam
+            su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
+                >/dev/null 2>&1
+            for _ in $(seq 1 60); do
+                game_running && break
+                sleep 2
+            done
+        fi
+    fi
+
+    if ! game_running; then
+        log "FAILED: the game would not start even after a Steam restart."
+        exit 1
+    fi
+    log "Process up."
 fi
 
-END=$(( $(date +%s) + TIMEOUT ))
-while [ "$(date +%s)" -lt "$END" ]; do
-	pgrep -x Stray-Win64-Shi >/dev/null || { echo "game exited"; exit 0; }
-	sleep 10
+# The first load after a shader dump is very slow: registering the pipeline events makes
+# ReShade drop the D3D12 PSO cache, so every shader recompiles. Be patient here.
+log "Waiting for the add-on heartbeat (first load recompiles every shader — this is slow)"
+for _ in $(seq 1 "$TIMEOUT"); do
+    [ -f "$STATUS" ] && break
+    game_running || { log "FAILED: the game exited before the add-on reported in."; exit 1; }
+    sleep 1
 done
-echo "timeout reached, game still running"
+
+if [ ! -f "$STATUS" ]; then
+    log "FAILED: no heartbeat after ${TIMEOUT}s. Is the add-on loading? Check:"
+    log "  grep -i stray-dlss '$GAME_DIR/ReShade.log'"
+    exit 1
+fi
+log "Add-on is alive (vkd3d=$(status_field vkd3d))"
+
+if [ "$PRESS_INPUT" -eq 0 ]; then
+    log "--no-input given; not pressing anything."
+    exit 0
+fi
+
+PAD_NODE=$(find_pad_node)
+if [ -z "$PAD_NODE" ]; then
+    log "FAILED: could not find the '$PAD_NAME' node."
+    log "  Steam Input creates it when the game starts; check /proc/bus/input/devices"
+    exit 1
+fi
+log "Pad node: /dev/input/$PAD_NODE"
+
+log "Pressing X every 0.5s until the shader census says we are in game"
+deadline=$(( $(date +%s) + TIMEOUT ))
+last_census=-1
+
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! game_running; then
+        log "FAILED: the game exited."
+        exit 1
+    fi
+
+    census=$(status_field shader_census)
+    if [ "$census" != "$last_census" ]; then
+        log "  census=$census  frame=$(status_field frame)  dispatches=$(status_field dispatches)"
+        last_census=$census
+    fi
+
+    if [ "$(status_field in_game)" -eq 1 ]; then
+        log "IN GAME (census=$census, taa_pipelines=$(status_field taa_pipelines))"
+        exit 0
+    fi
+
+    python3 /tmp/inject.py pad "/dev/input/$PAD_NODE" "$BTN_SOUTH" 60 >/dev/null 2>&1
+    sleep 0.5
+done
+
+log "TIMEOUT after ${TIMEOUT}s at census=$(status_field shader_census)."
+log "  If the census is stuck near the menu value the button is not reaching the game;"
+log "  if it is climbing, just raise --timeout."
+exit 1
