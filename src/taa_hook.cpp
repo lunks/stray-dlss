@@ -387,13 +387,39 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		}
 		hash = h->second;
 
+		// Named-pass suppression, BEFORE any early return.
+		//
+		// This used to sit further down and was silently defeated by the reporting throttle
+		// below ("g_report_count[hash] >= 2"): once a hash had been reported twice,
+		// on_dispatch returned before ever reaching the check, so the pass was suppressed for
+		// two frames and ran normally for the rest of the session. The test looked like it ran
+		// and measured nothing.
+		{
+			const bool alt_active = g_dry_run_alternate == 0 ||
+				g_alt_phase_suppressing.load(std::memory_order_relaxed);
+			if (g_dry_run_hash != 0 && hash == g_dry_run_hash && alt_active)
+			{
+				if (!g_dry_run_hash_logged)
+				{
+					g_dry_run_hash_logged = true;
+					STRAY_LOG_WARN("DRY RUN (hash): suppressing 0x%016llx, writing nothing.",
+						static_cast<unsigned long long>(hash));
+				}
+				return true;
+			}
+		}
+
 		{
 			HashStats &st = g_stats[hash];
 			st.gx = x;
 			st.gy = y;
 		}
 
-		if (g_report_count[hash] >= 2 && hash != kTaaMainHash)
+		// The reporting throttle must never apply while a dry run is active: it would suppress
+		// a pass for its first two dispatches and then let it run, which is a test that looks
+		// like it ran and measures nothing.
+		const bool dry_running = g_dry_run_hash != 0 || g_ngx_dry_run != 0;
+		if (!dry_running && g_report_count[hash] >= 2 && hash != kTaaMainHash)
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -525,19 +551,6 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	// A named pass can be suppressed regardless of what the matcher thinks of it, because the
 	// whole point is to test passes the strict signature rejects.
-	const bool alt_active = g_dry_run_alternate == 0 ||
-		g_alt_phase_suppressing.load(std::memory_order_relaxed);
-	if (g_dry_run_hash != 0 && hash == g_dry_run_hash && alt_active)
-	{
-		if (!g_dry_run_hash_logged)
-		{
-			g_dry_run_hash_logged = true;
-			STRAY_LOG_WARN("DRY RUN (hash): suppressing 0x%016llx and writing nothing.",
-				static_cast<unsigned long long>(hash));
-		}
-		return true;
-	}
-
 	// ---- Relaxed candidate report ----
 	//
 	// §2.3's signature demands a depth+stencil SRV pair over one resource, which was measured on
@@ -576,7 +589,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// still does not change, the TAA is not a compute dispatch of this shape and testing the
 		// candidates one by one would be wasted; the next question would be whether it is a
 		// draw, which we do not hook.
-		if (g_ngx_dry_run == 3 && is_relaxed_candidate && alt_active)
+		const bool alt_now = g_dry_run_alternate == 0 ||
+			g_alt_phase_suppressing.load(std::memory_order_relaxed);
+		if (g_ngx_dry_run == 3 && is_relaxed_candidate && alt_now)
 		{
 			if (!g_dry_run_hash_logged)
 			{
