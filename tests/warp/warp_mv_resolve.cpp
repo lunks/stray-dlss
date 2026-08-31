@@ -903,7 +903,9 @@ bool test_copy_from_shader_visible_source(Gpu &gpu)
 	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&visible)));
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-	srv.Format = DXGI_FORMAT_R32_FLOAT;
+	// The depth resource is R32G8X24_TYPELESS, so the only legal depth-plane view format is
+	// R32_FLOAT_X8X24_TYPELESS. R32_FLOAT is rejected and removes the device.
+	srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
 	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srv.Texture2D.MipLevels = 1;
