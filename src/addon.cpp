@@ -571,6 +571,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
 	case DLL_PROCESS_DETACH:
 		shader_dump::finish();
+		// A final census, unconditionally. The frame-300 census is driven by present events,
+		// so it never runs in a headless host — and a headless host is exactly how CI loads
+		// this add-on into the real ReShade with no game. Logging it on detach also gives
+		// field reports a definitive "what did the add-on actually see" line even when the
+		// user closes the game before frame 300.
+		STRAY_LOG_INFO("Final census: compute pipelines=%u, TAA matches=%u, dispatches=%u, "
+			"bind_pipeline=%d, push_descriptors=%d",
+			g_state.compute_pipelines_seen.load(std::memory_order_relaxed),
+			g_state.taa_pipelines_seen.load(std::memory_order_relaxed),
+			g_state.dispatches_seen.load(std::memory_order_relaxed),
+			g_state.saw_bind_pipeline.load(std::memory_order_relaxed) ? 1 : 0,
+			g_state.saw_push_descriptors.load(std::memory_order_relaxed) ? 1 : 0);
 		unregister_events();
 		state_tracking::unregister_events();
 		descriptor_tracking::unregister_events();

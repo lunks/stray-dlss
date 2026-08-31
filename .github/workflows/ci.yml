@@ -153,6 +153,19 @@ jobs:
           if (-not (Select-String -Path stray-dlss.log -Pattern 'register_addon succeeded' -Quiet)) {
             throw "the add-on loaded but reshade::register_addon did not succeed"
           }
+
+          # Registering is not the same as receiving events. These callbacks only exist in a
+          # ReShade built with full add-on support (RESHADE_ADDON >= 2), and CLAUDE.md calls out
+          # that "wrong ReShade build" would otherwise be indistinguishable from "the game binds
+          # differently". Assert the add-on actually saw our pipelines and dispatches.
+          $census = Select-String -Path stray-dlss.log -Pattern 'Final census: (.+)$' | Select-Object -First 1
+          if (-not $census) { throw "the add-on never logged its final census" }
+          Write-Host "Census: $($census.Matches[0].Groups[1].Value)"
+          if ($census.Line -match 'compute pipelines=(\d+).*dispatches=(\d+)') {
+            if ([int]$Matches[1] -eq 0) { throw "the add-on saw no compute pipelines: init_pipeline never fired" }
+            if ([int]$Matches[2] -eq 0) { throw "the add-on saw no dispatches: the dispatch event never fired" }
+            Write-Host "Add-on events confirmed live: $($Matches[1]) compute pipelines, $($Matches[2]) dispatches."
+          } else { throw "could not parse the census line" }
           if ($p.ExitCode -ne 0) { throw "harness reported failures while running through ReShade" }
           Write-Host "Real ReShade lane passed: the add-on registered and every harness test ran through ReShade's proxy."
 
