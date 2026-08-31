@@ -74,6 +74,14 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 	if (res.handle == 0)
 		return;
 
+	// Liveness FIRST. get_resource_desc dereferences the resource, and ReShade's view->resource
+	// map outlives the resource on D3D12 — so for a descriptor slot UE4 has recycled this is a
+	// read of freed memory, inside ReShade, before any of our own guards can run. Gating the
+	// resolve later was not enough: the access violation happens here, during binding capture,
+	// which is why the game still died on a frame the resolve correctly skipped.
+	if (!is_resource_live(res.handle))
+		return;
+
 	const reshade::api::resource_view_desc vd = device->get_resource_view_desc(view);
 	const reshade::api::resource_desc rd = device->get_resource_desc(res);
 
