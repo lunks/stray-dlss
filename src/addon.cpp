@@ -243,6 +243,15 @@ void on_init_device(reshade::api::device *device)
 	const std::uint64_t dry_hash_value = std::strtoull(dry_hash, nullptr, 0);
 	taa_hook::set_dry_run_hash(dry_hash_value);
 
+	char ngx_pass[32] = "";
+	size_t ngx_pass_size = sizeof(ngx_pass);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPassHash", ngx_pass, &ngx_pass_size);
+	const std::uint64_t ngx_pass_value = std::strtoull(ngx_pass, nullptr, 0);
+	taa_hook::set_ngx_pass_hash(ngx_pass_value);
+	if (ngx_pass_value != 0)
+		STRAY_LOG_INFO("DLSS will replace pass 0x%016llx ([STRAYDLSS] NgxPassHash).",
+			static_cast<unsigned long long>(ngx_pass_value));
+
 	int dry_alternate = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
 	taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));

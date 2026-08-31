@@ -56,6 +56,13 @@ int g_ngx_dry_run = 0;
 // suppression CHANGES the image. Independent of the matcher, so a pass the strict signature
 // rejects can still be tested.
 std::uint64_t g_dry_run_hash = 0;
+// [STRAYDLSS] NgxPassHash=0x... — the pass DLSS replaces, named explicitly.
+//
+// Preferred over the history-round-trip heuristic, which is necessary but not sufficient:
+// several passes bind their own previous output and it kept selecting ones whose suppression
+// changed nothing on screen. Suppressing 0xd2e4d8c23c362ed1 alone FREEZES the image, so that
+// pass's output is the picture.
+std::uint64_t g_ngx_pass_override = 0;
 // [STRAYDLSS] DryRunAlternate=<frames> — suppress the named pass for N frames, then let it run
 // for N frames, forever.
 //
@@ -287,6 +294,7 @@ const Diagnostics &diagnostics() { return g_diag; }
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
+void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
 
 void note_present(std::uint64_t frame)
@@ -727,8 +735,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// means DLSS's output goes somewhere the frame never reads.
 					const std::uint64_t pinned =
 						g_ngx_pass_hash.load(std::memory_order_relaxed);
-					const bool eligible = pinned != 0 ? (pinned == hash)
-					                                  : owns_temporal_history(hash);
+					// An explicitly named pass wins outright over the round-trip heuristic.
+					const bool eligible = g_ngx_pass_override != 0
+						? (hash == g_ngx_pass_override)
+						: (pinned != 0 ? (pinned == hash) : owns_temporal_history(hash));
 					if (g_ngx_evaluate && ngx::status().super_sampling_available && !eligible &&
 						pinned == 0 && !g_ngx_waiting_logged)
 					{

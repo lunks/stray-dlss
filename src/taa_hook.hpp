@@ -58,6 +58,10 @@ void set_ngx_dry_run(int mode);
 // pass that drives the picture is the one whose suppression changes the image.
 void set_dry_run_hash(std::uint64_t hash);
 
+// Name the pass DLSS replaces, overriding the history-round-trip heuristic — which is
+// necessary but not sufficient, since several passes bind their own previous output.
+void set_ngx_pass_hash(std::uint64_t hash);
+
 // Alternate the named pass between suppressed and normal every N frames, so both states occur
 // within one session and are seen against similar scene content. Transitions are logged.
 void set_dry_run_alternate(std::uint32_t frames);
