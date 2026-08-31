@@ -562,6 +562,15 @@ void on_present(
 		char when[32];
 		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
 		report_vkd3d_ext_hook(native, when);
+
+		// Report the resolve counters here too. The detach census is unreliable in practice:
+		// killing the game — which is how every unattended run ends — gives Wine no chance to
+		// run DllMain(PROCESS_DETACH), so the only census that survives is the launcher's, with
+		// everything at zero.
+		std::uint32_t attempts = 0, skipped = 0;
+		taa_hook::resolve_counters(attempts, skipped);
+		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,
+			skipped, attempts ? (100.0 * skipped / attempts) : 0.0);
 	}
 
 	// Report the add-on-level capability verdict once, after enough frames that the game has
