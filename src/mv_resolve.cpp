@@ -458,6 +458,24 @@ void shutdown()
 
 }
 
+void transition_output(ID3D12GraphicsCommandList *cmd, bool to_shader_resource)
+{
+	if (cmd == nullptr || g_state.out_mv == nullptr)
+		return;
+
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = g_state.out_mv;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = to_shader_resource
+		? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+		: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.StateAfter = to_shader_resource
+		? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+		: D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	cmd->ResourceBarrier(1, &barrier);
+}
+
 bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode)
 {
 	if (cmd == nullptr || !is_ready() || in.depth_resource == 0 ||

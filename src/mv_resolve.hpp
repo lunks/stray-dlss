@@ -59,6 +59,14 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 // R16G16_FLOAT at render resolution. Valid after a successful record().
 ID3D12Resource *output();
 
+// Transitions our motion-vector texture between the state our resolve writes it in
+// (UNORDERED_ACCESS) and the state a consumer must read it in (NON_PIXEL_SHADER_RESOURCE).
+//
+// NGX requires its inputs in NON_PIXEL_SHADER_RESOURCE and its output as a UAV; NVIDIA's guide
+// is explicit that wrong resource usage can yield a black image "without further indication",
+// and under vkd3d — which validates none of this — it faults instead.
+void transition_output(ID3D12GraphicsCommandList *cmd, bool to_shader_resource);
+
 // Allocation accounting. The GPU ran out of memory during a real run, and resource churn in
 // initialise() is the prime suspect: the render resolution is taken from whichever dispatch
 // matched, so a flapping size reallocates the heap, constant buffer and output texture. These

@@ -572,6 +572,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						if (colour != nullptr && output != nullptr &&
 							ngx::ensure_feature(native, fd))
 						{
+							// Our resolve just wrote the motion vectors as a UAV; NGX reads
+							// them as a shader resource. Without this the state is simply
+							// wrong, and vkd3d validates none of it. (CLAUDE.md §3)
+							mv::transition_output(native, /*to_shader_resource=*/true);
+
 							ngx::EvaluateInputs ei;
 							ei.color = colour;
 							ei.depth = reinterpret_cast<ID3D12Resource *>(depth_resource);
@@ -588,6 +593,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.pre_exposure = view.pre_exposure;
 
 							const bool ok = ngx::evaluate(native, ei);
+
+							// Back to UAV for next frame's resolve.
+							mv::transition_output(native, /*to_shader_resource=*/false);
 							if (!g_ngx_logged_once)
 							{
 								g_ngx_logged_once = true;
