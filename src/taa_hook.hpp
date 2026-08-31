@@ -49,6 +49,10 @@ void dump_summary();
 // first switch that changes what the player sees, so it is opt-in on its own.
 void set_ngx_evaluate(bool enabled);
 
+// Suppress the pinned pass without running DLSS, to establish whether that pass drives the
+// visible image at all. An identical-looking DLSS frame is otherwise ambiguous.
+void set_ngx_dry_run(bool enabled);
+
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 
 } // namespace stray_dlss::taa_hook

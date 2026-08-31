@@ -37,6 +37,14 @@ bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
 // player sees, so it is opt-in and separate from EnableNGX (which only brings NGX up).
 bool g_ngx_evaluate = false;
+// [STRAYDLSS] NgxDryRun. Suppresses the pinned pass's engine dispatch WITHOUT running DLSS, so
+// nothing writes u0 at all.
+//
+// This is the experiment that decides whether our output can reach the screen. If the image
+// visibly breaks, the pass we replace really does drive the picture and DLSS's result is being
+// used. If the image is unchanged, the pass is irrelevant and evaluating into it proves nothing
+// — which is exactly the ambiguity an identical-looking DLSS frame leaves open.
+bool g_ngx_dry_run = false;
 bool g_ngx_logged_once = false;      // the evaluate result
 bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE flag, because
                                      // sharing one meant the skip warning consumed the budget
@@ -255,6 +263,7 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
+void set_ngx_dry_run(bool enabled) { g_ngx_dry_run = enabled; }
 
 void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
@@ -595,7 +604,20 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						STRAY_LOG_INFO("DLSS is waiting for a pass to prove it owns the temporal "
 							"history before replacing anything.");
 					}
-					if (g_ngx_evaluate && ngx::status().super_sampling_available && eligible)
+					// Dry run: suppress the pinned pass and write nothing, to see whether it
+					// drives the visible image at all.
+					if (g_ngx_dry_run && eligible)
+					{
+						std::uint64_t expected = 0;
+						if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
+							STRAY_LOG_WARN("DRY RUN: suppressing pass 0x%016llx and writing "
+								"NOTHING. If the image is unchanged, this pass does not drive "
+								"the picture.", static_cast<unsigned long long>(hash));
+						suppress_engine_dispatch = true;
+					}
+
+					if (g_ngx_evaluate && !g_ngx_dry_run &&
+						ngx::status().super_sampling_available && eligible)
 					{
 						// Decide WHICH of the two colour slots is scene colour.
 						//

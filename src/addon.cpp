@@ -231,6 +231,13 @@ void on_init_device(reshade::api::device *device)
 	bool ngx_evaluate = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	bool ngx_dry_run = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
+	taa_hook::set_ngx_dry_run(ngx_dry_run);
+	if (ngx_dry_run)
+		STRAY_LOG_WARN("NgxDryRun is ON: the pinned pass will be suppressed and NOTHING written "
+			"in its place. This is a diagnostic, not a rendering mode.");
 	STRAY_LOG_INFO("DLSS evaluation is %s ([STRAYDLSS] NgxEvaluate). This is the switch that "
 		"changes the image; EnableNGX alone only brings NGX up.",
 		ngx_evaluate ? "ENABLED" : "disabled");
