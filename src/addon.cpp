@@ -226,6 +226,13 @@ void on_init_device(reshade::api::device *device)
 	int mv_dispatch_mode = 2;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "MvDispatch", mv_dispatch_mode);
 	taa_hook::configure(mv_resolve, restore_heaps, restore_state, mv_dispatch_mode);
+
+	bool ngx_evaluate = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
+	taa_hook::set_ngx_evaluate(ngx_evaluate);
+	STRAY_LOG_INFO("DLSS evaluation is %s ([STRAYDLSS] NgxEvaluate). This is the switch that "
+		"changes the image; EnableNGX alone only brings NGX up.",
+		ngx_evaluate ? "ENABLED" : "disabled");
 }
 
 void on_destroy_device(reshade::api::device *device)

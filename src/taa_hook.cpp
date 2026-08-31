@@ -3,6 +3,7 @@
 #include "frame_state.hpp"
 #include "log.hpp"
 #include "mv_resolve.hpp"
+#include "ngx_backend.hpp"
 
 #include <state_tracking.hpp>
 
@@ -33,6 +34,10 @@ bool g_stale_resource_logged = false;
 std::atomic<std::uint32_t> g_resolve_attempts{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
+// [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
+// player sees, so it is opt-in and separate from EnableNGX (which only brings NGX up).
+bool g_ngx_evaluate = false;
+bool g_ngx_logged_once = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
@@ -206,6 +211,8 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 } // namespace
 
 const Diagnostics &diagnostics() { return g_diag; }
+
+void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 
 void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
@@ -524,6 +531,80 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				if (mv::record(native, inputs, g_mv_dispatch_mode))
 				{
 					mark(5, "recorded");
+
+					// DLSS evaluation, opt-in and strictly after the motion-vector resolve —
+					// it consumes that resolve's output.
+					//
+					// Everything here is looked up by REGISTER and liveness-checked, for the
+					// same reason the resolve is: ReShade's view->resource map outlives the
+					// resource, and a dead pointer here would fault inside the driver.
+					if (g_ngx_evaluate && ngx::status().super_sampling_available)
+					{
+						ID3D12Resource *colour = nullptr;
+						ID3D12Resource *output = nullptr;
+						for (const auto &t : b.srvs)
+						{
+							// colour_srv_a and _b are scene colour and history in unknown
+							// order; last frame's u0 identifies the history, so the OTHER one
+							// is the scene colour we must feed DLSS.
+							const bool is_colour_slot =
+								t.slot == m.colour_srv_a || t.slot == m.colour_srv_b;
+							if (!is_colour_slot || !is_resource_live(t.resource))
+								continue;
+							const auto prev = g_prev_output.find(hash);
+							const bool is_history =
+								prev != g_prev_output.end() && prev->second == t.resource;
+							if (!is_history)
+								colour = reinterpret_cast<ID3D12Resource *>(t.resource);
+						}
+						for (const auto &u : b.uavs)
+						{
+							if (u.slot == m.output_uav && is_resource_live(u.resource))
+								output = reinterpret_cast<ID3D12Resource *>(u.resource);
+						}
+
+						ngx::FeatureDesc fd;
+						fd.render_width = render_w;
+						fd.render_height = render_h;
+						fd.output_width = m.output_width ? m.output_width : render_w;
+						fd.output_height = m.output_height ? m.output_height : render_h;
+
+						if (colour != nullptr && output != nullptr &&
+							ngx::ensure_feature(native, fd))
+						{
+							ngx::EvaluateInputs ei;
+							ei.color = colour;
+							ei.depth = reinterpret_cast<ID3D12Resource *>(depth_resource);
+							ei.motion_vectors = mv::output();
+							ei.output = output;
+							// TemporalAAParams.zw, straight through. (CLAUDE.md §2.7)
+							ei.jitter_x = view.temporal_aa_params.z;
+							ei.jitter_y = view.temporal_aa_params.w;
+							ei.render_width = render_w;
+							ei.render_height = render_h;
+							ei.reset = ue4::is_camera_cut(view) || m.camera_cut_dummies;
+							ei.pre_exposure = view.pre_exposure;
+
+							const bool ok = ngx::evaluate(native, ei);
+							if (!g_ngx_logged_once)
+							{
+								g_ngx_logged_once = true;
+								STRAY_LOG_INFO("DLSS evaluate %s: %ux%u -> %ux%u jitter=%.4f,%.4f "
+									"reset=%d preExposure=%.3f", ok ? "OK" : "FAILED",
+									render_w, render_h, fd.output_width, fd.output_height,
+									ei.jitter_x, ei.jitter_y, ei.reset ? 1 : 0, ei.pre_exposure);
+								if (!ok)
+									STRAY_LOG_ERROR("  %s", ngx::last_error());
+							}
+						}
+						else if (!g_ngx_logged_once)
+						{
+							g_ngx_logged_once = true;
+							STRAY_LOG_WARN("DLSS evaluate skipped: colour=%p output=%p feature=%s",
+								static_cast<void *>(colour), static_cast<void *>(output),
+								ngx::last_error());
+						}
+					}
 					if (!g_resolve_ran)
 					{
 						g_resolve_ran = true;
