@@ -84,6 +84,44 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### The NgxEvaluate crash: what has been ruled OUT
+
+DLSS evaluates correctly in Stray — `DLSS evaluate OK: 2560x1440 -> 2560x1440
+jitter=-0.3750,-0.0556 reset=0 preExposure=0.056`, no NGX error — and the game then dies about
+a second later at the loading→gameplay transition. **CPU access violation `0xc0000005`, no Xid,
+UE4's dump carries an empty callstack, and ReShade's log simply stops mid-frame.**
+
+A step trace that opens only after the first successful evaluate shows our entire cycle
+completing, repeatedly, right up to the end:
+
+```
+ngx-trace: barrier mv -> SRV → evaluate returned 1 → barrier mv -> UAV done
+ngx-trace: restore begin → restore done          (and again, and again)
+```
+
+**So the fault is downstream of our code.** Five hypotheses have been tried and none fixed it —
+do not spend the round trip re-testing them:
+
+1. **Resource lifetime.** NGX holds no references to what we pass it, so we AddRef colour, depth,
+   motion vectors and output at Evaluate and release them six frames later. Correct, and kept —
+   but not the cause.
+2. **Write-after-write on `u0`.** We now suppress the engine's TAA dispatch when DLSS produced
+   the output. Correct, and kept — but not the cause.
+3. **Wrong colour input.** NGX rejected it once — *"input Color parameter needs to be Tex2D
+   resource"* — so candidates are now filtered to live 2D textures of at least the render rect,
+   which excludes buffers and the 1×1 `BlackDummy`. Fixed the NGX error; the crash remained.
+4. **Replacing several passes.** The structural matcher matches many passes (numerous distinct
+   hashes each report a history round-trip), so suppression was hitting more than the TAA. DLSS
+   is now pinned to the first pass it successfully evaluates. Correct, and kept — but not the
+   cause.
+5. **Feature recreation mid-flight** was suspected from the timing but only one feature is ever
+   created in these runs, so it is not being torn down under the GPU.
+
+**Still untried:** whether ReShade's own effect runtime or another add-on is what dies (the other
+two add-ons are renamed `.disabled`, but ReShade still compiles and runs its own effects);
+evaluating only every Nth frame to see whether it is cumulative; and running with `MvDispatch=1`
+to shrink the GPU work while keeping the evaluate.
+
 ### CONFIRMED WORKING ON THE TARGET, 2026-08-31
 
 NGX initialises and reports DLSS available, in Stray, under vkd3d-proton, through ReShade:
