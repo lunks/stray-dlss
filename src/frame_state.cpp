@@ -8,6 +8,7 @@
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -435,6 +436,36 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 					// The shader register, which is what every fact in CLAUDE.md §2.3 is
 					// expressed in — not the descriptor's index in the table.
 					const uint32_t reg = range.dx_register_index + i;
+
+					// ONE-TIME: is the heap these descriptors live in shader-visible?
+					//
+					// mv_resolve copies them with CopyDescriptorsSimple, and D3D12 forbids a
+					// shader-visible SOURCE — reproduced in CI as
+					// "D3D12 ERROR #654: SrcDescriptorRangeStart points to a descriptor heap
+					// type that is CPU write only, so reading it is invalid". vkd3d-proton has
+					// no debug layer to say so, and an illegal copy there yields a descriptor
+					// the GPU rejects only when something reads it: exactly why MvDispatch=0
+					// survives and a single 1x1 dispatch hangs with Xid 109.
+					//
+					// Read-only, logged once, so the premise is measured rather than assumed.
+					{
+						static std::atomic<bool> reported{ false };
+						bool expected = false;
+						if (reported.compare_exchange_strong(expected, true) &&
+							heap.handle != 0)
+						{
+							auto *native = reinterpret_cast<::ID3D12DescriptorHeap *>(heap.handle);
+							const D3D12_DESCRIPTOR_HEAP_DESC hd = native->GetDesc();
+							const bool visible =
+								(hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+							STRAY_LOG_INFO("Descriptor source heap: type=%d NumDescriptors=%u "
+								"SHADER_VISIBLE=%s%s", static_cast<int>(hd.Type),
+								hd.NumDescriptors, visible ? "YES" : "no",
+								visible ? "  <-- CopyDescriptorsSimple from this is ILLEGAL "
+								          "(D3D12 #654); this is very likely the hang"
+								        : "  (legal copy source)");
+						}
+					}
 
 					switch (range.type)
 					{
