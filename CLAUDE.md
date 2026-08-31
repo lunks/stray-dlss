@@ -553,12 +553,17 @@ other pass in this title binds one resource as both `R32_FLOAT_X8X24` and `X32_G
 
 **Two convincing look-alikes, both excluded:**
 
-* `0x1708ec956099e259` — previously believed to be the primary TAA. It is a **reprojecting
-  denoiser** (SSR/SSGI/AO family): it reads depth and velocity and reprojects with
-  `ClipToPrevClip`, which is why its bindings look right. It declares `cb1[126]` and so never
+* `0x1708ec956099e259` — previously believed to be the primary TAA. It is
+  **`FSSDTemporalAccumulationCS`** (named offline 2026-08-31 via `shaderlib_extract.py
+  --find-hash` + CUE4Parse's name table): UE 4.27's Screen-Space Denoiser temporal
+  accumulation, permutation #5 of a 9-permutation family that ALSO contains
+  `0x52101a15e1a0c5cc` (#0), `0xee4b6c0ca521851f` and `0xf102e72bdc0355be` — retroactively
+  closing several unresolved bisection-era candidates. It reads depth and velocity and
+  reprojects with `ClipToPrevClip`, which is why its bindings look right. It declares `cb1[126]` and so never
   indexes View row 144 (`StateFrameIndexMod8`), which **every** `FTAAStandaloneCS` permutation
   reads — therefore it cannot be this shader. Dispatches 240×135, output 1920×1080.
-* `0x52101a15e1a0c5cc` — eleven SRVs, two UAVs, `cb1[131]`. Not TAA.
+* `0x52101a15e1a0c5cc` — `FSSDTemporalAccumulationCS` permutation #0 (see above). Eleven
+  SRVs, two UAVs, `cb1[131]`. Not TAA.
 
 **Bytecode evidence for the correction** (from the shipped DXBC, `cs_5_0`, `numthreads(8,8,1)`):
 
