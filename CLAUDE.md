@@ -300,20 +300,26 @@ pointers but packed handle-shaped values: a descriptor handle reaching vkd3d unc
 NGX the proxy and its descriptors are ReShade-synthetic; whatever path then carries them into
 vkd3d does not convert them, and vkd3d dereferences a bit-packed integer.
 
-**So the truth table in "The native-device rule has a trap" is wrong in its third row.** It
-predicted that native-device NGX with the ext hook installed would produce a silently wrong
-image. Measured, that combination produces a *correct* image — mean RGB identical to the control
-(`R=44 G=49 B=35`), no cast, no artifacts — while the proxy combination crashes. Keep the hook
-diagnostic, since knowing the hook's state is still worth logging, but **do not act on the
-prediction**: prefer the native device, and treat `NgxDevice` as the knob that settles it.
+**SUPERSEDED 2026-08-31, and the supersession is instructive.** The "correct image" measured
+for the native+patched row was an artifact: DLSS was pinned to a wrong pass AND its output was
+never being written (see below), so the screen simply showed the engine's own image. The truth
+table's third row IS broken as originally predicted — but the failure mode on vkd3d-proton 3.1
+is a loud rejection rather than a silent wrong texture: the mangled handle makes
+`NvAPI_D3D12_GetCudaMergedTextureSamplerObject` / `GetCudaIndependentDescriptorObject` fail
+with `nvapi status -5` on every evaluate (visible in our log via the NGX LoggingCallback),
+NGX reports evaluate success anyway, and the output resource stays untouched. Proven by
+`NgxDumpInputs=1`: changing colour/depth inputs, byte-identical all-zero 66 MB output across
+300 evaluates. `NgxPaint=1` (magenta clear of the captured `u0`) separately proved the output
+handle, the suppression and the downstream chain correct.
 
-**Still unproven, and it is the important part:** DLSS's output may not be reaching the screen at
-all. The pass it pinned to is `0xda289b0ddfa934c6`, which is neither of the TAA candidates
-measured at this resolution, so we may be replacing something that is not the temporal pass. An
-identical image is consistent with both "DLAA looks the same on a static scene" and "our output
-goes nowhere". The DLSS on-screen indicator
-(`DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024`) is the only thing that distinguishes
-them, and it needs a change to the game's Steam launch options.
+**Resolution: native device + `src/ext_unhook.{hpp,cpp}` (default ON, `ExtUnhook=0` opts out).**
+Capture the pristine slot pointers (7/8, and 14/15 for Ext2) at `init_device`, before the game's
+stack can have routed a query through ReShade's proxy; write them back immediately before NGX
+init, feature creation and every evaluate — one QueryInterface re-installs the patch at any
+time, so the repair is re-applied, never applied once. Safe in this process because the only
+caller of the CUDA entry points is `nvngx_dlss.dll` itself: Stray never calls them, DXVK-NVAPI
+only queries the interface. If capture finds the slots already ReShade-owned, the originals are
+unrecoverable and the repair disables itself loudly.
 
 ### The NgxEvaluate crash: what has been ruled OUT
 
@@ -434,11 +440,10 @@ startup-only check reports "safe" and is wrong, which is why the check is repeat
 run through `convert_to_original_cpu_descriptor_handle`, producing a garbage heap index, an
 out-of-bounds read, and a handle pointing anywhere — a wrong texture sampled with no error.
 
-**Consequence for §1: the native-device rule is no longer sufficient on its own.** The two
-self-consistent options are native-without-patch (not achievable here — the game installs it) and
-**proxy-with-patch**, which is what ReShade 6.8.0's hook is designed for: it converts correctly
-precisely because ReShade minted the handles. Revisit the §1 mandate against this measurement
-before enabling NGX.
+**Consequence for §1: the native-device rule is necessary but not sufficient.** Proxy-with-patch
+is not an option — measured, it crashes vkd3d on the synthetic packed handles that reach it
+unconverted through the non-hooked entry points. Native-with-repair is the working combination:
+`ext_unhook` restores the patched slots before every NGX call (see the resolution above).
 
 Full chain, prerequisites and diagnostics: `docs/RESEARCH.md` §1.
 
