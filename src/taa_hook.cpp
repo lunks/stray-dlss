@@ -47,10 +47,12 @@ bool g_ngx_dims_logged = false;
 // simply whatever it logged before dying — so the only way to localise it is to say what we are
 // about to do, every time, until we have seen it survive.
 std::atomic<int> g_ngx_trace_budget{ 24 };
+// Always takes at least one argument: MSVC does not support the GNU ##__VA_ARGS__ elision,
+// so a zero-argument variadic macro is a syntax error there.
 #define NGX_TRACE(fmt, ...) \
 	do { \
 		if (g_ngx_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) \
-			STRAY_LOG_INFO("  ngx-trace: " fmt, ##__VA_ARGS__); \
+			STRAY_LOG_INFO("  ngx-trace: " fmt, __VA_ARGS__); \
 	} while (0)
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
@@ -648,7 +650,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							// Our resolve just wrote the motion vectors as a UAV; NGX reads
 							// them as a shader resource. Without this the state is simply
 							// wrong, and vkd3d validates none of it. (CLAUDE.md §3)
-							NGX_TRACE("barrier mv -> SRV");
+							NGX_TRACE("%s", "barrier mv -> SRV");
 							mv::transition_output(native, /*to_shader_resource=*/true);
 
 							ngx::EvaluateInputs ei;
@@ -675,7 +677,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 							// Back to UAV for next frame's resolve.
 							mv::transition_output(native, /*to_shader_resource=*/false);
-							NGX_TRACE("barrier mv -> UAV done");
+							NGX_TRACE("%s", "barrier mv -> UAV done");
 							if (!g_ngx_logged_once)
 							{
 								g_ngx_logged_once = true;
@@ -719,9 +721,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// natively. Both faults were silent, and together they are the corruption.
 					if (g_restore_state)
 					{
-						NGX_TRACE("restore begin");
+						NGX_TRACE("%s", "restore begin");
 						restore_game_compute_state(cmd_list);
-						NGX_TRACE("restore done");
+						NGX_TRACE("%s", "restore done");
 						mark(6, "state-restored");
 					}
 				}
