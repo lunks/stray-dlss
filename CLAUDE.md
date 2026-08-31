@@ -84,6 +84,33 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### Candidate 0x8978e4e6431cacb3 is NOT the pass that drives the image (n=44)
+
+Measured with the alternating harness, `tools/measure-alternating.py`, 44 captures with a panning
+camera inside one session:
+
+```
+SUPPRESSED: n=21  mean=16464  sd=7810  median=12204  min=8138  max=36163
+normal    : n=23  mean=14831  sd=6545  median=12316  min=6451  max=30125
+```
+
+The means differ by 1633 against a standard error of the difference near 2183 (t ≈ 0.75), and
+the **medians are within 1%**. The mean gap is entirely a few outliers where the pan crossed
+bright detail. Suppressing this pass does not change the image.
+
+That matters because it was the strongest candidate: the only 1:1 pass with both the
+depth+stencil pair and full-resolution velocity, and the only one the strict matcher called
+"structure matches".
+
+**Know the test's power before trusting a negative.** With this spread it can only resolve a
+difference of roughly 2×SE ≈ 4400, about 27% of the mean. A subtle temporal difference would
+hide inside that. A sharper instrument would compare *consecutive* frames for temporal
+stability rather than absolute high-frequency energy — aliasing that shimmers frame to frame is
+what TAA removes, and that is a much larger signal than the absolute sharpness of any one frame.
+
+Remaining full-res-velocity candidates: `0xee4b6c0ca521851f`, `0xf102e72bdc0355be`,
+`0xd2b4d12546bf6dd5`, `0x52b3e5af4f54ff47`.
+
 ### How to test a temporal pass honestly (the method, after three false starts)
 
 Three things each defeated an earlier attempt, and all three must be handled together:
