@@ -980,6 +980,23 @@ pointer ReShade cannot be trusted for. Only liveness-checked view creation satis
 
 ---
 
+### The denoiser-suppression experiment: DLSS SR does NOT replace the SSD (measured 2026-08-31)
+
+Suppressing all nine cooked `FSSDTemporalAccumulationCS` permutations while DLSS SR ran,
+alternating every 900 frames within one gameplay session (The Slums, camera still after one
+pan, 32 captures classified by the ALT PHASE log):
+
+```
+SUPPRESSED: n=14  median=3599  (min 1078, max 6079)
+normal    : n=18  median=1051  (min  914, max 8942)
+```
+
+Median frame-to-frame shimmer is **3.4x higher with the denoiser off** — the suppressed
+group's MINIMUM sits at the normal group's median. DLSS SR's temporal accumulation does not
+absorb the screen-space denoiser's job; SSR/SSGI noise shimmers straight through. Consequence:
+"suppress the denoiser and let SR handle it" is dead, and DLSS Ray Reconstruction is the only
+candidate for replacing UE's denoiser — with a quantified 3.4x stability gap as its target.
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
@@ -1029,6 +1046,27 @@ wineserver down.
 existing options from `userdata/<id>/config/localconfig.vdf` first and merge** — Stray's
 `WINEDLLOVERRIDES="dxgi=n,b" %command% -dx12` is what loads ReShade; clobbering it silently
 removes the add-on.
+
+**ReShade config cannot deliver comma-separated values to an addon** (measured via the probe
+build): the ini parser stores `a,b,c` as a multi-element array and the addon-facing char getter
+returns ONLY element 0 while reporting the full value's size. Any list must go through a
+sidecar file (`stray-dlss-dryrun.txt`, `stray-dlss-hashes.txt`), never the ini. Related:
+killing the game and immediately rewriting the ini races ReShade's exit flush, which writes its
+loaded config back over fresh edits — always wait for the process to be fully gone (plus a few
+seconds) before touching ReShade.ini.
+
+**Loading screens are where the resolve path dies.** They produce structural TAA look-alikes
+over violently short-lived resources; one passed the liveness gate at capture and was destroyed
+before `CreateShaderResourceView` (the §5 vkCreateImageView crash — log truncates at "about to
+view velocity"). The resolve/evaluate machinery is therefore gated on `is_known_taa_hash` —
+unknown hashes never reach view creation.
+
+**`/tmp` on the box does not survive reboots** and it used to carry the launch tooling —
+`tools/launch-stray.sh` is now committed and must be re-staged (`scp` + `pct push`) after any
+box reboot, along with `measure.py` and the pad helper. When driving the menu by injected
+input, parse `/proc/bus/input/devices` handler tokens AFTER splitting on `=` — the raw line's
+first token is `Handlers=eventN`, which does not start with "event" (this exact bug produced
+"pad not found" against a present pad).
 
 **Box operational traps:** the games mount moved from `/mnt/GamesLinux` to
 `/run/media/deck/GamesLinux` between sessions — a path that worked yesterday can be an empty
