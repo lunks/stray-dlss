@@ -2,6 +2,7 @@
 
 #include "frame_state.hpp"
 #include "log.hpp"
+#include "input_dump.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_backend.hpp"
 
@@ -131,6 +132,9 @@ bool g_ngx_waiting_logged = false;
 // once the feature exists — so a single shared budget is spent long before the interesting part.
 // The trace therefore only opens after the first successful evaluate.
 std::atomic<bool> g_ngx_evaluated_once{ false };
+// Every evaluate attempt, independent of the named-pass tracing counters, so the input dump
+// fires even without NgxPassHash.
+std::atomic<std::uint64_t> g_evaluate_attempts{ 0 };
 std::atomic<int> g_ngx_trace_budget{ 40 };
 // Always takes at least one argument: MSVC does not support the GNU ##__VA_ARGS__ elision,
 // so a zero-argument variadic macro is a syntax error there.
@@ -1069,6 +1073,21 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									out_tex ? out_tex->width : 0, out_tex ? out_tex->height : 0,
 									out_tex ? static_cast<int>(out_tex->format) : -1);
 							}
+							const std::uint64_t eval_no =
+								g_evaluate_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+							if (input_dump::wants(eval_no))
+							{
+								// Both inputs sit in NON_PIXEL_SHADER_RESOURCE here — the
+								// engine transitioned them for the dispatch we are replacing.
+								input_dump::capture(reinterpret_cast<ID3D12Device *>(
+										device->get_native()), native, ei.color,
+									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "colour",
+									eval_no);
+								input_dump::capture(reinterpret_cast<ID3D12Device *>(
+										device->get_native()), native, ei.depth,
+									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "depth",
+									eval_no);
+							}
 							bool ok;
 							if (g_ngx_paint)
 							{
@@ -1101,6 +1120,13 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								suppress_engine_dispatch = true;
 							}
 							NGX_TRACE("evaluate returned %d", ok ? 1 : 0);
+							if (ok && input_dump::wants(eval_no))
+							{
+								// The output is in UAV state; NGX has just written it.
+								input_dump::capture(reinterpret_cast<ID3D12Device *>(
+										device->get_native()), native, ei.output,
+									D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "output", eval_no);
+							}
 
 							// Back to UAV for next frame's resolve.
 							mv::transition_output(native, /*to_shader_resource=*/false);

@@ -10,6 +10,7 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "frame_state.hpp"
+#include "input_dump.hpp"
 #include "pass_finder.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
@@ -259,6 +260,13 @@ void on_init_device(reshade::api::device *device)
 	if (ngx_force_reset)
 		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
 			"— the image will look aliased because nothing accumulates.");
+
+	bool dump_inputs = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDumpInputs", dump_inputs);
+	input_dump::set_enabled(dump_inputs);
+	if (dump_inputs)
+		STRAY_LOG_WARN("NgxDumpInputs is ON: the DLSS colour/depth inputs and output are dumped "
+			"to straydlss_*.bin at evaluates 600 and 900.");
 
 	bool ngx_paint = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPaint", ngx_paint);
@@ -516,6 +524,7 @@ void on_present(
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
+	input_dump::on_present();
 
 	// The pass finder's frame boundary. The presented back buffer is its fallback anchor
 	// when no tonemapper (3D LUT SRV) was seen this frame.
