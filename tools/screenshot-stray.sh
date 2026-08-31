@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Take a ReShade screenshot of the running game, and bring it back.
+#
+# This is the only way to SEE what the add-on produces without a human at the machine, and
+# seeing it is the only proof that matters: everything else we can measure says the pass runs,
+# not that the image is right.
+#
+# How it works (CLAUDE.md §2.11): ReShade's screenshot bind is KeyScreenshot=44, which is
+# VK_SNAPSHOT, which is Linux KEY_SYSRQ=99. Writing input_event structs straight to the
+# keyboard's /dev/input/eventN reaches input_inject_event() and every reader sees it — no
+# uinput, no ydotool, and nothing has the node EVIOCGRAB'd. ReShade then writes a PNG into the
+# game directory (SavePath=.\).
+set -euo pipefail
+
+HOST="${HOST:-root@192.168.0.210}"
+CT="${CT:-113}"
+GAME_DIR=/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64
+OUT="${1:-/tmp/stray-shot.png}"
+
+ssh -o ConnectTimeout=8 "$HOST" "pct exec $CT -- python3 - " <<'PY'
+import glob, os, struct, time
+
+GAME_DIR = "/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64"
+KEY_SYSRQ, EV_KEY, EV_SYN = 99, 0x01, 0x00
+
+def keyboard_node():
+    """The keyboard whose Handlers list includes `sysrq`.
+
+    That is precisely the node the kernel routes SysRq through, and it is the real keyboard
+    rather than the several other things that claim `kbd` — a Power Button, a PC Speaker and a
+    USB audio device all do, and injecting into those reaches nothing."""
+    name = None
+    for line in open("/proc/bus/input/devices"):
+        line = line.strip()
+        if line.startswith("N: Name="):
+            name = line.split("=", 1)[1].strip('"')
+        elif line.startswith("H: Handlers=") and "sysrq" in line:
+            for tok in line.split("=", 1)[1].split():
+                if tok.startswith("event"):
+                    return "/dev/input/" + tok, name
+    return None
+
+kb = keyboard_node()
+if not kb:
+    raise SystemExit("no sysrq-capable keyboard node found")
+dev, name = kb
+print(f"keyboard: {dev} ({name})")
+
+before = set(glob.glob(os.path.join(GAME_DIR, "*.png")))
+
+def emit(f, typ, code, val):
+    # struct input_event { struct timeval time; __u16 type, code; __s32 value; }
+    f.write(struct.pack("llHHi", 0, 0, typ, code, val))
+    f.flush()
+
+with open(dev, "wb") as f:
+    emit(f, EV_KEY, KEY_SYSRQ, 1)
+    emit(f, EV_SYN, 0, 0)
+    time.sleep(0.05)
+    emit(f, EV_KEY, KEY_SYSRQ, 0)
+    emit(f, EV_SYN, 0, 0)
+
+for _ in range(40):
+    time.sleep(0.5)
+    new = set(glob.glob(os.path.join(GAME_DIR, "*.png"))) - before
+    if new:
+        shot = max(new, key=os.path.getmtime)
+        print("SHOT:" + shot)
+        break
+else:
+    print("no new PNG appeared")
+PY
