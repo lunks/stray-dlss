@@ -5,6 +5,7 @@
 #include <d3d12.h>
 
 #include <cstdio>
+#include <vector>
 
 #if !defined(STRAY_DLSS_ENABLE_NGX)
 #define STRAY_DLSS_ENABLE_NGX 1
@@ -61,6 +62,43 @@ NVSDK_NGX_Handle *g_feature = nullptr;
 NVSDK_NGX_Parameter *g_feature_params = nullptr;
 FeatureDesc g_feature_desc;
 char g_last_error[256] = "";
+
+// Resources handed to NGX, kept alive until the GPU has certainly finished with them.
+//
+// NGX holds NO references to what we pass it — the manual says so, and it makes us responsible
+// (CLAUDE.md §5). EvaluateFeature only RECORDS work; the GPU runs it later. UE4 rotates and
+// frees these buffers constantly, so between recording and execution the game can drop the last
+// reference to the colour, depth or output texture and the resource dies underneath in-flight
+// work. That matches the observed failure exactly: our own cycle completes, the log stops
+// mid-frame, and the process dies with an access violation and no GPU fault at all.
+//
+// So take a reference for the duration and drop it a few frames later.
+constexpr std::size_t kKeepAliveFrames = 6;
+struct KeepAlive
+{
+	ID3D12Resource *resources[4] = {};
+	std::uint64_t frame = 0;
+};
+std::vector<KeepAlive> g_keep_alive;
+std::uint64_t g_eval_frame = 0;
+
+void release_keep_alive(bool all)
+{
+	for (auto it = g_keep_alive.begin(); it != g_keep_alive.end();)
+	{
+		if (all || it->frame + kKeepAliveFrames <= g_eval_frame)
+		{
+			for (ID3D12Resource *r : it->resources)
+				if (r != nullptr)
+					r->Release();
+			it = g_keep_alive.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
 
 void set_error(const char *what, NVSDK_NGX_Result result)
 {
@@ -195,6 +233,10 @@ const char *last_error() { return g_last_error; }
 
 void release_feature()
 {
+	// Everything we were holding for NGX goes first: after this the feature is gone and there
+	// is nothing left that could still be reading them.
+	release_keep_alive(/*all=*/true);
+
 	if (g_feature != nullptr)
 	{
 		NVSDK_NGX_D3D12_ReleaseFeature(g_feature);
@@ -320,6 +362,21 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 		set_error("EvaluateFeature", result);
 		return false;
 	}
+
+	// Hold the inputs and output alive past this frame. Evaluate only RECORDED the work.
+	KeepAlive ka;
+	ka.frame = g_eval_frame;
+	ka.resources[0] = in.color;
+	ka.resources[1] = in.depth;
+	ka.resources[2] = in.motion_vectors;
+	ka.resources[3] = in.output;
+	for (ID3D12Resource *r : ka.resources)
+		if (r != nullptr)
+			r->AddRef();
+	g_keep_alive.push_back(ka);
+
+	++g_eval_frame;
+	release_keep_alive(/*all=*/false);
 	return true;
 }
 
