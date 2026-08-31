@@ -86,7 +86,16 @@ def frame_difference(a, b):
     Absolute sharpness could not separate the groups because it is dominated by WHAT is on
     screen; this compares a frame only against itself a moment later, so the content cancels.
     """
-    out = subprocess.run(["magick", "compare", "-metric", "RMSE", a, b, "null:"],
+    # Crop away the animated CRT wall before comparing.
+    #
+    # Stray's starting apartment is full of screens that change every frame regardless of what
+    # the TAA does; they inflate the difference in BOTH groups equally and were holding the
+    # spread near 2000. CROP selects a region of floor and rug instead. Override with the CROP
+    # environment variable when the camera is somewhere else.
+    crop = os.environ.get("CROP", "1200x700+0+700")
+    out = subprocess.run(["magick", "compare", "-metric", "RMSE",
+                          "(", a, "-crop", crop, "+repage", ")",
+                          "(", b, "-crop", crop, "+repage", ")", "null:"],
                          capture_output=True, text=True)
     txt = (out.stderr or out.stdout).strip()
     m = re.search(r"\(([0-9.]+)\)", txt)

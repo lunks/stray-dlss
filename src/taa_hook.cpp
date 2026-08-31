@@ -566,7 +566,28 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				cand_out = &u;
 		}
 
-		if (cand_depth != nullptr && cand_velocity != nullptr && cand_out != nullptr)
+		const bool is_relaxed_candidate =
+			cand_depth != nullptr && cand_velocity != nullptr && cand_out != nullptr;
+
+		// Mode 3 suppresses EVERY pass with the TAA's essential shape — a depth SRV, a velocity
+		// SRV and an HDR colour UAV — not just the ones the strict §2.3 signature accepts.
+		//
+		// One run then answers whether the answer is in the candidate set at all. If the image
+		// still does not change, the TAA is not a compute dispatch of this shape and testing the
+		// candidates one by one would be wasted; the next question would be whether it is a
+		// draw, which we do not hook.
+		if (g_ngx_dry_run == 3 && is_relaxed_candidate)
+		{
+			if (!g_dry_run_hash_logged)
+			{
+				g_dry_run_hash_logged = true;
+				STRAY_LOG_WARN("DRY RUN (all candidates): suppressing every pass with a depth "
+					"SRV + velocity SRV + HDR colour UAV, writing nothing.");
+			}
+			return true;
+		}
+
+		if (is_relaxed_candidate)
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
 			if (!g_candidate_logged[hash])
