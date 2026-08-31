@@ -38,7 +38,9 @@ bool is_ready();
 // Records the resolve into the game's command list. The caller is responsible for restoring
 // whatever state it needs afterwards — this deliberately does not, because the NGX evaluation
 // that follows would clobber it again anyway.
-bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in);
+// `dispatch` false records every state change but skips the Dispatch itself, which separates
+// "our state changes break the game" from "our GPU work breaks the game" in one run.
+bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, bool dispatch);
 
 // R16G16_FLOAT at render resolution. Valid after a successful record().
 ID3D12Resource *output();
