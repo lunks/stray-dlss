@@ -40,6 +40,50 @@ def keyboard_node():
                     return "/dev/input/" + tok, name
     return None
 
+def pad_node():
+    """Steam Input re-emits the DualSense as "Microsoft X-Box 360 pad 0"; that node is what the
+    game reads, and its eventN is not stable (CLAUDE.md §2.11)."""
+    name = None
+    for line in open("/proc/bus/input/devices"):
+        line = line.strip()
+        if line.startswith("N: Name="):
+            name = line.split("=", 1)[1].strip('"')
+        elif line.startswith("H: Handlers=") and name == "Microsoft X-Box 360 pad 0":
+            for tok in line.split("=", 1)[1].split():
+                if tok.startswith("event"):
+                    return "/dev/input/" + tok
+    return None
+
+
+def pan_camera(seconds=1.2):
+    """Pan the camera with the right stick before the shot.
+
+    A STATIC scene hides everything temporal: with the camera still, TAA's history is already
+    converged, so suppressing the pass looks identical to leaving it in place. Any judgement
+    about a temporal pass has to be made while the image is moving.
+    """
+    import os
+    pad = pad_node()
+    if not pad:
+        print("no pad node; shot will be static")
+        return
+    EV_ABS, ABS_RX, EV_SYN = 0x03, 0x03, 0x00
+    with open(pad, "wb") as f:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            f.write(struct.pack("llHHi", 0, 0, EV_ABS, ABS_RX, 22000))
+            f.write(struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
+            f.flush()
+            time.sleep(0.05)
+        f.write(struct.pack("llHHi", 0, 0, EV_ABS, ABS_RX, 0))
+        f.write(struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
+        f.flush()
+    print(f"panned the camera for {seconds}s via {pad}")
+
+
+if os.environ.get("PAN", "1") == "1":
+    pan_camera()
+
 kb = keyboard_node()
 if not kb:
     raise SystemExit("no sysrq-capable keyboard node found")
