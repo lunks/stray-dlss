@@ -58,6 +58,7 @@ enum RrRefusalIndex
 	kRrResolveFailed = 6,
 	kRrCreateFailed = 7,
 	kRrEvaluateFailed = 8,
+	kRrGuidesStale = 9, // GBufferResolveAt=ssd: no guide record landed this frame
 };
 std::atomic<std::uint32_t> g_rr_refusals[kRrRefusalCount] = {};
 // Successful gbuffer_resolve records under RR — the guide-dump key. Keyed on RECORDS, not
@@ -256,27 +257,60 @@ const char *hook_format_name(TexFormat f)
 	return "?";
 }
 
-// The RR-first evaluate ([STRAYDLSS] NgxRR=2). Everything is fetched fresh per frame and
-// every missing precondition returns false so the caller falls back to the SR evaluate —
-// SR is the safety net EVERY frame, never just at startup. Log-once flags keep the paste
-// readable; the rr/fallback counters carry the rates.
-bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *native,
-                     const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
-                     const ue4::ViewParams &view)
-{
-	// One first-occurrence line per refusal reason, with specifics — plus the indexed
-	// counters, so the periodic line carries rates and the log carries the story.
-	static bool s_reason_logged[kRrRefusalCount] = {};
-	static bool s_rr_ok_logged = false;
-	const auto refuse = [](int reason) {
-		g_rr_refusals[reason].fetch_add(1, std::memory_order_relaxed);
-		const bool first = !s_reason_logged[reason];
-		s_reason_logged[reason] = true;
-		return first; // caller logs its specifics on the first occurrence only
-	};
+// ---- RR guide recording and the RR-first evaluate ([STRAYDLSS] NgxRR=2) ----
+//
+// The guide resolve and the DLSSD evaluate are two separately-placed halves. Measured
+// 2026-08-31 (guide dumps 600/900): at the TAA dispatch the identified A/B/C resources are
+// ALIVE — liveness passes, bind-age 0 — but their CONTENT is already recycled: GBufferA
+// read near-black (normals mean = normalized(-1,-1,-1)), ShadingModelID decoded 0, and the
+// unlit fallback covered ~95% of every guide. The pool reuses the targets' MEMORY within
+// the frame; the end-of-Render refcount release (RESEARCH-RR-GBUFFER.md §1.1) holds for
+// the resource OBJECT, not its content. So the resolve records at a point where content is
+// alive BY CONSTRUCTION: the first FSSDTemporalAccumulationCS dispatch of the frame, a
+// pass that READS the G-buffers as SRVs at that instant.
 
-	// The identification is re-captured EVERY frame (pointer rotation measured on 29 of 30
-	// stable frames) and served role-keyed from the freshest accepted candidate of any
+// [STRAYDLSS] GBufferResolveAt (set_gbuffer_resolve_at): true = record at the first SSD
+// temporal-accumulation dispatch each frame (the content-alive default under NgxRR=2);
+// false = record at the TAA hook, kept for A/B measurement of the content-death finding.
+std::atomic<bool> g_resolve_at_ssd{ true };
+
+// The handoff between the two halves, all under one mutex: which present-frame the guides
+// were recorded for, whether they currently sit in NON_PIXEL_SHADER_RESOURCE (the record
+// needs them back in UAV; the evaluate needs SRV), and the identification that fed them —
+// kept for the evaluate log line. Recording threads differ (the SSD and TAA dispatches can
+// be on different command lists), but the evaluate only proceeds after observing
+// g_guides_frame == this frame under the mutex, which orders the state transitions the
+// same way queue submission orders the GPU work.
+std::mutex g_rr_guides_mutex;
+std::uint64_t g_guides_frame = ~0ull;
+bool g_guides_in_srv = false;
+gbuffer_finder::Identification g_guides_id;
+
+// One first-occurrence line per refusal reason, with specifics — plus the indexed
+// counters, so the periodic line carries rates and the log carries the story.
+bool g_rr_reason_logged[kRrRefusalCount] = {};
+bool rr_refuse(int reason)
+{
+	g_rr_refusals[reason].fetch_add(1, std::memory_order_relaxed);
+	const bool first = !g_rr_reason_logged[reason];
+	g_rr_reason_logged[reason] = true;
+	return first; // the caller logs its specifics on the first occurrence only
+}
+
+// Defined below; the SSD trigger needs it before its definition point.
+bool read_view_cb(reshade::api::device *device, const reshade::api::buffer_range &cb,
+                  ue4::ViewParams &out);
+
+// Records the guide resolve onto `native` and leaves the four guides in
+// NON_PIXEL_SHADER_RESOURCE, reporting the identification that fed them. Shared by both
+// trigger points. Every failure path names its reason through rr_refuse and returns false
+// — the caller falls back to SR, never guesses.
+bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *native,
+                   std::uint32_t render_w, std::uint32_t render_h,
+                   const ue4::ViewParams &view, gbuffer_finder::Identification &out_id)
+{
+	// The identification is re-captured EVERY record (pointer rotation measured on 29 of
+	// 30 stable frames) and served role-keyed from the freshest accepted candidate of any
 	// accepted shape — the shape-locked rule starved RR to 0%. (gbuffer_finder.hpp)
 	gbuffer_finder::Identification id;
 	std::uint32_t stale_age = 0;
@@ -286,24 +320,24 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		break;
 	case gbuffer_finder::IdentRefusal::not_enabled:
 	case gbuffer_finder::IdentRefusal::not_armed:
-		if (refuse(kRrNotArmed))
+		if (rr_refuse(kRrNotArmed))
 			STRAY_LOG_INFO("RR: identification not ARMED yet (no candidate shape has held "
 				"30 frames); SR carries the frames. First occurrence only; the periodic "
 				"line carries the rate.");
 		return false;
 	case gbuffer_finder::IdentRefusal::no_candidate:
-		if (refuse(kRrNoCandidate))
+		if (rr_refuse(kRrNoCandidate))
 			STRAY_LOG_INFO("RR: armed but no accepted G-buffer bind recorded yet this "
 				"session; SR carries the frame. First occurrence only.");
 		return false;
 	case gbuffer_finder::IdentRefusal::stale_bind:
-		if (refuse(kRrStaleBind))
+		if (rr_refuse(kRrStaleBind))
 			STRAY_LOG_WARN("RR: freshest accepted G-buffer bind is %u presents old (max 2) "
 				"- the base pass stopped binding, or the finder's tap missed this frame. "
 				"SR carries the frame. First occurrence only.", stale_age);
 		return false;
 	case gbuffer_finder::IdentRefusal::roles_missing:
-		if (refuse(kRrRolesMissing))
+		if (rr_refuse(kRrRolesMissing))
 			STRAY_LOG_WARN("RR: the freshest candidate has an unknown A/B/C slot (licensee "
 				"format?) - refusing to guess. SR carries the frames. First occurrence "
 				"only.");
@@ -316,7 +350,7 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	if (!is_resource_live(id.gbuffer_a) || !is_resource_live(id.gbuffer_b) ||
 		!is_resource_live(id.gbuffer_c))
 	{
-		if (refuse(kRrLiveness))
+		if (rr_refuse(kRrLiveness))
 			STRAY_LOG_WARN("RR: a G-buffer resource died between bind and dispatch "
 				"(A=%p live=%d, B=%p live=%d, C=%p live=%d, bind age %u frames); SR "
 				"carries the frame. First occurrence only.",
@@ -333,11 +367,10 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	// row 8 turned out to be ClipToWorld — ue4_view.hpp) must actually hold a rotation
 	// before anything trusts them. A wrong matrix biases specular albedo silently — the
 	// §0.2 class of failure — so implausible rows mean SR, loudly, once. Every diagnostic
-	// line below carries the RR token: the previous version's value line started with bare
-	// spaces and a filtered log lost it, which cost the round-trip this comment memorialises.
+	// line carries the RR token: a values line without it was lost to a filtered log once.
 	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
 	{
-		if (refuse(kRrRowsImplausible))
+		if (rr_refuse(kRrRowsImplausible))
 		{
 			STRAY_LOG_ERROR("RR: View rows 12-15 (TranslatedWorldToView) do not hold a "
 				"rotation - SR carries the frames while this holds. All 16 floats follow.");
@@ -364,9 +397,9 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	}
 
 	auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
-	if (!gbr::initialise(native_device, ei.render_width, ei.render_height))
+	if (!gbr::initialise(native_device, render_w, render_h))
 	{
-		if (refuse(kRrResolveFailed))
+		if (rr_refuse(kRrResolveFailed))
 			STRAY_LOG_ERROR("RR: gbuffer_resolve initialise failed (%s); SR carries the "
 				"frames. First occurrence only.", gbr::last_error());
 		return false;
@@ -376,8 +409,8 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	gi.gbuffer_a = id.gbuffer_a;
 	gi.gbuffer_b = id.gbuffer_b;
 	gi.gbuffer_c = id.gbuffer_c;
-	gi.render_width = ei.render_width;
-	gi.render_height = ei.render_height;
+	gi.render_width = render_w;
+	gi.render_height = render_h;
 	gi.view_rect_min[0] = view.view_rect_min.x;
 	gi.view_rect_min[1] = view.view_rect_min.y;
 	// ViewToClipNoAA diagonal (row 32, measured): the jitter-free projection terms the
@@ -389,16 +422,32 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	// wrong NoV — which is why the extraction is a tested core helper, not inline math.
 	ue4::nov_rotation_rows(view.translated_world_to_view, gi.world_to_view);
 
+	// The guides must be in UAV state for the record. A frame whose evaluate never ran
+	// (SR fallback after a successful record) leaves them in SRV state; fix that here, on
+	// this list, before the dispatch that writes them.
+	{
+		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+		if (g_guides_in_srv)
+		{
+			gbr::transition_outputs(native, /*to_shader_resource=*/false);
+			g_guides_in_srv = false;
+		}
+	}
+
 	if (!gbr::record(native, gi, /*dispatch_mode=*/2))
 	{
-		if (refuse(kRrResolveFailed))
+		if (rr_refuse(kRrResolveFailed))
 			STRAY_LOG_ERROR("RR: gbuffer_resolve record failed (%s); SR carries the frames. "
 				"First occurrence only.", gbr::last_error());
 		return false;
 	}
 
-	// Guides were just written as UAVs; NGX reads them as shader resources.
+	// Written as UAVs; NGX (and the dump copies) read them as shader resources.
 	gbr::transition_outputs(native, /*to_shader_resource=*/true);
+	{
+		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+		g_guides_in_srv = true;
+	}
 
 	// The guide-dump channel keys on successful RESOLVE RECORDS, not the shared
 	// evaluate-attempt counter: a session where the RR create or evaluate fails still
@@ -407,15 +456,145 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	const std::uint64_t rr_rec_no = g_rr_records.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (input_dump::wants(rr_rec_no))
 	{
-		auto *dump_dev = reinterpret_cast<ID3D12Device *>(device->get_native());
-		input_dump::capture(dump_dev, native, gbr::normals_roughness(),
+		input_dump::capture(native_device, native, gbr::normals_roughness(),
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_normals", rr_rec_no);
-		input_dump::capture(dump_dev, native, gbr::roughness(),
+		input_dump::capture(native_device, native, gbr::roughness(),
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_roughness", rr_rec_no);
-		input_dump::capture(dump_dev, native, gbr::diffuse_albedo(),
+		input_dump::capture(native_device, native, gbr::diffuse_albedo(),
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_diffuse", rr_rec_no);
-		input_dump::capture(dump_dev, native, gbr::specular_albedo(),
+		input_dump::capture(native_device, native, gbr::specular_albedo(),
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_specular", rr_rec_no);
+	}
+
+	out_id = id;
+	return true;
+}
+
+// The SSD-dispatch trigger: called from intercept_dispatch for every large dispatch whose
+// hash is in the FSSDTemporalAccumulationCS family. That pass reads the G-buffers as SRVs,
+// so their CONTENT is alive at this instant by construction — the property the TAA-point
+// record measurably lacks. Records on the SSD pass's own command list, BEFORE its dispatch
+// proceeds (RR-0 never suppresses it); first sighting per frame only.
+//
+// RR-1 LOOKAHEAD (comment only): when the SSD family is suppressed via DryRunHash, the
+// suppression return in intercept_dispatch fires BEFORE this trigger is reached, so the
+// trigger disappears with the pass. The candidate replacements for that phase are (a) the
+// first dispatch after the last base-pass RT unbind (the finder already sees every RT
+// bind), or (b) the deferred-lighting pass's first draw — both sit between base-pass
+// completion and the pool's content reuse. Alternatively, hoist this call above the
+// dry-run suppression so a suppressed SSD dispatch still donates its bindings.
+void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint64_t hash)
+{
+	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 2 ||
+		!g_resolve_at_ssd.load(std::memory_order_relaxed))
+		return;
+	if (!is_ssd_temporal_hash(hash))
+		return;
+
+	// First sighting per frame only — the family dispatches several times (SSR/SSGI/AO
+	// instances), and one record per frame is both sufficient and cheapest.
+	const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+		if (g_guides_frame == frame)
+			return;
+	}
+
+	DispatchBindings b;
+	if (!resolve_compute_bindings(cmd_list, b))
+	{
+		if (rr_refuse(kRrResolveFailed))
+			STRAY_LOG_ERROR("RR: could not resolve the SSD dispatch's bindings for the View "
+				"CB; guides cannot record at the SSD trigger. First occurrence only.");
+		return;
+	}
+
+	// The View CB, exactly as the TAA path finds it: try every bound CB, keep the one
+	// that parses plausibly. The SSD pass carries the same View buffer.
+	reshade::api::device *device = cmd_list->get_device();
+	ue4::ViewParams view{};
+	bool view_ok = false;
+	for (const auto &cb : b.constant_buffers)
+	{
+		ue4::ViewParams candidate{};
+		if (read_view_cb(device, cb.second, candidate) && ue4::view_params_plausible(candidate))
+		{
+			view = candidate;
+			view_ok = true;
+			break;
+		}
+	}
+	if (!view_ok)
+	{
+		if (rr_refuse(kRrResolveFailed))
+			STRAY_LOG_ERROR("RR: no plausible View CB on the SSD dispatch; guides cannot "
+				"record at the SSD trigger. First occurrence only.");
+		return;
+	}
+
+	const float vw = view.view_size_and_inv_size.x;
+	const float vh = view.view_size_and_inv_size.y;
+	const auto render_w = static_cast<std::uint32_t>(vw);
+	const auto render_h = static_cast<std::uint32_t>(vh);
+
+	auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+	gbuffer_finder::Identification id;
+	if (!record_guides(device, native, render_w, render_h, view, id))
+		return; // the reason was counted and logged inside
+
+	{
+		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+		g_guides_frame = frame;
+		g_guides_id = id;
+	}
+
+	static std::atomic<int> s_trigger_logged{ 0 };
+	if (s_trigger_logged.fetch_add(1, std::memory_order_relaxed) == 0)
+		STRAY_LOG_INFO("RR: guide resolve recorded at the SSD trigger (hash=0x%016llx, "
+			"frame %llu, %ux%u) - the content-alive point; the TAA-hook evaluate consumes "
+			"these guides later this frame. First occurrence only.",
+			static_cast<unsigned long long>(hash),
+			static_cast<unsigned long long>(frame), render_w, render_h);
+}
+
+// The RR-first evaluate ([STRAYDLSS] NgxRR=2). Consumes the guides recorded at the SSD
+// trigger (or records them here under GBufferResolveAt=taa — the A/B mode that measures
+// the content-death finding), then evaluates DLSSD. Every missing precondition returns
+// false so the caller falls back to the SR evaluate — SR is the safety net EVERY frame,
+// never just at startup.
+bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *native,
+                     const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
+                     const ue4::ViewParams &view)
+{
+	static bool s_rr_ok_logged = false;
+
+	gbuffer_finder::Identification id;
+	if (g_resolve_at_ssd.load(std::memory_order_relaxed))
+	{
+		bool have_guides = false;
+		const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+			if (g_guides_frame == frame && g_guides_in_srv)
+			{
+				id = g_guides_id;
+				have_guides = true;
+			}
+		}
+		if (!have_guides)
+		{
+			if (rr_refuse(kRrGuidesStale))
+				STRAY_LOG_WARN("RR: no guide record this frame (no SSD temporal-accumulation "
+					"dispatch seen yet this frame, or its record refused - see any earlier "
+					"RR lines); SR carries the frame. First occurrence only. "
+					"GBufferResolveAt=taa restores the in-hook record for A/B.");
+			return false;
+		}
+	}
+	else
+	{
+		if (!record_guides(device, native, ei.render_width, ei.render_height, view, id))
+			return false; // the reason was counted and logged inside
 	}
 
 	bool ok = false;
@@ -423,7 +602,7 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	{
 		// ngx_backend logged the create failure (latched, once per size); the counter
 		// carries the per-frame rate.
-		refuse(kRrCreateFailed);
+		rr_refuse(kRrCreateFailed);
 	}
 	else
 	{
@@ -433,9 +612,10 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		er.specular_albedo = gbr::specular_albedo();
 		er.normals_roughness = gbr::normals_roughness();
 		er.roughness = gbr::roughness();
-		// WorldToView = rows 12-15 (mirror-verified, rotation-checked above); ViewToClip =
-		// ViewToClipNoAA rows 32-35 (measured) — jitter reaches NGX separately, so the
-		// unjittered projection is the consistent pairing. Both row-major, as stored.
+		// WorldToView = rows 12-15 (mirror-verified, rotation-checked at record time);
+		// ViewToClip = ViewToClipNoAA rows 32-35 (measured) — jitter reaches NGX
+		// separately, so the unjittered projection is the consistent pairing. Both
+		// row-major, as stored.
 		std::memcpy(er.world_to_view, view.translated_world_to_view.m,
 			sizeof(er.world_to_view));
 		std::memcpy(er.view_to_clip, view.view_to_clip_no_aa.m, sizeof(er.view_to_clip));
@@ -455,13 +635,14 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 			{
 				s_rr_ok_logged = true;
 				STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u with guides "
-					"(A=%p B=%p C=%p swapBC=%d shape=%s bind-age=%u). SR remains the "
-					"per-frame fallback.",
+					"(A=%p B=%p C=%p swapBC=%d shape=%s bind-age=%u resolve-at=%s). SR "
+					"remains the per-frame fallback.",
 					ei.render_width, ei.render_height, fd.output_width, fd.output_height,
 					reinterpret_cast<void *>(id.gbuffer_a),
 					reinterpret_cast<void *>(id.gbuffer_b),
 					reinterpret_cast<void *>(id.gbuffer_c), gbr::bc_swapped() ? 1 : 0,
-					id.velocity_in_set ? "with-velocity" : "velocity-free", id.age_frames);
+					id.velocity_in_set ? "with-velocity" : "velocity-free", id.age_frames,
+					g_resolve_at_ssd.load(std::memory_order_relaxed) ? "ssd" : "taa");
 			}
 			else if (shape != s_last_shape && s_shape_flips_logged < 4)
 			{
@@ -472,15 +653,19 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 			}
 			s_last_shape = shape;
 		}
-		else if (refuse(kRrEvaluateFailed))
+		else if (rr_refuse(kRrEvaluateFailed))
 		{
 			STRAY_LOG_ERROR("DLSS RR evaluate FAILED (%s); SR carries the frames. First "
 				"occurrence only.", ngx::last_error());
 		}
 	}
 
-	// Back to UAV for the next frame's resolve, evaluate or not.
+	// Back to UAV for the next record, evaluate or not.
 	gbr::transition_outputs(native, /*to_shader_resource=*/false);
+	{
+		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
+		g_guides_in_srv = false;
+	}
 	return ok;
 }
 
@@ -591,6 +776,10 @@ const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_rr(int mode) { g_ngx_rr_mode.store(mode, std::memory_order_relaxed); }
+void set_gbuffer_resolve_at(bool at_ssd)
+{
+	g_resolve_at_ssd.store(at_ssd, std::memory_order_relaxed);
+}
 void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 {
 	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
@@ -599,6 +788,7 @@ void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 const char *const kRrRefusalNames[kRrRefusalCount] = {
 	"not-armed", "no-candidate", "stale-bind", "roles-missing", "liveness",
 	"rows-implausible", "resolve-failed", "create-failed", "evaluate-failed",
+	"guides-stale",
 };
 void rr_refusal_counters(std::uint32_t out[kRrRefusalCount])
 {
@@ -768,6 +958,13 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			return false;
 		}
 	}
+
+	// The RR guide-resolve trigger ([STRAYDLSS] GBufferResolveAt=ssd): the first SSD
+	// temporal-accumulation dispatch of the frame reads the G-buffers as SRVs, so their
+	// content is alive HERE — record the guides on this list before the dispatch proceeds
+	// (RR-0 never suppresses it; the throttle above cannot eat this call because every RR
+	// session sets NgxEvaluate, which disables the throttle entirely).
+	maybe_record_guides_at_ssd(cmd_list, hash);
 
 	DispatchBindings b;
 	if (!resolve_compute_bindings(cmd_list, b))

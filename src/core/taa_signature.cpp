@@ -39,6 +39,37 @@ bool is_known_taa_hash(std::uint64_t hash)
 	return false;
 }
 
+// The baked FSSDTemporalAccumulationCS members (taa_signature.hpp) plus the runtime
+// extension, same lock-free pattern as the TAA extras below.
+constexpr std::uint64_t kKnownSsdHashes[] = {
+	kDenoiserLookalikeHash, // permutation #5 - measured dispatching in live gameplay
+	kSecondCandidateHash,   // permutation #0
+};
+std::uint64_t g_extra_ssd_hashes[64];
+std::atomic<std::size_t> g_extra_ssd_count{ 0 };
+
+bool is_ssd_temporal_hash(std::uint64_t hash)
+{
+	for (const std::uint64_t h : kKnownSsdHashes)
+		if (h == hash)
+			return true;
+	const std::size_t n = g_extra_ssd_count.load(std::memory_order_acquire);
+	for (std::size_t i = 0; i < n && i < 64; ++i)
+		if (g_extra_ssd_hashes[i] == hash)
+			return true;
+	return false;
+}
+
+void set_extra_ssd_hashes(const std::uint64_t *hashes, std::size_t count)
+{
+	if (count > 64)
+		count = 64;
+	g_extra_ssd_count.store(0, std::memory_order_release);
+	for (std::size_t i = 0; i < count; ++i)
+		g_extra_ssd_hashes[i] = hashes == nullptr ? 0 : hashes[i];
+	g_extra_ssd_count.store(count, std::memory_order_release);
+}
+
 void set_extra_taa_hashes(const std::uint64_t *hashes, std::size_t count)
 {
 	count = std::min<std::size_t>(count, 64);

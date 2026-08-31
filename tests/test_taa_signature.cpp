@@ -176,3 +176,25 @@ TEST_CASE("any cooked permutation earns hash_and_structural, not only 0x901e")
 	const auto r = stray_dlss::match_taa_dispatch(s, 1280, 720);
 	CHECK(r.verdict == stray_dlss::MatchVerdict::hash_and_structural);
 }
+
+TEST_CASE("the SSD temporal-accumulation family: baked members plus runtime extension")
+{
+	// The RR guide-resolve trigger fires on any family member (content-alive point). Two
+	// permutations are baked (the ones named offline; #5 is the measured live dispatcher);
+	// the rest arrive via stray-dlss-ssd-hashes.txt through set_extra_ssd_hashes.
+	CHECK(stray_dlss::is_ssd_temporal_hash(stray_dlss::kDenoiserLookalikeHash));
+	CHECK(stray_dlss::is_ssd_temporal_hash(stray_dlss::kSecondCandidateHash));
+	// TAA permutations are NOT SSD members - the families must never blur together.
+	CHECK(!stray_dlss::is_ssd_temporal_hash(stray_dlss::kTaaMainHash));
+	CHECK(!stray_dlss::is_ssd_temporal_hash(0));
+
+	const std::uint64_t extras[2] = { 0x1111222233334444ull, 0x5555666677778888ull };
+	stray_dlss::set_extra_ssd_hashes(extras, 2);
+	CHECK(stray_dlss::is_ssd_temporal_hash(0x1111222233334444ull));
+	CHECK(stray_dlss::is_ssd_temporal_hash(0x5555666677778888ull));
+	CHECK(stray_dlss::is_ssd_temporal_hash(stray_dlss::kDenoiserLookalikeHash)); // baked survive
+
+	// A reload replaces the extra set entirely.
+	stray_dlss::set_extra_ssd_hashes(nullptr, 0);
+	CHECK(!stray_dlss::is_ssd_temporal_hash(0x1111222233334444ull));
+}

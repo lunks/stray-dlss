@@ -64,9 +64,15 @@ void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks);
 // WHY the fallbacks happened, per reason — the starvation run (2026-08-31, 0% RR with a
 // reasonless log) proved totals alone cost a whole round-trip. Indexed; order matches
 // kRrRefusalNames. Each reason also logs a first-occurrence line with specifics.
-constexpr int kRrRefusalCount = 9;
+constexpr int kRrRefusalCount = 10;
 extern const char *const kRrRefusalNames[kRrRefusalCount];
 void rr_refusal_counters(std::uint32_t out[kRrRefusalCount]);
+
+// [STRAYDLSS] GBufferResolveAt: true = "ssd" (record the guide resolve at the first SSD
+// temporal-accumulation dispatch each frame — the content-alive point, the default under
+// NgxRR=2), false = "taa" (record at the TAA hook; kept for A/B measurement of the
+// measured content-death-at-TAA finding).
+void set_gbuffer_resolve_at(bool at_ssd);
 
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the

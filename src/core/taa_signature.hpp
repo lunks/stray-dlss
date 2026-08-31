@@ -140,6 +140,21 @@ constexpr std::uint64_t kDenoiserLookalikeHash = 0x1708ec956099e259ull;
 // cooked permutations). Eleven SRVs, two UAVs, cb1[131].
 constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull;
 
+// True when `hash` is a known FSSDTemporalAccumulationCS permutation — the SSD
+// temporal-accumulation family whose dispatches READ the G-buffers as SRVs, which makes
+// the first one each frame the content-alive trigger point for the RR guide resolve
+// (measured 2026-08-31: at the TAA dispatch the G-buffer OBJECTS are alive but their
+// CONTENT is already recycled — near-black, unlit fallback over ~95% of the frame).
+//
+// Nine permutations are cooked (the family was suppressed wholesale in the 3.4x
+// denoiser-suppression experiment via the operator's dry-run file, whose list was never
+// committed); the TWO named offline are baked here — permutation #5 is the one measured
+// dispatching steadily in live gameplay, so the trigger works with the baked set — and
+// set_extra_ssd_hashes extends the family at runtime from stray-dlss-ssd-hashes.txt,
+// exactly like the TAA override, so the deploy tooling can supply all nine, no rebuild.
+bool is_ssd_temporal_hash(std::uint64_t hash);
+void set_extra_ssd_hashes(const std::uint64_t *hashes, std::size_t count);
+
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)
 constexpr std::uint32_t kTaaTileSize = 8;
 

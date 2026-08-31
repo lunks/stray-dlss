@@ -263,6 +263,22 @@ void on_init_device(reshade::api::device *device)
 			"the G-buffer identification is stable; SR is the per-frame fallback. Grep for "
 			"'DLSS RR' and 'RR:' lines.");
 
+	// [STRAYDLSS] GBufferResolveAt: "ssd" (default) records the guide resolve at the first
+	// SSD temporal-accumulation dispatch each frame — the content-alive point (measured:
+	// at the TAA hook the G-buffer objects are alive but their CONTENT is recycled);
+	// "taa" keeps the old in-hook record for A/B measurement.
+	char resolve_at[16] = "ssd";
+	size_t resolve_at_size = sizeof(resolve_at);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferResolveAt", resolve_at,
+		&resolve_at_size);
+	const bool resolve_at_ssd = std::strcmp(resolve_at, "taa") != 0;
+	taa_hook::set_gbuffer_resolve_at(resolve_at_ssd);
+	if (ngx_rr == 2)
+		STRAY_LOG_INFO("RR guide resolve records at the %s trigger ([STRAYDLSS] "
+			"GBufferResolveAt=%s).",
+			resolve_at_ssd ? "SSD-dispatch (content-alive)" : "TAA-hook (A/B mode)",
+			resolve_at_ssd ? "ssd" : "taa");
+
 	// [STRAYDLSS] GBufferSwapBC: the B/C content-check flip (gbuffer_resolve.hpp). The B/C
 	// slot order is unverified by content until the guide dump says otherwise; this flips
 	// which identified resource feeds which role, no rebuild.
@@ -899,6 +915,38 @@ void load_hash_override_file()
 	set_extra_taa_hashes(hashes, n);
 	g_extra_hashes_loaded = static_cast<int>(n);
 	STRAY_LOG_INFO("stray-dlss-hashes.txt: %zu extra TAA permutation hashes loaded.", n);
+
+	// stray-dlss-ssd-hashes.txt: the FSSDTemporalAccumulationCS family beyond the two
+	// baked members (core/taa_signature.hpp) — the RR guide-resolve trigger fires on any
+	// member. The full nine live in the deploy tooling's list (the same list the 3.4x
+	// suppression experiment used); one hex hash per line, # comments.
+	std::FILE *sf = nullptr;
+	fopen_s(&sf, "stray-dlss-ssd-hashes.txt", "r");
+	if (sf != nullptr)
+	{
+		std::uint64_t ssd_hashes[64];
+		std::size_t sn = 0;
+		char sline[128];
+		while (sn < 64 && std::fgets(sline, sizeof(sline), sf) != nullptr)
+		{
+			const char *q = sline;
+			while (*q == ' ' || *q == '\t')
+				++q;
+			if (*q == '#' || *q == '\n' || *q == 0)
+				continue;
+			const std::uint64_t h = std::strtoull(q, nullptr, 16);
+			if (h != 0)
+				ssd_hashes[sn++] = h;
+		}
+		std::fclose(sf);
+		set_extra_ssd_hashes(ssd_hashes, sn);
+		STRAY_LOG_INFO("stray-dlss-ssd-hashes.txt: %zu extra SSD family hashes loaded "
+			"(RR guide trigger).", sn);
+	}
+	else
+	{
+		set_extra_ssd_hashes(nullptr, 0);
+	}
 }
 
 void draw_status(reshade::api::effect_runtime *runtime)
