@@ -572,12 +572,23 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						// history instead of the scene colour produces a plausible-looking image
 						// that never converges — the worst kind of bug here, because it looks
 						// like it works.
+						// A candidate must be a real 2D colour texture of at least the render
+						// rect. NGX rejects anything else outright — "input Color parameter
+						// needs to be Tex2D resource" — and the slots can legitimately hold a
+						// buffer, or the 1x1 BlackDummy UE4 substitutes on a camera cut.
+						// describe() records width/height as 0 for a buffer, so this excludes
+						// those too.
+						const auto colour_candidate = [&](const BoundTexture &t) {
+							return is_resource_live(t.resource) && t.width >= render_w &&
+								t.height >= render_h && t.width > 0 && t.height > 0;
+						};
+
 						std::uint64_t slot_a = 0, slot_b = 0;
 						for (const auto &t : b.srvs)
 						{
-							if (t.slot == m.colour_srv_a && is_resource_live(t.resource))
+							if (t.slot == m.colour_srv_a && colour_candidate(t))
 								slot_a = t.resource;
-							else if (t.slot == m.colour_srv_b && is_resource_live(t.resource))
+							else if (t.slot == m.colour_srv_b && colour_candidate(t))
 								slot_b = t.resource;
 						}
 
@@ -612,7 +623,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						}
 						else
 						{
-							colour_reason = "no live colour slot";
+							colour_reason = "no colour slot is a Tex2D of at least the render rect";
 						}
 
 						ID3D12Resource *colour =
