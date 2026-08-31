@@ -26,6 +26,7 @@ std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     
 bool g_resolve_ran = false;
 bool g_resolve_failed_logged = false;
 bool g_stale_resource_logged = false;
+bool g_render_size_logged = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
@@ -468,13 +469,39 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
 			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
 
-			if (mv::initialise(native_device, m.render_width, m.render_height))
+			// The RENDER rect comes from the View constant buffer, not from a texture extent.
+			//
+			// DispatchMatch::render_width is the DEPTH TEXTURE's width, and UE4 allocates depth
+			// and velocity at the full scene-buffer extent, not the view size (CLAUDE.md §2.5).
+			// At 50% screen percentage that is 2560x1440 where the render rect is 1280x720 — so
+			// using it allocated four times the output we need and, worse, handed the shader a
+			// RenderSize that makes every motion vector wrong. View.ViewSizeAndInvSize (row 130)
+			// is the authoritative answer and we already parse it.
+			std::uint32_t render_w = m.render_width;
+			std::uint32_t render_h = m.render_height;
+			const float vw = view.view_size_and_inv_size.x;
+			const float vh = view.view_size_and_inv_size.y;
+			if (vw >= 1.0f && vh >= 1.0f && vw <= static_cast<float>(m.render_width) &&
+				vh <= static_cast<float>(m.render_height))
+			{
+				render_w = static_cast<std::uint32_t>(vw);
+				render_h = static_cast<std::uint32_t>(vh);
+			}
+			if (!g_render_size_logged)
+			{
+				g_render_size_logged = true;
+				STRAY_LOG_INFO("Render rect %ux%u from View.ViewSizeAndInvSize; depth/velocity "
+					"are %ux%u at the scene-buffer extent.", render_w, render_h,
+					m.render_width, m.render_height);
+			}
+
+			if (mv::initialise(native_device, render_w, render_h))
 			{
 				mv::ResolveInputs inputs;
 				inputs.depth_resource = depth_resource;
 				inputs.velocity_resource = velocity_resource;
-				inputs.render_width = m.render_width;
-				inputs.render_height = m.render_height;
+				inputs.render_width = render_w;
+				inputs.render_height = render_h;
 				inputs.view = &view;
 
 				mark(3, "mv-initialised");
@@ -489,7 +516,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					{
 						g_resolve_ran = true;
 						STRAY_LOG_INFO("MV resolve ran: %ux%u R16G16_FLOAT from depth=t%u "
-							"velocity=t%u", m.render_width, m.render_height,
+							"velocity=t%u", render_w, render_h,
 							m.depth_srv, m.velocity_srv);
 					}
 
