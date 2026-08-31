@@ -559,6 +559,30 @@ Hard constraints:
 
 The full detail is in `docs/RESEARCH.md`. These are the things that bite.
 
+### The screenshot channel is the only judge of the image
+
+Everything else we measure says the pass *runs*; only a picture says it is *right*, and a single
+picture is not enough. `tools/screenshot-stray.sh` injects `KEY_SYSRQ` on the keyboard node
+whose `Handlers` include **`sysrq`** — a Power Button, a PC Speaker and a USB audio device all
+advertise `kbd` and injecting into those reaches nothing — and ReShade writes a PNG into the
+game directory.
+
+**Always take a control.** Measured 2026-08-31, strongly-cyan pixels in the scene's dark left
+third (`magick … -crop 900x1440+0+0 -fx "(g>0.6 && b>0.6 && r<0.35)"`):
+
+| Frame | Mode | cyan px |
+|---|---|---|
+| control | `MvDispatch=0` | **48** |
+| A | `MvDispatch=2` | 248 |
+| B | `MvDispatch=2` | 1810 |
+| C | `MvDispatch=2` | 6054 |
+
+**`MvDispatch=2` still corrupts the image** — small cyan blocks that move between frames, 5× to
+126× the control. The first mode-2 screenshot looked clean and led to a premature "the image is
+correct"; it was one frame near the bottom of that range, with nothing to compare against. One
+frame proves nothing: the CRT wall in that room animates, so a whole-frame pixel count is
+dominated by legitimate content. Crop to a region the control leaves dark, and compare.
+
 ### Two descriptor hazards that cost a day, both measured
 
 **1. Never `CopyDescriptorsSimple` out of the game's bound heap.** UE4 binds a shader-visible
