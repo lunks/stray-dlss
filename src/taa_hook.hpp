@@ -61,7 +61,8 @@ void set_ngx_dry_run(int mode);
 
 // Suppress exactly one named pass and write nothing, regardless of the matcher's verdict. The
 // pass that drives the picture is the one whose suppression changes the image.
-void set_dry_run_hash(std::uint64_t hash);
+// Comma-list capable: suppress every named pass (max 16). Empty count disables.
+void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count);
 
 // Name the pass DLSS replaces, overriding the history-round-trip heuristic — which is
 // necessary but not sufficient, since several passes bind their own previous output.

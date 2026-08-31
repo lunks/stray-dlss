@@ -51,12 +51,23 @@ bool g_ngx_evaluate = false;
 // leaves the image unchanged, the matcher never sees the pass that draws the picture, and
 // bisecting candidates one at a time would be wasted effort.
 int g_ngx_dry_run = 0;
-// [STRAYDLSS] DryRunHash=0x... — suppress exactly ONE named pass and write nothing.
+// [STRAYDLSS] DryRunHash=0x...[,0x...] — suppress the named passes and write nothing.
 //
 // This is how a candidate is tested: the pass that drives the picture is the one whose
 // suppression CHANGES the image. Independent of the matcher, so a pass the strict signature
-// rejects can still be tested.
-std::uint64_t g_dry_run_hash = 0;
+// rejects can still be tested. A LIST suppresses a whole permutation family in one session —
+// e.g. all nine cooked FSSDTemporalAccumulationCS permutations for the denoiser experiment,
+// which stays valid across resolution changes.
+std::uint64_t g_dry_run_hashes[16];
+std::size_t g_dry_run_hash_count = 0;
+
+bool is_dry_run_hash(std::uint64_t hash)
+{
+	for (std::size_t i = 0; i < g_dry_run_hash_count; ++i)
+		if (g_dry_run_hashes[i] == hash)
+			return true;
+	return false;
+}
 // [STRAYDLSS] NgxPassHash=0x... — the pass DLSS replaces, named explicitly.
 //
 // Preferred over the history-round-trip heuristic, which is necessary but not sufficient:
@@ -118,7 +129,6 @@ std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
-bool g_dry_run_hash_logged = false;
 bool g_dry_run_all_logged = false;
 bool g_dry_run_mode2_logged = false;
 bool g_ngx_waiting_logged = false;
@@ -326,7 +336,12 @@ const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
-void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
+void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count)
+{
+	g_dry_run_hash_count = count < 16 ? count : 16;
+	for (std::size_t i = 0; i < g_dry_run_hash_count; ++i)
+		g_dry_run_hashes[i] = hashes[i];
+}
 void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
 void set_ngx_paint(bool enabled) { g_ngx_paint = enabled; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
@@ -450,14 +465,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// two frames and ran normally for the rest of the session. The test looked like it ran
 		// and measured nothing.
 		{
-			if (g_dry_run_hash != 0 && hash == g_dry_run_hash && dry_run_phase_active())
+			if (is_dry_run_hash(hash) && dry_run_phase_active())
 			{
-				if (!g_dry_run_hash_logged)
-				{
-					g_dry_run_hash_logged = true;
+				static std::atomic<int> s_logged{ 0 };
+				if (s_logged.fetch_add(1, std::memory_order_relaxed) < 16)
 					STRAY_LOG_WARN("DRY RUN (hash): suppressing 0x%016llx, writing nothing.",
 						static_cast<unsigned long long>(hash));
-				}
 				return true;
 			}
 		}
@@ -475,7 +488,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// silently truncated a dry run once; here it let the named pass reach phase B exactly
 		// three times out of 3558 dispatches, so DLSS could never evaluate. Disable it whenever
 		// anything downstream depends on seeing the pass.
-		const bool dry_running = g_dry_run_hash != 0 || g_ngx_dry_run != 0 ||
+		const bool dry_running = g_dry_run_hash_count != 0 || g_ngx_dry_run != 0 ||
 			g_ngx_pass_override != 0 || g_ngx_evaluate;
 		if (!dry_running && g_report_count[hash] >= 2 && !is_known_taa_hash(hash))
 		{

@@ -247,11 +247,30 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
 	taa_hook::set_ngx_dry_run(ngx_dry_run);
 
-	char dry_hash[32] = "";
+	char dry_hash[384] = "";
 	size_t dry_hash_size = sizeof(dry_hash);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
-	const std::uint64_t dry_hash_value = std::strtoull(dry_hash, nullptr, 0);
-	taa_hook::set_dry_run_hash(dry_hash_value);
+	std::uint64_t dry_hashes[16];
+	std::size_t dry_hash_count = 0;
+	std::uint64_t dry_hash_value = 0; // first entry, for the existing log line
+	for (const char *q = dry_hash; dry_hash_count < 16 && *q != 0;)
+	{
+		char *end = nullptr;
+		const std::uint64_t h = std::strtoull(q, &end, 0);
+		if (end == q)
+			break;
+		if (h != 0)
+		{
+			if (dry_hash_count == 0)
+				dry_hash_value = h;
+			dry_hashes[dry_hash_count++] = h;
+		}
+		q = (*end == ',') ? end + 1 : end;
+	}
+	taa_hook::set_dry_run_hashes(dry_hashes, dry_hash_count);
+	if (dry_hash_count > 1)
+		STRAY_LOG_WARN("DryRunHash: %zu passes will be suppressed (comma list).",
+			dry_hash_count);
 
 	char ngx_pass[32] = "";
 	size_t ngx_pass_size = sizeof(ngx_pass);
