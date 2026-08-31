@@ -10,6 +10,7 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "frame_state.hpp"
+#include "pass_finder.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
 
@@ -323,6 +324,7 @@ void on_reset_command_list(reshade::api::command_list *cmd_list)
 {
 	reset_command_list_state(cmd_list);
 	taa_hook::forget_command_list(cmd_list);
+	pass_finder::forget_command_list(cmd_list);
 }
 
 void on_push_constants(
@@ -383,13 +385,19 @@ void on_init_pipeline(
 		}
 
 		if (!is_compute)
-			continue; // the census counts PS too, but only CS is hashed for identification
+		{
+			// The census counts PS too, but only CS is hashed for identification. The pass
+			// finder additionally attributes draws by pixel-shader hash.
+			pass_finder::note_pipeline(pipeline.handle, hash, /*is_compute=*/false);
+			continue;
+		}
 
 		{
 			std::lock_guard<std::mutex> lock(g_state.mutex);
 			g_state.compute_pipeline_hashes[pipeline.handle] = hash;
 		}
 		g_state.compute_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
+		pass_finder::note_pipeline(pipeline.handle, hash, /*is_compute=*/true);
 
 		// Getting the real bytecode off the user's machine settles the binding layout
 		// offline, which is worth far more than any inference we could make here.
@@ -423,6 +431,7 @@ void on_destroy_pipeline(reshade::api::device *device, reshade::api::pipeline pi
 	(void)device;
 	// ID3D12PipelineState pointers get recycled, so eviction is not optional.
 	taa_hook::forget_pipeline(pipeline.handle);
+	pass_finder::forget_pipeline(pipeline.handle);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	g_state.compute_pipeline_hashes.erase(pipeline.handle);
 }
@@ -439,6 +448,7 @@ void on_bind_pipeline(
 
 	// Remember the pipeline per command list so a dispatch can be attributed to a hash.
 	taa_hook::set_bound_pipeline(cmd_list, pipeline.handle);
+	pass_finder::note_bind_pipeline(cmd_list, pipeline.handle);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	if (g_state.compute_pipeline_hashes.count(pipeline.handle) != 0)
 		g_state.bound_compute_pipeline[cmd_list] = pipeline.handle;
@@ -461,6 +471,10 @@ bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, u
 
 	if (taa_hook::intercept_dispatch(cmd_list, x, y, z))
 		return true;
+
+	// Strictly AFTER the intercept decision: a suppressed dispatch never executes, and
+	// recording one would enter a phantom writer into the pass finder's last-writer table.
+	pass_finder::note_dispatch(cmd_list, x, y, z);
 
 	if (shader_dump::enabled())
 	{
@@ -492,7 +506,6 @@ void on_present(
 	const reshade::api::rect *dirty_rects)
 {
 	(void)queue;
-	(void)swapchain;
 	(void)source_rect;
 	(void)dest_rect;
 	(void)dirty_rect_count;
@@ -503,6 +516,12 @@ void on_present(
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
+
+	// The pass finder's frame boundary. The presented back buffer is its fallback anchor
+	// when no tonemapper (3D LUT SRV) was seen this frame.
+	if (pass_finder::enabled())
+		pass_finder::on_present(frame, swapchain != nullptr
+			? swapchain->get_current_back_buffer() : reshade::api::resource{ 0 });
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every 30 frames; cheap and always current.
@@ -725,12 +744,108 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 		g_state.taa_pipelines_seen.load());
 }
 
+// ---- pass-finder event handlers ----
+//
+// Registered only when [STRAYDLSS] PassFinder=1: every extra event ReShade dispatches costs
+// a call per operation even when the handler early-outs, and the finder is a diagnostic.
+// All of the skip-capable ones return false — the finder observes, never suppresses.
+
+void on_pf_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
+	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
+{
+	pass_finder::note_render_targets(cmd_list, count, rtvs, dsv);
+}
+
+bool on_pf_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t count,
+	const reshade::api::render_pass_render_target_desc *rts,
+	const reshade::api::render_pass_depth_stencil_desc *ds,
+	reshade::api::render_pass_flags flags)
+{
+	(void)flags;
+	// D3D12 allows at most 8 simultaneous render targets, so the fixed array cannot clip.
+	reshade::api::resource_view views[8] = {};
+	const uint32_t n = count < 8 ? count : 8;
+	for (uint32_t i = 0; i < n; ++i)
+		views[i] = rts[i].view;
+	pass_finder::note_render_targets(cmd_list, n, views,
+		ds != nullptr ? ds->view : reshade::api::resource_view{ 0 });
+	return false;
+}
+
+bool on_pf_draw(reshade::api::command_list *cmd_list, uint32_t vertex_count,
+	uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
+{
+	(void)instance_count;
+	(void)first_vertex;
+	(void)first_instance;
+	pass_finder::note_draw(cmd_list, vertex_count);
+	return false;
+}
+
+bool on_pf_draw_indexed(reshade::api::command_list *cmd_list, uint32_t index_count,
+	uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+{
+	(void)instance_count;
+	(void)first_index;
+	(void)vertex_offset;
+	(void)first_instance;
+	pass_finder::note_draw(cmd_list, index_count);
+	return false;
+}
+
+bool on_pf_copy_resource(reshade::api::command_list *cmd_list,
+	reshade::api::resource source, reshade::api::resource dest)
+{
+	pass_finder::note_copy(cmd_list, source, dest);
+	return false;
+}
+
+bool on_pf_copy_texture_region(reshade::api::command_list *cmd_list,
+	reshade::api::resource source, uint32_t source_subresource,
+	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
+	uint32_t dest_subresource, const reshade::api::subresource_box *dest_box,
+	reshade::api::filter_mode filter)
+{
+	(void)source_subresource;
+	(void)source_box;
+	(void)dest_subresource;
+	(void)dest_box;
+	(void)filter;
+	pass_finder::note_copy(cmd_list, source, dest);
+	return false;
+}
+
+bool on_pf_resolve_texture_region(reshade::api::command_list *cmd_list,
+	reshade::api::resource source, uint32_t source_subresource,
+	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
+	uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z,
+	reshade::api::format format)
+{
+	(void)source_subresource;
+	(void)source_box;
+	(void)dest_subresource;
+	(void)dest_x;
+	(void)dest_y;
+	(void)dest_z;
+	(void)format;
+	pass_finder::note_copy(cmd_list, source, dest);
+	return false;
+}
+
+void on_pf_execute_command_list(reshade::api::command_queue *queue,
+	reshade::api::command_list *cmd_list)
+{
+	(void)queue;
+	pass_finder::note_execute(cmd_list);
+}
+
 // Registering the pipeline events is not free: ReShade responds by routing every PSO creation
 // through ID3D12Device2::CreatePipelineState and dropping the cached-PSO blob. Under
 // vkd3d-proton that means every shader recompiles on each launch, which for a UE4 title is a
 // very long first load. Worth it while we need bytecode; wasteful otherwise, so it is a
 // switch. (docs/RESEARCH.md §2.5)
 bool g_pipeline_events_registered = false;
+bool g_pass_finder_events_registered = false;
 
 void register_events()
 {
@@ -753,7 +868,16 @@ void register_events()
 
 	bool hash_shaders = true;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "HashShaders", hash_shaders);
-	g_pipeline_events_registered = hash_shaders || shader_dump::enabled();
+
+	// [STRAYDLSS] PassFinder, default OFF: dataflow identification of the TAA pass — the
+	// bounded walk backwards from the tonemapper (core/pass_walk.hpp), proven in CI and here
+	// only LOGGING its verdict against the live game. It attributes events by shader hash,
+	// so enabling it forces the pipeline events (and their PSO-cache cost) on.
+	bool pass_finder_enabled = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "PassFinder", pass_finder_enabled);
+	pass_finder::set_enabled(pass_finder_enabled);
+
+	g_pipeline_events_registered = hash_shaders || shader_dump::enabled() || pass_finder_enabled;
 
 	if (g_pipeline_events_registered)
 	{
@@ -776,6 +900,22 @@ void register_events()
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 
+	if (pass_finder_enabled)
+	{
+		g_pass_finder_events_registered = true;
+		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+			on_pf_bind_render_targets);
+		reshade::register_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);
+		reshade::register_event<reshade::addon_event::draw>(on_pf_draw);
+		reshade::register_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
+		reshade::register_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
+		reshade::register_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
+		reshade::register_event<reshade::addon_event::resolve_texture_region>(
+			on_pf_resolve_texture_region);
+		reshade::register_event<reshade::addon_event::execute_command_list>(
+			on_pf_execute_command_list);
+	}
+
 	reshade::register_overlay(nullptr, draw_status); // settings page under our add-on entry
 	reshade::register_overlay("OSD", draw_osd);      // always-visible one-liner
 }
@@ -784,6 +924,21 @@ void unregister_events()
 {
 	reshade::unregister_overlay("OSD", draw_osd);
 	reshade::unregister_overlay(nullptr, draw_status);
+
+	if (g_pass_finder_events_registered)
+	{
+		reshade::unregister_event<reshade::addon_event::execute_command_list>(
+			on_pf_execute_command_list);
+		reshade::unregister_event<reshade::addon_event::resolve_texture_region>(
+			on_pf_resolve_texture_region);
+		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
+		reshade::unregister_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
+		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
+		reshade::unregister_event<reshade::addon_event::draw>(on_pf_draw);
+		reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);
+		reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+			on_pf_bind_render_targets);
+	}
 
 	reshade::unregister_event<reshade::addon_event::present>(on_present);
 	reshade::unregister_event<reshade::addon_event::dispatch>(on_dispatch);

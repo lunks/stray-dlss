@@ -48,6 +48,11 @@ struct BoundTexture
 	// safe way to read the resource: it needs no resource pointer and no format guessing.
 	// Last so the positional initialisers in the tests stay meaningful.
 	std::uint64_t descriptor = 0;
+	// True for a 3D (volume) texture view. The dataflow walk anchors on this: the tonemapper
+	// is the only pass in an Unreal frame that binds a 3D texture SRV — the colour-grading
+	// LUT (PostProcessTonemap.cpp:533,765). Appended after `descriptor` so the positional
+	// initialisers above keep their meaning.
+	bool is_3d = false;
 };
 
 struct DispatchSignature

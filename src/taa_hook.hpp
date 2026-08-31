@@ -21,6 +21,11 @@ void forget_command_list(reshade::api::command_list *cmd_list);
 // Returns true to suppress the game's dispatch. Phase A always returns false.
 bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z);
 
+// True once this hash has demonstrated the history round-trip: UE4 bound its previous u0
+// back as one of its SRVs on a later frame (CLAUDE.md §2.9). Accumulates over the session.
+// Consumed by the pass finder's dataflow walk as one half of its owns_history oracle.
+bool owns_temporal_history(std::uint64_t hash);
+
 // Counters that localise WHY a dispatch was not reported. Each is a distinct early exit, so
 // one glance at the status file says which stage is failing instead of costing a round trip.
 struct Diagnostics
