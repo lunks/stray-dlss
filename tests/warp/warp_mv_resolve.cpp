@@ -76,6 +76,22 @@ struct Gpu
 // NVIDIA driver — the layer WARP cannot model.
 bool g_use_hardware = false;
 
+// Set by --expect-reshade. When ReShade's DLL is dropped in beside this exe as d3d12.dll, our
+// D3D12CreateDevice goes through its proxy, so EVERY test in this file then runs against
+// ReShade's real device and command-list proxies — its descriptor-heap wrappers and its
+// handle conversion — rather than straight at the runtime. That is the one part of the add-on's
+// environment we otherwise cannot reach offline, so CI asserts it really happened rather than
+// silently testing the plain runtime.
+bool g_expect_reshade = false;
+
+// True when the d3d12.dll we bound to is ReShade's proxy. It exports the add-on entry points;
+// the real runtime does not.
+bool running_under_reshade()
+{
+	const HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
+	return d3d12 != nullptr && ::GetProcAddress(d3d12, "ReShadeRegisterAddon") != nullptr;
+}
+
 bool create_gpu(Gpu &gpu)
 {
 	// The debug layer is the entire point of this harness; without it WARP would merely run
@@ -742,11 +758,23 @@ bool test_reshade_restore_call_pattern(Gpu &gpu)
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
-		if (std::string(argv[i]) == "--hardware")
+	{
+		const std::string arg = argv[i];
+		if (arg == "--hardware")
 			g_use_hardware = true;
+		else if (arg == "--expect-reshade")
+			g_expect_reshade = true;
+	}
 
 	std::printf("D3D12 harness for the motion-vector resolve pass (%s)\n",
 		g_use_hardware ? "HARDWARE adapter" : "WARP software adapter");
+
+	const bool under_reshade = running_under_reshade();
+	std::printf("d3d12.dll is %s\n",
+		under_reshade ? "ReShade's proxy - every test below runs through it"
+		              : "the plain runtime");
+	if (g_expect_reshade)
+		check(under_reshade, "we are running through ReShade's D3D12 proxy, as required");
 
 	Gpu gpu;
 	if (!create_gpu(gpu))

@@ -99,6 +99,70 @@ jobs:
 
       # A .addon64 that does not export what ReShade looks for loads and then does nothing,
       # with no error anyone can see. Check it here instead of discovering it in the game.
+      # ------------------------------------------------------------------------------------
+      # Real-ReShade lane.
+      #
+      # ReShade attaches its add-on path inside the hooked D3D12CreateDevice
+      # (source/d3d12/d3d12.cpp:40 in v6.8.0), NOT at swapchain creation or Present -- and it
+      # refuses WARP only in its D3D10/D3D11 paths (d3d10.cpp:159, d3d11.cpp:150), never in
+      # source/d3d12/. So a headless console app with no window and no swapchain is enough to
+      # load the real ReShade and the real add-on.
+      #
+      # Dropping ReShade in as d3d12.dll means the harness's own D3D12CreateDevice returns
+      # ReShade's proxy, so every existing test then runs against its real device and
+      # command-list wrappers -- its descriptor-heap proxies and handle conversion, the code
+      # CLAUDE.md flags as having no release-build validation. That environment is otherwise
+      # unreachable without the game.
+      - name: Real ReShade lane (NGX=OFF only)
+        if: matrix.ngx == 'OFF'
+        shell: pwsh
+        working-directory: build
+        run: |
+          # The shipped installer, not a self-built ReShade: the point is to test the binary
+          # the user actually runs. Its DLLs are embedded .NET resources.
+          Invoke-WebRequest -Uri "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe" `
+                            -OutFile setup.exe -UseBasicParsing
+          $asm = [System.Reflection.Assembly]::LoadFrom((Resolve-Path setup.exe))
+          $names = $asm.GetManifestResourceNames()
+          Write-Host "Embedded resources: $($names -join ', ')"
+          $res = $names | Where-Object { $_ -match 'ReShade64\.dll$' } | Select-Object -First 1
+          if (-not $res) { throw "ReShade64.dll not found among installer resources" }
+          $in = $asm.GetManifestResourceStream($res)
+          $out = [System.IO.File]::Create((Join-Path (Get-Location) 'd3d12.dll'))
+          $in.CopyTo($out); $out.Close(); $in.Close()
+          $ver = (Get-Item d3d12.dll).VersionInfo.FileVersion
+          Write-Host "Extracted ReShade $ver as d3d12.dll ($((Get-Item d3d12.dll).Length) bytes)"
+
+          Copy-Item stray-dlss.addon64 . -ErrorAction SilentlyContinue
+          # Written as an array, not a here-string: a here-string's lines would sit at column 0
+          # and terminate this YAML block scalar.
+          Set-Content ReShade.ini @('[GENERAL]', 'AddonPath=.', '[ADDON]', 'AddonPath=.')
+
+          # A hang here is a ReShade assert dialog, so bound it rather than waiting for the
+          # job timeout.
+          $p = Start-Process -FilePath .\stray_dlss_warp.exe -ArgumentList '--expect-reshade' `
+                             -NoNewWindow -PassThru `
+                             -RedirectStandardOutput harness-reshade.txt `
+                             -RedirectStandardError harness-reshade.err
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw "harness hung under ReShade (assert dialog?)" }
+          Get-Content harness-reshade.txt
+          if (Test-Path harness-reshade.err) { Get-Content harness-reshade.err }
+
+          if (Test-Path ReShade.log) {
+            Write-Host "--- ReShade.log (add-on lines) ---"
+            Select-String -Path ReShade.log -Pattern 'add-on|addon' | Select-Object -First 20 | ForEach-Object { $_.Line }
+          } else { throw "ReShade.log was not written - ReShade did not initialise" }
+
+          if (-not (Test-Path stray-dlss.log)) { throw "the add-on never ran: stray-dlss.log is absent" }
+          Write-Host "--- stray-dlss.log ---"
+          Get-Content stray-dlss.log | Select-Object -First 30
+
+          if (-not (Select-String -Path stray-dlss.log -Pattern 'register_addon succeeded' -Quiet)) {
+            throw "the add-on loaded but reshade::register_addon did not succeed"
+          }
+          if ($p.ExitCode -ne 0) { throw "harness reported failures while running through ReShade" }
+          Write-Host "Real ReShade lane passed: the add-on registered and every harness test ran through ReShade's proxy."
+
       - name: Verify add-on exports
         shell: pwsh
         run: |
