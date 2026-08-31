@@ -865,9 +865,22 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								out_tex = &u;
 						}
 
+						// The scene colour is at RENDER resolution, NOT the output's.
+						//
+						// I had this backwards. Matching the colour against the OUTPUT works only
+						// at 1:1; under temporal upsampling the inputs are render-res and the
+						// output is display-res (measured: inputs 1920x1080, u0 3840x2160). That
+						// filter therefore rejected the real scene colour and accepted some
+						// full-res buffer instead, so DLSS got InRenderSubrectDimensions of
+						// 1920x1080 with a 3840x2160 colour texture and sampled the wrong quarter
+						// of it — a coherent but wrong image, "the cat sideways".
+						//
+						// Match the render rect, which is what DLSS is told the inputs are, and
+						// require the same format as the output since TAA's colour and result are
+						// the same buffer kind. Width/height of 0 means a buffer, not a texture.
 						const auto colour_candidate = [&](const BoundTexture &t) {
 							return out_tex != nullptr && is_resource_live(t.resource) &&
-								t.width == out_tex->width && t.height == out_tex->height &&
+								t.width == render_w && t.height == render_h &&
 								t.format == out_tex->format && t.width > 0 && t.height > 0;
 						};
 
@@ -982,6 +995,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							if (!g_ngx_inputs_logged)
 							{
 								g_ngx_inputs_logged = true;
+								STRAY_LOG_INFO("DLSS render=%ux%u output=%ux%u — colour must be "
+									"render-res, output display-res.", render_w, render_h,
+									fd.output_width, fd.output_height);
 								STRAY_LOG_INFO("DLSS inputs: colour=%p depth=%p mv=%p out=%p "
 									"(out %ux%u fmt=%d)", static_cast<void *>(ei.color),
 									static_cast<void *>(ei.depth),
