@@ -10,6 +10,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <mutex>
 #include <vector>
 
 namespace stray_dlss::mv {
@@ -295,11 +297,46 @@ void create_srvs(UINT slot, ID3D12Resource *depth, ID3D12Resource *velocity)
 	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srv.Texture2D.MipLevels = 1;
 
-	srv.Format = srv_format_for(depth->GetDesc().Format);
+	// Log every distinct resource once, immediately BEFORE viewing it.
+	//
+	// Under vkd3d a bad view faults inside the driver — "err:vulkan:vkCreateImageView Exception
+	// 0xc0000005" — with nothing to say which resource or which field was wrong. Printing the
+	// desc first localises it: if the log line is missing, GetDesc itself faulted and the
+	// pointer is stale; if it is present, the pointer was live and the view description is at
+	// fault.
+	const auto note = [](const char *what, ID3D12Resource *res) {
+		static std::mutex m;
+		static std::vector<ID3D12Resource *> seen;
+		{
+			std::lock_guard<std::mutex> lock(m);
+			if (std::find(seen.begin(), seen.end(), res) != seen.end())
+				return;
+			seen.push_back(res);
+		}
+		const D3D12_RESOURCE_DESC d = res->GetDesc();
+		STRAY_LOG_INFO("about to view %s %p: dim=%d fmt=%d %llux%u mips=%u arr=%u samples=%u "
+			"flags=0x%x", what, static_cast<void *>(res), static_cast<int>(d.Dimension),
+			static_cast<int>(d.Format), static_cast<unsigned long long>(d.Width), d.Height,
+			d.MipLevels, d.DepthOrArraySize, d.SampleDesc.Count,
+			static_cast<unsigned>(d.Flags));
+	};
+
+	note("depth", depth);
+	const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+	srv.Format = srv_format_for(dd.Format);
+	// A multisampled resource needs a TEXTURE2DMS view; asking for TEXTURE2D builds a Vulkan
+	// image view the driver rejects.
+	srv.ViewDimension = dd.SampleDesc.Count > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS
+	                                            : D3D12_SRV_DIMENSION_TEXTURE2D;
 	g_state.device->CreateShaderResourceView(depth, &srv, dest);
 
 	dest.ptr += g_state.descriptor_size;
-	srv.Format = srv_format_for(velocity->GetDesc().Format);
+	note("velocity", velocity);
+	const D3D12_RESOURCE_DESC vd = velocity->GetDesc();
+	srv.Format = srv_format_for(vd.Format);
+	srv.ViewDimension = vd.SampleDesc.Count > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS
+	                                            : D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv.Texture2D.MipLevels = 1;
 	g_state.device->CreateShaderResourceView(velocity, &srv, dest);
 }
 
