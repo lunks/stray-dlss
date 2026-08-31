@@ -91,7 +91,6 @@ bool g_ngx_registers_logged = false;
 // Worth doing because every input has now been corrected on its own terms — colour comes from
 // the shader's declared register, render and output resolutions are separated — and the failure
 // is unchanged. That points at something the inputs' identity cannot explain.
-bool g_ngx_force_reset = false;
 // [STRAYDLSS] NgxPaint — clear the captured output to magenta instead of evaluating.
 bool g_ngx_paint = false;
 // Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
@@ -329,7 +328,6 @@ void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
 void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
-void set_ngx_force_reset(bool enabled) { g_ngx_force_reset = enabled; }
 void set_ngx_paint(bool enabled) { g_ngx_paint = enabled; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
 
@@ -479,7 +477,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// anything downstream depends on seeing the pass.
 		const bool dry_running = g_dry_run_hash != 0 || g_ngx_dry_run != 0 ||
 			g_ngx_pass_override != 0 || g_ngx_evaluate;
-		if (!dry_running && g_report_count[hash] >= 2 && hash != kTaaMainHash)
+		if (!dry_running && g_report_count[hash] >= 2 && !is_known_taa_hash(hash))
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -502,7 +500,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			// Explain the failure for the shaders that actually matter, once each, rather
 			// than only for whichever dispatch happened to be first overall.
 			if (!g_failure_dumped[hash] && g_failure_dumps < 4 &&
-				(hash == kTaaMainHash || hash == kSecondCandidateHash ||
+				(is_known_taa_hash(hash) || hash == kSecondCandidateHash ||
 				 hash == kDenoiserLookalikeHash || y >= 200))
 			{
 				g_failure_dumped[hash] = true;
@@ -1055,8 +1053,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.render_height = render_h;
 							// The three signals ORed inside is_camera_cut: View.CameraCut,
 							// TemporalAAJitter.zw == .xy, and a 1x1 history/velocity dummy.
-							ei.reset = g_ngx_force_reset ||
-								ue4::is_camera_cut(view, m.camera_cut_dummies);
+							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
 
 							NGX_TRACE("evaluate colour=%p depth=%p mv=%p out=%p",

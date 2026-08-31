@@ -258,13 +258,6 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_INFO("DLSS will replace pass 0x%016llx ([STRAYDLSS] NgxPassHash).",
 			static_cast<unsigned long long>(ngx_pass_value));
 
-	bool ngx_force_reset = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxForceReset", ngx_force_reset);
-	taa_hook::set_ngx_force_reset(ngx_force_reset);
-	if (ngx_force_reset)
-		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
-			"— the image will look aliased because nothing accumulates.");
-
 	int ngx_preset = 0;
 	if (reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPreset", ngx_preset) &&
 		ngx_preset != 0)
@@ -432,10 +425,10 @@ void on_init_pipeline(
 		shader_dump::dump_compute_shader(hash, shader->code, shader->code_size);
 		taa_hook::set_pipeline_hash(pipeline.handle, hash);
 
-		if (hash == kTaaMainHash)
+		if (is_known_taa_hash(hash))
 		{
 			g_state.taa_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
-			STRAY_LOG_INFO("FOUND FTAAStandaloneCS (MainUpsampling): hash=0x%016llx "
+			STRAY_LOG_INFO("FOUND FTAAStandaloneCS permutation: hash=0x%016llx "
 				"pipeline=0x%016llx bytes=%zu",
 				static_cast<unsigned long long>(hash),
 				static_cast<unsigned long long>(pipeline.handle),

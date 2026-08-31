@@ -156,3 +156,23 @@ TEST_CASE("a dispatch with no colour UAV is rejected")
 
 	CHECK(match_taa_dispatch(sig, 1920, 1080).verdict == MatchVerdict::no_match);
 }
+
+TEST_CASE("known-hash table: live-measured permutations in, look-alikes out")
+{
+	// The three live-measured TAA hashes are all cooked permutations...
+	CHECK(stray_dlss::is_known_taa_hash(0x901e041a7cadc9dbull)); // 4K/50%
+	CHECK(stray_dlss::is_known_taa_hash(0xd2e4d8c23c362ed1ull)); // 1440p/50%
+	CHECK(stray_dlss::is_known_taa_hash(0xe14e7fc8d0db9b0full));
+	// ...and the two convincing look-alikes are not.
+	CHECK(!stray_dlss::is_known_taa_hash(stray_dlss::kDenoiserLookalikeHash));
+	CHECK(!stray_dlss::is_known_taa_hash(stray_dlss::kSecondCandidateHash));
+	CHECK(!stray_dlss::is_known_taa_hash(0ull));
+}
+
+TEST_CASE("any cooked permutation earns hash_and_structural, not only 0x901e")
+{
+	stray_dlss::DispatchSignature s = make_stray_taa(1280, 720, 2560, 1440);
+	s.shader_hash = 0xd2e4d8c23c362ed1ull;
+	const auto r = stray_dlss::match_taa_dispatch(s, 1280, 720);
+	CHECK(r.verdict == stray_dlss::MatchVerdict::hash_and_structural);
+}

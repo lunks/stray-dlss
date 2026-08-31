@@ -1,5 +1,7 @@
 #include "taa_signature.hpp"
 
+#include "taa_hashes.hpp"
+
 #include <algorithm>
 
 namespace stray_dlss {
@@ -17,6 +19,14 @@ bool is_dummy(const BoundTexture &t)
 }
 
 } // namespace
+
+bool is_known_taa_hash(std::uint64_t hash)
+{
+	for (const std::uint64_t h : kKnownTaaHashes)
+		if (h == hash)
+			return true;
+	return false;
+}
 
 bool is_hdr_colour(TexFormat f)
 {
@@ -153,11 +163,11 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 
 	r.has_downsample_uav = sig.uavs.size() > 1;
 
-	r.verdict = (sig.shader_hash == kTaaMainHash) ? MatchVerdict::hash_and_structural
-	                                              : MatchVerdict::structural_only;
+	r.verdict = is_known_taa_hash(sig.shader_hash) ? MatchVerdict::hash_and_structural
+	                                               : MatchVerdict::structural_only;
 	r.reason = (r.verdict == MatchVerdict::hash_and_structural)
-	               ? "hash and structure agree"
-	               : "structure matches, hash unfamiliar (AA quality or resolution changed?)";
+	               ? "hash is a cooked FTAAStandaloneCS permutation and structure agrees"
+	               : "structure matches, hash unfamiliar (game update? regenerate taa_hashes)";
 	return r;
 }
 

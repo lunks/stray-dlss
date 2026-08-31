@@ -118,6 +118,12 @@ struct MatchResult
 // AA_UPSAMPLE==1, and carries the upsample-only kernel constants 0.905 / -1.9.
 constexpr std::uint64_t kTaaMainHash = 0x901e041a7cadc9dbull;
 
+// True when `hash` is one of the cooked FTAAStandaloneCS permutations extracted offline from
+// the game's own shader cache (src/core/taa_hashes.hpp, 27 entries). This is the hash half of
+// identification: ANY permutation counts, so resolution / screen-percentage / AA-quality
+// changes keep the strong verdict without live rediscovery.
+bool is_known_taa_hash(std::uint64_t hash);
+
 // A reprojecting denoiser (SSR/SSGI/AO family), not TAA: cb1[126], eight float SRVs, no
 // uint2 stencil view. It reads depth and velocity and reprojects with ClipToPrevClip, which
 // is why its bindings look convincing and why it was mistaken for the TAA pass.
