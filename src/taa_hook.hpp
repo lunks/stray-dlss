@@ -67,6 +67,9 @@ void set_ngx_pass_hash(std::uint64_t hash);
 void set_dry_run_alternate(std::uint32_t frames);
 void note_present(std::uint64_t frame);
 
+// seen / reached-phase-B / passed-live-and-cut / recorded / evaluated, for the named pass.
+void named_pass_counters(std::uint32_t out[5]);
+
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 
 } // namespace stray_dlss::taa_hook

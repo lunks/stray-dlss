@@ -633,6 +633,11 @@ void on_present(
 		// killing the game — which is how every unattended run ends — gives Wine no chance to
 		// run DllMain(PROCESS_DETACH), so the only census that survives is the launcher's, with
 		// everything at zero.
+		std::uint32_t named[5] = {};
+		taa_hook::named_pass_counters(named);
+		STRAY_LOG_INFO("[%s] named pass: seen=%u phaseB=%u live=%u recorded=%u evaluated=%u",
+			when, named[0], named[1], named[2], named[3], named[4]);
+
 		std::uint32_t attempts = 0, skipped = 0;
 		taa_hook::resolve_counters(attempts, skipped);
 		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,

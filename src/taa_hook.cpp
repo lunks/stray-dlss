@@ -77,6 +77,14 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // sharing one meant the skip warning consumed the budget
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
+// Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
+// qualifying LATER — which is exactly what happened: the gate logs fired before NGX had even
+// initialised, so they proved nothing about the frames that mattered.
+std::atomic<std::uint32_t> g_named_seen{ 0 };
+std::atomic<std::uint32_t> g_named_phaseb{ 0 };
+std::atomic<std::uint32_t> g_named_live{ 0 };
+std::atomic<std::uint32_t> g_named_recorded{ 0 };
+std::atomic<std::uint32_t> g_named_evaluated{ 0 };
 bool g_ngx_gate_logged = false;
 bool g_ngx_gate2_logged = false;
 bool g_ngx_gate3_logged = false;
@@ -397,6 +405,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			return false;
 		}
 		hash = h->second;
+		if (g_ngx_pass_override != 0 && hash == g_ngx_pass_override)
+			g_named_seen.fetch_add(1, std::memory_order_relaxed);
 
 		// Named-pass suppression, BEFORE any early return.
 		//
@@ -646,6 +656,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// DLSS silently never ran for it and the outer conditions all looked satisfied, which
 		// means one of the inner gates rejected it. Guessing which cost a round trip; say it.
 		const bool tracing = g_ngx_pass_override != 0 && hash == g_ngx_pass_override;
+		if (tracing)
+			g_named_phaseb.fetch_add(1, std::memory_order_relaxed);
 		// The RESOURCES, not the game's descriptors: those live in UE4's bound shader-visible
 		// heap, and D3D12 forbids copying out of one (#654). We build our own views instead.
 		std::uint64_t depth_resource = 0;
@@ -692,6 +704,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				reinterpret_cast<void *>(depth_resource),
 				reinterpret_cast<void *>(velocity_resource));
 		}
+
+		if (tracing && view_ok && resources_live && !m.camera_cut_dummies)
+			g_named_live.fetch_add(1, std::memory_order_relaxed);
 
 		if (view_ok && resources_live && !m.camera_cut_dummies)
 		{
@@ -749,6 +764,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						reinterpret_cast<void *>(velocity_resource), recorded ? 1 : 0,
 						recorded ? "ok" : mv::last_error());
 				}
+				if (tracing && recorded)
+					g_named_recorded.fetch_add(1, std::memory_order_relaxed);
+
 				if (recorded)
 				{
 					mark(5, "recorded");
@@ -928,6 +946,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								static_cast<void *>(ei.color), static_cast<void *>(ei.depth),
 								static_cast<void *>(ei.motion_vectors),
 								static_cast<void *>(ei.output));
+							if (tracing)
+								g_named_evaluated.fetch_add(1, std::memory_order_relaxed);
 							const bool ok = ngx::evaluate(native, ei);
 							if (ok)
 							{
@@ -1045,6 +1065,15 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	// match, no resolve, evaluate skipped or failed — must let the engine run, or the frame
 	// simply loses its temporal anti-aliasing.
 	return suppress_engine_dispatch;
+}
+
+void named_pass_counters(std::uint32_t out[5])
+{
+	out[0] = g_named_seen.load(std::memory_order_relaxed);
+	out[1] = g_named_phaseb.load(std::memory_order_relaxed);
+	out[2] = g_named_live.load(std::memory_order_relaxed);
+	out[3] = g_named_recorded.load(std::memory_order_relaxed);
+	out[4] = g_named_evaluated.load(std::memory_order_relaxed);
 }
 
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
