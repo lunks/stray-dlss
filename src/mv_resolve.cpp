@@ -81,6 +81,19 @@ struct State
 
 	Stats stats;
 
+	// Inputs AddRef'd at record() and released only once the GPU can no longer be executing
+	// the dispatch that reads them. UE4 destroys depth/velocity buffers mid-load moments after
+	// they were captured; liveness at capture time cannot cover GPU execution time, and a
+	// freed VkImage read by our dispatch is an Xid 109 CTX SWITCH TIMEOUT (measured twice,
+	// 2026-08-31, both at save-load transitions). Same principle as ngx_backend's keep-alive.
+	struct LiveInput
+	{
+		ID3D12Resource *a = nullptr;
+		ID3D12Resource *b = nullptr;
+		std::uint64_t frame = 0;
+	};
+	std::vector<LiveInput> input_keep_alive;
+
 	char error[256] = {};
 };
 
@@ -474,6 +487,15 @@ void shutdown()
 	}
 	g_state.retired.clear();
 
+	for (auto &li : g_state.input_keep_alive)
+	{
+		if (li.a != nullptr)
+			li.a->Release();
+		if (li.b != nullptr)
+			li.b->Release();
+	}
+	g_state.input_keep_alive.clear();
+
 	release(g_state.out_mv);
 	release(g_state.constants);
 	release(g_state.heap);
@@ -547,6 +569,32 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	// This frame's slice of every per-frame resource.
 	const UINT slot = ring::slot_for_frame(g_state.frame);
 	g_state.frame++;
+
+	{
+		LiveInput li;
+		li.a = reinterpret_cast<ID3D12Resource *>(in.depth_resource);
+		li.b = reinterpret_cast<ID3D12Resource *>(in.velocity_resource);
+		li.frame = g_state.frame;
+		if (li.a != nullptr)
+			li.a->AddRef();
+		if (li.b != nullptr)
+			li.b->AddRef();
+		g_state.input_keep_alive.push_back(li);
+		for (auto it = g_state.input_keep_alive.begin();
+			it != g_state.input_keep_alive.end();)
+		{
+			if (ring::is_safe_to_release(g_state.frame, it->frame))
+			{
+				if (it->a != nullptr)
+					it->a->Release();
+				if (it->b != nullptr)
+					it->b->Release();
+				it = g_state.input_keep_alive.erase(it);
+			}
+			else
+				++it;
+		}
+	}
 
 	// Unconditionally, every frame. See the note on the removed descriptor cache.
 	create_srvs(slot, reinterpret_cast<ID3D12Resource *>(in.depth_resource),
