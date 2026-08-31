@@ -576,7 +576,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// still does not change, the TAA is not a compute dispatch of this shape and testing the
 		// candidates one by one would be wasted; the next question would be whether it is a
 		// draw, which we do not hook.
-		if (g_ngx_dry_run == 3 && is_relaxed_candidate)
+		if (g_ngx_dry_run == 3 && is_relaxed_candidate && alt_active)
 		{
 			if (!g_dry_run_hash_logged)
 			{
