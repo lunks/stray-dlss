@@ -526,8 +526,9 @@ void on_present(
 			// looks like. That makes the device choice worth testing rather than assuming, so
 			// it can be forced either way from the ini.
 			char device_pref[16] = "auto";
+			size_t device_pref_size = sizeof(device_pref);
 			reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDevice", device_pref,
-				sizeof(device_pref));
+				&device_pref_size);
 			const bool force_native = std::strcmp(device_pref, "native") == 0;
 			const bool force_proxy = std::strcmp(device_pref, "proxy") == 0;
 
