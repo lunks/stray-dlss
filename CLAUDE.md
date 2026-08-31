@@ -84,6 +84,34 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### The device choice, settled by experiment — and §1's prediction was wrong
+
+**Measured 2026-08-31.** The `NgxEvaluate` crash was caused by giving NGX **ReShade's proxy
+device**. Forcing it onto the **native** device (`[STRAYDLSS] NgxDevice=native`) reaches gameplay
+and keeps running: DLSS feature created 2560×1440 DLAA preset K, pinned to one pass, repeated
+`DLSS evaluate OK`, game healthy at 40% GPU.
+
+The crash was inside **vkd3d-proton itself** — `d3d12core.dll +0x3A4AB0`, called from
+`+0x395BB0`, with `rbx=rcx=8146001500000004` and `rdx=rsi=0048002500000001`. Those are not
+pointers but packed handle-shaped values: a descriptor handle reaching vkd3d unconverted. Give
+NGX the proxy and its descriptors are ReShade-synthetic; whatever path then carries them into
+vkd3d does not convert them, and vkd3d dereferences a bit-packed integer.
+
+**So the truth table in "The native-device rule has a trap" is wrong in its third row.** It
+predicted that native-device NGX with the ext hook installed would produce a silently wrong
+image. Measured, that combination produces a *correct* image — mean RGB identical to the control
+(`R=44 G=49 B=35`), no cast, no artifacts — while the proxy combination crashes. Keep the hook
+diagnostic, since knowing the hook's state is still worth logging, but **do not act on the
+prediction**: prefer the native device, and treat `NgxDevice` as the knob that settles it.
+
+**Still unproven, and it is the important part:** DLSS's output may not be reaching the screen at
+all. The pass it pinned to is `0xda289b0ddfa934c6`, which is neither of the TAA candidates
+measured at this resolution, so we may be replacing something that is not the temporal pass. An
+identical image is consistent with both "DLAA looks the same on a static scene" and "our output
+goes nowhere". The DLSS on-screen indicator
+(`DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024`) is the only thing that distinguishes
+them, and it needs a change to the game's Steam launch options.
+
 ### The NgxEvaluate crash: what has been ruled OUT
 
 DLSS evaluates correctly in Stray — `DLSS evaluate OK: 2560x1440 -> 2560x1440
