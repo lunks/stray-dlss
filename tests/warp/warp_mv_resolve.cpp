@@ -318,16 +318,17 @@ bool test_no_allocation_churn(Gpu &gpu)
 		after.live_retired,
 		static_cast<unsigned long long>(after.bytes_live));
 
-	// 200 alternating frames must not leave 200 sets of resources alive. A handful in flight is
-	// expected and correct; unbounded growth is the bug.
-	check(after.live_retired <= 2 * stray_dlss::ring::kFrameCount,
-		"retired resources are released rather than accumulating");
+	// Under a grow-only policy an alternating resolution must allocate a bounded number of
+	// times, not once per change. Anything that scales with frame count is the bug that took
+	// the machine down.
+	const auto created = after.resource_sets_created - before.resource_sets_created;
+	std::printf("  created %llu resource sets across 200 alternating frames\n",
+		static_cast<unsigned long long>(created));
+
+	check(created <= 4, "allocation count is bounded, not per-frame");
+	check(after.live_retired <= 4, "retired sets stay few");
 	check(after.bytes_live < 200ull * 1024 * 1024,
 		"live GPU memory stays well under 200 MB");
-
-	const auto created = after.resource_sets_created - before.resource_sets_created;
-	std::printf("  NOTE: %llu resource sets created across 200 alternating frames\n",
-		static_cast<unsigned long long>(created));
 
 	const int errors = drain_validation(gpu, "churn");
 	check(errors == 0, "no D3D12 validation errors during churn");

@@ -47,6 +47,8 @@ struct State
 	UINT constant_stride = 0;
 	std::uint64_t frame = 0;
 
+	// The size actually ALLOCATED, which only ever grows. The size in use each frame can be
+	// smaller; the shader bounds itself by RenderSize from the constant buffer.
 	std::uint32_t width = 0;
 	std::uint32_t height = 0;
 
@@ -321,22 +323,30 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 	if (device == nullptr || width == 0 || height == 0)
 		return false;
 
-	if (g_state.device == device && g_state.width == width && g_state.height == height &&
-		is_ready())
-		return true;
-
+	// GROW-ONLY. Reallocating whenever the resolution changes is what killed the machine: the
+	// render resolution comes from whichever dispatch matched, so it alternates during loading,
+	// and each change orphaned a descriptor heap, constant buffer and output texture. Freeing
+	// those on a frame counter has nothing to do with when the GPU finished with them — the
+	// WARP harness reproduces it in 200 frames as "resource deleted prior to closing the
+	// command list", followed by DEVICE_REMOVED. On the real machine it read as
+	// NV_ERR_NO_MEMORY, then Xid 109 CTX SWITCH TIMEOUT, then a hang.
+	//
+	// Allocating for the largest size seen removes the churn entirely rather than trying to
+	// time the frees correctly. A smaller frame simply dispatches over part of the texture.
 	if (g_state.device != device)
 	{
 		shutdown();
 		g_state.device = device;
 	}
-	else if (g_state.width != width || g_state.height != height)
+
+	const bool fits = width <= g_state.width && height <= g_state.height;
+	if (fits && is_ready())
+		return true;
+
+	if (!fits && is_ready())
 	{
-		// Resolution changed. The old heap, constant buffer and output are still referenced by
-		// up to kFrameCount in-flight command lists, so they are RETIRED rather than released:
-		// freeing a descriptor heap a queued dispatch still binds is a GPU fault, and the
-		// resolution does change between the loading screen and gameplay — exactly where the
-		// crash was observed.
+		// Growing. Rare — at most a couple of times per session — so the old set is simply kept
+		// alive until shutdown rather than freed on a guess about GPU progress.
 		State::Retired r;
 		r.heap = g_state.heap;
 		r.constants = g_state.constants;
@@ -349,6 +359,9 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 		g_state.heap = nullptr;
 		g_state.constants = nullptr;
 		g_state.out_mv = nullptr;
+
+		width = width > g_state.width ? width : g_state.width;
+		height = height > g_state.height ? height : g_state.height;
 	}
 
 	if (g_state.root_signature == nullptr && !create_root_signature())
@@ -432,8 +445,10 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 
 	if (dispatch_mode != 0)
 	{
-		const UINT gx = (dispatch_mode == 1) ? 1u : (g_state.width + 7) / 8;
-		const UINT gy = (dispatch_mode == 1) ? 1u : (g_state.height + 7) / 8;
+		// Over the FRAME's size, not the allocated size — the texture may be larger under the
+		// grow-only policy, and the shader bounds itself by RenderSize anyway.
+		const UINT gx = (dispatch_mode == 1) ? 1u : (in.render_width + 7) / 8;
+		const UINT gy = (dispatch_mode == 1) ? 1u : (in.render_height + 7) / 8;
 		cmd->Dispatch(gx, gy, 1);
 
 		// The motion vectors are read by NGX immediately afterwards, so make the write visible.
