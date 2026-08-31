@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -516,8 +517,28 @@ void on_present(
 		{
 			g_state.ngx_attempted.store(true, std::memory_order_relaxed);
 
+			// [STRAYDLSS] NgxDevice: auto (default), native, or proxy.
+			//
+			// The automatic choice follows the measured ext-hook state, which is the reasoning
+			// in CLAUDE.md §1. But the crash we are chasing faults inside d3d12core.dll —
+			// vkd3d-proton itself — with registers holding packed handle-shaped values rather
+			// than pointers, which is what an unconverted descriptor handle reaching vkd3d
+			// looks like. That makes the device choice worth testing rather than assuming, so
+			// it can be forced either way from the ini.
+			char device_pref[16] = "auto";
+			reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDevice", device_pref,
+				sizeof(device_pref));
+			const bool force_native = std::strcmp(device_pref, "native") == 0;
+			const bool force_proxy = std::strcmp(device_pref, "proxy") == 0;
+
 			ID3D12Device *device = native;
-			if (hooked)
+			if (force_native)
+			{
+				STRAY_LOG_WARN("NGX forced onto the NATIVE device by [STRAYDLSS] NgxDevice; the "
+					"ext hook is %s, so this is %s.", hooked ? "INSTALLED" : "absent",
+					hooked ? "the combination CLAUDE.md calls broken" : "safe");
+			}
+			else if (hooked || force_proxy)
 			{
 				if (ID3D12Device *proxy = reshade_proxy_device(native))
 				{
