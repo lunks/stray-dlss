@@ -756,13 +756,24 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		if (tracing && view_ok && resources_live)
 			g_named_live.fetch_add(1, std::memory_order_relaxed);
 
+		// Only run the resolve/evaluate machinery for passes that are actually cooked
+		// FTAAStandaloneCS permutations (or an explicit override). Loading screens produce
+		// structural look-alikes over violently short-lived resources — a resource can pass
+		// the liveness gate at capture and be destroyed before CreateShaderResourceView, which
+		// is the §5 vkCreateImageView crash. Measured 2026-08-31: session died at "about to
+		// view velocity" while resolving structural candidate 0x56571dffb2076ce9 during a
+		// save load. Now that identification is table-driven, unknown hashes have nothing to
+		// gain from the resolve path.
+		const bool worth_resolving = is_known_taa_hash(hash) ||
+			(g_ngx_pass_override != 0 && hash == g_ngx_pass_override);
+
 		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set
 		// via is_camera_cut — so the engine's TAA never runs once DLSS engages. Skipping them
 		// let the engine's TAA blend against DLSS-written history, which flickered. The dummy
 		// velocity is harmless: its out-of-bounds loads return zero, the decode's validity test
 		// fails, the camera-motion branch yields ~zero vectors, and a reset frame ignores
 		// motion vectors regardless.
-		if (view_ok && resources_live)
+		if (worth_resolving && view_ok && resources_live)
 		{
 			mark(2, "descriptors-found");
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
