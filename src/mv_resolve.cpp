@@ -281,7 +281,12 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 	{
 		D3D12_CPU_DESCRIPTOR_HANDLE uav = base;
 		uav.ptr += ring::descriptor_offset_in_slot(f, 2, g_state.descriptor_size);
-		g_state.device->CreateUnorderedAccessView(g_state.out_mv, nullptr, &uav_desc, uav);
+		// descriptor_device, NOT device: `uav` came from our heap, so it is in whatever handle
+		// space that heap belongs to. Writing a ReShade synthetic handle with the native device
+		// treats a bit-packed value as an address — measured as
+		// EXCEPTION_ACCESS_VIOLATION writing 0x2c0000568, which decodes as heap index 0x2C.
+		g_state.descriptor_device->CreateUnorderedAccessView(g_state.out_mv, nullptr, &uav_desc,
+			uav);
 	}
 
 	g_state.width = width;
