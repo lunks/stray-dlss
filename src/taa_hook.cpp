@@ -457,11 +457,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		g_diag.best_height = h;
 	}
 
-	// ---- Phase B: run our own motion-vector resolve on the game's command list ----
+	// ---- Phase B: our motion-vector resolve, and DLSS, on the game's command list ----
 	//
-	// Still returns false at the end, so the engine's TAA runs as normal and the image is
-	// unchanged. This exists to get the resolve executing and provably correct before anything
-	// depends on its output.
+	// Returns false unless DLSS actually produced this pass's output, in which case the
+	// engine's own TAA dispatch must be suppressed — see where this is set.
+	bool suppress_engine_dispatch = false;
+
 	if (g_mv_resolve_enabled &&
 		(m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only))
 	{
@@ -679,7 +680,18 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								static_cast<void *>(ei.output));
 							const bool ok = ngx::evaluate(native, ei);
 							if (ok)
+							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
+								// Suppress the engine's own TAA dispatch for this pass.
+								//
+								// Not optional. We have just written DLSS's result into u0; if
+								// the engine then runs its TAA it overwrites that, so our work
+								// is discarded AND both passes write the same UAV in one command
+								// list with no barrier between them — a write-after-write hazard
+								// on a resource the next frame reads back as history.
+								// (CLAUDE.md §3: return true to skip the engine's dispatch.)
+								suppress_engine_dispatch = true;
+							}
 							NGX_TRACE("evaluate returned %d", ok ? 1 : 0);
 
 							// Back to UAV for next frame's resolve.
@@ -773,7 +785,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				g_prev_output[hash] = t.resource;
 	}
 
-	return false; // Phase A never suppresses the engine's dispatch.
+	// Suppress ONLY when DLSS actually produced this pass's output. Every other path — no
+	// match, no resolve, evaluate skipped or failed — must let the engine run, or the frame
+	// simply loses its temporal anti-aliasing.
+	return suppress_engine_dispatch;
 }
 
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
