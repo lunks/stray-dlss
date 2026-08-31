@@ -144,6 +144,7 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/taa_hook.hpp
         src/pass_finder.cpp
         src/pass_finder.hpp
+        src/ext_unhook.cpp
         src/input_dump.cpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp

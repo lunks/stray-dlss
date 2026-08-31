@@ -1,5 +1,7 @@
 #include "ngx_backend.hpp"
 
+#include "ext_unhook.hpp"
+
 #include "log.hpp"
 
 #include <d3d12.h>
@@ -158,6 +160,9 @@ Status initialise(ID3D12Device *device)
 		return g_status;
 	}
 
+	// Undo ReShade's ext-vtable patch before NGX first touches the extension interface.
+	ext_unhook::repair();
+
 	NVSDK_NGX_LoggingInfo logging_info = {};
 	logging_info.LoggingCallback = ngx_log_callback;
 	logging_info.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
@@ -252,6 +257,9 @@ void release_feature()
 
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 {
+	// CreateFeature builds NGX's cubin descriptor objects; undo ReShade's ext-vtable patch
+	// first or they are built against mangled handles. (src/ext_unhook.hpp)
+	ext_unhook::repair();
 	if (!g_status.initialised || !g_status.super_sampling_available || cmd == nullptr)
 		return false;
 	if (desc.render_width == 0 || desc.output_width == 0)
@@ -325,6 +333,9 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 {
+	// The game can re-install the patch with a single QueryInterface at any time; repair
+	// immediately before NGX resolves its descriptors. (src/ext_unhook.hpp)
+	ext_unhook::repair();
 	if (g_feature == nullptr || g_feature_params == nullptr || cmd == nullptr)
 		return false;
 	if (in.color == nullptr || in.depth == nullptr || in.motion_vectors == nullptr ||

@@ -9,6 +9,7 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "ext_unhook.hpp"
 #include "frame_state.hpp"
 #include "input_dump.hpp"
 #include "pass_finder.hpp"
@@ -206,6 +207,9 @@ void on_init_device(reshade::api::device *device)
 	STRAY_LOG_INFO("init_device: ID3D12Device=%p", static_cast<void *>(native));
 
 	report_vkd3d_ext_hook(native, "init_device");
+	// Save the pristine extension vtable NOW — the game's stack installs ReShade's patch by
+	// frame ~120, and once installed the originals are unrecoverable from inside the process.
+	ext_unhook::capture(native);
 
 	if (native != nullptr)
 	{
@@ -260,6 +264,13 @@ void on_init_device(reshade::api::device *device)
 	if (ngx_force_reset)
 		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
 			"— the image will look aliased because nothing accumulates.");
+
+	bool ext_unhook_enabled = true;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "ExtUnhook", ext_unhook_enabled);
+	ext_unhook::set_enabled(ext_unhook_enabled);
+	if (!ext_unhook_enabled)
+		STRAY_LOG_WARN("ExtUnhook=0: ReShade's vkd3d ext-vtable patch will NOT be undone before "
+			"NGX calls; expect the frozen-output failure while anything queries the proxy.");
 
 	bool dump_inputs = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDumpInputs", dump_inputs);
