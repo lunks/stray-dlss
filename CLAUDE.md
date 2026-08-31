@@ -200,6 +200,34 @@ other pass in this title binds one resource as both `R32_FLOAT_X8X24` and `X32_G
 created as **1920×1080 → 3840×2160** (a Performance-ratio feature), **not DLAA** — which
 inverts the plan's staging, since there is no 1:1 pass to replace.
 
+### 2.3.1 Confirmed from the game's own shipped configuration
+
+Extracted from `Hk_project-WindowsNoEditor.pak` (`tools/pakextract.py`) and from the live prefix
+config. Copies are kept in `docs/game-config/`. These retire several previously *derived* facts
+to HARD — they are the developers' own settings, not inference:
+
+| Setting | Value | Source | What it settles |
+|---|---|---|---|
+| `r.DefaultFeature.AntiAliasing` | **2** (TAA) | `DefaultEngine.ini:54` | TAA is the AA method |
+| `r.TemporalAA.Upsampling` | **True** | `DefaultEngine.ini:69` | **TAAU ships enabled.** The upsampling TAA pass is the game's own default, not a user setting |
+| `r.BasePassOutputsVelocity` | **True** | `DefaultEngine.ini:59` | Velocity is written in the base pass, so coverage is broader than stock UE4 — helpful for DLSS, but the resolve pass is still required |
+| `r.PostProcessAAQuality` | **3** (Medium) | `WindowsEngine.ini:18` | Confirms the earlier derivation exactly |
+| `r.DOF.TemporalAAQuality` | 0 | `WindowsEngine.ini:58` | |
+| `ScreenPercentage` | **50** | live `GameUserSettings.ini` | Renders 1920×1080 |
+| `ResolutionSizeX/Y` | **3840×2160** | live `GameUserSettings.ini` | Output is 4K |
+
+So the render/output relationship measured at runtime — 1920×1080 in, 3840×2160 out — is
+exactly what the shipped configuration asks for. **`ETAAPassConfig::MainUpsampling` is
+confirmed by the game's own settings**, independently of the bytecode and binding evidence.
+
+The only user-added override in the live `Engine.ini` is `r.BasePassOutputsVelocity=1`, which is
+redundant since the game already ships it as True.
+
+**Reading the pak.** It is version 11, **unencrypted**, 5.3 GiB, 55,120 entries.
+`tools/paklist.py` lists it and `tools/pakextract.py` extracts by regex, both reading only the
+index blobs rather than the archive — worth knowing, because a bulk copy is neither necessary
+nor kind to a machine someone is playing on.
+
 **Shader census:** 728 distinct PS/CS shaders in gameplay, `not_dxbc=0`, `dxil=0` — every one is
 **DXBC**. ~150 in the main menu, rising to ~728 on entering gameplay.
 
