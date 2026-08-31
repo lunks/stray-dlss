@@ -385,10 +385,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// That is the pass resetting, not an error.
 		if (view_ok && depth_res != nullptr && velocity_res != nullptr && !m.camera_cut_dummies)
 		{
-			auto *device = reinterpret_cast<ID3D12Device *>(cmd_list->get_device()->get_native());
+			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
 			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
 
-			if (mv::initialise(device, m.render_width, m.render_height))
+			if (mv::initialise(native_device, m.render_width, m.render_height))
 			{
 				mv::ResolveInputs inputs;
 				inputs.depth = depth_res;
