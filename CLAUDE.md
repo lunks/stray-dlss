@@ -206,8 +206,23 @@ not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
 **The TAA pass is:**
 
 ```
-0x901e041a7cadc9db          <-- previously mislabelled "a measured false positive"
+0x901e041a7cadc9db          <-- at 3840x2160 output / 1920x1080 render
 ```
+
+> **MEASURED 2026-08-31 AT A DIFFERENT RESOLUTION.** Running at **2560×1440 output / 1280×720
+> render** (still 50% screen percentage), the structural matcher finds the pass but the hash is
+> **not** `0x901e…`. Two candidates come back `structural_only`, both dispatching 320×180 = the
+> **output** rect:
+>
+> ```
+> 0xd2e4d8c23c362ed1        0xe14e7fc8d0db9b0f
+> ```
+>
+> The two known look-alikes were correctly **excluded** in the same run, so the exclusion rules
+> hold. **The hash is resolution-dependent — it is a permutation fingerprint, not the shader's
+> identity.** Never gate on it alone; the depth+stencil-over-one-resource signature plus a
+> dispatch covering the output rect is what actually identifies the pass. Also measured in the
+> same frames: the View CB appeared at **b4**, not b1, so that register is not invariant either.
 
 Captured live at 3840×2160 output. Note every input is **1920×1080**: the game already runs
 **temporal upsampling at 50% screen percentage**, so the pass is `ETAAPassConfig::MainUpsampling`,
