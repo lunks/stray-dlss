@@ -84,6 +84,33 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### DLSS runs, but into a pass that does not drive the image (measured 2026-08-31)
+
+`NgxDryRun` suppresses the pinned pass and writes **nothing** in its place. If that pass drove
+the picture, the image would visibly break. It does not:
+
+```
+DRY RUN: suppressing pass 0x2a7ec4fd7daced09 and writing NOTHING
+mean RGB  control R=44 G=49 B=35 | DLSS R=44 G=49 B=35 | dry run R=44 G=49 B=35
+```
+
+**So every "DLSS evaluate OK" so far has written into a texture the frame never displays.** The
+API side is correct — feature created, evaluated, no NGX error, no crash — and the result is
+invisible. An unchanged image was never evidence of success.
+
+Two further facts from the same runs:
+
+* The pass chosen **varies between runs** (`0xda289b0ddfa934c6`, then `0x2a7ec4fd7daced09`), so
+  the history round-trip test matches SEVERAL passes and pins to whichever proves itself first.
+  §2.9 calls the round-trip decisive; measured here it is necessary but not sufficient.
+* Neither hash is one of the structural TAA candidates measured at this resolution
+  (`0xd2e4d8c23c362ed1` / `0xe14e7fc8d0db9b0f`).
+
+**The identification problem is therefore open, and it is now the whole problem.** The way to
+close it is the dry run itself, applied per candidate: suppress exactly one pass, screenshot,
+and compare. The pass that drives the image is the one whose suppression changes it. That is a
+bisection over a handful of candidates and needs no new theory.
+
 ### The device choice, settled by experiment — and §1's prediction was wrong
 
 **Measured 2026-08-31.** The `NgxEvaluate` crash was caused by giving NGX **ReShade's proxy
