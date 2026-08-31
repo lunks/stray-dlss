@@ -3,6 +3,7 @@
 #include "taa_hashes.hpp"
 
 #include <algorithm>
+#include <atomic>
 
 namespace stray_dlss {
 namespace {
@@ -20,12 +21,31 @@ bool is_dummy(const BoundTexture &t)
 
 } // namespace
 
+// Written once at init (or on an explicit UI reload) and read on the dispatch hot path, so
+// the extra table is a fixed array published through an acquire/release counter rather than a
+// lock. A reload writes the entries first, then the count.
+std::uint64_t g_extra_taa_hashes[64];
+std::atomic<std::size_t> g_extra_taa_count{ 0 };
+
 bool is_known_taa_hash(std::uint64_t hash)
 {
 	for (const std::uint64_t h : kKnownTaaHashes)
 		if (h == hash)
 			return true;
+	const std::size_t n = g_extra_taa_count.load(std::memory_order_acquire);
+	for (std::size_t i = 0; i < n; ++i)
+		if (g_extra_taa_hashes[i] == hash)
+			return true;
 	return false;
+}
+
+void set_extra_taa_hashes(const std::uint64_t *hashes, std::size_t count)
+{
+	count = std::min<std::size_t>(count, 64);
+	g_extra_taa_count.store(0, std::memory_order_release);
+	for (std::size_t i = 0; i < count; ++i)
+		g_extra_taa_hashes[i] = hashes == nullptr ? 0 : hashes[i];
+	g_extra_taa_count.store(count, std::memory_order_release);
 }
 
 bool is_hdr_colour(TexFormat f)

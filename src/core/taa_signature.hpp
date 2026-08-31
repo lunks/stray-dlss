@@ -124,6 +124,11 @@ constexpr std::uint64_t kTaaMainHash = 0x901e041a7cadc9dbull;
 // changes keep the strong verdict without live rediscovery.
 bool is_known_taa_hash(std::uint64_t hash);
 
+// Extend the known-permutation set at runtime with hashes from an operator-supplied override
+// file (a game update recooks the shaders; the user regenerates the list offline and drops it
+// beside the add-on — no rebuild). Replaces any previous extra set; capped at 64 entries.
+void set_extra_taa_hashes(const std::uint64_t *hashes, std::size_t count);
+
 // A reprojecting denoiser (SSR/SSGI/AO family), not TAA: cb1[126], eight float SRVs, no
 // uint2 stencil view. It reads depth and velocity and reprojects with ClipToPrevClip, which
 // is why its bindings look convincing and why it was mistaken for the TAA pass.

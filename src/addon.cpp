@@ -9,6 +9,7 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "core/taa_hashes.hpp"
 #include "ext_unhook.hpp"
 #include "frame_state.hpp"
 #include "input_dump.hpp"
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -99,6 +101,8 @@ struct State
 };
 
 State g_state;
+
+void load_hash_override_file(); // defined beside the overlay below
 
 // Reports whether ReShade's vkd3d extension hook is installed on the ID3D12DeviceExt vtable.
 //
@@ -303,6 +307,8 @@ void on_init_device(reshade::api::device *device)
 	STRAY_LOG_INFO("DLSS evaluation is %s ([STRAYDLSS] NgxEvaluate). This is the switch that "
 		"changes the image; EnableNGX alone only brings NGX up.",
 		ngx_evaluate ? "ENABLED" : "disabled");
+
+	load_hash_override_file();
 }
 
 void on_destroy_device(reshade::api::device *device)
@@ -732,6 +738,41 @@ void on_present(
 	}
 }
 
+// [STRAYDLSS] hash override file: one fnv1a64 per line (0x-prefixed or bare hex, # comments),
+// generated offline by tools/stray_taa_hashes.py after a game update. Read from the game's
+// working directory, the same place ReShade.log lands.
+int g_extra_hashes_loaded = -1; // -1: no file
+
+void load_hash_override_file()
+{
+	std::FILE *f = nullptr;
+	fopen_s(&f, "stray-dlss-hashes.txt", "r");
+	if (f == nullptr)
+	{
+		g_extra_hashes_loaded = -1;
+		set_extra_taa_hashes(nullptr, 0);
+		return;
+	}
+	std::uint64_t hashes[64];
+	std::size_t n = 0;
+	char line[128];
+	while (n < 64 && std::fgets(line, sizeof(line), f) != nullptr)
+	{
+		const char *p = line;
+		while (*p == ' ' || *p == '\t')
+			++p;
+		if (*p == '#' || *p == '\n' || *p == 0)
+			continue;
+		const std::uint64_t h = std::strtoull(p, nullptr, 16);
+		if (h != 0)
+			hashes[n++] = h;
+	}
+	std::fclose(f);
+	set_extra_taa_hashes(hashes, n);
+	g_extra_hashes_loaded = static_cast<int>(n);
+	STRAY_LOG_INFO("stray-dlss-hashes.txt: %zu extra TAA permutation hashes loaded.", n);
+}
+
 void draw_status(reshade::api::effect_runtime *runtime)
 {
 	(void)runtime;
@@ -744,6 +785,12 @@ void draw_status(reshade::api::effect_runtime *runtime)
 	ImGui::Text("vkd3d-proton:   %s", g_state.is_vkd3d ? "yes" : "no");
 	ImGui::Text("NGX init:       %s", ngx_status.initialised ? "ok" : "FAILED");
 	ImGui::Text("DLSS SR:        %s", ngx_status.super_sampling_available ? "available" : "unavailable");
+	ImGui::Text("TAA hash table: %zu baked%s", std::size(kKnownTaaHashes),
+		g_extra_hashes_loaded < 0 ? " (no override file)" : "");
+	if (g_extra_hashes_loaded >= 0)
+		ImGui::Text("                +%d from stray-dlss-hashes.txt", g_extra_hashes_loaded);
+	if (ImGui::Button("Reload hash file"))
+		load_hash_override_file();
 	if (ngx_status.needs_updated_driver)
 		ImGui::Text("Driver:         needs >= %u.%u", ngx_status.min_driver_major, ngx_status.min_driver_minor);
 	ImGui::Separator();

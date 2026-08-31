@@ -29,8 +29,9 @@ A shared-code section without the archive argument fails loudly; an inline secti
 consults the archive. pakextract names outputs by flattening the pak path ('/' -> '_'); use
 whatever names it printed.
 Optional: --dump-dir DIR writes each permutation as <freq>_<fnv1a64>.dxbc (the shader_dump
-naming), --emit-header FILE writes the verified permutation hashes as a C++ header (refused
-when the verdict fails), --self-test runs the synthetic format tests and touches no files.
+naming), --emit-header FILE writes the verified permutation hashes as a C++ header, and
+--emit-hashes FILE writes them as plain text for the add-on's stray-dlss-hashes.txt override
+(both refused when the verdict fails), --self-test runs the synthetic tests, no files touched.
 
 Format provenance -- each claim read from UE 4.27.2 source, not inferred:
   * .ushaderbytecode = uint32 version (==2, ShaderCodeLibrary.cpp:60,722-726), then six TArrays
@@ -418,7 +419,7 @@ def emit_header(path, hashes, cache_path, cache_bytes, section_index):
     print(f"[emit] {path}: {len(hashes)} hashes", file=sys.stderr)
 
 
-def run(cache_path, archive_path=None, dump_dir=None, emit_header_path=None,
+def run(cache_path, archive_path=None, dump_dir=None, emit_header_path=None, emit_hashes_path=None,
         expect_present=EXPECT_PRESENT, expect_absent=EXPECT_ABSENT, expect_note=EXPECT_NOTE):
     cache = open(cache_path, 'rb').read()
     sections = parse_global_cache(cache, os.path.basename(cache_path))
@@ -503,6 +504,14 @@ def run(cache_path, archive_path=None, dump_dir=None, emit_header_path=None,
         if not ok:
             die("--emit-header refused: the verdict failed, these hashes are not trustworthy")
         emit_header(emit_header_path, hashes, cache_path, cache, taa['index'])
+    if emit_hashes_path is not None:
+        if not ok:
+            die("--emit-hashes refused: the verdict failed, these hashes are not trustworthy")
+        with open(emit_hashes_path, 'w') as f:
+            f.write(f"# FTAAStandaloneCS permutations, {os.path.basename(cache_path)}\n")
+            for h in sorted(hashes):
+                f.write(f"0x{h:016x}\n")
+        print(f"[emit] {emit_hashes_path}: {len(hashes)} hashes", file=sys.stderr)
     return 0 if ok else 3
 
 
@@ -700,6 +709,14 @@ def main(argv):
     if '--self-test' in argv:
         self_test()
         return 0
+    emit_hashes_path = None
+    if '--emit-hashes' in argv:
+        i = argv.index('--emit-hashes')
+        try:
+            emit_hashes_path = argv[i + 1]
+        except IndexError:
+            die("--emit-hashes needs a file argument")
+        del argv[i:i + 2]
     emit_header_path = None
     if '--emit-header' in argv:
         i = argv.index('--emit-header')
@@ -725,7 +742,7 @@ def main(argv):
         return 2
     try:
         return run(argv[0], argv[1] if len(argv) == 2 else None, dump_dir,
-                   emit_header_path)
+                   emit_header_path, emit_hashes_path)
     except OSError as ex:
         die(f"cannot read input: {ex}")
 
