@@ -78,6 +78,7 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
 bool g_ngx_inputs_logged = false;
+bool g_ngx_registers_logged = false;
 // Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
 // qualifying LATER — which is exactly what happened: the gate logs fired before NGX had even
 // initialised, so they proved nothing about the frames that mattered.
@@ -865,6 +866,46 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								out_tex = &u;
 						}
 
+						// Prefer the SHADER'S OWN register assignment over guessing from
+						// formats and sizes.
+						//
+						// FTAAStandaloneCS binds fixed registers, documented in CLAUDE.md §2.3
+						// from the pass's own DXBC: t1 InputSceneColor, t2 SceneDepthTexture,
+						// t3 GBufferVelocityTexture, t5 HistoryBuffer_0, u0 OutComputeTex_0.
+						// Those come from TAAStandalone.usf, so they are what the shader reads —
+						// not an inference about what a colour buffer usually looks like.
+						//
+						// Every heuristic tried here has picked the wrong resource at least once:
+						// "not last frame's u0" chose the history, "matches the output" chose a
+						// full-res buffer under upsampling. A register is not a guess.
+						//
+						// Only trusted on a confirmed hash match, because the register assignment
+						// belongs to THAT permutation; §2.3's table was read from the upsampling
+						// variant. Anything else falls back to the heuristics below, which are
+						// weaker but not permutation-specific.
+						constexpr std::uint32_t kSceneColourReg = 1;   // t1, CLAUDE.md §2.3
+						constexpr std::uint32_t kHistoryReg = 5;       // t5, CLAUDE.md §2.3
+						const bool trust_registers =
+							m.verdict == MatchVerdict::hash_and_structural;
+
+						std::uint64_t reg_colour = 0;
+						if (trust_registers)
+						{
+							for (const auto &t : b.srvs)
+							{
+								if (t.slot == kSceneColourReg && is_resource_live(t.resource))
+									reg_colour = t.resource;
+							}
+							if (!g_ngx_registers_logged)
+							{
+								g_ngx_registers_logged = true;
+								STRAY_LOG_INFO("Using §2.3 register map (hash confirmed): "
+									"colour=t%u history=t%u -> colour=%p",
+									kSceneColourReg, kHistoryReg,
+									reinterpret_cast<void *>(reg_colour));
+							}
+						}
+
 						// The scene colour is at RENDER resolution, NOT the output's.
 						//
 						// I had this backwards. Matching the colour against the OUTPUT works only
@@ -900,9 +941,13 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								history = prev->second;
 						}
 
-						std::uint64_t colour_handle = 0;
-						const char *colour_reason = "ok";
-						if (slot_a != 0 && slot_b != 0 && history != 0)
+						std::uint64_t colour_handle = reg_colour;
+						const char *colour_reason = reg_colour != 0 ? "register t1" : "ok";
+						if (reg_colour != 0)
+						{
+							// Already decided by register; nothing to infer.
+						}
+						else if (slot_a != 0 && slot_b != 0 && history != 0)
 						{
 							if (slot_a == history)      colour_handle = slot_b;
 							else if (slot_b == history) colour_handle = slot_a;
