@@ -12,6 +12,7 @@
 
 #include "core/ring.hpp"
 #include "core/view_params.hpp"
+#include "d3d12_restore.hpp"
 #include "mv_resolve.hpp"
 
 #include <d3d12.h>
@@ -335,6 +336,226 @@ bool test_no_allocation_churn(Gpu &gpu)
 	return true;
 }
 
+
+// ---- test 3: the restore puts the game's state back exactly ------------------------------
+//
+// This is the corruption test. A mock "game" dispatch reads a root constant, a root CBV and a
+// descriptor-table SRV, and writes them out. Run it once to get a golden result; then run it
+// again with our clobber and restore in between. If the restore is wrong, the second result
+// differs — which is what "the image went purple" looks like when reduced to numbers.
+
+#include <warp_probe.h>
+
+struct Probe
+{
+	ComPtr<ID3D12RootSignature> rs;
+	ComPtr<ID3D12PipelineState> pso;
+	ComPtr<ID3D12DescriptorHeap> gpu_heap;   // shader-visible: the "game's" heap
+	ComPtr<ID3D12Resource> cbv;              // root CBV contents
+	ComPtr<ID3D12Resource> source;           // texture read through the table
+	ComPtr<ID3D12Resource> out;              // UAV the probe writes
+	ComPtr<ID3D12Resource> readback;
+	D3D12_GPU_DESCRIPTOR_HANDLE table = {};
+};
+
+bool build_probe(Gpu &gpu, Probe &p)
+{
+	// Root layout on purpose mirrors UE4's shape: constants, a root CBV, and a table.
+	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+	ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	ranges[0].NumDescriptors = 1;
+	ranges[0].BaseShaderRegister = 0;
+	ranges[0].OffsetInDescriptorsFromTableStart = 0;
+	ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	ranges[1].NumDescriptors = 1;
+	ranges[1].BaseShaderRegister = 0;
+	ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+	D3D12_ROOT_PARAMETER params[3] = {};
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[0].Constants.ShaderRegister = 0;
+	params[0].Constants.Num32BitValues = 4;
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	params[1].Descriptor.ShaderRegister = 1;
+	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[2].DescriptorTable.NumDescriptorRanges = 2;
+	params[2].DescriptorTable.pDescriptorRanges = ranges;
+
+	D3D12_ROOT_SIGNATURE_DESC rd = {};
+	rd.NumParameters = 3;
+	rd.pParameters = params;
+
+	ComPtr<ID3DBlob> blob, err;
+	HR(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err));
+	HR(gpu.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+		IID_PPV_ARGS(&p.rs)));
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+	pd.pRootSignature = p.rs.Get();
+	pd.CS.pShaderBytecode = g_warp_probe_dxbc;
+	pd.CS.BytecodeLength = sizeof(g_warp_probe_dxbc);
+	HR(gpu.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&p.pso)));
+
+	D3D12_HEAP_PROPERTIES def = {}; def.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_HEAP_PROPERTIES up = {};  up.Type = D3D12_HEAP_TYPE_UPLOAD;
+	D3D12_HEAP_PROPERTIES rb = {};  rb.Type = D3D12_HEAP_TYPE_READBACK;
+
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = 256; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	HR(gpu.device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&p.cbv)));
+
+	// A known value in the root CBV, so a lost binding is visible in the output.
+	{
+		void *m = nullptr; D3D12_RANGE nr = {0,0};
+		HR(p.cbv->Map(0, &nr, &m));
+		const UINT v[4] = { 0xABCD1234u, 0, 0, 0 };
+		memcpy(m, v, sizeof(v));
+		p.cbv->Unmap(0, nullptr);
+	}
+
+	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&p.out)));
+
+	bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+	HR(gpu.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd,
+		D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&p.readback)));
+
+	D3D12_RESOURCE_DESC td = {};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = 4; td.Height = 4; td.DepthOrArraySize = 1; td.MipLevels = 1;
+	td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; td.SampleDesc.Count = 1;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&p.source)));
+
+	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	hd.NumDescriptors = 2;
+	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p.gpu_heap)));
+
+	const UINT inc = gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	D3D12_CPU_DESCRIPTOR_HANDLE c = p.gpu_heap->GetCPUDescriptorHandleForHeapStart();
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+	sd.Texture2D.MipLevels = 1;
+	gpu.device->CreateShaderResourceView(p.source.Get(), &sd, c);
+
+	c.ptr += inc;
+	D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+	ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	ud.Format = DXGI_FORMAT_UNKNOWN;
+	ud.Buffer.NumElements = 4;
+	ud.Buffer.StructureByteStride = 16;
+	gpu.device->CreateUnorderedAccessView(p.out.Get(), nullptr, &ud, c);
+
+	p.table = p.gpu_heap->GetGPUDescriptorHandleForHeapStart();
+	return true;
+}
+
+// Binds the probe's state exactly as a game would, then dispatches.
+void bind_probe_state(Gpu &gpu, Probe &p, UINT marker)
+{
+	ID3D12DescriptorHeap *heaps[] = { p.gpu_heap.Get() };
+	gpu.list->SetDescriptorHeaps(1, heaps);
+	gpu.list->SetComputeRootSignature(p.rs.Get());
+	const UINT consts[4] = { marker, 0, 0, 0 };
+	gpu.list->SetComputeRoot32BitConstants(0, 4, consts, 0);
+	gpu.list->SetComputeRootConstantBufferView(1, p.cbv->GetGPUVirtualAddress());
+	gpu.list->SetComputeRootDescriptorTable(2, p.table);
+	gpu.list->SetPipelineState(p.pso.Get());
+}
+
+bool read_probe(Gpu &gpu, Probe &p, UINT out[4])
+{
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = p.out.Get();
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	gpu.list->ResourceBarrier(1, &b);
+	gpu.list->CopyBufferRegion(p.readback.Get(), 0, p.out.Get(), 0, 16);
+	std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+	gpu.list->ResourceBarrier(1, &b);
+
+	if (!flush(gpu))
+		return false;
+
+	void *m = nullptr;
+	D3D12_RANGE r = { 0, 16 };
+	HR(p.readback->Map(0, &r, &m));
+	memcpy(out, m, 16);
+	p.readback->Unmap(0, nullptr);
+	return true;
+}
+
+bool test_restore_preserves_game_state(Gpu &gpu)
+{
+	std::printf("\n[test] our clobber + restore leaves the game's dispatch unchanged\n");
+
+	Probe p;
+	if (!build_probe(gpu, p))
+		return false;
+
+	GameResources game;
+	if (!create_game_resources(gpu, game, 1920, 1080))
+		return false;
+	if (!stray_dlss::mv::initialise(gpu.device.Get(), 1920, 1080))
+		return false;
+	drain_validation(gpu, "probe-setup");
+
+	// GOLDEN: the game's dispatch with nothing of ours in the way.
+	UINT golden[4] = {};
+	bind_probe_state(gpu, p, 0x1111u);
+	gpu.list->Dispatch(1, 1, 1);
+	if (!read_probe(gpu, p, golden))
+		return false;
+	std::printf("  golden  = %08X %08X %08X %08X\n", golden[0], golden[1], golden[2], golden[3]);
+
+	// NOW: bind the game state, clobber it with our pass, restore, then dispatch.
+	bind_probe_state(gpu, p, 0x1111u);
+
+	const auto view = make_view(1920, 1080);
+	stray_dlss::mv::ResolveInputs in;
+	in.depth_descriptor = game.depth_srv.ptr;
+	in.velocity_descriptor = game.velocity_srv.ptr;
+	in.render_width = 1920;
+	in.render_height = 1080;
+	in.view = &view;
+	stray_dlss::mv::record(gpu.list.Get(), in, 2);
+
+	// The restore, exactly as the add-on performs it: heaps first (the ReShade half, done here
+	// natively because the harness has no ReShade), then the native replay under test.
+	ID3D12DescriptorHeap *heaps[] = { p.gpu_heap.Get() };
+	gpu.list->SetDescriptorHeaps(1, heaps);
+
+	stray_dlss::NativeComputeState snap;
+	snap.root_signature = p.rs.Get();
+	snap.tables = { 0, 0, p.table.ptr };            // params 0 and 1 are NOT tables
+	snap.root_cbv = { { 1u, p.cbv->GetGPUVirtualAddress() } };
+	snap.root_constants = { { 0u, { 0x1111u, 0, 0, 0 } } };
+	snap.pso = p.pso.Get();
+	stray_dlss::restore_native_compute_state(gpu.list.Get(), snap);
+
+	UINT after[4] = {};
+	gpu.list->Dispatch(1, 1, 1);
+	if (!read_probe(gpu, p, after))
+		return false;
+	std::printf("  restored= %08X %08X %08X %08X\n", after[0], after[1], after[2], after[3]);
+
+	check(memcmp(golden, after, sizeof(golden)) == 0,
+		"the game's dispatch produces identical output after our clobber and restore");
+	check(drain_validation(gpu, "probe") == 0, "no validation errors across clobber and restore");
+	return true;
+}
+
 } // namespace
 
 int main()
@@ -351,6 +572,7 @@ int main()
 
 	test_dispatch_is_valid(gpu);
 	test_no_allocation_churn(gpu);
+	test_restore_preserves_game_state(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");

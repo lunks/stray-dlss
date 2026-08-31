@@ -142,6 +142,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/taa_hook.hpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp
+        src/d3d12_restore.cpp
+        src/d3d12_restore.hpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -210,10 +212,13 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
     add_executable(stray_dlss_warp
         tests/warp/warp_mv_resolve.cpp
         tests/warp/log_stub.cpp
-        src/mv_resolve.cpp)
+        src/mv_resolve.cpp
+        src/d3d12_restore.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
+    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/warp_probe.hlsl"
+                   main cs_5_0 g_warp_probe_dxbc)
 
     target_include_directories(stray_dlss_warp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(stray_dlss_warp PRIVATE stray_dlss_core d3d12 dxgi d3dcompiler)

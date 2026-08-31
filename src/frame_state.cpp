@@ -1,5 +1,6 @@
 #include "frame_state.hpp"
 
+#include "d3d12_restore.hpp"
 #include "log.hpp"
 
 #include <d3d12.h>
@@ -583,35 +584,45 @@ void restore_game_compute_state(reshade::api::command_list *cmd_list)
 		}
 	}
 
-	// 4. Compute root arguments, NATIVELY — the part ReShade cannot replay for us. Native
-	//    because ReShade caches nothing for root descriptors, so there is nothing to desync,
-	//    and because its push_descriptors path for root SRV/UAV mis-handles them.
+	// 4. Compute root arguments and the PSO, NATIVELY — the part ReShade cannot replay for us.
+	//    Native because ReShade caches nothing for root descriptors, so there is nothing to
+	//    desync, and because its push_descriptors path for root SRV/UAV mis-handles them.
 	//
 	//    Replayed only if captured under THIS layout; arguments harvested under a different
 	//    root signature index different parameters and must never be replayed here.
+	//
+	//    Built as a plain snapshot and handed to restore_native_compute_state, which is the
+	//    same function the WARP harness exercises — so the ordering and skip rules below are
+	//    covered by a golden-output test rather than only by reasoning.
+	NativeComputeState snapshot;
+	snapshot.root_signature = reinterpret_cast<::ID3D12RootSignature *>(compute_layout.handle);
+
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		const auto it = g_root.find(cmd_list);
 		if (it != g_root.end() && it->second.layout == compute_layout.handle)
 		{
 			for (const auto &cbv : it->second.root_cbv_va)
-				native->SetComputeRootConstantBufferView(cbv.first, cbv.second);
+				snapshot.root_cbv.emplace_back(cbv.first, cbv.second);
 			for (const auto &srv : it->second.root_srv_va)
-				native->SetComputeRootShaderResourceView(srv.first, srv.second);
+				snapshot.root_srv.emplace_back(srv.first, srv.second);
 			for (const auto &uav : it->second.root_uav_va)
-				native->SetComputeRootUnorderedAccessView(uav.first, uav.second);
+				snapshot.root_uav.emplace_back(uav.first, uav.second);
 			for (const auto &rc : it->second.root_constants)
-				if (!rc.second.empty())
-					native->SetComputeRoot32BitConstants(rc.first,
-						static_cast<UINT>(rc.second.size()), rc.second.data(), 0);
+				snapshot.root_constants.emplace_back(rc.first, rc.second);
 		}
 	}
 
-	// 5. The pipeline state object. D3D12 has one PSO slot shared by graphics and compute, and
-	//    the last thing the game bound before this dispatch is its TAA compute PSO.
+	// D3D12 has one PSO slot shared by graphics and compute, and the last thing the game bound
+	// before this dispatch is its TAA compute PSO.
 	const auto pso = state->pipelines.find(reshade::api::pipeline_stage::all);
 	if (pso != state->pipelines.end() && pso->second.handle != 0)
-		cmd_list->bind_pipeline(reshade::api::pipeline_stage::all, pso->second);
+		snapshot.pso = reinterpret_cast<::ID3D12PipelineState *>(pso->second.handle);
+
+	// The root signature and tables were already re-bound through ReShade above, so they are
+	// left out of the snapshot here to avoid issuing them twice.
+	snapshot.root_signature = nullptr;
+	restore_native_compute_state(native, snapshot);
 
 	// 6. Nothing else. Viewports, scissors, render targets, blend factor and stencil reference
 	//    are untouched by anything we do.
