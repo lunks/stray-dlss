@@ -84,6 +84,32 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### The candidate set DOES contain a pass that drives the image (measured 2026-08-31)
+
+Suppressing **every** relaxed candidate (`NgxDryRun=3`: any dispatch with a depth SRV, a
+velocity SRV and an HDR colour UAV), alternating within one session, fixed viewpoint, n=32:
+
+```
+SUPPRESSED: n=16  mean=15263  sd=23448  median=3107  min=569  max=71461
+normal    : n=16  mean= 2431  sd= 3258  median=1474  min=620  max=14787
+```
+
+Median frame-to-frame shimmer is **2.1× higher** when suppressed, and the suppressed group has
+a tail the normal group has nothing like (71461 against 14787). Use the medians: the means are
+outlier-driven.
+
+**The effect grew monotonically as each confound was removed** — 47% → 71% → 111% median gap —
+which is what a real signal emerging from noise looks like, and is more persuasive than any one
+run. The three fixes, in order of how much they mattered: comparing a frame against itself
+rather than measuring absolute sharpness; cropping away the animated CRT wall; and finally
+**not panning at all during measurement**, since a pair caught while the camera is still
+settling differs enormously whatever the TAA is doing.
+
+**This revises the earlier "DLSS's output is invisible" reading.** At least one pass in the
+candidate set does drive the picture; the strict §2.3 signature simply is not selecting it. The
+next step is a bisection over the candidate list — suppress half, measure, halve again — which
+this instrument is finally sharp enough to run.
+
 ### Temporal stability is the right metric, and the CRT wall is the confound
 
 Absolute sharpness could not separate the groups (sd 7810 against a 1633 difference). Comparing
