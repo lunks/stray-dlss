@@ -84,6 +84,31 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### Temporal stability is the right metric, and the CRT wall is the confound
+
+Absolute sharpness could not separate the groups (sd 7810 against a 1633 difference). Comparing
+a frame against ITSELF a moment later, camera still, is far better: content cancels, and working
+temporal AA converges so consecutive still frames are nearly identical, while suppressing it
+lets jitter reshuffle sub-pixel sampling every frame.
+
+Re-measuring `0x8978e4e6431cacb3` that way, n=32:
+
+```
+SUPPRESSED: n=17  mean=3898  sd=2250  median=3851
+normal    : n=15  mean=3140  sd=1825  median=2617
+```
+
+Suppressed frames shimmer **more**, which is the physically correct direction, and the medians
+differ by 47%. But t ≈ 1.05 on the means — **not significant**, so this neither confirms nor
+overturns the n=44 negative above.
+
+**The confound is the scene.** Stray's starting apartment is full of animated CRT screens that
+change every frame no matter what the TAA does, and they contribute to the frame difference in
+both groups equally. That is almost certainly what is holding the spread at ~2000. Two ways to
+fix it, in order of cheapness: crop the measurement to a region with no screens in it, or drive
+the cat somewhere without them. Either should shrink the variance far more than adding samples
+will.
+
 ### Candidate 0x8978e4e6431cacb3 is NOT the pass that drives the image (n=44)
 
 Measured with the alternating harness, `tools/measure-alternating.py`, 44 captures with a panning
