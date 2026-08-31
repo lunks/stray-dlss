@@ -544,23 +544,62 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// resource, and a dead pointer here would fault inside the driver.
 					if (g_ngx_evaluate && ngx::status().super_sampling_available)
 					{
-						ID3D12Resource *colour = nullptr;
-						ID3D12Resource *output = nullptr;
+						// Decide WHICH of the two colour slots is scene colour.
+						//
+						// colour_srv_a and _b are scene colour and history in an order the
+						// signature cannot determine. Last frame's u0 identifies the history
+						// (CLAUDE.md §2.9), so the other slot is the scene colour DLSS needs.
+						//
+						// If we cannot tell them apart we must SKIP, not guess. Feeding DLSS the
+						// history instead of the scene colour produces a plausible-looking image
+						// that never converges — the worst kind of bug here, because it looks
+						// like it works.
+						std::uint64_t slot_a = 0, slot_b = 0;
 						for (const auto &t : b.srvs)
 						{
-							// colour_srv_a and _b are scene colour and history in unknown
-							// order; last frame's u0 identifies the history, so the OTHER one
-							// is the scene colour we must feed DLSS.
-							const bool is_colour_slot =
-								t.slot == m.colour_srv_a || t.slot == m.colour_srv_b;
-							if (!is_colour_slot || !is_resource_live(t.resource))
-								continue;
-							const auto prev = g_prev_output.find(hash);
-							const bool is_history =
-								prev != g_prev_output.end() && prev->second == t.resource;
-							if (!is_history)
-								colour = reinterpret_cast<ID3D12Resource *>(t.resource);
+							if (t.slot == m.colour_srv_a && is_resource_live(t.resource))
+								slot_a = t.resource;
+							else if (t.slot == m.colour_srv_b && is_resource_live(t.resource))
+								slot_b = t.resource;
 						}
+
+						std::uint64_t history = 0;
+						{
+							const auto prev = g_prev_output.find(hash);
+							if (prev != g_prev_output.end())
+								history = prev->second;
+						}
+
+						std::uint64_t colour_handle = 0;
+						const char *colour_reason = "ok";
+						if (slot_a != 0 && slot_b != 0 && history != 0)
+						{
+							if (slot_a == history)      colour_handle = slot_b;
+							else if (slot_b == history) colour_handle = slot_a;
+							else                        colour_reason = "neither slot is last frame's u0";
+						}
+						else if (slot_a != 0 && slot_b == 0)
+						{
+							// Only one live colour slot: on a camera cut UE4 substitutes the 1x1
+							// BlackDummy for history, so the survivor is the scene colour.
+							colour_handle = slot_a;
+						}
+						else if (slot_b != 0 && slot_a == 0)
+						{
+							colour_handle = slot_b;
+						}
+						else if (history == 0)
+						{
+							colour_reason = "no history seen yet, cannot tell colour from history";
+						}
+						else
+						{
+							colour_reason = "no live colour slot";
+						}
+
+						ID3D12Resource *colour =
+							reinterpret_cast<ID3D12Resource *>(colour_handle);
+						ID3D12Resource *output = nullptr;
 						for (const auto &u : b.uavs)
 						{
 							if (u.slot == m.output_uav && is_resource_live(u.resource))
@@ -634,9 +673,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						else if (dims_ok && !g_ngx_skip_logged)
 						{
 							g_ngx_skip_logged = true;
-							STRAY_LOG_WARN("DLSS evaluate skipped: colour=%p output=%p feature=%s",
-								static_cast<void *>(colour), static_cast<void *>(output),
-								ngx::last_error());
+							STRAY_LOG_WARN("DLSS evaluate skipped: colour=%p (%s) output=%p "
+								"feature=%s", static_cast<void *>(colour), colour_reason,
+								static_cast<void *>(output), ngx::last_error());
 						}
 					}
 					if (!g_resolve_ran)
