@@ -865,6 +865,77 @@ bool test_vkd3d_ext_hook_reachability(Gpu &gpu)
 	return true;
 }
 
+// Is copying FROM a shader-visible heap what kills us?
+//
+// mv_resolve copies the game's SRV descriptors into its own heap. The harness has always
+// created those source SRVs in a NON-shader-visible heap, on the assumption that the handles we
+// capture come from UE4's offline heaps. That assumption is load-bearing and untested: the
+// descriptors ReShade reports at dispatch time are the ones in the heap the game has BOUND,
+// and a bound heap is necessarily shader-visible.
+//
+// D3D12 forbids a shader-visible source for CopyDescriptorsSimple. If that is what we do in
+// the game, the copy produces a descriptor the GPU rejects — which matches the measured
+// behaviour exactly: MvDispatch=0 (copy, never dispatch) survives, MvDispatch=1 (one 1x1
+// group) hangs with Xid 109, because a bad descriptor only bites when it is read.
+//
+// This test does not assert a verdict; it establishes which way D3D12 rules, so the fix is
+// chosen on evidence rather than on my reading of the spec.
+bool test_copy_from_shader_visible_source(Gpu &gpu)
+{
+	std::printf("\n[test] is CopyDescriptorsSimple from a SHADER-VISIBLE source rejected?\n");
+
+	if (!gpu.info)
+	{
+		std::printf("  SKIP: no info queue, so nothing can judge this\n");
+		return true;
+	}
+
+	GameResources game;
+	if (!create_game_resources(gpu, game, 1920, 1080))
+		return false;
+
+	// A shader-visible heap holding one SRV — the shape a game actually has bound.
+	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	hd.NumDescriptors = 4;
+	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ComPtr<ID3D12DescriptorHeap> visible;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&visible)));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.Format = DXGI_FORMAT_R32_FLOAT;
+	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2D.MipLevels = 1;
+	const D3D12_CPU_DESCRIPTOR_HANDLE visible_cpu = visible->GetCPUDescriptorHandleForHeapStart();
+	gpu.device->CreateShaderResourceView(game.depth.Get(), &srv, visible_cpu);
+	drain_validation(gpu, "shader-visible-setup");
+
+	// A non-shader-visible destination, as our resolve pass would use.
+	hd.NumDescriptors = 4;
+	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	ComPtr<ID3D12DescriptorHeap> dest_heap;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dest_heap)));
+
+	gpu.device->CopyDescriptorsSimple(1, dest_heap->GetCPUDescriptorHandleForHeapStart(),
+		visible_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	const int errors = drain_validation(gpu, "copy-from-shader-visible", /*expected=*/true);
+	if (errors > 0)
+	{
+		std::printf("  FINDING: D3D12 REJECTS a shader-visible source. If the handles we capture\n");
+		std::printf("           in game live in the game's BOUND heap, our copy is illegal and\n");
+		std::printf("           that is the hang.\n");
+	}
+	else
+	{
+		std::printf("  FINDING: D3D12 accepts a shader-visible source here, so this is NOT the\n");
+		std::printf("           cause and the hang lies elsewhere.\n");
+	}
+	std::printf("  (recorded, not asserted)\n");
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -900,6 +971,7 @@ int main(int argc, char **argv)
 	test_restore_preserves_game_state(gpu);
 	test_reshade_restore_call_pattern(gpu);
 	test_vkd3d_ext_hook_reachability(gpu);
+	test_copy_from_shader_visible_source(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");
