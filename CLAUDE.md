@@ -84,6 +84,23 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### A STATIC SCENE INVALIDATES EVERY TEMPORAL TEST — read this before trusting the two below
+
+The launch script drives the cat to gameplay and then stops, so every screenshot taken this
+session was of a **stationary camera**. With nothing moving, TAA's history is already converged:
+suppressing the pass produces very nearly the same image as leaving it in place. So
+"suppressing it changed nothing" does **not** establish "that pass does not matter" — it may only
+mean nothing was moving.
+
+That undermines the two sections below, which were written from static captures. Treat their
+conclusions as unproven, not as facts.
+
+`tools/screenshot-stray.sh` now pans the right stick (`ABS_RX` on the
+"Microsoft X-Box 360 pad 0" node) for about a second before capturing; `PAN=0` restores the old
+behaviour. The remaining difficulty is that a moving camera also changes the scene, so frames
+from different runs are no longer directly comparable — a content-independent metric, or a
+toggle within a single run, is needed to compare them honestly.
+
 ### The §2.3 signature does not match this configuration (measured 2026-08-31)
 
 `NgxDryRun=2` suppresses **every** structurally matched pass and writes nothing. The image is
