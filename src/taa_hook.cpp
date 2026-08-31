@@ -37,7 +37,11 @@ bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
 // player sees, so it is opt-in and separate from EnableNGX (which only brings NGX up).
 bool g_ngx_evaluate = false;
-bool g_ngx_logged_once = false;
+bool g_ngx_logged_once = false;      // the evaluate result
+bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE flag, because
+                                     // sharing one meant the skip warning consumed the budget
+                                     // and the successful evaluate never reported at all
+bool g_ngx_dims_logged = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
@@ -569,7 +573,27 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						fd.output_width = m.output_width ? m.output_width : render_w;
 						fd.output_height = m.output_height ? m.output_height : render_h;
 
-						if (colour != nullptr && output != nullptr &&
+						// The two dimensions come from DIFFERENT sources — render from the View
+						// CB's view rect, output from this dispatch's coverage — so they can
+						// disagree, and several passes match structurally with different output
+						// sizes. NGX rejects input > output outright:
+						//   "Input dimensions (2560 x 1440) must be <= output dimensions
+						//    (1280 x 720)"
+						// which is a half-res pass being handed the full-res view rect. Skip
+						// those rather than thrashing CreateFeature against them.
+						const bool dims_ok = fd.output_width >= fd.render_width &&
+							fd.output_height >= fd.render_height &&
+							fd.render_width > 0 && fd.output_width > 0;
+						if (!dims_ok && !g_ngx_dims_logged)
+						{
+							g_ngx_dims_logged = true;
+							STRAY_LOG_INFO("Skipping DLSS for this pass: render %ux%u > output "
+								"%ux%u, so it is not the full-res pass we want.",
+								fd.render_width, fd.render_height,
+								fd.output_width, fd.output_height);
+						}
+
+						if (dims_ok && colour != nullptr && output != nullptr &&
 							ngx::ensure_feature(native, fd))
 						{
 							// Our resolve just wrote the motion vectors as a UAV; NGX reads
@@ -607,9 +631,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									STRAY_LOG_ERROR("  %s", ngx::last_error());
 							}
 						}
-						else if (!g_ngx_logged_once)
+						else if (dims_ok && !g_ngx_skip_logged)
 						{
-							g_ngx_logged_once = true;
+							g_ngx_skip_logged = true;
 							STRAY_LOG_WARN("DLSS evaluate skipped: colour=%p output=%p feature=%s",
 								static_cast<void *>(colour), static_cast<void *>(output),
 								ngx::last_error());
