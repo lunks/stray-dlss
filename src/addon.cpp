@@ -175,7 +175,6 @@ void on_init_device(reshade::api::device *device)
 	STRAY_LOG_INFO("init_device: ID3D12Device=%p", static_cast<void *>(native));
 
 	report_vkd3d_ext_hook(native, "init_device");
-	}
 
 	if (native != nullptr)
 	{
