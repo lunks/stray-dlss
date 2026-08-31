@@ -470,6 +470,25 @@ void on_present(
 		ngx::initialise(device);
 	}
 
+	// Re-check the vkd3d ext hook periodically.
+	//
+	// The answer can change mid-session: whoever installs the patch may do so at any point, and
+	// the most likely trigger is the game's own first NvAPI call, which can happen long after
+	// device creation. A startup-only check would report "safe" and be wrong later. These are
+	// passive reads of a vtable slot — no interception, no NGX, nothing that can affect the
+	// image — so they are safe to leave on.
+	if (frame == 300 || frame == 1200 || frame == 3600)
+	{
+		ID3D12Device *native = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			native = g_state.native_device;
+		}
+		char when[32];
+		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
+		report_vkd3d_ext_hook(native, when);
+	}
+
 	// Report the add-on-level capability verdict once, after enough frames that the game has
 	// certainly bound something.
 	// Well after gameplay has started, so every steady-state pass has had a chance to run.
