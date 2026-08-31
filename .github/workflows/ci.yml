@@ -122,20 +122,9 @@ jobs:
           # the user actually runs. Its DLLs are embedded .NET resources.
           Invoke-WebRequest -Uri "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe" `
                             -OutFile setup.exe -UseBasicParsing
-          # The installer is a self-extracting zip: it opens its own file as a ZipArchive
-          # (setup/MainWindow.xaml.cs:987-1009), so we can read the DLL straight out of it.
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $fs = [System.IO.File]::OpenRead((Resolve-Path setup.exe))
-          $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
-          Write-Host "Setup archive entries: $(($zip.Entries | ForEach-Object { $_.Name }) -join ', ')"
-          $entry = $zip.GetEntry('ReShade64.dll')
-          if (-not $entry) { throw "ReShade64.dll is not in the setup archive" }
-          $in = $entry.Open()
-          $out = [System.IO.File]::Create((Join-Path (Get-Location) 'd3d12.dll'))
-          $in.CopyTo($out)
-          $out.Close(); $in.Close(); $zip.Dispose(); $fs.Close()
-          $dll = Get-Item d3d12.dll
-          Write-Host "Extracted ReShade $($dll.VersionInfo.FileVersion) as d3d12.dll ($($dll.Length) bytes)"
+          python ../tools/extract_reshade.py setup.exe d3d12.dll
+          if (-not (Test-Path d3d12.dll)) { throw "failed to extract ReShade64.dll" }
+          Write-Host "ReShade version: $((Get-Item d3d12.dll).VersionInfo.FileVersion)"
 
           Copy-Item stray-dlss.addon64 . -ErrorAction SilentlyContinue
           # Written as an array, not a here-string: a here-string's lines would sit at column 0
