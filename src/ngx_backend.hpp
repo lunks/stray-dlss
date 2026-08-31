@@ -76,6 +76,10 @@ struct EvaluateInputs
 bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in);
 
 // Releases the feature. The GPU must already be idle for it.
+// [STRAYDLSS] NgxPreset: 0=driver default, 10=J, 11=K (default), 12=L, 13=M. J is often
+// calmer on specular sparkle. Takes effect at the next feature (re)creation.
+void set_preset(int preset);
+
 void release_feature();
 
 // The most recent failure, for reporting without another round trip.

@@ -4,9 +4,15 @@
 Entry encoding follows FPakFile::DecodePakEntry / FPakEntry::Encode in UE 4.27's
 IPlatformFilePak.cpp.
 """
-import struct, sys, os, re, zlib
+import json, struct, sys, os, re, zlib
 
-PAK, OUTDIR, PATTERN = sys.argv[1], sys.argv[2], re.compile(sys.argv[3], re.I)
+# --raw: write each matched entry's COMPRESSED payload plus a .json block map instead of
+# decompressing. For Oodle-compressed entries (method name from the pak footer; Stray:
+# 1=Zlib 2=Oodle) python cannot decode the blocks — dump them raw here and decompress
+# offline with tools/oodle_unblock.py + an ooz build.
+RAW_MODE = '--raw' in sys.argv
+argv = [a for a in sys.argv if a != '--raw']
+PAK, OUTDIR, PATTERN = argv[1], argv[2], re.compile(argv[3], re.I)
 MAGIC = 0x5A6F12E1
 
 def fstring(buf, off):
@@ -92,6 +98,14 @@ with open(PAK, 'rb') as f:
             hdr += 4 + 4 + len(e['blocks']) * 16
         f.seek(e['offset'] + hdr)
         raw = f.read(e['size'])
+        if RAW_MODE:
+            base = os.path.join(OUTDIR, full.replace('/', '_'))
+            open(base + '.raw', 'wb').write(raw)
+            meta = {'path': full, 'method': e['method'], 'usize': e['usize'],
+                    'size': e['size'], 'block_size': e['block_size'], 'blocks': e['blocks']}
+            open(base + '.json', 'w').write(json.dumps(meta, indent=1))
+            print(f"{e['size']:>9}  RAW {full} (method {e['method']}, {len(e['blocks'])} blocks)")
+            continue
         if e['method'] == 0:
             data = raw
         else:

@@ -36,6 +36,7 @@ void shutdown(ID3D12Device *) { g_status = Status{}; }
 
 bool ensure_feature(ID3D12GraphicsCommandList *, const FeatureDesc &) { return false; }
 bool evaluate(ID3D12GraphicsCommandList *, const EvaluateInputs &) { return false; }
+void set_preset(int) {}
 void release_feature() {}
 const char *last_error() { return "<ngx disabled>"; }
 
@@ -45,6 +46,23 @@ const char *last_error() { return "<ngx disabled>"; }
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+
+namespace stray_dlss::ngx {
+namespace {
+// [STRAYDLSS] NgxPreset via set_preset: 10=J 11=K 12=L 13=M, 0=driver default. K is the
+// transformer preset and the default; J is often calmer on specular sparkle when a game's
+// denoisers were tuned for the engine's own TAA. (CLAUDE.md §5)
+int g_preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+} // namespace
+void set_preset(int preset)
+{
+	if (preset == 0 || (preset >= 10 && preset <= 13))
+		g_preset = preset;
+	else
+		STRAY_LOG_WARN("NgxPreset %d invalid (0, 10=J, 11=K, 12=L, 13=M); keeping %d.",
+			preset, g_preset);
+}
+} // namespace stray_dlss::ngx
 
 namespace stray_dlss::ngx {
 namespace {
@@ -290,15 +308,16 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 		? NVSDK_NGX_PerfQuality_Value_DLAA
 		: NVSDK_NGX_PerfQuality_Value_MaxQuality;
 
+	const int preset = g_preset;
+
 	// Preset hints must be set BEFORE CreateFeature; setting them afterwards has no effect.
 	// Only 0, J, K, L and M are valid — A–D were removed and E/F are deprecated. K is the
 	// transformer preset and the best image quality. (CLAUDE.md §5)
-	constexpr int kPresetK = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
-	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, kPresetK);
-	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, kPresetK);
-	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, kPresetK);
-	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, kPresetK);
-	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, kPresetK);
+	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, preset);
+	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, preset);
+	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, preset);
+	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, preset);
+	g_feature_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, preset);
 
 	NVSDK_NGX_DLSS_Create_Params create = {};
 	create.Feature.InWidth = desc.render_width;
@@ -325,9 +344,10 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 	g_feature_desc = desc;
 	g_last_error[0] = 0;
-	STRAY_LOG_INFO("DLSS feature created: %ux%u -> %ux%u, %s, preset K, flags=0x%x",
+	STRAY_LOG_INFO("DLSS feature created: %ux%u -> %ux%u, %s, preset=%d, flags=0x%x",
 		desc.render_width, desc.render_height, desc.output_width, desc.output_height,
-		is_dlaa ? "DLAA" : "MaxQuality", static_cast<unsigned>(create.InFeatureCreateFlags));
+		is_dlaa ? "DLAA" : "MaxQuality", preset,
+		static_cast<unsigned>(create.InFeatureCreateFlags));
 	return true;
 }
 

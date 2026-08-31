@@ -265,6 +265,15 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
 			"— the image will look aliased because nothing accumulates.");
 
+	int ngx_preset = 0;
+	if (reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPreset", ngx_preset) &&
+		ngx_preset != 0)
+	{
+		ngx::set_preset(ngx_preset);
+		STRAY_LOG_INFO("NgxPreset=%d requested ([STRAYDLSS] NgxPreset; 10=J 11=K 12=L 13=M).",
+			ngx_preset);
+	}
+
 	bool ext_unhook_enabled = true;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "ExtUnhook", ext_unhook_enabled);
 	ext_unhook::set_enabled(ext_unhook_enabled);
