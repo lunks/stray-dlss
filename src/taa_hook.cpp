@@ -439,7 +439,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// The reporting throttle must never apply while a dry run is active: it would suppress
 		// a pass for its first two dispatches and then let it run, which is a test that looks
 		// like it ran and measures nothing.
-		const bool dry_running = g_dry_run_hash != 0 || g_ngx_dry_run != 0;
+		// The throttle exists to stop log spam, and it must never gate BEHAVIOUR. It already
+		// silently truncated a dry run once; here it let the named pass reach phase B exactly
+		// three times out of 3558 dispatches, so DLSS could never evaluate. Disable it whenever
+		// anything downstream depends on seeing the pass.
+		const bool dry_running = g_dry_run_hash != 0 || g_ngx_dry_run != 0 ||
+			g_ngx_pass_override != 0 || g_ngx_evaluate;
 		if (!dry_running && g_report_count[hash] >= 2 && hash != kTaaMainHash)
 		{
 			// Still track the output resource each frame: the history round-trip (this
