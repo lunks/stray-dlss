@@ -103,6 +103,8 @@ std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
 bool g_dry_run_hash_logged = false;
+bool g_dry_run_all_logged = false;
+bool g_dry_run_mode2_logged = false;
 bool g_ngx_waiting_logged = false;
 
 bool owns_temporal_history(std::uint64_t hash)
@@ -308,6 +310,17 @@ void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
 void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
 
+// True when a dry run should suppress RIGHT NOW.
+//
+// Every dry-run mode must go through this. Two of the three modes were written without it and
+// suppressed in BOTH halves of the alternation, which produces a null difference that looks
+// exactly like a real negative — the single most misleading failure this project has had.
+bool dry_run_phase_active()
+{
+	return g_dry_run_alternate == 0 ||
+		g_alt_phase_suppressing.load(std::memory_order_relaxed);
+}
+
 void note_present(std::uint64_t frame)
 {
 	g_present_frame.store(frame, std::memory_order_relaxed);
@@ -416,9 +429,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// two frames and ran normally for the rest of the session. The test looked like it ran
 		// and measured nothing.
 		{
-			const bool alt_active = g_dry_run_alternate == 0 ||
-				g_alt_phase_suppressing.load(std::memory_order_relaxed);
-			if (g_dry_run_hash != 0 && hash == g_dry_run_hash && alt_active)
+			if (g_dry_run_hash != 0 && hash == g_dry_run_hash && dry_run_phase_active())
 			{
 				if (!g_dry_run_hash_logged)
 				{
@@ -615,13 +626,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// still does not change, the TAA is not a compute dispatch of this shape and testing the
 		// candidates one by one would be wasted; the next question would be whether it is a
 		// draw, which we do not hook.
-		const bool alt_now = g_dry_run_alternate == 0 ||
-			g_alt_phase_suppressing.load(std::memory_order_relaxed);
-		if (g_ngx_dry_run == 3 && is_relaxed_candidate && alt_now)
+		if (g_ngx_dry_run == 3 && is_relaxed_candidate && dry_run_phase_active())
 		{
-			if (!g_dry_run_hash_logged)
+			if (!g_dry_run_all_logged)
 			{
-				g_dry_run_hash_logged = true;
+				g_dry_run_all_logged = true;
 				STRAY_LOG_WARN("DRY RUN (all candidates): suppressing every pass with a depth "
 					"SRV + velocity SRV + HDR colour UAV, writing nothing.");
 			}
@@ -800,18 +809,18 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					}
 					// Dry run. Mode 2 suppresses everything we match; mode 1 only the pinned
 					// pass. Either way nothing is written in its place.
-					if (g_ngx_dry_run == 2)
+					if (g_ngx_dry_run == 2 && dry_run_phase_active())
 					{
-						if (!g_ngx_waiting_logged)
+						if (!g_dry_run_mode2_logged)
 						{
-							g_ngx_waiting_logged = true;
+							g_dry_run_mode2_logged = true;
 							STRAY_LOG_WARN("DRY RUN (all): suppressing EVERY structurally matched "
 								"pass and writing nothing. If the image is unchanged, the matcher "
 								"never sees the pass that draws the picture.");
 						}
 						suppress_engine_dispatch = true;
 					}
-					else if (g_ngx_dry_run == 1 && eligible)
+					else if (g_ngx_dry_run == 1 && eligible && dry_run_phase_active())
 					{
 						std::uint64_t expected = 0;
 						if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
