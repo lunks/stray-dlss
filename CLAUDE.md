@@ -559,6 +559,32 @@ Hard constraints:
 
 The full detail is in `docs/RESEARCH.md`. These are the things that bite.
 
+### Two descriptor hazards that cost a day, both measured
+
+**1. Never `CopyDescriptorsSimple` out of the game's bound heap.** UE4 binds a shader-visible
+heap — measured `type=0, NumDescriptors=500000, SHADER_VISIBLE=YES` — and D3D12 forbids a
+shader-visible copy SOURCE: *"D3D12 ERROR #654: SrcDescriptorRangeStart points to a descriptor
+heap type that is CPU write only, so reading it (in this case a copy source) is invalid"*
+(reproduced in our own CI). vkd3d-proton has no debug layer to object, so the illegal copy
+silently writes a descriptor the GPU rejects **only when something reads it** — which is why a
+bind-only mode survives and a single 1×1 dispatch dies with `Xid 109 CTX SWITCH TIMEOUT`.
+
+**2. ReShade's `view → resource` map outlives the resource on D3D12.** It never calls
+`destroy_resource_view`, so a descriptor slot UE4 has recycled still maps to the **destroyed**
+resource. Building an SRV from one faults inside the driver —
+`err:vulkan:vkCreateImageView Exception 0xc0000005` — and takes the game with it.
+`GetDesc()` does **not** protect you: it reads freed-but-still-mapped memory and returns
+entirely plausible values (`2560×1440`, `R32G8X24_TYPELESS`). UE4 rotates these buffers
+constantly, so it happens within seconds of gameplay.
+
+Track liveness yourself from `init_resource` / `destroy_resource` and refuse anything not known
+live (`is_resource_live`, `src/frame_state.hpp`). Keep a set of LIVE resources, never of dead
+ones: D3D12 reuses addresses, so a freed pointer can come back as a different valid resource.
+Measured working: `depth=…53465B60 live=0` was skipped and the game survived.
+
+**Together these are a vice.** Copying descriptors is illegal; recreating views needs a resource
+pointer ReShade cannot be trusted for. Only liveness-checked view creation satisfies both.
+
 ### ReShade 6.8 add-on API
 
 * **Pin headers to tag `v6.8.0`.** `RESHADE_API_VERSION` is **20**; ReShade rejects anything newer
