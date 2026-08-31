@@ -208,6 +208,12 @@ TexFormat to_tex_format(reshade::api::format f)
 	case format::r16_float:              return TexFormat::r16_float;
 	case format::r8g8b8a8_unorm:
 	case format::r8g8b8a8_unorm_srgb:    return TexFormat::r8g8b8a8_unorm;
+	// UE4's PF_B8G8R8A8, the stock GBufferB/C format — created typeless, viewed unorm or
+	// srgb. The gbuffer classifier needs to see all three as one thing.
+	// (core/gbuffer_classify.hpp)
+	case format::b8g8r8a8_typeless:
+	case format::b8g8r8a8_unorm:
+	case format::b8g8r8a8_unorm_srgb:    return TexFormat::b8g8r8a8_unorm;
 	default:                             return TexFormat::unknown;
 	}
 }
@@ -226,6 +232,7 @@ const char *format_name(reshade::api::format f)
 	case format::r32g32b32a32_float:   return "R32G32B32A32_FLOAT";
 	case format::r11g11b10_float:      return "R11G11B10_FLOAT";
 	case format::r8g8b8a8_unorm:       return "R8G8B8A8_UNORM";
+	case format::b8g8r8a8_unorm:       return "B8G8R8A8_UNORM";
 	case format::r10g10b10a2_unorm:    return "R10G10B10A2_UNORM";
 	case format::r32_float:            return "R32_FLOAT";
 	case format::r16_float:            return "R16_FLOAT";
