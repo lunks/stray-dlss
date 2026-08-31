@@ -180,6 +180,11 @@ if(STRAY_DLSS_BUILD_ADDON)
     # Keep symbols for field crash triage, but do not pay for them in the binary.
     target_link_options(stray-dlss PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 
+    # Shaders are compiled to DXBC here and embedded, never compiled at runtime.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
+    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
+                   main cs_5_0 g_mv_resolve_dxbc)
+
     install(TARGETS stray-dlss RUNTIME DESTINATION .)
     install(FILES $<TARGET_PDB_FILE:stray-dlss> DESTINATION . OPTIONAL)
 endif()
