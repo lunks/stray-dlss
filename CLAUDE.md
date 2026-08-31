@@ -572,6 +572,7 @@ The full detail is in `docs/RESEARCH.md`. These are the things that bite.
 |---|---|---|---|
 | Unit (Linux, doctest) | every push | pure functions: hashing, matrix math, jitter, velocity decode | anything touching D3D12 |
 | **WARP** (Windows CI) | every push | our D3D12 usage is *legal* — the debug layer and GPU-based validation judge it | vkd3d-proton's behaviour; NGX |
+| **Real ReShade** (Windows CI) | every push | the add-on loads into the **shipped ReShade 6.8.0.2155** and its events fire; every harness test runs through ReShade's *real* device and command-list proxies | NGX; the game's actual bindings |
 | **Hardware** (`tools/run-harness-proton.sh`) | by hand | our D3D12 usage *behaves* on the real driver through real vkd3d-proton | validation: vkd3d implements no `ID3D12InfoQueue`, so every "no validation errors" assertion is vacuous there |
 
 They are complementary and none of them replaces seeing the game render.
@@ -589,6 +590,20 @@ They are complementary and none of them replaces seeing the game render.
   root-CBV parameter and requires the debug layer to report
   `D3D12_MESSAGE_ID_SET_DESCRIPTOR_TABLE_INVALID = 708` (verified in `d3d12sdklayers.h:2726`
   and reproduced in our own CI). That is the mistake ReShade's own `state_block` makes.
+* **ReShade attaches its add-on path inside the hooked `D3D12CreateDevice`**
+  (v6.8.0 `source/d3d12/d3d12.cpp:40`), *not* at swapchain creation or `Present`, and it refuses
+  WARP only in its D3D10/D3D11 paths (`d3d10.cpp:159`, `d3d11.cpp:150`) — there is no adapter
+  check anywhere in `source/d3d12/`. **So a headless console app with no window and no swapchain
+  is enough to load real ReShade and the real add-on.** Dropping the shipped DLL in as
+  `d3d12.dll` makes our own `D3D12CreateDevice` return ReShade's proxy, so every harness test
+  then runs through its descriptor-heap wrappers and handle conversion — the code §1 flags as
+  having no release-build validation.
+* The setup exe is a **self-extracting zip** (`setup/MainWindow.xaml.cs:987`).
+  `tools/extract_reshade.py` pulls `ReShade64.dll` out of it; .NET's `ZipArchive` refuses the
+  prepended PE, Python's `zipfile` does not.
+* **Registering is not receiving.** The add-on logs a census on detach, and CI fails if it saw
+  zero compute pipelines or zero dispatches — that is the automated form of the §5 warning that
+  "wrong ReShade build" is otherwise indistinguishable from "the game binds differently".
 * **The ReShade half of the restore is tested by a fake `command_list`**
   (`tests/warp/fake_reshade_command_list.hpp`). The interface is pure abstract, `state_tracking`
   is a plain struct, and `bind_descriptor_tables` is a defaulted forwarder to pure-virtual
