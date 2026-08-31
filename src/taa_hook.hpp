@@ -16,6 +16,7 @@ namespace stray_dlss::taa_hook {
 void set_pipeline_hash(uint64_t pipeline_handle, std::uint64_t hash);
 void forget_pipeline(uint64_t pipeline_handle);
 void set_bound_pipeline(reshade::api::command_list *cmd_list, uint64_t pipeline_handle);
+void forget_command_list(reshade::api::command_list *cmd_list);
 
 // Returns true to suppress the game's dispatch. Phase A always returns false.
 bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z);

@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace stray_dlss::mv {
 namespace {
@@ -26,11 +27,14 @@ struct Params
 static_assert(sizeof(Params) % 16 == 0, "constant buffer must be 16-byte aligned");
 
 // Descriptor table layout: t0 depth, t1 velocity, u0 output.
-constexpr UINT kDescriptorCount = 3;
+constexpr UINT kDescriptorsPerFrame = 3;
 
-// The constant buffer is written every frame from the CPU, so it is triple-buffered to avoid
-// overwriting data a queued frame is still reading.
+// Everything the CPU writes per frame is versioned this many times, because dispatches recorded
+// one or two frames ago may still be executing and reading it. The constant buffer always was;
+// the DESCRIPTORS were not, which meant rewriting slots the GPU was concurrently consuming.
 constexpr UINT kFrameCount = 3;
+
+constexpr UINT kDescriptorCount = kDescriptorsPerFrame * kFrameCount;
 
 struct State
 {
@@ -49,8 +53,23 @@ struct State
 	std::uint32_t width = 0;
 	std::uint32_t height = 0;
 
-	std::uint64_t last_depth_descriptor = 0;
-	std::uint64_t last_velocity_descriptor = 0;
+	// Deliberately NO descriptor cache keyed on handle VALUES. UE4's offline descriptor
+	// allocator recycles freed slots, so a destroyed velocity buffer's SRV and its replacement
+	// land on the SAME CPU handle. Comparing handles then skips the copy and leaves our heap
+	// pointing at a view of a resource vkd3d-proton has already destroyed — the GPU reads freed
+	// memory, which is the crash. The copy is cheap; do it every frame.
+
+	// Resources retired by a resolution change, released only once the GPU can no longer be
+	// referencing them. Releasing immediately frees a descriptor heap that in-flight command
+	// lists still bind.
+	struct Retired
+	{
+		ID3D12DescriptorHeap *heap = nullptr;
+		ID3D12Resource *constants = nullptr;
+		ID3D12Resource *out_mv = nullptr;
+		UINT retire_frame = 0;
+	};
+	std::vector<Retired> retired;
 
 	char error[256] = {};
 };
@@ -213,15 +232,18 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 		return false;
 	}
 
-	// The UAV never changes, so it is written once.
+	// The UAV never changes, but each frame's slice needs its own copy of it.
 	D3D12_CPU_DESCRIPTOR_HANDLE base = g_state.heap->GetCPUDescriptorHandleForHeapStart();
-	D3D12_CPU_DESCRIPTOR_HANDLE uav = base;
-	uav.ptr += static_cast<SIZE_T>(2) * g_state.descriptor_size;
-
 	D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
 	uav_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
 	uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-	g_state.device->CreateUnorderedAccessView(g_state.out_mv, nullptr, &uav_desc, uav);
+
+	for (UINT f = 0; f < kFrameCount; ++f)
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE uav = base;
+		uav.ptr += static_cast<SIZE_T>(f * kDescriptorsPerFrame + 2) * g_state.descriptor_size;
+		g_state.device->CreateUnorderedAccessView(g_state.out_mv, nullptr, &uav_desc, uav);
+	}
 
 	g_state.width = width;
 	g_state.height = height;
@@ -236,9 +258,11 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 // and the game rotates its velocity buffer constantly, so it happens within seconds. Copying
 // descriptors needs no resource pointer and no format guessing — the game already described
 // the view exactly as its own shader reads it. (docs/RESEARCH.md §2.7)
-void copy_srvs(std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor)
+// Copies the game's SRV descriptors into THIS frame's slots. Called every frame, never cached.
+void copy_srvs(UINT slot, std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE dest = g_state.heap->GetCPUDescriptorHandleForHeapStart();
+	dest.ptr += static_cast<SIZE_T>(slot) * kDescriptorsPerFrame * g_state.descriptor_size;
 
 	D3D12_CPU_DESCRIPTOR_HANDLE src_depth = {};
 	src_depth.ptr = static_cast<SIZE_T>(depth_descriptor);
@@ -250,9 +274,24 @@ void copy_srvs(std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor
 	src_velocity.ptr = static_cast<SIZE_T>(velocity_descriptor);
 	g_state.device->CopyDescriptorsSimple(1, dest, src_velocity,
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
 
-	g_state.last_depth_descriptor = depth_descriptor;
-	g_state.last_velocity_descriptor = velocity_descriptor;
+// Releases retired resources once kFrameCount further frames have been recorded, by which point
+// no in-flight list can still reference them.
+void retire_expired()
+{
+	for (auto it = g_state.retired.begin(); it != g_state.retired.end();)
+	{
+		if (g_state.frame < it->retire_frame + kFrameCount * 2)
+		{
+			++it;
+			continue;
+		}
+		release(it->heap);
+		release(it->constants);
+		release(it->out_mv);
+		it = g_state.retired.erase(it);
+	}
 }
 
 } // namespace
@@ -277,10 +316,21 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 	}
 	else if (g_state.width != width || g_state.height != height)
 	{
-		// Resolution changed: only the size-dependent resources need rebuilding.
-		release(g_state.out_mv);
-		release(g_state.heap);
-		release(g_state.constants);
+		// Resolution changed. The old heap, constant buffer and output are still referenced by
+		// up to kFrameCount in-flight command lists, so they are RETIRED rather than released:
+		// freeing a descriptor heap a queued dispatch still binds is a GPU fault, and the
+		// resolution does change between the loading screen and gameplay — exactly where the
+		// crash was observed.
+		State::Retired r;
+		r.heap = g_state.heap;
+		r.constants = g_state.constants;
+		r.out_mv = g_state.out_mv;
+		r.retire_frame = g_state.frame;
+		g_state.retired.push_back(r);
+
+		g_state.heap = nullptr;
+		g_state.constants = nullptr;
+		g_state.out_mv = nullptr;
 	}
 
 	if (g_state.root_signature == nullptr && !create_root_signature())
@@ -296,6 +346,14 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 
 void shutdown()
 {
+	for (auto &r : g_state.retired)
+	{
+		release(r.heap);
+		release(r.constants);
+		release(r.out_mv);
+	}
+	g_state.retired.clear();
+
 	release(g_state.out_mv);
 	release(g_state.constants);
 	release(g_state.heap);
@@ -304,8 +362,7 @@ void shutdown()
 	g_state.device = nullptr;
 	g_state.width = 0;
 	g_state.height = 0;
-	g_state.last_depth_descriptor = 0;
-	g_state.last_velocity_descriptor = 0;
+
 }
 
 bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode)
@@ -314,13 +371,14 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 		in.velocity_descriptor == 0 || in.view == nullptr)
 		return false;
 
-	if (in.depth_descriptor != g_state.last_depth_descriptor ||
-		in.velocity_descriptor != g_state.last_velocity_descriptor)
-		copy_srvs(in.depth_descriptor, in.velocity_descriptor);
-
-	// Fill this frame's slice of the constant ring.
+	// This frame's slice of every per-frame resource.
 	const UINT slot = g_state.frame % kFrameCount;
 	g_state.frame++;
+
+	// Unconditionally, every frame. See the note on the removed descriptor cache.
+	copy_srvs(slot, in.depth_descriptor, in.velocity_descriptor);
+
+	retire_expired();
 
 	Params params = {};
 	std::memcpy(params.clip_to_prev_clip, in.view->clip_to_prev_clip.m, sizeof(params.clip_to_prev_clip));
@@ -350,7 +408,9 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 
 	cmd->SetComputeRootConstantBufferView(0,
 		g_state.constants->GetGPUVirtualAddress() + slot * g_state.constant_stride);
-	cmd->SetComputeRootDescriptorTable(1, g_state.heap->GetGPUDescriptorHandleForHeapStart());
+	D3D12_GPU_DESCRIPTOR_HANDLE table = g_state.heap->GetGPUDescriptorHandleForHeapStart();
+	table.ptr += static_cast<UINT64>(slot) * kDescriptorsPerFrame * g_state.descriptor_size;
+	cmd->SetComputeRootDescriptorTable(1, table);
 
 	if (dispatch_mode != 0)
 	{

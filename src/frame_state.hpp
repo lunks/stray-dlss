@@ -79,6 +79,31 @@ void note_push_descriptors(
 // happened to be first.
 void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *why);
 
+// Captures a root constant push, which ReShade's state_tracking does not track at all.
+void note_push_constants(
+	reshade::api::command_list *cmd_list,
+	reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout,
+	uint32_t layout_param,
+	uint32_t first,
+	uint32_t count,
+	const void *values);
+
+// Re-establishes the compute state the game had before our pass ran.
+//
+// This exists because ReShade's state_block CANNOT do it. state_tracking.cpp registers only
+// bind_render_targets, bind_pipeline, bind_pipeline_states, bind_viewports, bind_scissor_rects
+// and bind_descriptor_tables — there is no push_descriptors or push_constants handler — so
+// apply() can never replay the game's ROOT descriptors, and UE4's D3D12 RHI binds its uniform
+// buffers as root CBVs. Restoring with apply() alone leaves the game's own TAA dispatch running
+// with undefined root arguments every frame we inject, which is the visible corruption.
+//
+// It is also replayed NATIVELY rather than through ReShade. We changed the root signature on
+// the native list, which ReShade's proxy never saw; its bind_descriptor_tables caches the
+// current root signature and would skip re-setting it, then bind the game's tables against OUR
+// layout. Setting it natively re-syncs reality with both ReShade's cache and UE4's own.
+void restore_game_compute_state(reshade::api::command_list *cmd_list);
+
 // Recovers the descriptor heaps the game currently has bound, by resolving the heaps that own
 // the descriptor tables ReShade tracked for this command list.
 //

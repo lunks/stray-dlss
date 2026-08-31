@@ -173,6 +173,19 @@ void on_init_command_list(reshade::api::command_list *cmd_list)
 void on_reset_command_list(reshade::api::command_list *cmd_list)
 {
 	reset_command_list_state(cmd_list);
+	taa_hook::forget_command_list(cmd_list);
+}
+
+void on_push_constants(
+	reshade::api::command_list *cmd_list,
+	reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout,
+	uint32_t layout_param,
+	uint32_t first,
+	uint32_t count,
+	const uint32_t *values)
+{
+	note_push_constants(cmd_list, stages, layout, layout_param, first, count, values);
 }
 
 void on_init_pipeline_layout(
@@ -489,6 +502,9 @@ void register_events()
 	}
 	reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
 	reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
+	// ReShade's own state_tracking does not register this, which is why its state_block can
+	// never replay root constants.
+	reshade::register_event<reshade::addon_event::push_constants>(on_push_constants);
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 
@@ -503,6 +519,7 @@ void unregister_events()
 
 	reshade::unregister_event<reshade::addon_event::present>(on_present);
 	reshade::unregister_event<reshade::addon_event::dispatch>(on_dispatch);
+	reshade::unregister_event<reshade::addon_event::push_constants>(on_push_constants);
 	reshade::unregister_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
 	reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
 	if (g_pipeline_events_registered)

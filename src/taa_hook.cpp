@@ -251,6 +251,14 @@ void set_bound_pipeline(reshade::api::command_list *cmd_list, uint64_t pipeline_
 		g_bound[cmd_list] = pipeline_handle;
 }
 
+void forget_command_list(reshade::api::command_list *cmd_list)
+{
+	// Without this a reset command list keeps its previous pipeline attribution, so a dispatch
+	// can be blamed on a shader that is no longer bound.
+	std::lock_guard<std::mutex> lock(g_mutex);
+	g_bound.erase(cmd_list);
+}
+
 bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
 {
 	// Cheap rejection first: this runs on every dispatch, thousands of times a frame.
@@ -451,10 +459,6 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 				mark(3, "mv-initialised");
 
-				// The heaps that owned this dispatch's own descriptors — precisely what the
-				// game had bound here.
-				::ID3D12DescriptorHeap *const *game_heaps = b.heaps;
-				const unsigned int heap_count = g_restore_heaps ? b.heap_count : 0u;
 
 				mark(4, "heaps-collected");
 
@@ -476,24 +480,17 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// the game's heap and re-binding them while our heap is current is an
 					// invalid binding — UE4 dies with LowLevelFatalError, not an error you can
 					// read. (docs/RESEARCH.md §3.5)
-					if (heap_count > 0)
-						native->SetDescriptorHeaps(heap_count, game_heaps);
-
-					mark(6, "heaps-restored");
-
-					// Restore the rest of the state too, heaps first.
+					// Put the game's compute state back, in full and natively.
 					//
-					// The earlier reasoning that UE4 re-sets the root signature and PSO before
-					// every dispatch was wrong: its D3D12 RHI CACHES what it believes is
-					// currently bound and skips redundant sets, so changing them behind its
-					// back leaves that cache lying and the next draw uses ours. With our own
-					// access violation now fixed, the remaining crash sits entirely inside the
-					// game, which is what a state desync looks like.
+					// state_block::apply used to be called here and is deliberately gone: it
+					// registers no push_descriptors handler, so it cannot replay the root
+					// CBVs UE4 binds its uniform buffers through, and it re-binds tables via
+					// ReShade's proxy whose root-signature cache we desynced by setting ours
+					// natively. Both faults were silent, and together they are the corruption.
 					if (g_restore_state)
 					{
-						if (auto *tracked = cmd_list->get_private_data<state_tracking>())
-							tracked->apply(cmd_list);
-						mark(7, "state-restored");
+						restore_game_compute_state(cmd_list);
+						mark(6, "state-restored");
 					}
 				}
 				else if (!g_resolve_failed_logged)

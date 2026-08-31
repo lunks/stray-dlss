@@ -4,9 +4,12 @@
 
 #include <d3d12.h>
 
+#include "log.hpp"
+
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>
 
+#include <cstring>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -24,6 +27,16 @@ struct RootDescriptors
 	// Every root constant buffer, not just the last. UE4 binds several, and which one carries
 	// the View uniform buffer is not fixed — keeping only one loses it on most frames.
 	std::vector<std::pair<uint32_t, reshade::api::buffer_range>> constant_buffers;
+
+	// --- everything needed to REPLAY the game's compute root arguments ---
+	//
+	// Keyed by ROOT PARAMETER INDEX (not shader register), because that is what
+	// SetComputeRoot* takes. GPU virtual addresses are resolved at capture time, while the
+	// resource is certainly alive, rather than dereferencing an ID3D12Resource later.
+	std::unordered_map<uint32_t, std::uint64_t> root_cbv_va;
+	std::unordered_map<uint32_t, std::uint64_t> root_srv_va;
+	std::unordered_map<uint32_t, std::uint64_t> root_uav_va;
+	std::unordered_map<uint32_t, std::vector<uint32_t>> root_constants;
 };
 
 std::mutex g_mutex;
@@ -69,6 +82,18 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 	t.width = rd.texture.width;
 	t.height = rd.texture.height;
 	out.push_back(t);
+}
+
+// Resolves a bound buffer to its GPU virtual address NOW, while the resource is certainly
+// alive. Storing the ID3D12Resource* and dereferencing it at replay time would reintroduce the
+// stale-pointer hazard that ReShade's missing destroy_resource_view on D3D12 already caused
+// once. (docs/RESEARCH.md §2.7)
+std::uint64_t gpu_address(const reshade::api::buffer_range &range)
+{
+	if (range.buffer.handle == 0)
+		return 0;
+	auto *res = reinterpret_cast<::ID3D12Resource *>(range.buffer.handle);
+	return res->GetGPUVirtualAddress() + range.offset;
 }
 
 } // namespace
@@ -208,7 +233,11 @@ void note_push_descriptors(
 			// View uniform buffer is not fixed, so overwriting a single slot loses it on most
 			// frames — which is why the CB read intermittently failed.
 			if (ranges[i].buffer.handle != 0)
+			{
 				rd.constant_buffers.emplace_back(layout_param, ranges[i]);
+				// Last write wins per root parameter, which matches D3D12 semantics.
+				rd.root_cbv_va[layout_param] = gpu_address(ranges[i]);
+			}
 			break;
 		}
 		case reshade::api::descriptor_type::shader_resource_view:
@@ -221,6 +250,20 @@ void note_push_descriptors(
 		{
 			const auto *views = static_cast<const reshade::api::resource_view *>(update.descriptors);
 			describe(device, views[i], reg, rd.uavs);
+			break;
+		}
+		case reshade::api::descriptor_type::buffer_shader_resource_view:
+		{
+			const auto *ranges = static_cast<const reshade::api::buffer_range *>(update.descriptors);
+			if (ranges[i].buffer.handle != 0)
+				rd.root_srv_va[layout_param] = gpu_address(ranges[i]);
+			break;
+		}
+		case reshade::api::descriptor_type::buffer_unordered_access_view:
+		{
+			const auto *ranges = static_cast<const reshade::api::buffer_range *>(update.descriptors);
+			if (ranges[i].buffer.handle != 0)
+				rd.root_uav_va[layout_param] = gpu_address(ranges[i]);
 			break;
 		}
 		default:
@@ -414,6 +457,119 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 	}
 
 	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();
+}
+
+void note_push_constants(
+	reshade::api::command_list *cmd_list,
+	reshade::api::shader_stage stages,
+	reshade::api::pipeline_layout layout,
+	uint32_t layout_param,
+	uint32_t first,
+	uint32_t count,
+	const void *values)
+{
+	(void)layout;
+	if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::all_compute)) == 0)
+		return;
+	if (values == nullptr || count == 0)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_mutex);
+	std::vector<uint32_t> &dst = g_root[cmd_list].root_constants[layout_param];
+	if (dst.size() < first + count)
+		dst.resize(first + count, 0);
+	std::memcpy(dst.data() + first, values, static_cast<size_t>(count) * 4);
+}
+
+void restore_game_compute_state(reshade::api::command_list *cmd_list)
+{
+	auto *native = reinterpret_cast<::ID3D12GraphicsCommandList *>(cmd_list->get_native());
+	auto *state = cmd_list->get_private_data<state_tracking>();
+	if (native == nullptr || state == nullptr)
+		return;
+
+	reshade::api::device *device = cmd_list->get_device();
+
+	// 1. Heaps first. Every descriptor TABLE binding is invalidated by a heap change, so the
+	//    heaps must be current before any table is re-bound. Both types: leaving the sampler
+	//    heap unbound invalidates every later sampler table in the list.
+	::ID3D12DescriptorHeap *heaps[2] = {};
+	unsigned int heap_count = 0;
+	collect_bound_heaps(cmd_list, heaps, &heap_count);
+	if (heap_count > 0)
+		native->SetDescriptorHeaps(heap_count, heaps);
+
+	constexpr auto kComputeBits = static_cast<uint32_t>(reshade::api::shader_stage::all_compute);
+
+	for (const auto &entry : state->descriptor_tables)
+	{
+		const bool is_compute = (static_cast<uint32_t>(entry.first) & kComputeBits) != 0;
+		const auto layout = entry.second.first;
+		const auto &tables = entry.second.second;
+		if (layout.handle == 0)
+			continue;
+
+		if (is_compute)
+		{
+			// 2. The root signature, natively. Our own SetComputeRootSignature invalidated
+			//    every compute root argument the game had set, and ReShade's proxy never saw
+			//    the change — its cache still believes the game's is bound and would skip
+			//    re-setting it. Setting it here re-syncs ReShade's cache, UE4's own state
+			//    cache and reality in one call.
+			native->SetComputeRootSignature(reinterpret_cast<::ID3D12RootSignature *>(layout.handle));
+
+			// 3. Tables.
+			for (uint32_t param = 0; param < tables.size(); ++param)
+			{
+				if (tables[param].handle == 0)
+					continue;
+				D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+				h.ptr = tables[param].handle;
+				native->SetComputeRootDescriptorTable(param, h);
+			}
+		}
+		else
+		{
+			// Graphics root arguments are NOT invalidated by anything we do — we never touch
+			// the graphics root signature — but the heap swap did invalidate its tables.
+			for (uint32_t param = 0; param < tables.size(); ++param)
+			{
+				if (tables[param].handle == 0)
+					continue;
+				D3D12_GPU_DESCRIPTOR_HANDLE h = {};
+				h.ptr = tables[param].handle;
+				native->SetGraphicsRootDescriptorTable(param, h);
+			}
+		}
+	}
+
+	// 4. Root descriptors and root constants — the part ReShade cannot replay, and the reason
+	//    state_block::apply alone left the game's TAA reading undefined uniform buffers.
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		const auto it = g_root.find(cmd_list);
+		if (it != g_root.end())
+		{
+			for (const auto &cbv : it->second.root_cbv_va)
+				native->SetComputeRootConstantBufferView(cbv.first, cbv.second);
+			for (const auto &srv : it->second.root_srv_va)
+				native->SetComputeRootShaderResourceView(srv.first, srv.second);
+			for (const auto &uav : it->second.root_uav_va)
+				native->SetComputeRootUnorderedAccessView(uav.first, uav.second);
+			for (const auto &rc : it->second.root_constants)
+				if (!rc.second.empty())
+					native->SetComputeRoot32BitConstants(rc.first,
+						static_cast<UINT>(rc.second.size()), rc.second.data(), 0);
+		}
+	}
+
+	// 5. The pipeline state object. D3D12 has one PSO slot shared by graphics and compute, and
+	//    the last thing the game bound before this dispatch is its TAA compute PSO.
+	const auto pso = state->pipelines.find(reshade::api::pipeline_stage::all);
+	if (pso != state->pipelines.end() && pso->second.handle != 0)
+		native->SetPipelineState(reinterpret_cast<::ID3D12PipelineState *>(pso->second.handle));
+
+	(void)device;
 }
 
 void collect_bound_heaps(reshade::api::command_list *cmd_list,
