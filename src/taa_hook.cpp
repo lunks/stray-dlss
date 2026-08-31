@@ -15,7 +15,8 @@ std::mutex g_mutex;
 std::unordered_map<uint64_t, std::uint64_t> g_pipeline_hashes;                  // pipeline -> DXBC hash
 std::unordered_map<reshade::api::command_list *, uint64_t> g_bound;             // cmd list -> pipeline
 std::unordered_map<std::uint64_t, std::uint64_t> g_prev_output;                 // hash -> its u0 last frame
-std::unordered_map<std::uint64_t, bool> g_reported;                             // hash -> already logged
+std::unordered_map<std::uint64_t, std::uint32_t> g_report_count;                // hash -> reports emitted
+std::unordered_map<std::uint64_t, bool> g_steady_reported;                      // hash -> saw a non-cut frame
 
 // Per-shader outcome census. One dispatch report shows one shader; this shows the whole
 // field, which is what actually answers "does the TAA pass ever reach the resolver".
@@ -58,6 +59,11 @@ const char *tex_format_name(TexFormat f)
 	case TexFormat::r16g16b16a16_float:       return "RGBA16_FLOAT (colour)";
 	case TexFormat::r16g16_float:             return "RG16_FLOAT";
 	case TexFormat::r32g32b32a32_float:       return "RGBA32_FLOAT";
+	case TexFormat::r11g11b10_float:          return "R11G11B10_FLOAT (colour)";
+	case TexFormat::r10g10b10a2_unorm:        return "R10G10B10A2_UNORM";
+	case TexFormat::r32_float:                return "R32_FLOAT";
+	case TexFormat::r16_float:                return "R16_FLOAT";
+	case TexFormat::r8g8b8a8_unorm:           return "R8G8B8A8_UNORM";
 	case TexFormat::unknown:                  return "other";
 	}
 	return "?";
@@ -91,7 +97,11 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 {
 	STRAY_LOG_INFO("=========== DISPATCH REPORT  0x%016llx ===========",
 		static_cast<unsigned long long>(hash));
-	STRAY_LOG_INFO("verdict = %s (%s)", verdict_name(m.verdict), m.reason);
+	STRAY_LOG_INFO("verdict = %s (%s)%s", verdict_name(m.verdict), m.reason,
+		m.camera_cut_dummies ? "  [CAMERA-CUT FRAME: velocity/history are 1x1 dummies]" : "");
+	if (m.output_width != 0)
+		STRAY_LOG_INFO("output = %ux%u  upsampling = %s", m.output_width, m.output_height,
+			m.is_upsampling ? "YES" : "no");
 	STRAY_LOG_INFO("dispatch = %ux%ux%u  ->  covers %ux%u px at 8x8", gx, gy, gz, gx * 8, gy * 8);
 
 	for (const auto &t : b.srvs)
@@ -216,7 +226,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			st.gy = y;
 		}
 
-		if (g_reported[hash] && hash != kTaaMainHash && hash != kDenoiserLookalikeHash)
+		if (g_report_count[hash] >= 2 && hash != kTaaMainHash)
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -316,18 +326,24 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 	// Report every large dispatch once, whatever the verdict. During Phase A the point is to
 	// see the whole field, not only what we already expect to find.
-	bool first_time = false;
+	// Report twice: the first sighting is almost always a camera-cut frame, where velocity and
+	// history are 1x1 dummies, so a steady-state frame is needed to see the real bindings.
+	bool should_report = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		if (!g_reported[hash])
+		const bool want_steady = m.verdict != MatchVerdict::excluded && !m.camera_cut_dummies &&
+			!g_steady_reported[hash];
+		if (g_report_count[hash] == 0 || want_steady)
 		{
-			g_reported[hash] = true;
-			first_time = true;
+			if (!m.camera_cut_dummies)
+				g_steady_reported[hash] = true;
+			++g_report_count[hash];
+			should_report = true;
 			++g_diag.candidates_reported;
 		}
 	}
 
-	if (first_time)
+	if (should_report)
 		report(hash, b, m, view, view_ok, x, y, z);
 
 	if (view_ok)

@@ -140,6 +140,12 @@ TexFormat to_tex_format(reshade::api::format f)
 	case format::r16g16b16a16_float:     return TexFormat::r16g16b16a16_float;
 	case format::r16g16_float:           return TexFormat::r16g16_float;
 	case format::r32g32b32a32_float:     return TexFormat::r32g32b32a32_float;
+	case format::r11g11b10_float:        return TexFormat::r11g11b10_float;
+	case format::r10g10b10a2_unorm:      return TexFormat::r10g10b10a2_unorm;
+	case format::r32_float:              return TexFormat::r32_float;
+	case format::r16_float:              return TexFormat::r16_float;
+	case format::r8g8b8a8_unorm:
+	case format::r8g8b8a8_unorm_srgb:    return TexFormat::r8g8b8a8_unorm;
 	default:                             return TexFormat::unknown;
 	}
 }

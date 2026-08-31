@@ -18,6 +18,13 @@ bool is_dummy(const BoundTexture &t)
 
 } // namespace
 
+bool is_hdr_colour(TexFormat f)
+{
+	// Scene colour is not necessarily RGBA16_FLOAT. UE4 commonly uses R11G11B10_FLOAT for the
+	// scene-colour target, and the TAA history can differ from the input, so both must count.
+	return f == TexFormat::r16g16b16a16_float || f == TexFormat::r11g11b10_float;
+}
+
 MatchResult match_taa_dispatch(const DispatchSignature &sig,
                                std::uint32_t view_width,
                                std::uint32_t view_height)
@@ -76,7 +83,7 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 	const BoundTexture *output = nullptr;
 	for (const auto &t : sig.uavs)
 	{
-		if (t.format == TexFormat::r16g16b16a16_float && !is_dummy(t))
+		if (is_hdr_colour(t.format) && !is_dummy(t))
 		{
 			if (output != nullptr && t.resource != output->resource)
 				continue; // keep the first; extra colour UAVs are aliases of the inputs
@@ -86,7 +93,7 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 
 	if (output == nullptr)
 	{
-		r.reason = "no R16G16B16A16_FLOAT output UAV";
+		r.reason = "no HDR float colour output UAV";
 		return r;
 	}
 
@@ -125,7 +132,7 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 	bool dummy_colour = false;
 	for (const auto &t : sig.srvs)
 	{
-		if (t.format != TexFormat::r16g16b16a16_float)
+		if (!is_hdr_colour(t.format))
 			continue;
 		if (is_dummy(t))
 			dummy_colour = true;

@@ -24,7 +24,15 @@ enum class TexFormat
 	r16g16b16a16_float,       // scene colour, history, TAA output
 	r16g16_float,             // our resolved motion vectors
 	r32g32b32a32_float,       // eye adaptation (1x1)
+	r11g11b10_float,          // UE4's usual scene-colour format
+	r10g10b10a2_unorm,        // the swapchain
+	r32_float,
+	r16_float,
+	r8g8b8a8_unorm,
 };
+
+// True for any format DLSS will accept as pInColor: an HDR-capable float colour target.
+bool is_hdr_colour(TexFormat f);
 
 struct BoundTexture
 {
