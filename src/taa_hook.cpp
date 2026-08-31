@@ -107,6 +107,20 @@ bool read_view_cb(reshade::api::device *device, const reshade::api::buffer_range
 	if (rd.heap != reshade::api::memory_heap::upload && rd.heap != reshade::api::memory_heap::unknown)
 		return false;
 
+	// BOUNDS CHECK, and it is not a formality — its absence was the access violation.
+	//
+	// Every bound constant buffer gets tried until one decodes as a plausible View, and most
+	// of them are small: UE4's $Globals allocations are a few hundred bytes. Copying a fixed
+	// 2448 bytes out of one that sits near the end of its page reads unmapped memory and kills
+	// the process, with the fault landing inside memcpy where it is hard to attribute.
+	//
+	// buffer_range::size is UINT64_MAX for root CBVs, where ReShade does not know the extent,
+	// so the resource's own size is the authority.
+	if (cb.size != UINT64_MAX && cb.size < ue4::kViewPrefixBytes)
+		return false;
+	if (rd.buffer.size < cb.offset + ue4::kViewPrefixBytes)
+		return false;
+
 	void *mapped = nullptr;
 	if (!device->map_buffer_region(cb.buffer, cb.offset, ue4::kViewPrefixBytes,
 			reshade::api::map_access::read_only, &mapped) || mapped == nullptr)
