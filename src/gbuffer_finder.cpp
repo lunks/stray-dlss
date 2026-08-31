@@ -124,12 +124,25 @@ bool g_first_candidate_logged = false;
 // which phase 3's capture design needs to know.
 std::uint64_t g_pointer_rotation_frames = 0; // stable-shape frames where any pointer changed
 GBufferClassification g_current;
-// The freshest accepted candidate, updated at BIND time (g_current only updates at
-// present): the base pass binds early in the frame and the TAA hook consumes late in the
-// SAME frame, so this table's pointers are one bind old, not one frame old — the smallest
-// staleness window the recorder can offer. current_identification() serves from here.
+// The freshest accepted candidate OF ANY ACCEPTED SHAPE, updated at BIND time (g_current
+// only updates at present): the base pass binds early in the frame and the TAA hook
+// consumes late in the SAME frame, so this table's pointers are one bind old, not one
+// frame old — the smallest staleness window the recorder can offer.
+// current_identification() serves from here, role-keyed (gbuffer_finder.hpp — the
+// shape-keyed rule starved RR to 0%, measured 2026-08-31).
 GBufferClassification g_latest;
 bool g_have_latest = false;
+std::uint64_t g_latest_present = 0; // present counter at the serving bind
+std::uint64_t g_present_counter = 0;
+// The initial arming gate: ANY candidate shape holding kStableFrames arms serving for the
+// rest of the session. Never un-arms — freshness and roles gate afterwards.
+bool g_armed = false;
+
+// A bind older than this many presents means the base pass stopped binding (menu without
+// a scene, a hitch) or the tap missed it — refuse rather than serve pool-recycled
+// pointers. The base pass binds every rendered frame, so 2 is already generous slop for
+// recording-thread timing.
+constexpr std::uint64_t kMaxIdentAgeFrames = 2;
 bool g_have_current = false;
 std::uint64_t g_consecutive = 0;
 bool g_reported_current = false;
@@ -382,6 +395,7 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 		{
 			g_latest = cls; // freshest pointers for current_identification()
 			g_have_latest = true;
+			g_latest_present = g_present_counter;
 			ListRecord &lr = g_lists[cmd_list];
 			lr.pending = std::move(cls);
 			lr.has_pending = true;
@@ -448,17 +462,27 @@ void forget_command_list(reshade::api::command_list *cmd_list)
 	}
 }
 
-bool current_identification(Identification &out, std::uint64_t min_consecutive)
+IdentRefusal current_identification(Identification &out, std::uint32_t *stale_age_out)
 {
 	if (!g_enabled)
-		return false;
+		return IdentRefusal::not_enabled;
 	std::lock_guard<std::mutex> lock(g_mutex);
-	if (!g_have_current || !g_have_latest || g_consecutive < min_consecutive)
-		return false;
-	// The stability claim belongs to the SHAPE tracked at present time; the pointers come
-	// from the freshest bind. A shape change between them invalidates the pairing.
-	if (!same_shape(g_latest, g_current))
-		return false;
+	if (!g_armed)
+		return IdentRefusal::not_armed;
+	if (!g_have_latest)
+		return IdentRefusal::no_candidate;
+
+	// Freshness, not shape: the serving bind must be from this present interval or the
+	// couple before it. Shape is NOT compared against the stability winner — both accepted
+	// shapes name the same roles, and locking to one starved RR (header comment).
+	const std::uint64_t age = g_present_counter - g_latest_present;
+	if (age > kMaxIdentAgeFrames)
+	{
+		if (stale_age_out != nullptr)
+			*stale_age_out = static_cast<std::uint32_t>(
+				age > 0xFFFFFFFFull ? 0xFFFFFFFFull : age);
+		return IdentRefusal::stale_bind;
+	}
 
 	Identification id;
 	for (const auto &t : g_latest.targets)
@@ -472,12 +496,13 @@ bool current_identification(Identification &out, std::uint64_t min_consecutive)
 		}
 	}
 	if (id.gbuffer_a == 0 || id.gbuffer_b == 0 || id.gbuffer_c == 0)
-		return false; // a role went unknown (licensee format) - refuse, never guess
+		return IdentRefusal::roles_missing; // an unknown slot - refuse, never guess
 	id.extent_width = g_latest.extent_width;
 	id.extent_height = g_latest.extent_height;
-	id.consecutive_frames = g_consecutive;
+	id.age_frames = static_cast<std::uint32_t>(age);
+	id.velocity_in_set = g_latest.velocity_corroborated;
 	out = id;
-	return true;
+	return IdentRefusal::ok;
 }
 
 void on_present(std::uint64_t frame)
@@ -505,8 +530,10 @@ void on_present(std::uint64_t frame)
 	EventStats window_snap;
 	std::vector<std::pair<std::string, std::uint64_t>> rejects;
 
+	bool log_armed = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_present_counter;
 
 		// Harvest every open list, so draws recorded but not yet flushed count for THIS
 		// frame. A list executed after the present would attribute to the next frame —
@@ -601,6 +628,11 @@ void on_present(std::uint64_t frame)
 			}
 			g_last_draws = best->draws;
 
+			if (g_consecutive >= kStableFrames && !g_armed)
+			{
+				g_armed = true;
+				log_armed = true;
+			}
 			if (g_consecutive >= kStableFrames && !g_reported_current &&
 				g_reports_logged < kReportBudget)
 			{
@@ -620,6 +652,13 @@ void on_present(std::uint64_t frame)
 		g_denoiser_srvs.clear();
 		g_denoiser_seen_this_frame = false;
 	}
+
+	if (log_armed)
+		STRAY_LOG_INFO("GBUF identification ARMED at frame %llu: a candidate shape held "
+			"%llu frames; from here RR serving is gated by bind freshness and roles only "
+			"(role-keyed, any accepted shape).",
+			static_cast<unsigned long long>(frame),
+			static_cast<unsigned long long>(kStableFrames));
 
 	if (log_recovered)
 		STRAY_LOG_WARN("GBUF base-pass candidate APPEARED at frame %llu after %llu "

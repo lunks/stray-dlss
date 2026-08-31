@@ -57,14 +57,20 @@ void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_ha
 
 void forget_command_list(reshade::api::command_list *cmd_list);
 
-// The live identification, for the RR path. Fills A/B/C with the MOST RECENT same-shape
-// candidate's resource handles — the measured pointer rotation means a consumer must
-// re-capture every frame and still liveness-check each handle before touching it (the
-// table is from a bind earlier in the frame; the pool can have recycled it since). Returns
-// true only when the finder is enabled, a base-pass candidate's SHAPE has held for at
-// least `min_consecutive` frames, and all three of GBufferA/B/C carry their named roles
-// (an unknown slot — a licensee format — refuses loudly here rather than feeding RR a
-// guess). extent is the shared scene-buffer extent.
+// The live identification, for the RR path — ROLE-KEYED, deliberately not shape-keyed.
+//
+// Measured 2026-08-31 (the RR-0 starvation run): stability was earned by the 8-target
+// load-boundary shape while frames kept binding accepted candidates whose shape differed,
+// and the old "freshest same-shape bind" rule then refused EVERY frame — 0% RR with no
+// reason in the log. Both the velocity-free 6-RTV set and the with-velocity 7-RTV set are
+// ACCEPTED candidates that name the same A/B/C roles, so the serving rule is now: A/B/C
+// resources from the freshest accepted candidate of ANY accepted shape. Stability (any
+// candidate shape holding kStableFrames) is only the initial ARMING gate; once armed it
+// never gates again — freshness and role presence do.
+//
+// The measured pointer rotation (29 of 30 stable frames) means a consumer must re-capture
+// every frame and still liveness-check each handle before touching it: the table is from
+// a bind earlier in the frame, and the pool can have recycled it since.
 struct Identification
 {
 	std::uint64_t gbuffer_a = 0;
@@ -72,9 +78,29 @@ struct Identification
 	std::uint64_t gbuffer_c = 0;
 	std::uint32_t extent_width = 0;
 	std::uint32_t extent_height = 0;
-	std::uint64_t consecutive_frames = 0;
+	// Presents since the serving bind was recorded: 0 = this frame's interval. The caller
+	// gets it for telemetry; anything the accessor would refuse as stale never comes back.
+	std::uint32_t age_frames = 0;
+	// True when the serving candidate carried a velocity member at stock slot 4 — the
+	// shape note for the evaluate log line.
+	bool velocity_in_set = false;
 };
-bool current_identification(Identification &out, std::uint64_t min_consecutive);
+
+// Why current_identification refused — each maps to a fallback-telemetry counter, because
+// the starvation run proved a reasonless refusal costs a whole round-trip.
+enum class IdentRefusal
+{
+	ok = 0,
+	not_enabled,  // the finder is off
+	not_armed,    // no candidate shape has ever held kStableFrames
+	no_candidate, // armed, but no accepted bind recorded yet (transient)
+	stale_bind,   // the freshest accepted bind is too many presents old
+	roles_missing,// the freshest candidate has an unknown A/B/C slot (licensee format)
+};
+
+// Fills `out` and returns ok, or names the refusal. `stale_age_out` reports the bind age
+// on stale_bind so the first-occurrence log can carry the number.
+IdentRefusal current_identification(Identification &out, std::uint32_t *stale_age_out = nullptr);
 
 // Frame boundary: merges the frame's candidates, tracks stability, and logs the
 // identification once stable (again if it changes). While no base-pass candidate is seen

@@ -816,8 +816,21 @@ void on_present(
 		std::uint32_t rr_ok = 0, rr_fallback = 0;
 		taa_hook::rr_counters(rr_ok, rr_fallback);
 		if (rr_ok + rr_fallback > 0)
+		{
 			STRAY_LOG_INFO("[%s] RR evaluates=%u SR fallbacks=%u (%.1f%% RR)", when, rr_ok,
 				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
+			// The per-reason breakdown — the starvation run proved totals without reasons
+			// cost a whole round-trip. One line, all nine reasons, by name.
+			std::uint32_t r[taa_hook::kRrRefusalCount] = {};
+			taa_hook::rr_refusal_counters(r);
+			char line[256];
+			int off = std::snprintf(line, sizeof(line), "[%s] RR refusals:", when);
+			for (int i = 0; i < taa_hook::kRrRefusalCount; ++i)
+				if (off > 0 && off < static_cast<int>(sizeof(line)))
+					off += std::snprintf(line + off, sizeof(line) - off, " %s=%u",
+						taa_hook::kRrRefusalNames[i], r[i]);
+			STRAY_LOG_INFO("%s", line);
+		}
 	}
 
 	// Report the add-on-level capability verdict once, after enough frames that the game has

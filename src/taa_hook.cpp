@@ -45,6 +45,25 @@ bool g_ngx_evaluate = false;
 std::atomic<int> g_ngx_rr_mode{ 0 };
 std::atomic<std::uint32_t> g_rr_evaluates{ 0 };
 std::atomic<std::uint32_t> g_rr_fallbacks{ 0 };
+// Refusal reasons, indexed per kRrRefusalNames (taa_hook.hpp). Bumped by try_evaluate_rr
+// on every false return so the periodic line can say WHY frames fell back to SR.
+enum RrRefusalIndex
+{
+	kRrNotArmed = 0,
+	kRrNoCandidate = 1,
+	kRrStaleBind = 2,
+	kRrRolesMissing = 3,
+	kRrLiveness = 4,
+	kRrRowsImplausible = 5,
+	kRrResolveFailed = 6,
+	kRrCreateFailed = 7,
+	kRrEvaluateFailed = 8,
+};
+std::atomic<std::uint32_t> g_rr_refusals[kRrRefusalCount] = {};
+// Successful gbuffer_resolve records under RR — the guide-dump key. Keyed on RECORDS, not
+// the shared evaluate-attempt counter: a session where create/evaluate fails still
+// resolves guides, and they must still dump (the whole point of the offline B/C check).
+std::atomic<std::uint64_t> g_rr_records{ 0 };
 // [STRAYDLSS] NgxDryRun. Suppresses the pinned pass's engine dispatch WITHOUT running DLSS, so
 // nothing writes u0 at all.
 //
@@ -243,26 +262,51 @@ const char *hook_format_name(TexFormat f)
 // readable; the rr/fallback counters carry the rates.
 bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *native,
                      const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
-                     const ue4::ViewParams &view, std::uint64_t eval_no)
+                     const ue4::ViewParams &view)
 {
-	static bool s_no_ident_logged = false;
-	static bool s_rotation_logged = false;
-	static bool s_resolve_failed_logged = false;
+	// One first-occurrence line per refusal reason, with specifics — plus the indexed
+	// counters, so the periodic line carries rates and the log carries the story.
+	static bool s_reason_logged[kRrRefusalCount] = {};
 	static bool s_rr_ok_logged = false;
-	static bool s_rr_fail_logged = false;
+	const auto refuse = [](int reason) {
+		g_rr_refusals[reason].fetch_add(1, std::memory_order_relaxed);
+		const bool first = !s_reason_logged[reason];
+		s_reason_logged[reason] = true;
+		return first; // caller logs its specifics on the first occurrence only
+	};
 
-	// The identification must be stable AND re-captured per frame: the measured pointer
-	// rotation means yesterday's — even last frame's — pointers are not this frame's.
-	// (gbuffer_finder.hpp)
+	// The identification is re-captured EVERY frame (pointer rotation measured on 29 of 30
+	// stable frames) and served role-keyed from the freshest accepted candidate of any
+	// accepted shape — the shape-locked rule starved RR to 0%. (gbuffer_finder.hpp)
 	gbuffer_finder::Identification id;
-	if (!gbuffer_finder::current_identification(id, 30))
+	std::uint32_t stale_age = 0;
+	switch (gbuffer_finder::current_identification(id, &stale_age))
 	{
-		if (!s_no_ident_logged)
-		{
-			s_no_ident_logged = true;
-			STRAY_LOG_INFO("RR: no stable G-buffer identification yet (GBufferFinder); SR "
-				"carries the frames until one holds 30 frames. This line logs once.");
-		}
+	case gbuffer_finder::IdentRefusal::ok:
+		break;
+	case gbuffer_finder::IdentRefusal::not_enabled:
+	case gbuffer_finder::IdentRefusal::not_armed:
+		if (refuse(kRrNotArmed))
+			STRAY_LOG_INFO("RR: identification not ARMED yet (no candidate shape has held "
+				"30 frames); SR carries the frames. First occurrence only; the periodic "
+				"line carries the rate.");
+		return false;
+	case gbuffer_finder::IdentRefusal::no_candidate:
+		if (refuse(kRrNoCandidate))
+			STRAY_LOG_INFO("RR: armed but no accepted G-buffer bind recorded yet this "
+				"session; SR carries the frame. First occurrence only.");
+		return false;
+	case gbuffer_finder::IdentRefusal::stale_bind:
+		if (refuse(kRrStaleBind))
+			STRAY_LOG_WARN("RR: freshest accepted G-buffer bind is %u presents old (max 2) "
+				"- the base pass stopped binding, or the finder's tap missed this frame. "
+				"SR carries the frame. First occurrence only.", stale_age);
+		return false;
+	case gbuffer_finder::IdentRefusal::roles_missing:
+		if (refuse(kRrRolesMissing))
+			STRAY_LOG_WARN("RR: the freshest candidate has an unknown A/B/C slot (licensee "
+				"format?) - refusing to guess. SR carries the frames. First occurrence "
+				"only.");
 		return false;
 	}
 
@@ -271,16 +315,27 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	// exactly this to depth/velocity).
 	if (!is_resource_live(id.gbuffer_a) || !is_resource_live(id.gbuffer_b) ||
 		!is_resource_live(id.gbuffer_c))
+	{
+		if (refuse(kRrLiveness))
+			STRAY_LOG_WARN("RR: a G-buffer resource died between bind and dispatch "
+				"(A=%p live=%d, B=%p live=%d, C=%p live=%d, bind age %u frames); SR "
+				"carries the frame. First occurrence only.",
+				reinterpret_cast<void *>(id.gbuffer_a),
+				is_resource_live(id.gbuffer_a) ? 1 : 0,
+				reinterpret_cast<void *>(id.gbuffer_b),
+				is_resource_live(id.gbuffer_b) ? 1 : 0,
+				reinterpret_cast<void *>(id.gbuffer_c),
+				is_resource_live(id.gbuffer_c) ? 1 : 0, id.age_frames);
 		return false;
+	}
 
 	// The DERIVED View rows 8-10 must actually hold a rotation before anything trusts
 	// them (gbuffer_resolve.hpp). A wrong matrix biases specular albedo silently — the
 	// §0.2 class of failure — so implausible rows mean SR, loudly, once.
 	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
 	{
-		if (!s_rotation_logged)
+		if (refuse(kRrRowsImplausible))
 		{
-			s_rotation_logged = true;
 			const float *m = view.translated_world_to_view.m;
 			STRAY_LOG_ERROR("RR: View rows 8-10 (TranslatedWorldToView, DERIVED layout) do "
 				"not hold a rotation - SR carries the frames while this holds. Rows:");
@@ -295,7 +350,12 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 
 	auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
 	if (!gbr::initialise(native_device, ei.render_width, ei.render_height))
+	{
+		if (refuse(kRrResolveFailed))
+			STRAY_LOG_ERROR("RR: gbuffer_resolve initialise failed (%s); SR carries the "
+				"frames. First occurrence only.", gbr::last_error());
 		return false;
+	}
 
 	gbr::ResolveInputs gi;
 	gi.gbuffer_a = id.gbuffer_a;
@@ -315,20 +375,41 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 
 	if (!gbr::record(native, gi, /*dispatch_mode=*/2))
 	{
-		if (!s_resolve_failed_logged)
-		{
-			s_resolve_failed_logged = true;
+		if (refuse(kRrResolveFailed))
 			STRAY_LOG_ERROR("RR: gbuffer_resolve record failed (%s); SR carries the frames. "
-				"This line logs once.", gbr::last_error());
-		}
+				"First occurrence only.", gbr::last_error());
 		return false;
 	}
 
 	// Guides were just written as UAVs; NGX reads them as shader resources.
 	gbr::transition_outputs(native, /*to_shader_resource=*/true);
 
+	// The guide-dump channel keys on successful RESOLVE RECORDS, not the shared
+	// evaluate-attempt counter: a session where the RR create or evaluate fails still
+	// produced guides, and dumping them is the whole point of the offline B/C check —
+	// under the old keying a 0%-RR session could never produce a guide file.
+	const std::uint64_t rr_rec_no = g_rr_records.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (input_dump::wants(rr_rec_no))
+	{
+		auto *dump_dev = reinterpret_cast<ID3D12Device *>(device->get_native());
+		input_dump::capture(dump_dev, native, gbr::normals_roughness(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_normals", rr_rec_no);
+		input_dump::capture(dump_dev, native, gbr::roughness(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_roughness", rr_rec_no);
+		input_dump::capture(dump_dev, native, gbr::diffuse_albedo(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_diffuse", rr_rec_no);
+		input_dump::capture(dump_dev, native, gbr::specular_albedo(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_specular", rr_rec_no);
+	}
+
 	bool ok = false;
-	if (ngx::ensure_feature_rr(native, fd))
+	if (!ngx::ensure_feature_rr(native, fd))
+	{
+		// ngx_backend logged the create failure (latched, once per size); the counter
+		// carries the per-frame rate.
+		refuse(kRrCreateFailed);
+	}
+	else
 	{
 		ngx::EvaluateInputsRR er;
 		er.base = ei;
@@ -347,37 +428,38 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 
 		ok = ngx::evaluate_rr(native, er);
 
-		if (ok && input_dump::wants(eval_no))
+		if (ok)
 		{
-			// The guide-dump channel: the same readback path as the colour/depth dumps,
-			// for the offline B/C-order and encoding eyeball check. All four are in
-			// NON_PIXEL_SHADER_RESOURCE here (transitioned above).
-			auto *dev = reinterpret_cast<ID3D12Device *>(device->get_native());
-			input_dump::capture(dev, native, er.normals_roughness,
-				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_normals", eval_no);
-			input_dump::capture(dev, native, er.roughness,
-				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_roughness", eval_no);
-			input_dump::capture(dev, native, er.diffuse_albedo,
-				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_diffuse", eval_no);
-			input_dump::capture(dev, native, er.specular_albedo,
-				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_specular", eval_no);
+			// The serving shape is worth a line the first time and on every flip (rate
+			// limited): it says WHICH accepted candidate fed the guides.
+			static int s_last_shape = -1;
+			static int s_shape_flips_logged = 0;
+			const int shape = id.velocity_in_set ? 1 : 0;
+			if (!s_rr_ok_logged)
+			{
+				s_rr_ok_logged = true;
+				STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u with guides "
+					"(A=%p B=%p C=%p swapBC=%d shape=%s bind-age=%u). SR remains the "
+					"per-frame fallback.",
+					ei.render_width, ei.render_height, fd.output_width, fd.output_height,
+					reinterpret_cast<void *>(id.gbuffer_a),
+					reinterpret_cast<void *>(id.gbuffer_b),
+					reinterpret_cast<void *>(id.gbuffer_c), gbr::bc_swapped() ? 1 : 0,
+					id.velocity_in_set ? "with-velocity" : "velocity-free", id.age_frames);
+			}
+			else if (shape != s_last_shape && s_shape_flips_logged < 4)
+			{
+				++s_shape_flips_logged;
+				STRAY_LOG_INFO("RR: serving shape changed to %s (both are accepted "
+					"candidates; role-keyed serving). Logged at most 4 times.",
+					id.velocity_in_set ? "with-velocity" : "velocity-free");
+			}
+			s_last_shape = shape;
 		}
-
-		if (ok && !s_rr_ok_logged)
+		else if (refuse(kRrEvaluateFailed))
 		{
-			s_rr_ok_logged = true;
-			STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u with guides "
-				"(A=%p B=%p C=%p swapBC=%d). SR remains the per-frame fallback.",
-				ei.render_width, ei.render_height, fd.output_width, fd.output_height,
-				reinterpret_cast<void *>(id.gbuffer_a),
-				reinterpret_cast<void *>(id.gbuffer_b),
-				reinterpret_cast<void *>(id.gbuffer_c), gbr::bc_swapped() ? 1 : 0);
-		}
-		if (!ok && !s_rr_fail_logged)
-		{
-			s_rr_fail_logged = true;
-			STRAY_LOG_ERROR("DLSS RR evaluate FAILED (%s); SR carries the frames. This "
-				"line logs once.", ngx::last_error());
+			STRAY_LOG_ERROR("DLSS RR evaluate FAILED (%s); SR carries the frames. First "
+				"occurrence only.", ngx::last_error());
 		}
 	}
 
@@ -497,6 +579,15 @@ void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 {
 	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
 	sr_fallbacks = g_rr_fallbacks.load(std::memory_order_relaxed);
+}
+const char *const kRrRefusalNames[kRrRefusalCount] = {
+	"not-armed", "no-candidate", "stale-bind", "roles-missing", "liveness",
+	"rows-implausible", "resolve-failed", "create-failed", "evaluate-failed",
+};
+void rr_refusal_counters(std::uint32_t out[kRrRefusalCount])
+{
+	for (int i = 0; i < kRrRefusalCount; ++i)
+		out[i] = g_rr_refusals[i].load(std::memory_order_relaxed);
 }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count)
@@ -1294,8 +1385,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								ok = false;
 								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)
 								{
-									ok = try_evaluate_rr(device, native, ei, fd, view,
-										eval_no);
+									ok = try_evaluate_rr(device, native, ei, fd, view);
 									if (ok)
 										g_rr_evaluates.fetch_add(1,
 											std::memory_order_relaxed);

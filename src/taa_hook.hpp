@@ -61,6 +61,14 @@ void set_ngx_rr(int mode);
 // says whether RR is carrying frames. Reported periodically by the add-on.
 void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks);
 
+// WHY the fallbacks happened, per reason — the starvation run (2026-08-31, 0% RR with a
+// reasonless log) proved totals alone cost a whole round-trip. Indexed; order matches
+// kRrRefusalNames. Each reason also logs a first-occurrence line with specifics.
+constexpr int kRrRefusalCount = 9;
+extern const char *const kRrRefusalNames[kRrRefusalCount];
+void rr_refusal_counters(std::uint32_t out[kRrRefusalCount]);
+
+
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the
 // visible image at all. An identical-looking DLSS frame is otherwise ambiguous.
 // 0 = off, 1 = suppress only the pinned pass, 2 = suppress every structurally matched pass.
