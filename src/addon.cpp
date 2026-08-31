@@ -249,7 +249,8 @@ void on_init_device(reshade::api::device *device)
 
 	char dry_hash[384] = "";
 	size_t dry_hash_size = sizeof(dry_hash);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
+	const bool dry_hash_read =
+		reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
 	std::uint64_t dry_hashes[16];
 	std::size_t dry_hash_count = 0;
 	std::uint64_t dry_hash_value = 0; // first entry, for the existing log line
@@ -266,6 +267,51 @@ void on_init_device(reshade::api::device *device)
 			dry_hashes[dry_hash_count++] = h;
 		}
 		q = (*end == ',') ? end + 1 : end;
+	}
+	// Diagnostic for the config mystery measured 2026-08-31: values present in the ini's
+	// [STRAYDLSS] section read back empty while sibling keys work. This logs what the API
+	// actually returned so one pasted log settles it.
+	STRAY_LOG_INFO("config probe: DryRunHash read=%d size=%zu raw='%.48s' parsed=%zu",
+		dry_hash_read ? 1 : 0, dry_hash_size, dry_hash, dry_hash_count);
+
+	// stray-dlss-dryrun.txt beside the game overrides BOTH dry-run settings, bypassing
+	// ReShade's config entirely: `alternate=<frames>` on one line, one hash per line
+	// otherwise, # comments. Written directly by the deploy tooling.
+	{
+		std::FILE *f = nullptr;
+		fopen_s(&f, "stray-dlss-dryrun.txt", "r");
+		if (f != nullptr)
+		{
+			dry_hash_count = 0;
+			dry_hash_value = 0;
+			int alt_override = -1;
+			char line[128];
+			while (std::fgets(line, sizeof(line), f) != nullptr)
+			{
+				const char *q = line;
+				while (*q == ' ' || *q == '\t')
+					++q;
+				if (*q == '#' || *q == '\n' || *q == 0)
+					continue;
+				if (std::strncmp(q, "alternate=", 10) == 0)
+				{
+					alt_override = std::atoi(q + 10);
+					continue;
+				}
+				const std::uint64_t h = std::strtoull(q, nullptr, 16);
+				if (h != 0 && dry_hash_count < 16)
+				{
+					if (dry_hash_count == 0)
+						dry_hash_value = h;
+					dry_hashes[dry_hash_count++] = h;
+				}
+			}
+			std::fclose(f);
+			if (alt_override >= 0)
+				taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(alt_override));
+			STRAY_LOG_WARN("stray-dlss-dryrun.txt: %zu suppression hashes, alternate=%d "
+				"(file overrides the ini).", dry_hash_count, alt_override);
+		}
 	}
 	taa_hook::set_dry_run_hashes(dry_hashes, dry_hash_count);
 	if (dry_hash_count > 1)
@@ -312,8 +358,12 @@ void on_init_device(reshade::api::device *device)
 			"evaluating. If the screen is not magenta, the output handle is wrong.");
 
 	int dry_alternate = 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
-	taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));
+	const bool alt_read =
+		reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
+	STRAY_LOG_INFO("config probe: DryRunAlternate read=%d value=%d",
+		alt_read ? 1 : 0, dry_alternate);
+	if (dry_alternate > 0) // never zero a file-based override with an absent ini key
+		taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));
 	if (dry_alternate > 0)
 		STRAY_LOG_WARN("DryRunAlternate=%d: the named pass alternates suppressed/normal every "
 			"%d frames, so both states appear in one session.", dry_alternate, dry_alternate);
