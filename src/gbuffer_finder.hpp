@@ -53,8 +53,11 @@ void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_ha
 void forget_command_list(reshade::api::command_list *cmd_list);
 
 // Frame boundary: merges the frame's candidates, tracks stability, and logs the
-// identification once stable (again if it changes), or a FAILED line when no base-pass
-// candidate has been seen for long enough.
+// identification once stable (again if it changes). While no base-pass candidate is seen
+// it logs a FAILED block — first after kFailFrames, then RE-FIRING once a minute for as
+// long as the drought lasts — each carrying that window's event census (bind counts, RTV
+// histogram, velocity sightings, rejection tallies), because in a negative world the
+// census IS the observation. Every line contains the grep token GBUF.
 void on_present(std::uint64_t frame);
 
 } // namespace stray_dlss::gbuffer_finder

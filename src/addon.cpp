@@ -1074,6 +1074,11 @@ void register_events()
 	if (pass_finder_enabled || gbuffer_finder_enabled)
 	{
 		g_finder_rt_events_registered = true;
+		// Logged so a pasted log PROVES the events were registered for this combination of
+		// flags — the 2026-08-31 GBufferFinder run could not distinguish "tap registered
+		// but never fired" from "tap never registered" after the fact.
+		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
+			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
 		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
 			on_pf_bind_render_targets);
 		reshade::register_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);

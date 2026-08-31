@@ -12,14 +12,20 @@
 #include <utility>
 #include <vector>
 
+// EVERY line this module logs contains the token "GBUF" (the block headers spell out
+// "GBUFFER FINDER", whose prefix is GBUF; every detail line starts with "GBUF"). Learned
+// from the 2026-08-31 observation run: the first FAILED block's tally lines began with
+// bare spaces, and a log filtered for the finder's name showed exactly one line — the
+// tallies, which WERE the observation, never reached the report. One grep token must
+// recover the whole story. (CLAUDE.md §0.1: maximum diagnostic payload per round-trip.)
+
 namespace stray_dlss::gbuffer_finder {
 namespace {
 
 // The stock base pass binds SceneColor + GBufferA/B/C + velocity = 5 RTVs
-// (core/gbuffer_classify.hpp); everything else in a UE4 frame binds 0-2. Gating on the
-// COUNT argument alone means no view is ever described for the frame's hundreds of narrow
-// binds. 4 rather than 5 so a licensee set one target short is still classified — and
-// rejected with a reason — instead of being invisible.
+// (core/gbuffer_classify.hpp); everything else in a UE4 frame binds 0-2. Only sets at
+// least this wide are CLASSIFIED. 4 rather than 5 so a licensee set one target short is
+// still classified — and rejected with a reason — instead of being invisible.
 constexpr uint32_t kMinMrtCount = 4;
 
 // The identification must hold this many consecutive frames before it is logged. Half a
@@ -27,16 +33,24 @@ constexpr uint32_t kMinMrtCount = 4;
 // enough that one short observation run settles it.
 constexpr std::uint64_t kStableFrames = 30;
 
-// No base-pass candidate for this long logs a FAILED line: ten seconds at 60 fps, far
-// longer than any loading hitch. The main menu is EXPECTED to trip it (no base pass runs
-// there — the shader census is ~150 against ~728 in gameplay, CLAUDE.md §2.3.1), so the
-// line says so rather than crying wolf.
+// No base-pass candidate for this long logs the first FAILED block: ten seconds at
+// 60 fps, far longer than any loading hitch. The main menu is EXPECTED to trip it (no
+// base pass runs there — the shader census is ~150 against ~728 in gameplay, CLAUDE.md
+// §2.3.1), so the block says so rather than crying wolf.
 constexpr std::uint64_t kFailFrames = 600;
 
-// Log budgets, in the pass_finder mould: a verdict repeated every stability window would
-// drown the very log the user pastes back.
+// While the drought continues, the FAILED block RE-FIRES this often (one minute at
+// 60 fps), each time with the event tallies of its own window. Measured 2026-08-31: a
+// once-per-session FAILED fired at the menu and then minutes of candidate-less GAMEPLAY
+// produced nothing — in a negative world the tallies are the observation, and a single
+// menu-time block taught almost nothing about why.
+constexpr std::uint64_t kFailRepeatFrames = 3600;
+
+// Log budgets, in the pass_finder mould: enough re-fires to cover a long session (20
+// blocks = ~20 minutes of continuous drought after the first), bounded so a pathological
+// run cannot drown the log the user pastes back.
 constexpr int kReportBudget = 8;
-constexpr int kFailBudget = 3;
+constexpr int kFailBudget = 20;
 constexpr int kRejectReasonsLogged = 4;
 
 std::mutex g_mutex;
@@ -65,6 +79,30 @@ std::vector<Candidate> g_frame_candidates;
 std::unordered_set<std::uint64_t> g_denoiser_srvs;
 bool g_denoiser_seen_this_frame = false;
 
+// Event-level census. This is what separates the two failure worlds the 2026-08-31 run
+// could not tell apart: "the bind_render_targets tap never fired" (registration or
+// ReShade-event bug) versus "it fired but nothing carried the base-pass signature" (the
+// velocity-anchor assumption is wrong for Stray). Kept twice: per session, and per FAILED
+// window so consecutive blocks show what changed between menu and gameplay.
+struct EventStats
+{
+	std::uint64_t rt_events = 0;            // every note_render_targets call, any count
+	std::uint64_t histogram[9] = {};        // by RTV count; bucket 8 = "8 or more"
+	std::uint32_t max_rtv_count = 0;
+	std::uint64_t wide_sets = 0;            // count >= kMinMrtCount
+	std::uint64_t velocity_sightings = 0;   // binds with a live R16G16B16A16_UNORM RTV
+	std::uint32_t velocity_widest_bind = 0; // widest RTV count among those binds
+	std::uint32_t velocity_w = 0;           // extent of the last velocity RTV seen
+	std::uint32_t velocity_h = 0;
+};
+EventStats g_session;
+EventStats g_window;
+bool g_first_rt_event_logged = false;
+
+// Rejection tallies for classified-but-refused wide sets, session plus window.
+std::unordered_map<std::string, std::uint64_t> g_session_rejects;
+std::unordered_map<std::string, std::uint64_t> g_window_rejects;
+
 // Cross-frame stability. Identity is (slot, resource, format) per member — by register
 // first, never by pointer alone (CLAUDE.md §2.9).
 GBufferClassification g_current;
@@ -78,13 +116,9 @@ std::vector<char> g_corroborated;
 bool g_denoiser_seen_in_run = false;
 
 std::uint64_t g_frames_without_candidate = 0;
+bool g_failed_in_this_drought = false;
 int g_reports_logged = 0;
 int g_fail_reports_logged = 0;
-
-// Cumulative diagnostics so the FAILED report can name what was missing.
-std::uint64_t g_wide_sets_seen = 0;          // binds with >= kMinMrtCount RTVs
-std::uint64_t g_wide_sets_with_velocity = 0; // of those, containing the velocity format
-std::unordered_map<std::string, std::uint64_t> g_reject_tally;
 
 bool same_targets(const GBufferClassification &a, const GBufferClassification &b)
 {
@@ -125,6 +159,29 @@ void flush_pending_locked(ListRecord &lr)
 	lr.pending_draws = 0;
 }
 
+void log_event_stats(const char *label, const EventStats &s)
+{
+	STRAY_LOG_ERROR("GBUF   %s: rt-bind events=%llu max-RTVs=%u wide(>=%u)=%llu "
+		"velocity-RTV sightings=%llu", label,
+		static_cast<unsigned long long>(s.rt_events), s.max_rtv_count, kMinMrtCount,
+		static_cast<unsigned long long>(s.wide_sets),
+		static_cast<unsigned long long>(s.velocity_sightings));
+	STRAY_LOG_ERROR("GBUF   %s RTV-count histogram: 0:%llu 1:%llu 2:%llu 3:%llu 4:%llu "
+		"5:%llu 6:%llu 7:%llu 8+:%llu", label,
+		static_cast<unsigned long long>(s.histogram[0]),
+		static_cast<unsigned long long>(s.histogram[1]),
+		static_cast<unsigned long long>(s.histogram[2]),
+		static_cast<unsigned long long>(s.histogram[3]),
+		static_cast<unsigned long long>(s.histogram[4]),
+		static_cast<unsigned long long>(s.histogram[5]),
+		static_cast<unsigned long long>(s.histogram[6]),
+		static_cast<unsigned long long>(s.histogram[7]),
+		static_cast<unsigned long long>(s.histogram[8]));
+	if (s.velocity_sightings > 0)
+		STRAY_LOG_ERROR("GBUF   %s velocity: last RTV %ux%u, widest bind carrying it had "
+			"%u targets", label, s.velocity_w, s.velocity_h, s.velocity_widest_bind);
+}
+
 } // namespace
 
 void set_enabled(bool value)
@@ -134,8 +191,8 @@ void set_enabled(bool value)
 		STRAY_LOG_WARN("GBUFFER FINDER enabled ([STRAYDLSS] GBufferFinder): classifying every "
 			"render-target set with >= %u targets against the stock UE 4.27 base-pass layout "
 			"and LOGGING the identification once it holds %llu consecutive frames. Log-only; "
-			"nothing acts on it. (DLSS-RR phase 1)", kMinMrtCount,
-			static_cast<unsigned long long>(kStableFrames));
+			"nothing acts on it. Grep the log for GBUF to collect every line. (DLSS-RR "
+			"phase 1)", kMinMrtCount, static_cast<unsigned long long>(kStableFrames));
 }
 
 bool enabled()
@@ -150,6 +207,7 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 		return;
 
 	// Whatever the new set is, the previous one on this list is done receiving draws.
+	bool first_event = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		const auto it = g_lists.find(cmd_list);
@@ -158,37 +216,93 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 			flush_pending_locked(it->second);
 			it->second.has_pending = false;
 		}
-	}
 
-	if (count < kMinMrtCount)
+		// The event census counts EVERY tap, before any gate: a session total of zero here
+		// is the registration-bug verdict, and nothing downstream can produce it.
+		const std::size_t bucket = count < 8 ? count : 8;
+		for (EventStats *s : { &g_session, &g_window })
+		{
+			++s->rt_events;
+			++s->histogram[bucket];
+			if (count > s->max_rtv_count)
+				s->max_rtv_count = count;
+			if (count >= kMinMrtCount)
+				++s->wide_sets;
+		}
+		if (!g_first_rt_event_logged)
+		{
+			g_first_rt_event_logged = true;
+			first_event = true;
+		}
+	}
+	if (first_event)
+		STRAY_LOG_INFO("GBUF first render-target bind event received (count=%u): the event "
+			"tap is alive.", count);
+
+	if (count == 0)
 		return;
 
-	// describe_bound_view is liveness-checked FIRST, like every view this project touches:
-	// ReShade's view->resource map outlives the resource on D3D12. (frame_state.hpp,
-	// CLAUDE.md §5 "Two descriptor hazards".) Done outside our lock — it takes
-	// frame_state's own.
+	// Describe the RTVs of EVERY bind, not only wide ones: the velocity census must see a
+	// velocity-format target in a NARROW set too — that is exactly the "base-pass velocity
+	// is not driving a wide MRT set" signal (stock UE4 without r.BasePassOutputsVelocity
+	// renders velocity in its own thin pass). describe_bound_view is liveness-checked
+	// FIRST, like every view this project touches (frame_state.hpp, CLAUDE.md §5 "Two
+	// descriptor hazards"), and runs outside our lock — it takes frame_state's own.
 	reshade::api::device *device = cmd_list->get_device();
 	std::vector<BoundTexture> rts;
 	for (uint32_t i = 0; i < count; ++i)
 		describe_bound_view(device, rtvs[i], i, rts);
-	if (dsv.handle != 0)
+	if (count >= kMinMrtCount && dsv.handle != 0)
 		describe_bound_view(device, dsv, count, rts);
+
+	bool has_velocity = false;
+	std::uint32_t vel_w = 0, vel_h = 0;
+	for (const auto &t : rts)
+		if (t.format == TexFormat::r16g16b16a16_unorm && (t.width > 1 || t.height > 1))
+		{
+			has_velocity = true;
+			vel_w = t.width;
+			vel_h = t.height;
+		}
+
+	// Narrow sets: census only, no classification.
+	if (count < kMinMrtCount)
+	{
+		if (has_velocity)
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			for (EventStats *s : { &g_session, &g_window })
+			{
+				++s->velocity_sightings;
+				if (count > s->velocity_widest_bind)
+					s->velocity_widest_bind = count;
+				s->velocity_w = vel_w;
+				s->velocity_h = vel_h;
+			}
+		}
+		return;
+	}
 
 	GBufferClassification cls = classify_render_target_set(rts);
 
 	std::lock_guard<std::mutex> lock(g_mutex);
 
-	++g_wide_sets_seen;
-	for (const auto &t : rts)
-		if (t.format == TexFormat::r16g16b16a16_unorm && (t.width > 1 || t.height > 1))
+	if (has_velocity)
+	{
+		for (EventStats *s : { &g_session, &g_window })
 		{
-			++g_wide_sets_with_velocity;
-			break;
+			++s->velocity_sightings;
+			if (count > s->velocity_widest_bind)
+				s->velocity_widest_bind = count;
+			s->velocity_w = vel_w;
+			s->velocity_h = vel_h;
 		}
+	}
 
 	if (!cls.is_base_pass)
 	{
-		++g_reject_tally[cls.reason];
+		++g_session_rejects[cls.reason];
+		++g_window_rejects[cls.reason];
 		return;
 	}
 
@@ -252,13 +366,18 @@ void on_present(std::uint64_t frame)
 	bool log_stable = false;
 	bool log_changed = false;
 	bool log_failed = false;
+	bool log_recovered = false;
 	GBufferClassification snap;
 	std::vector<char> corro;
 	std::uint64_t consecutive = 0;
 	std::uint32_t draws = 0;
 	bool denoiser_run = false;
 	std::uint64_t old_stable = 0;
-	std::uint64_t wide = 0, wide_vel = 0;
+	std::uint64_t fail_frames = 0;
+	std::uint64_t recovered_after = 0;
+	int fail_report_no = 0;
+	EventStats session_snap;
+	EventStats window_snap;
 	std::vector<std::pair<std::string, std::uint64_t>> rejects;
 
 	{
@@ -282,18 +401,40 @@ void on_present(std::uint64_t frame)
 		{
 			++g_frames_without_candidate;
 			g_consecutive = 0;
-			if (g_frames_without_candidate == kFailFrames &&
-				g_fail_reports_logged < kFailBudget)
+
+			// First block after kFailFrames, then a re-fire every kFailRepeatFrames of
+			// CONTINUED drought — each with its own window's tallies, so menu-time and
+			// gameplay-time windows are separately observable. Measured 2026-08-31 that a
+			// single once-per-session block was nearly worthless.
+			const bool due = g_frames_without_candidate == kFailFrames ||
+				(g_frames_without_candidate > kFailFrames &&
+				 (g_frames_without_candidate - kFailFrames) % kFailRepeatFrames == 0);
+			if (due && g_fail_reports_logged < kFailBudget)
 			{
 				++g_fail_reports_logged;
+				g_failed_in_this_drought = true;
 				log_failed = true;
-				wide = g_wide_sets_seen;
-				wide_vel = g_wide_sets_with_velocity;
-				rejects.assign(g_reject_tally.begin(), g_reject_tally.end());
+				fail_report_no = g_fail_reports_logged;
+				fail_frames = g_frames_without_candidate;
+				session_snap = g_session;
+				window_snap = g_window;
+				rejects.assign(g_window_rejects.begin(), g_window_rejects.end());
+				g_window = EventStats{};
+				g_window_rejects.clear();
 			}
 		}
 		else
 		{
+			// A candidate after a reported drought is news in itself — it timestamps the
+			// menu-to-gameplay (or load) transition against the FAILED windows.
+			if (g_failed_in_this_drought)
+			{
+				g_failed_in_this_drought = false;
+				log_recovered = true;
+				recovered_after = g_frames_without_candidate;
+				g_window = EventStats{};
+				g_window_rejects.clear();
+			}
 			g_frames_without_candidate = 0;
 
 			if (g_have_current && same_targets(best->cls, g_current))
@@ -346,11 +487,15 @@ void on_present(std::uint64_t frame)
 		g_denoiser_seen_this_frame = false;
 	}
 
+	if (log_recovered)
+		STRAY_LOG_WARN("GBUF base-pass candidate APPEARED at frame %llu after %llu "
+			"candidate-less frames.", static_cast<unsigned long long>(frame),
+			static_cast<unsigned long long>(recovered_after));
+
 	if (log_changed)
-		STRAY_LOG_WARN("GBUFFER FINDER: identification CHANGED at frame %llu after %llu "
-			"stable frames (resolution change, or a different scene's allocation). The new "
-			"set reports when it has held %llu frames.",
-			static_cast<unsigned long long>(frame),
+		STRAY_LOG_WARN("GBUF identification CHANGED at frame %llu after %llu stable frames "
+			"(resolution change, or a different scene's allocation). The new set reports "
+			"when it has held %llu frames.", static_cast<unsigned long long>(frame),
 			static_cast<unsigned long long>(old_stable),
 			static_cast<unsigned long long>(kStableFrames));
 
@@ -359,13 +504,13 @@ void on_present(std::uint64_t frame)
 		STRAY_LOG_INFO("======== GBUFFER FINDER  frame %llu: identification STABLE for %llu "
 			"frames ========", static_cast<unsigned long long>(frame),
 			static_cast<unsigned long long>(consecutive));
-		STRAY_LOG_INFO("base pass: %zu targets at %ux%u (scene-buffer extent), %u draws this "
-			"frame, stock roles matched %d/4", snap.targets.size(), snap.extent_width,
+		STRAY_LOG_INFO("GBUF base pass: %zu targets at %ux%u (scene-buffer extent), %u draws "
+			"this frame, stock roles matched %d/4", snap.targets.size(), snap.extent_width,
 			snap.extent_height, draws, snap.stock_roles_matched);
 		for (std::size_t i = 0; i < snap.targets.size(); ++i)
 		{
 			const GBufferTarget &t = snap.targets[i];
-			STRAY_LOG_INFO("  slot %u  %-12s res=0x%016llx  %-12s %ux%u  stock=%-3s "
+			STRAY_LOG_INFO("GBUF   slot %u  %-12s res=0x%016llx  %-12s %ux%u  stock=%-3s "
 				"ssr-srv=%s%s%s", t.tex.slot, gbuffer_role_name(t.role),
 				static_cast<unsigned long long>(t.tex.resource),
 				tex_format_name(t.tex.format), t.tex.width, t.tex.height,
@@ -374,44 +519,62 @@ void on_present(std::uint64_t frame)
 				t.note[0] != 0 ? "  <- " : "", t.note);
 		}
 		if (snap.bc_order_by_slot_only)
-			STRAY_LOG_INFO("  B/C order: both 8-bit RGBA - assigned by the stock slot order "
-				"ALONE (SOFT); formats cannot distinguish them. The observation run must "
-				"confirm which is base colour.");
-		STRAY_LOG_INFO("  ssr cross-check: denoiser 0x%016llx dispatched during this run: "
-			"%s%s", static_cast<unsigned long long>(kDenoiserLookalikeHash),
+			STRAY_LOG_INFO("GBUF   B/C order: both 8-bit RGBA - assigned by the stock slot "
+				"order ALONE (SOFT); formats cannot distinguish them. The observation run "
+				"must confirm which is base colour.");
+		STRAY_LOG_INFO("GBUF   ssr cross-check: denoiser 0x%016llx dispatched during this "
+			"run: %s%s", static_cast<unsigned long long>(kDenoiserLookalikeHash),
 			denoiser_run ? "yes" : "no",
 			denoiser_run ? "" :
 			" (its hash is configuration-specific, CLAUDE.md §2.3; absence proves nothing)");
-		STRAY_LOG_INFO("  log-only: nothing acts on this identification yet (DLSS-RR "
+		STRAY_LOG_INFO("GBUF   log-only: nothing acts on this identification yet (DLSS-RR "
 			"phase 1)");
-		STRAY_LOG_INFO("====================================================");
+		STRAY_LOG_INFO("GBUF ===============================================");
 	}
 
 	if (log_failed)
 	{
 		STRAY_LOG_ERROR("GBUFFER FINDER FAILED: no base-pass candidate for %llu consecutive "
-			"frames (at frame %llu).", static_cast<unsigned long long>(kFailFrames),
-			static_cast<unsigned long long>(frame));
-		STRAY_LOG_ERROR("  binds with >=%u render targets so far: %llu; of those containing "
-			"an R16G16B16A16_UNORM member: %llu", kMinMrtCount,
-			static_cast<unsigned long long>(wide),
-			static_cast<unsigned long long>(wide_vel));
-		if (wide == 0)
-			STRAY_LOG_ERROR("  no wide MRT set was ever bound: main menu or loading screen "
-				"(no base pass runs there), or this configuration does not render a "
-				"deferred base pass.");
-		else if (wide_vel == 0)
-			STRAY_LOG_ERROR("  wide MRT sets exist but none carries the velocity format: "
-				"r.BasePassOutputsVelocity is not in effect here, or velocity uses a "
-				"different format than the measured R16G16B16A16_UNORM (CLAUDE.md §2.5).");
+			"frames (at frame %llu, report %d).",
+			static_cast<unsigned long long>(fail_frames),
+			static_cast<unsigned long long>(frame), fail_report_no);
+		log_event_stats("window", window_snap);
+		log_event_stats("session", session_snap);
+
+		// The verdict lines: which failure world is this? Ordered from the most to the
+		// least fundamental, on the SESSION totals.
+		if (session_snap.rt_events == 0)
+			STRAY_LOG_ERROR("GBUF   ZERO render-target bind events ever received: the event "
+				"tap never fired. Registration bug, or this ReShade build does not dispatch "
+				"bind_render_targets/begin_render_pass - the classifier never saw anything.");
+		else if (session_snap.wide_sets == 0)
+		{
+			STRAY_LOG_ERROR("GBUF   no >=%u-RTV set was ever bound: this configuration does "
+				"not render a wide-MRT base pass where the finder can see it.", kMinMrtCount);
+			if (session_snap.velocity_sightings > 0)
+				STRAY_LOG_ERROR("GBUF   yet velocity-format RTVs DO appear, widest bind %u "
+					"targets: velocity is rendered in a thin pass, so the wide-MRT "
+					"base-pass-velocity anchor assumption FAILS for Stray - the classifier "
+					"needs a new signature.", session_snap.velocity_widest_bind);
+		}
+		else if (session_snap.velocity_sightings == 0)
+			STRAY_LOG_ERROR("GBUF   wide sets exist but no R16G16B16A16_UNORM RTV was ever "
+				"seen ANYWHERE: velocity does not reach the RT path in the measured format "
+				"(CLAUDE.md §2.5), or its RTV never resolves (liveness/describe failure).");
+		else
+			STRAY_LOG_ERROR("GBUF   wide sets AND velocity RTVs both exist but no set "
+				"carried both per the rules: the rejection reasons below name the failing "
+				"rule.");
 		std::sort(rejects.begin(), rejects.end(),
 			[](const auto &a, const auto &b) { return a.second > b.second; });
 		const std::size_t n = rejects.size() < static_cast<std::size_t>(kRejectReasonsLogged)
 			? rejects.size() : static_cast<std::size_t>(kRejectReasonsLogged);
 		for (std::size_t i = 0; i < n; ++i)
-			STRAY_LOG_ERROR("  rejected %llux: %s",
+			STRAY_LOG_ERROR("GBUF   rejected %llux: %s",
 				static_cast<unsigned long long>(rejects[i].second),
 				rejects[i].first.c_str());
+		if (rejects.empty())
+			STRAY_LOG_ERROR("GBUF   (no wide set reached classification in this window)");
 	}
 }
 
