@@ -77,6 +77,9 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // sharing one meant the skip warning consumed the budget
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
+bool g_ngx_gate_logged = false;
+bool g_ngx_gate2_logged = false;
+bool g_ngx_gate3_logged = false;
 // The ONE pass DLSS is allowed to replace.
 //
 // The structural matcher legitimately matches several passes — the log shows many distinct
@@ -637,6 +640,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		(m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only))
 	{
 		mark(1, "entered-phaseB");
+
+		// Trace the NAMED pass through every gate between here and Evaluate.
+		//
+		// DLSS silently never ran for it and the outer conditions all looked satisfied, which
+		// means one of the inner gates rejected it. Guessing which cost a round trip; say it.
+		const bool tracing = g_ngx_pass_override != 0 && hash == g_ngx_pass_override;
 		// The RESOURCES, not the game's descriptors: those live in UE4's bound shader-visible
 		// heap, and D3D12 forbids copying out of one (#654). We build our own views instead.
 		std::uint64_t depth_resource = 0;
@@ -674,6 +683,16 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				is_resource_live(velocity_resource) ? 1 : 0);
 		}
 
+		if (tracing && !g_ngx_gate_logged)
+		{
+			g_ngx_gate_logged = true;
+			STRAY_LOG_WARN("GATE 0x%016llx: view_ok=%d resources_live=%d camera_cut_dummies=%d "
+				"depth=%p velocity=%p", static_cast<unsigned long long>(hash), view_ok ? 1 : 0,
+				resources_live ? 1 : 0, m.camera_cut_dummies ? 1 : 0,
+				reinterpret_cast<void *>(depth_resource),
+				reinterpret_cast<void *>(velocity_resource));
+		}
+
 		if (view_ok && resources_live && !m.camera_cut_dummies)
 		{
 			mark(2, "descriptors-found");
@@ -704,6 +723,14 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				STRAY_LOG_INFO("Render rect %ux%u from View.ViewSizeAndInvSize; depth/velocity "
 					"are %ux%u at the scene-buffer extent.", render_w, render_h,
 					m.render_width, m.render_height);
+			}
+
+			if (tracing && !g_ngx_gate2_logged)
+			{
+				g_ngx_gate2_logged = true;
+				STRAY_LOG_WARN("GATE2 0x%016llx: passed the live/cut gate; render=%ux%u "
+					"mv_init=%d", static_cast<unsigned long long>(hash), render_w, render_h,
+					mv::initialise(native_device, render_w, render_h) ? 1 : 0);
 			}
 
 			if (mv::initialise(native_device, render_w, render_h))
