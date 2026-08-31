@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Measure whether suppressing one pass changes the image, honestly.
 
+Metric: TEMPORAL STABILITY — the RMS difference between two frames taken moments apart with
+the camera still. Converged temporal AA makes them nearly identical; without it, jitter makes
+the same still scene shimmer.
+
 Runs INSIDE CT113. Captures N frames while the add-on alternates a named pass between
 suppressed and normal, classifies each frame by which phase it landed in, and reports
 high-frequency energy per group.
@@ -71,15 +75,22 @@ def shoot(kb, before):
     return None
 
 
-def hf_energy(path):
-    """Laplacian standard deviation: aliasing raises it, temporal accumulation lowers it."""
-    out = subprocess.run(["magick", path, "-colorspace", "gray", "-morphology", "Convolve",
-                          "Laplacian:0", "-format", "%[fx:standard_deviation*100000]", "info:"],
+def frame_difference(a, b):
+    """RMS difference between two frames captured moments apart, with the camera STILL.
+
+    A far stronger signal than any single frame's sharpness, and it sidesteps scene variance
+    entirely. Working temporal AA converges: with the camera still, consecutive frames are
+    nearly identical. Suppress it and the jitter sequence changes the sub-pixel sampling every
+    frame, so the same still scene shimmers.
+
+    Absolute sharpness could not separate the groups because it is dominated by WHAT is on
+    screen; this compares a frame only against itself a moment later, so the content cancels.
+    """
+    out = subprocess.run(["magick", "compare", "-metric", "RMSE", a, b, "null:"],
                          capture_output=True, text=True)
-    try:
-        return float(out.stdout.strip())
-    except ValueError:
-        return None
+    txt = (out.stderr or out.stdout).strip()
+    m = re.search(r"\(([0-9.]+)\)", txt)
+    return float(m.group(1)) * 100000 if m else None
 
 
 def phase_intervals():
@@ -116,16 +127,29 @@ def main():
 
     rows = []
     for i in range(count):
+        # Pan only occasionally, to sample different scenery. The PAIR itself is always taken
+        # with the camera still, because that is what makes converged frames identical.
+        if i % 4 == 0:
+            pan(pad, 0.7)
+            time.sleep(0.6)      # let the history settle before judging its stability
+
         before = set(glob.glob(os.path.join(GAME_DIR, "*.png")))
-        pan(pad)
-        shot = shoot(kb, before)
-        if not shot:
+        first = shoot(kb, before)
+        if not first:
             print(f"{i}: no shot", flush=True)
             continue
-        e = hf_energy(shot)
-        rows.append((os.path.getmtime(shot), e, shot))
-        print(f"{i}: hf={e:.0f}", flush=True)
-        os.remove(shot)          # 5 MB each; the number is what matters
+        before2 = set(glob.glob(os.path.join(GAME_DIR, "*.png")))
+        second = shoot(kb, before2)
+        if not second:
+            os.remove(first)
+            print(f"{i}: no second shot", flush=True)
+            continue
+
+        e = frame_difference(first, second)
+        rows.append((os.path.getmtime(second), e, second))
+        print(f"{i}: framediff={e:.0f}" if e is not None else f"{i}: framediff=?", flush=True)
+        os.remove(first)         # 5 MB each; the number is what matters
+        os.remove(second)
 
     tr = phase_intervals()
     groups = {True: [], False: []}
