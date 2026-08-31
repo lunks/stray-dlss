@@ -755,6 +755,116 @@ bool test_reshade_restore_call_pattern(Gpu &gpu)
 	return true;
 }
 
+// Does ReShade's vkd3d extension hook reach descriptors we mint on the ORIGINAL device?
+//
+// CLAUDE.md §1 mandates initialising NGX with device::get_native() -- the original vkd3d
+// device -- precisely to bypass ReShade's descriptor remapping. ReShade 6.8.0 added a hook that
+// assumes the opposite: inside its proxy's QueryInterface for IID_ID3D12DeviceExt* it patches
+// vtable slots 7/8 (and 14/15 for Ext2) of vkd3d's ID3D12DeviceExt, and those hooks run every
+// handle through convert_to_original_cpu_descriptor_handle
+// (d3d12_device.cpp:123-141, d3d12_extensions.cpp).
+//
+// That conversion is:
+//     heap_index = (handle.ptr >> heap_index_start) & 0xFFFFFFF;
+//     assert(heap_index < _descriptor_heaps.size() && ...);      // compiled out in Release
+//     return _descriptor_heaps[heap_index]->_orig_base_cpu_handle.ptr + ...;
+// A real vkd3d handle yields a garbage index, an out-of-bounds read, and a handle pointing
+// anywhere. Those entry points are the CUDA texture/surface objects, which is the path
+// nvngx_dlss.dll uses under vkd3d -- so DLSS would sample the wrong texture, silently. A colour
+// cast is exactly what that looks like.
+//
+// The whole question is whether the patch is REACHABLE in our configuration. vkd3d-proton uses a
+// single static vtable for the extension interface, so if anything in the process queries
+// ReShade's proxy for this interface even once, the patch becomes process-global and applies to
+// interfaces obtained straight from the original device -- ours included.
+//
+// This probe answers only that, and deliberately never calls the CUDA functions: it reads the
+// vtable slot from the original device's interface, forces the patch by querying the proxy, and
+// reads the slot again.
+bool test_vkd3d_ext_hook_reachability(Gpu &gpu)
+{
+	std::printf("\n[test] whether ReShade's vkd3d ext hook reaches the original device\n");
+
+	if (!running_under_reshade())
+	{
+		std::printf("  SKIP: not running under ReShade, so there is no hook to observe\n");
+		return true;
+	}
+
+	// {7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42} - ReShade's "give me the original object".
+	constexpr GUID kUnwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
+		{ 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+	// {11EA7A1A-0F6A-49BF-B612-3E30F8E201DD} / {E859C4AC-BA8F-41C4-8EAC-1137FDE6158D}
+	constexpr GUID kDeviceExt = { 0x11ea7a1a, 0x0f6a, 0x49bf,
+		{ 0xb6, 0x12, 0x3e, 0x30, 0xf8, 0xe2, 0x01, 0xdd } };
+	constexpr GUID kDeviceExt2 = { 0xe859c4ac, 0xba8f, 0x41c4,
+		{ 0x8e, 0xac, 0x11, 0x37, 0xfd, 0xe6, 0x15, 0x8d } };
+
+	ComPtr<IUnknown> original;
+	if (FAILED(gpu.device->QueryInterface(kUnwrapped, reinterpret_cast<void **>(original.GetAddressOf()))))
+	{
+		std::printf("  SKIP: could not unwrap ReShade's proxy device\n");
+		return true;
+	}
+
+	// Take the extension interface from the ORIGINAL device. This goes through vkd3d's own
+	// QueryInterface, so it installs nothing.
+	ComPtr<IUnknown> ext_via_original;
+	if (FAILED(original->QueryInterface(kDeviceExt, reinterpret_cast<void **>(ext_via_original.GetAddressOf()))))
+	{
+		std::printf("  SKIP: no ID3D12DeviceExt on this device (expected off vkd3d-proton)\n");
+		return true;
+	}
+
+	const auto vtable_slot = [](IUnknown *obj, int slot) -> void * {
+		return (*reinterpret_cast<void ***>(obj))[slot];
+	};
+	void *const before_get_cuda_surface = vtable_slot(ext_via_original.Get(), 8);
+
+	// Now force the patch, the way any component that queries the PROXY would.
+	ComPtr<IUnknown> ext_via_proxy;
+	const HRESULT hr = gpu.device->QueryInterface(kDeviceExt2,
+		reinterpret_cast<void **>(ext_via_proxy.GetAddressOf()));
+	if (FAILED(hr))
+	{
+		// Fall back to the base interface; only slots 7/8 get patched then.
+		gpu.device->QueryInterface(kDeviceExt, reinterpret_cast<void **>(ext_via_proxy.GetAddressOf()));
+	}
+
+	void *const after_get_cuda_surface = vtable_slot(ext_via_original.Get(), 8);
+	const bool patched = before_get_cuda_surface != after_get_cuda_surface;
+
+	std::printf("  GetCudaSurfaceObject slot: before=%p after=%p\n",
+		before_get_cuda_surface, after_get_cuda_surface);
+
+	if (patched)
+	{
+		// Confirm the new pointer really lives inside ReShade's module rather than being
+		// coincidental churn.
+		HMODULE owner = nullptr;
+		::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(after_get_cuda_surface), &owner);
+		wchar_t path[MAX_PATH] = {};
+		if (owner != nullptr)
+			::GetModuleFileNameW(owner, path, MAX_PATH);
+		std::printf("  patched entry belongs to: %ls\n", path[0] ? path : L"<unknown>");
+
+		std::printf("  REACHABLE: querying ReShade's proxy patched the vtable that the ORIGINAL\n");
+		std::printf("             device's interface uses. NGX descriptors minted per CLAUDE.md\n");
+		std::printf("             would be run through convert_to_original_cpu_descriptor_handle.\n");
+	}
+	else
+	{
+		std::printf("  NOT REACHABLE: the original device's interface is unaffected.\n");
+	}
+
+	// Deliberately not a pass/fail assertion. Both answers are legitimate findings, and which
+	// one holds is exactly what we did not know; failing CI on it would be asserting the
+	// conclusion rather than measuring it.
+	std::printf("  (recorded, not asserted - this probe measures rather than judges)\n");
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -789,6 +899,7 @@ int main(int argc, char **argv)
 	test_no_allocation_churn(gpu);
 	test_restore_preserves_game_state(gpu);
 	test_reshade_restore_call_pattern(gpu);
+	test_vkd3d_ext_hook_reachability(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");
