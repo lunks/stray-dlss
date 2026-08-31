@@ -138,7 +138,9 @@ bool create_gpu(Gpu &gpu)
 }
 
 // Drains the info queue, printing and counting anything at error severity or worse.
-int drain_validation(Gpu &gpu, const char *phase)
+// `expected` flips the reporting for the negative-control test, where an error is the
+// desired outcome and its ID is the thing worth recording.
+int drain_validation(Gpu &gpu, const char *phase, bool expected = false)
 {
 	if (!gpu.info)
 		return 0;
@@ -157,8 +159,9 @@ int drain_validation(Gpu &gpu, const char *phase)
 		if (msg->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ||
 			msg->Severity == D3D12_MESSAGE_SEVERITY_ERROR)
 		{
-			std::printf("  [%s] D3D12 %s: %.*s\n", phase,
+			std::printf("  [%s] %sD3D12 %s #%d: %.*s\n", phase, expected ? "EXPECTED " : "",
 				msg->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION" : "ERROR",
+				static_cast<int>(msg->ID),
 				static_cast<int>(msg->DescriptionByteLength), msg->pDescription);
 			++errors;
 		}
@@ -587,6 +590,51 @@ bool test_restore_preserves_game_state(Gpu &gpu)
 
 } // namespace
 
+// A negative control for every other test in this file.
+//
+// The others assert "no D3D12 validation errors", which is only evidence if the detector
+// can actually fire. So commit the precise bug we are guarding against — binding a
+// descriptor table to a root parameter that is really a root CBV — and require the debug
+// layer to catch it. ReShade's own state_block makes exactly this mistake, which is why it
+// is the bug we most need a tripwire for. If this test ever stops reporting an error, the
+// clean bill of health the other tests give is worthless and they must not be trusted.
+bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
+{
+	std::printf("\n[test] the debug layer catches a table bound to a root-CBV parameter\n");
+
+	if (!gpu.info)
+	{
+		// vkd3d-proton does not implement ID3D12InfoQueue, so there is nothing here to detect
+		// with. Say so rather than passing quietly: on hardware this proves nothing, and the
+		// "no validation errors" claims in the other tests are equally hollow there.
+		std::printf("  SKIP: no info queue on this device (expected under vkd3d-proton)\n");
+		std::printf("  NOTE: validation coverage is a CI/WARP property, not a hardware one\n");
+		return true;
+	}
+
+	Probe p;
+	if (!build_probe(gpu, p))
+		return false;
+	drain_validation(gpu, "negative-control-setup");
+
+	// Root parameter 1 is D3D12_ROOT_PARAMETER_TYPE_CBV (see build_probe). Binding a
+	// descriptor table to it is the illegal call we must never emit.
+	ID3D12DescriptorHeap *heaps[] = { p.gpu_heap.Get() };
+	gpu.list->SetDescriptorHeaps(1, heaps);
+	gpu.list->SetComputeRootSignature(p.rs.Get());
+	gpu.list->SetComputeRootDescriptorTable(1, p.table);
+
+	const int errors = drain_validation(gpu, "deliberate-misuse", /*expected=*/true);
+	check(errors > 0, "the debug layer reported the illegal root-parameter binding");
+
+	// The recorded list is garbage now; reset it so later tests start clean.
+	gpu.list->Close();
+	gpu.allocator->Reset();
+	gpu.list->Reset(gpu.allocator.Get(), nullptr);
+	drain_validation(gpu, "negative-control-teardown");
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -604,6 +652,7 @@ int main(int argc, char **argv)
 	}
 	std::printf("device up, info queue %s\n", gpu.info ? "active" : "UNAVAILABLE");
 
+	test_validation_catches_wrong_root_parameter_type(gpu);
 	test_dispatch_is_valid(gpu);
 	test_no_allocation_churn(gpu);
 	test_restore_preserves_game_state(gpu);
