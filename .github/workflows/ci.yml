@@ -122,42 +122,20 @@ jobs:
           # the user actually runs. Its DLLs are embedded .NET resources.
           Invoke-WebRequest -Uri "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe" `
                             -OutFile setup.exe -UseBasicParsing
-          # The installer is a WPF app: its DLLs are entries inside a compiled
-          # '*.g.resources' container, not top-level manifest resources.
-          $asm = [System.Reflection.Assembly]::LoadFrom((Resolve-Path setup.exe))
-          Write-Host "Manifest resources: $($asm.GetManifestResourceNames() -join ', ')"
-          $bytes = $null
-          foreach ($rn in $asm.GetManifestResourceNames()) {
-            $stream = $asm.GetManifestResourceStream($rn)
-            if ($rn -notlike '*.resources') { continue }
-            $reader = New-Object System.Resources.ResourceReader($stream)
-            foreach ($entry in $reader) {
-              Write-Host ("  entry: {0} [{1}]" -f $entry.Key, $entry.Value.GetType().Name)
-              if ($entry.Key -notmatch 'reshade64\.dll') { continue }
-              if ($entry.Value -is [byte[]]) {
-                $bytes = $entry.Value
-              } elseif ($entry.Value -is [System.IO.Stream]) {
-                $ms = New-Object System.IO.MemoryStream
-                $entry.Value.CopyTo($ms)
-                $bytes = $ms.ToArray()
-              }
-            }
-            $reader.Close()
-          }
-          if (-not $bytes) { throw "ReShade64.dll not found inside the installer resources" }
-
-          # Stored compressed in some releases; a PE always starts 'MZ'.
-          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            Write-Host "Payload is not a PE (first bytes $($bytes[0]),$($bytes[1])); trying deflate"
-            $src = New-Object System.IO.MemoryStream(,$bytes)
-            $ds = New-Object System.IO.Compression.DeflateStream($src, [System.IO.Compression.CompressionMode]::Decompress)
-            $ms = New-Object System.IO.MemoryStream
-            $ds.CopyTo($ms); $bytes = $ms.ToArray()
-            if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "resource is neither a PE nor deflate-compressed" }
-          }
-          [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) 'd3d12.dll'), $bytes)
-          $ver = (Get-Item d3d12.dll).VersionInfo.FileVersion
-          Write-Host "Extracted ReShade $ver as d3d12.dll ($($bytes.Length) bytes)"
+          # The installer is a self-extracting zip: it opens its own file as a ZipArchive
+          # (setup/MainWindow.xaml.cs:987-1009), so we can read the DLL straight out of it.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $fs = [System.IO.File]::OpenRead((Resolve-Path setup.exe))
+          $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+          Write-Host "Setup archive entries: $(($zip.Entries | ForEach-Object { $_.Name }) -join ', ')"
+          $entry = $zip.GetEntry('ReShade64.dll')
+          if (-not $entry) { throw "ReShade64.dll is not in the setup archive" }
+          $in = $entry.Open()
+          $out = [System.IO.File]::Create((Join-Path (Get-Location) 'd3d12.dll'))
+          $in.CopyTo($out)
+          $out.Close(); $in.Close(); $zip.Dispose(); $fs.Close()
+          $dll = Get-Item d3d12.dll
+          Write-Host "Extracted ReShade $($dll.VersionInfo.FileVersion) as d3d12.dll ($($dll.Length) bytes)"
 
           Copy-Item stray-dlss.addon64 . -ErrorAction SilentlyContinue
           # Written as an array, not a here-string: a here-string's lines would sit at column 0
