@@ -46,12 +46,17 @@ bool g_ngx_dims_logged = false;
 // within about a second, the UE4 dump carries an empty callstack, and the add-on's last line is
 // simply whatever it logged before dying — so the only way to localise it is to say what we are
 // about to do, every time, until we have seen it survive.
-std::atomic<int> g_ngx_trace_budget{ 24 };
+// Restore runs on EVERY intercepted dispatch, many times a frame, while evaluate only starts
+// once the feature exists — so a single shared budget is spent long before the interesting part.
+// The trace therefore only opens after the first successful evaluate.
+std::atomic<bool> g_ngx_evaluated_once{ false };
+std::atomic<int> g_ngx_trace_budget{ 40 };
 // Always takes at least one argument: MSVC does not support the GNU ##__VA_ARGS__ elision,
 // so a zero-argument variadic macro is a syntax error there.
 #define NGX_TRACE(fmt, ...) \
 	do { \
-		if (g_ngx_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) \
+		if (g_ngx_evaluated_once.load(std::memory_order_relaxed) && \
+			g_ngx_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) \
 			STRAY_LOG_INFO("  ngx-trace: " fmt, __VA_ARGS__); \
 	} while (0)
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
@@ -673,6 +678,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								static_cast<void *>(ei.motion_vectors),
 								static_cast<void *>(ei.output));
 							const bool ok = ngx::evaluate(native, ei);
+							if (ok)
+								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
 							NGX_TRACE("evaluate returned %d", ok ? 1 : 0);
 
 							// Back to UAV for next frame's resolve.
