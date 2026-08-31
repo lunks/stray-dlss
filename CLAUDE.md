@@ -566,6 +566,34 @@ The full detail is in `docs/RESEARCH.md`. These are the things that bite.
   device API, every detected shader hash, the chosen TAA hash *and why*, the raw View CB rows, the
   computed jitter and MV scale, feature flags, NGX result codes by name, every state transition.
   The user pastes this back; it must diagnose without a second round-trip.
+### The three test lanes, and what each can actually prove
+
+| Lane | Runs | Proves | Blind to |
+|---|---|---|---|
+| Unit (Linux, doctest) | every push | pure functions: hashing, matrix math, jitter, velocity decode | anything touching D3D12 |
+| **WARP** (Windows CI) | every push | our D3D12 usage is *legal* — the debug layer and GPU-based validation judge it | vkd3d-proton's behaviour; NGX |
+| **Hardware** (`tools/run-harness-proton.sh`) | by hand | our D3D12 usage *behaves* on the real driver through real vkd3d-proton | validation: vkd3d implements no `ID3D12InfoQueue`, so every "no validation errors" assertion is vacuous there |
+
+They are complementary and none of them replaces seeing the game render.
+
+* **The hardware lane needs a private display and a private Wine prefix.** Reusing the game's
+  `DISPLAY` freezes it instantly: that display is gamescope's nested X server, Wine creates
+  windows as soon as `winex11.drv` initialises, gamescope focuses the newest toplevel, and a
+  harness that never presents leaves the compositor stuck on the game's last frame. It reads
+  exactly like a game hang and is not one. Reusing the game's prefix joins its `wineserver`.
+  The script uses `xvfb-run -a` and its own compatdata; keep it that way.
+* **Wine gives the harness no console**, so its stdout is lost. The script redirects inside
+  Windows via `cmd` and reads the file back.
+* **A "no validation errors" assertion is only evidence if the detector can fire.** The harness
+  therefore contains a negative control that deliberately binds a descriptor table to a
+  root-CBV parameter and requires the debug layer to report
+  `D3D12_MESSAGE_ID_SET_DESCRIPTOR_TABLE_INVALID = 708` (verified in `d3d12sdklayers.h:2726`
+  and reproduced in our own CI). That is the mistake ReShade's own `state_block` makes.
+* **The ReShade half of the restore is tested by a fake `command_list`**
+  (`tests/warp/fake_reshade_command_list.hpp`). The interface is pure abstract, `state_tracking`
+  is a plain struct, and `bind_descriptor_tables` is a defaulted forwarder to pure-virtual
+  `bind_descriptor_tables2` — so overriding one records both. `get_native()` returns the
+  harness's *real* command list, so the native calls execute and are validated for free.
 * Give the user one copy-pasteable launch line for bug reports:
   `DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%`, plus
   `DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024` for visual proof DLSS is running (**1024,
