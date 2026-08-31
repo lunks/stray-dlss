@@ -430,19 +430,21 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		(m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only))
 	{
 		mark(1, "entered-phaseB");
-		std::uint64_t depth_descriptor = 0;
-		std::uint64_t velocity_descriptor = 0;
+		// The RESOURCES, not the game's descriptors: those live in UE4's bound shader-visible
+		// heap, and D3D12 forbids copying out of one (#654). We build our own views instead.
+		std::uint64_t depth_resource = 0;
+		std::uint64_t velocity_resource = 0;
 		for (const auto &t : b.srvs)
 		{
 			if (t.slot == m.depth_srv)
-				depth_descriptor = t.descriptor;
+				depth_resource = t.resource;
 			if (t.slot == m.velocity_srv && t.format == TexFormat::r16g16b16a16_unorm)
-				velocity_descriptor = t.descriptor;
+				velocity_resource = t.resource;
 		}
 
 		// On a camera-cut frame velocity is the 1x1 dummy, so there is nothing to resolve.
 		// That is the pass resetting, not an error.
-		if (view_ok && depth_descriptor != 0 && velocity_descriptor != 0 && !m.camera_cut_dummies)
+		if (view_ok && depth_resource != 0 && velocity_resource != 0 && !m.camera_cut_dummies)
 		{
 			mark(2, "descriptors-found");
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
@@ -451,8 +453,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			if (mv::initialise(native_device, m.render_width, m.render_height))
 			{
 				mv::ResolveInputs inputs;
-				inputs.depth_descriptor = depth_descriptor;
-				inputs.velocity_descriptor = velocity_descriptor;
+				inputs.depth_resource = depth_resource;
+				inputs.velocity_resource = velocity_resource;
 				inputs.render_width = m.render_width;
 				inputs.render_height = m.render_height;
 				inputs.view = &view;

@@ -18,12 +18,23 @@ namespace stray_dlss::mv {
 
 struct ResolveInputs
 {
-	// The GAME's CPU descriptor handles for its depth and velocity SRVs, copied into our heap
-	// rather than recreated. Recreating them would mean dereferencing ID3D12Resource pointers
-	// that ReShade may have stale (it never calls destroy_resource_view on D3D12), which is an
-	// access violation the moment the game rotates a buffer. (docs/RESEARCH.md §2.7)
-	std::uint64_t depth_descriptor = 0;
-	std::uint64_t velocity_descriptor = 0;
+	// The GAME's depth and velocity RESOURCES. We build our own SRVs for them rather than
+	// copying the game's descriptors.
+	//
+	// Copying was the original design, on the assumption that the handles we capture live in
+	// UE4's offline heaps. Measured in the live game they do not: the source heap is
+	// `type=0 NumDescriptors=500000 SHADER_VISIBLE=YES`. D3D12 forbids a shader-visible copy
+	// SOURCE — "D3D12 ERROR #654: SrcDescriptorRangeStart points to a descriptor heap type that
+	// is CPU write only, so reading it is invalid", reproduced in our own CI. vkd3d-proton has
+	// no debug layer to object, so the illegal copy silently produced a descriptor the GPU
+	// rejected: MvDispatch=0 survived because nothing read it, and a single 1x1 dispatch hung
+	// the GPU with Xid 109.
+	//
+	// The old comment here warned that recreating views means dereferencing resource pointers
+	// ReShade may hold stale. That risk is unchanged by this: describe() already asks ReShade
+	// for get_resource_desc on the same resource, so we depend on its validity either way.
+	std::uint64_t depth_resource = 0;
+	std::uint64_t velocity_resource = 0;
 	std::uint32_t render_width = 0;
 	std::uint32_t render_height = 0;
 	const ue4::ViewParams *view = nullptr;

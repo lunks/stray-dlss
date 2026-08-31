@@ -301,8 +301,8 @@ bool test_dispatch_is_valid(Gpu &gpu)
 
 	const auto view = make_view(kW, kH);
 	stray_dlss::mv::ResolveInputs in;
-	in.depth_descriptor = game.depth_srv.ptr;
-	in.velocity_descriptor = game.velocity_srv.ptr;
+	in.depth_resource = reinterpret_cast<std::uint64_t>(game.depth.Get());
+	in.velocity_resource = reinterpret_cast<std::uint64_t>(game.velocity.Get());
 	in.render_width = kW;
 	in.render_height = kH;
 	in.view = &view;
@@ -350,8 +350,8 @@ bool test_no_allocation_churn(Gpu &gpu)
 
 		const auto view = make_view(w, h);
 		stray_dlss::mv::ResolveInputs in;
-		in.depth_descriptor = g.depth_srv.ptr;
-		in.velocity_descriptor = g.velocity_srv.ptr;
+		in.depth_resource = reinterpret_cast<std::uint64_t>(g.depth.Get());
+		in.velocity_resource = reinterpret_cast<std::uint64_t>(g.velocity.Get());
 		in.render_width = w;
 		in.render_height = h;
 		in.view = &view;
@@ -577,8 +577,8 @@ bool test_restore_preserves_game_state(Gpu &gpu)
 
 	const auto view = make_view(1920, 1080);
 	stray_dlss::mv::ResolveInputs in;
-	in.depth_descriptor = game.depth_srv.ptr;
-	in.velocity_descriptor = game.velocity_srv.ptr;
+	in.depth_resource = reinterpret_cast<std::uint64_t>(game.depth.Get());
+	in.velocity_resource = reinterpret_cast<std::uint64_t>(game.velocity.Get());
 	in.render_width = 1920;
 	in.render_height = 1080;
 	in.view = &view;

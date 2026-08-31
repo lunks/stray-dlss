@@ -260,22 +260,47 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 // and the game rotates its velocity buffer constantly, so it happens within seconds. Copying
 // descriptors needs no resource pointer and no format guessing — the game already described
 // the view exactly as its own shader reads it. (docs/RESEARCH.md §2.7)
-// Copies the game's SRV descriptors into THIS frame's slots. Called every frame, never cached.
-void copy_srvs(UINT slot, std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor)
+// The SRV format to view a resource through.
+//
+// Depth is created TYPELESS so it can carry both depth and stencil, and a view must name one
+// plane explicitly — the depth plane here. Getting this wrong is not survivable: the debug
+// layer rejects the view and REMOVES THE DEVICE (seen in our own CI when R32_FLOAT was used
+// for an R32G8X24_TYPELESS resource).
+DXGI_FORMAT srv_format_for(DXGI_FORMAT resource_format)
+{
+	switch (resource_format)
+	{
+	case DXGI_FORMAT_R32G8X24_TYPELESS:     return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+	case DXGI_FORMAT_R24G8_TYPELESS:        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	case DXGI_FORMAT_R32_TYPELESS:          return DXGI_FORMAT_R32_FLOAT;
+	case DXGI_FORMAT_R16_TYPELESS:          return DXGI_FORMAT_R16_UNORM;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_UNORM;
+	default:                                return resource_format;  // already typed
+	}
+}
+
+// Builds THIS frame's SRVs for the game's depth and velocity, straight into our own heap.
+//
+// We do NOT copy the game's descriptors. Measured in the live game, they live in the heap UE4
+// has bound — type=0, 500000 descriptors, SHADER_VISIBLE=YES — and D3D12 forbids a
+// shader-visible copy source (#654, reproduced in CI). vkd3d-proton raises nothing, so the
+// illegal copy quietly produced a descriptor the GPU rejected on first read: Xid 109.
+void create_srvs(UINT slot, ID3D12Resource *depth, ID3D12Resource *velocity)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE dest = g_state.heap->GetCPUDescriptorHandleForHeapStart();
 	dest.ptr += ring::descriptor_offset(slot, g_state.descriptor_size);
 
-	D3D12_CPU_DESCRIPTOR_HANDLE src_depth = {};
-	src_depth.ptr = static_cast<SIZE_T>(depth_descriptor);
-	g_state.device->CopyDescriptorsSimple(1, dest, src_depth,
-		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2D.MipLevels = 1;
+
+	srv.Format = srv_format_for(depth->GetDesc().Format);
+	g_state.device->CreateShaderResourceView(depth, &srv, dest);
 
 	dest.ptr += g_state.descriptor_size;
-	D3D12_CPU_DESCRIPTOR_HANDLE src_velocity = {};
-	src_velocity.ptr = static_cast<SIZE_T>(velocity_descriptor);
-	g_state.device->CopyDescriptorsSimple(1, dest, src_velocity,
-		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	srv.Format = srv_format_for(velocity->GetDesc().Format);
+	g_state.device->CreateShaderResourceView(velocity, &srv, dest);
 }
 
 // Releases retired resources once kFrameCount further frames have been recorded, by which point
@@ -398,8 +423,8 @@ void shutdown()
 
 bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode)
 {
-	if (cmd == nullptr || !is_ready() || in.depth_descriptor == 0 ||
-		in.velocity_descriptor == 0 || in.view == nullptr)
+	if (cmd == nullptr || !is_ready() || in.depth_resource == 0 ||
+		in.velocity_resource == 0 || in.view == nullptr)
 		return false;
 
 	// This frame's slice of every per-frame resource.
@@ -407,7 +432,8 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	g_state.frame++;
 
 	// Unconditionally, every frame. See the note on the removed descriptor cache.
-	copy_srvs(slot, in.depth_descriptor, in.velocity_descriptor);
+	create_srvs(slot, reinterpret_cast<ID3D12Resource *>(in.depth_resource),
+		reinterpret_cast<ID3D12Resource *>(in.velocity_resource));
 
 	retire_expired();
 
