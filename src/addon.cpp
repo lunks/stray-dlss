@@ -279,6 +279,23 @@ void on_init_device(reshade::api::device *device)
 			resolve_at_ssd ? "SSD-dispatch (content-alive)" : "TAA-hook (A/B mode)",
 			resolve_at_ssd ? "ssd" : "taa");
 
+	// [STRAYDLSS] NgxExposure: "auto" (default — today's behaviour, DLSS estimates
+	// exposure itself via the AutoExposure create flag) | "texture" (the flag is dropped
+	// and the engine's eye-adaptation texture rides every SR evaluate as
+	// pInExposureTexture). Creation-time property; A/B across launches. The candidate fix
+	// for the red/cyan single-pixel pops: bright neon highlights mis-weighted by DLSS's
+	// own exposure estimate in a dark scene.
+	char exposure_mode[16] = "auto";
+	size_t exposure_mode_size = sizeof(exposure_mode);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxExposure", exposure_mode,
+		&exposure_mode_size);
+	const bool exposure_texture = std::strcmp(exposure_mode, "texture") == 0;
+	ngx::set_exposure_from_texture(exposure_texture);
+	STRAY_LOG_INFO("DLSS exposure source: %s ([STRAYDLSS] NgxExposure=auto|texture).",
+		exposure_texture
+			? "engine eye-adaptation TEXTURE (AutoExposure flag dropped at create)"
+			: "DLSS AUTO-exposure (the AutoExposure create flag, today's behaviour)");
+
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
 	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
 	bool resolve_only = false;

@@ -155,6 +155,17 @@ constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull;
 bool is_ssd_temporal_hash(std::uint64_t hash);
 void set_extra_ssd_hashes(const std::uint64_t *hashes, std::size_t count);
 
+// The eye-adaptation SRV of an intercepted TAA dispatch: register t0, 1x1
+// R32G32B32A32_FLOAT, present EVERY frame (CLAUDE.md §2.3 — it is NOT one of the
+// camera-cut dummies: those replace only the velocity and colour slots, and the BlackDummy
+// is not RGBA32F). Returns the resource handle, or 0 when absent. Register t0 wins when it
+// fits the signature; otherwise the only structural 1x1-RGBA32F binding is accepted, so a
+// permutation with shifted registers still yields the texture. Used as DLSS's exposure
+// texture under [STRAYDLSS] NgxExposure=texture — the official UE plugin passes exactly
+// this texture, unmodified, as pInExposureTexture (DLSSUpscaler.cpp:1075-1089 /
+// NGXD3D12RHI.cpp:267-269, v3.7.3 mirror, fetched 2026-08-31).
+std::uint64_t find_eye_adaptation_srv(const std::vector<BoundTexture> &srvs);
+
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)
 constexpr std::uint32_t kTaaTileSize = 8;
 

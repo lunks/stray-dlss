@@ -198,3 +198,43 @@ TEST_CASE("the SSD temporal-accumulation family: baked members plus runtime exte
 	stray_dlss::set_extra_ssd_hashes(nullptr, 0);
 	CHECK(!stray_dlss::is_ssd_temporal_hash(0x1111222233334444ull));
 }
+
+TEST_CASE("the eye-adaptation finder: t0 by register, structural fallback, dummies rejected")
+{
+	using stray_dlss::BoundTexture;
+	using stray_dlss::TexFormat;
+
+	// The measured §2.3 binding set: t0 is the 1x1 RGBA32F eye adaptation.
+	std::vector<BoundTexture> srvs = {
+		{ 0, 0x1000, TexFormat::r32g32b32a32_float, 1, 1 },
+		{ 1, 0x2000, TexFormat::r16g16b16a16_float, 1920, 1080 },
+		{ 2, 0x3000, TexFormat::r32_float_x8x24_typeless, 1920, 1080 },
+		{ 3, 0x4000, TexFormat::r16g16b16a16_unorm, 1920, 1080 },
+	};
+	CHECK(stray_dlss::find_eye_adaptation_srv(srvs) == 0x1000);
+
+	// Register t0 wins over a stray structural 1x1 RGBA32F elsewhere.
+	srvs.push_back({ 9, 0x9000, TexFormat::r32g32b32a32_float, 1, 1 });
+	CHECK(stray_dlss::find_eye_adaptation_srv(srvs) == 0x1000);
+
+	// A permutation with shifted registers still yields the texture structurally.
+	std::vector<BoundTexture> shifted = {
+		{ 0, 0x2000, TexFormat::r16g16b16a16_float, 1920, 1080 },
+		{ 2, 0x1000, TexFormat::r32g32b32a32_float, 1, 1 },
+	};
+	CHECK(stray_dlss::find_eye_adaptation_srv(shifted) == 0x1000);
+
+	// Camera-cut 1x1 dummies are DIFFERENT formats and must never be picked — even at t0.
+	std::vector<BoundTexture> cut = {
+		{ 0, 0x5000, TexFormat::r16g16b16a16_float, 1, 1 }, // a dummy squatting on t0
+		{ 3, 0x6000, TexFormat::r16g16b16a16_unorm, 1, 1 }, // velocity BlackDummy
+	};
+	CHECK(stray_dlss::find_eye_adaptation_srv(cut) == 0);
+
+	// A full-size RGBA32F buffer is not the eye adaptation; absence returns 0.
+	std::vector<BoundTexture> none = {
+		{ 0, 0x7000, TexFormat::r32g32b32a32_float, 256, 256 },
+	};
+	CHECK(stray_dlss::find_eye_adaptation_srv(none) == 0);
+	CHECK(stray_dlss::find_eye_adaptation_srv({}) == 0);
+}

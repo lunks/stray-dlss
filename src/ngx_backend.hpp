@@ -55,12 +55,36 @@ struct FeatureDesc
 // Returns false and records last_error() on failure; the caller must then not evaluate.
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
 
+// [STRAYDLSS] NgxExposure: false = "auto" (today's behaviour — the feature is created
+// with NVSDK_NGX_DLSS_Feature_Flags_AutoExposure and DLSS estimates exposure itself);
+// true = "texture" (the flag is dropped and the engine's own eye-adaptation texture is
+// passed as pInExposureTexture at every evaluate). CREATION-TIME property: read once at
+// init, A/B'd across launches. The official UE plugin implements exactly this pair
+// (r.NGX.DLSS.AutoExposure; NGXRHI.cpp:537-546 sets the flag from it, NGXD3D12RHI.cpp:
+// 267-269 nulls the texture under auto — v3.7.3 mirror, fetched 2026-08-31).
+void set_exposure_from_texture(bool use_texture);
+bool exposure_from_texture();
+
 struct EvaluateInputs
 {
 	ID3D12Resource *color = nullptr;           // render-res scene colour, still pre-exposed
 	ID3D12Resource *depth = nullptr;           // render-res depth, reversed-Z
 	ID3D12Resource *motion_vectors = nullptr;  // our dense RG16_FLOAT field
 	ID3D12Resource *output = nullptr;          // output-res UAV, ALLOW_UNORDERED_ACCESS
+	// The engine's eye-adaptation texture (TAA register t0: 1x1 RGBA32F), consumed only
+	// under NgxExposure=texture; null falls back to DLSS's default exposure of 1.0 for
+	// that frame (the helper's InExposureScale 0->1 mapping, nvsdk_ngx_helpers.h:508).
+	// VALUE SEMANTICS, the load-bearing point: texel .x is UE's smoothed exposure
+	// multiplier — `OutColor.x = MiddleGreyExposureCompensation * SmoothedExposureScale`
+	// (PostProcessEyeAdaptation.usf:95-112, 4.27.2 mirror, fetched 2026-08-31) — the value
+	// the tonemapper multiplies scene colour by. The official
+	// plugin passes this texture UNMODIFIED while ALSO passing View.PreExposure as
+	// InPreExposure in BOTH exposure modes (DLSSUpscaler.cpp:1085-1089) — no reciprocal,
+	// no combining, no double-apply at the integration layer: NGX separates the two
+	// internally (pre-exposure names what is baked into the colour buffer; the exposure
+	// texture names the tonemapper's multiplier). We reproduce that exactly: this texture
+	// straight through, pre_exposure (row 135.y) straight through, unchanged in both modes.
+	ID3D12Resource *exposure = nullptr;
 
 	// TemporalAAParams.zw, passed straight through: already render-resolution pixels in
 	// [-0.5, +0.5]. No negation, no scaling. (CLAUDE.md §2.7)

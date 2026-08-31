@@ -1611,6 +1611,40 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
 
+							// [STRAYDLSS] NgxExposure=texture: the engine's eye-adaptation
+							// texture (register t0 of this very dispatch — 1x1 RGBA32F,
+							// present every frame, CLAUDE.md §2.3) becomes DLSS's exposure
+							// source; .x is UE's ExposureScale and the official plugin
+							// passes the texture unmodified alongside PreExposure
+							// (ngx_backend.hpp carries the full derivation). Liveness-
+							// checked like every capture. A miss cannot fall back to
+							// AutoExposure per frame — that is a creation-time flag — so
+							// the frame gets DLSS's default exposure 1.0 instead, loudly,
+							// once; a PERSISTENT miss means flip NgxExposure back to auto.
+							if (ngx::exposure_from_texture())
+							{
+								const std::uint64_t eye = find_eye_adaptation_srv(b.srvs);
+								if (eye != 0 && is_resource_live(eye))
+								{
+									ei.exposure = reinterpret_cast<ID3D12Resource *>(eye);
+								}
+								else
+								{
+									static bool s_eye_missing_logged = false;
+									if (!s_eye_missing_logged)
+									{
+										s_eye_missing_logged = true;
+										STRAY_LOG_WARN("NgxExposure=texture but no live 1x1 "
+											"RGBA32F eye-adaptation SRV on this dispatch "
+											"(found=%d live=%d); DLSS gets default exposure "
+											"1.0 for such frames. If this persists, set "
+											"NgxExposure=auto. First occurrence only.",
+											eye != 0 ? 1 : 0,
+											eye != 0 && is_resource_live(eye) ? 1 : 0);
+									}
+								}
+							}
+
 							NGX_TRACE("evaluate colour=%p depth=%p mv=%p out=%p",
 								static_cast<void *>(ei.color), static_cast<void *>(ei.depth),
 								static_cast<void *>(ei.motion_vectors),

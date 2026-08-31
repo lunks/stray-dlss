@@ -45,6 +45,8 @@ const char *last_error() { return "<ngx disabled>"; }
 namespace { RRStatus g_rr_status; }
 void set_rr_mode(int) {}
 int rr_mode() { return 0; }
+void set_exposure_from_texture(bool) {}
+bool exposure_from_texture() { return false; }
 const RRStatus &rr_status() { return g_rr_status; }
 bool ensure_feature_rr(ID3D12GraphicsCommandList *, const FeatureDesc &) { return false; }
 bool evaluate_rr(ID3D12GraphicsCommandList *, const EvaluateInputsRR &) { return false; }
@@ -95,6 +97,9 @@ NVSDK_NGX_Handle *g_feature = nullptr;
 NVSDK_NGX_Parameter *g_feature_params = nullptr;
 FeatureDesc g_feature_desc;
 char g_last_error[256] = "";
+
+// [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
+bool g_exposure_from_texture = false;
 
 // --- Ray Reconstruction state ([STRAYDLSS] NgxRR) ---
 int g_rr_mode = 0;
@@ -467,6 +472,9 @@ void set_rr_mode(int mode)
 int rr_mode() { return g_rr_mode; }
 const RRStatus &rr_status() { return g_rr_status; }
 
+void set_exposure_from_texture(bool use_texture) { g_exposure_from_texture = use_texture; }
+bool exposure_from_texture() { return g_exposure_from_texture; }
+
 void release_feature_rr()
 {
 	release_probe_feature(/*force=*/true);
@@ -608,6 +616,10 @@ bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 	eval.InMVScaleY = 1.0f;
 	eval.InPreExposure = in.base.pre_exposure;
 	eval.InFrameTimeDeltaInMsec = in.frame_time_delta_ms;
+	// Deliberately NO pInExposureTexture here even under NgxExposure=texture: "Exposure,
+	// Auto-Exposure, Sharpness ... are not supported by DLSS Ray Reconstruction" (RR guide
+	// PDF §3.7, RESEARCH-RR-GBUFFER.md §2.1) — InPreExposure is the one exposure input RR
+	// takes, and it is passed above. The exposure-texture fix is an SR-path change.
 
 	if (in.have_matrices)
 	{
@@ -707,13 +719,20 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	create.Feature.InTargetHeight = desc.output_height;
 	create.Feature.InPerfQualityValue = quality;
 	// IsHDR because scene colour is linear HDR and pre-exposed; MVLowRes because our motion
-	// vectors are at render resolution; DepthInverted because UE4 uses reversed-Z; AutoExposure
-	// because we supply no exposure texture. Never DoSharpening — deprecated and inert.
+	// vectors are at render resolution; DepthInverted because UE4 uses reversed-Z. Never
+	// DoSharpening — deprecated and inert. AutoExposure (1<<6 = 0x40, nvsdk_ngx_defs.h:297)
+	// only under NgxExposure=auto: in texture mode the engine's eye-adaptation texture is
+	// the exposure source and the flag must be ABSENT — exactly the official UE plugin's
+	// pair (NGXRHI.cpp:537-546: `bUseAutoExposure ? Flags_AutoExposure : 0`).
 	create.InFeatureCreateFlags =
 		NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
 		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
 		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-		NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+		(g_exposure_from_texture ? 0 : NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
+	STRAY_LOG_INFO("DLSS SR create flags: IsHDR|MVLowRes|DepthInverted%s = 0x%02x "
+		"(NgxExposure=%s)", g_exposure_from_texture ? "" : "|AutoExposure",
+		static_cast<unsigned>(create.InFeatureCreateFlags),
+		g_exposure_from_texture ? "texture" : "auto");
 
 	result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &g_feature, g_feature_params, &create);
 	if (NVSDK_NGX_FAILED(result) || g_feature == nullptr)
@@ -766,6 +785,11 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	eval.InMVScaleX = 1.0f;
 	eval.InMVScaleY = 1.0f;
 	eval.InPreExposure = in.pre_exposure;
+	// NgxExposure=texture: the eye-adaptation texture via NVSDK_NGX_Parameter_ExposureTexture
+	// (helpers.h:466); InExposureScale stays 0 -> the helper maps it to 1.0 (:508). NGX
+	// reads channel 0 of the 1x1 RGBA32F with a formatted read — the plugin ships UE's
+	// RGBA32F eye-adaptation texture unconverted, which is the existence proof.
+	eval.pInExposureTexture = in.exposure;
 
 	const NVSDK_NGX_Result result =
 		NGX_D3D12_EVALUATE_DLSS_EXT(cmd, g_feature, g_feature_params, &eval);
@@ -782,6 +806,7 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	ka.resources[1] = in.depth;
 	ka.resources[2] = in.motion_vectors;
 	ka.resources[3] = in.output;
+	ka.resources[4] = in.exposure; // null under NgxExposure=auto
 	for (ID3D12Resource *r : ka.resources)
 		if (r != nullptr)
 			r->AddRef();

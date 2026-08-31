@@ -70,6 +70,26 @@ void set_extra_ssd_hashes(const std::uint64_t *hashes, std::size_t count)
 	g_extra_ssd_count.store(count, std::memory_order_release);
 }
 
+std::uint64_t find_eye_adaptation_srv(const std::vector<BoundTexture> &srvs)
+{
+	// The signature is FORMAT + EXTENT, not register alone: 1x1 R32G32B32A32_FLOAT. The
+	// 1x1 BlackDummy that replaces velocity/colour on a cut is a different format, so it
+	// can never be picked; a 1x1 RGBA32F is the eye-adaptation buffer and nothing else in
+	// the frame (CLAUDE.md §2.3).
+	std::uint64_t structural = 0;
+	for (const auto &t : srvs)
+	{
+		if (t.width != 1 || t.height != 1 || t.format != TexFormat::r32g32b32a32_float ||
+			t.resource == 0)
+			continue;
+		if (t.slot == 0)
+			return t.resource; // the §2.3 register map: t0 wins outright
+		if (structural == 0)
+			structural = t.resource;
+	}
+	return structural;
+}
+
 void set_extra_taa_hashes(const std::uint64_t *hashes, std::size_t count)
 {
 	count = std::min<std::size_t>(count, 64);
