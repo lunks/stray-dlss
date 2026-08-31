@@ -750,6 +750,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		// this add-on into the real ReShade with no game. Logging it on detach also gives
 		// field reports a definitive "what did the add-on actually see" line even when the
 		// user closes the game before frame 300.
+		{
+			std::uint32_t attempts = 0, skipped = 0;
+			taa_hook::resolve_counters(attempts, skipped);
+			STRAY_LOG_INFO("Resolve attempts=%u skipped_stale=%u (%.1f%%) — a skipped frame "
+				"contributes no motion vectors.", attempts, skipped,
+				attempts ? (100.0 * skipped / attempts) : 0.0);
+		}
 		STRAY_LOG_INFO("Final census: compute pipelines=%u, TAA matches=%u, dispatches=%u, "
 			"bind_pipeline=%d, push_descriptors=%d",
 			g_state.compute_pipelines_seen.load(std::memory_order_relaxed),

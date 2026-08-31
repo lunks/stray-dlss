@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -26,6 +27,11 @@ std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     
 bool g_resolve_ran = false;
 bool g_resolve_failed_logged = false;
 bool g_stale_resource_logged = false;
+// How often the resolve is attempted versus skipped because ReShade named a dead resource.
+// A skip is safe but not free: that frame contributes no motion vectors, and a high rate would
+// mean our view->resource lookups are unreliable in general, not just occasionally.
+std::atomic<std::uint32_t> g_resolve_attempts{ 0 };
+std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
@@ -451,6 +457,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it.
 		const bool resources_live = is_resource_live(depth_resource) &&
 			is_resource_live(velocity_resource);
+		if (depth_resource != 0 && velocity_resource != 0)
+		{
+			g_resolve_attempts.fetch_add(1, std::memory_order_relaxed);
+			if (!resources_live)
+				g_resolve_skipped_stale.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (!resources_live && depth_resource != 0 && velocity_resource != 0 &&
 			!g_stale_resource_logged)
 		{
@@ -580,6 +592,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	}
 
 	return false; // Phase A never suppresses the engine's dispatch.
+}
+
+void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
+{
+	attempts = g_resolve_attempts.load(std::memory_order_relaxed);
+	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

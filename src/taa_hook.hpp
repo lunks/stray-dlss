@@ -43,4 +43,8 @@ const Diagnostics &diagnostics();
 // Dumps the per-shader outcome census. Call once, after gameplay has been running a while.
 void dump_summary();
 
+// How many times the resolve was attempted, and how many of those were skipped because
+// ReShade reported a resource that is no longer live.
+void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
+
 } // namespace stray_dlss::taa_hook
