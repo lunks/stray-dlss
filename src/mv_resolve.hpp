@@ -18,8 +18,12 @@ namespace stray_dlss::mv {
 
 struct ResolveInputs
 {
-	ID3D12Resource *depth = nullptr;     // R32G8X24_TYPELESS, read as R32_FLOAT_X8X24
-	ID3D12Resource *velocity = nullptr;  // R16G16B16A16_UNORM, buffer-sized and sparse
+	// The GAME's CPU descriptor handles for its depth and velocity SRVs, copied into our heap
+	// rather than recreated. Recreating them would mean dereferencing ID3D12Resource pointers
+	// that ReShade may have stale (it never calls destroy_resource_view on D3D12), which is an
+	// access violation the moment the game rotates a buffer. (docs/RESEARCH.md §2.7)
+	std::uint64_t depth_descriptor = 0;
+	std::uint64_t velocity_descriptor = 0;
 	std::uint32_t render_width = 0;
 	std::uint32_t render_height = 0;
 	const ue4::ViewParams *view = nullptr;

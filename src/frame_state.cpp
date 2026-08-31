@@ -53,6 +53,7 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 	BoundTexture t;
 	t.slot = reg;
 	t.resource = res.handle;
+	t.descriptor = view.handle; // a real D3D12_CPU_DESCRIPTOR_HANDLE.ptr
 	if (rd.type == reshade::api::resource_type::buffer)
 	{
 		// A buffer has no extent; reading rd.texture on one prints nonsense.

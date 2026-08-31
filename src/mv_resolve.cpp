@@ -49,11 +49,8 @@ struct State
 	std::uint32_t width = 0;
 	std::uint32_t height = 0;
 
-	// Rebuilding the SRVs every frame is the simple correct choice: the game's depth and
-	// velocity resources are recreated on resolution changes and after device resets, and
-	// caching them by pointer would silently outlive them.
-	ID3D12Resource *last_depth = nullptr;
-	ID3D12Resource *last_velocity = nullptr;
+	std::uint64_t last_depth_descriptor = 0;
+	std::uint64_t last_velocity_descriptor = 0;
 
 	char error[256] = {};
 };
@@ -231,31 +228,31 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 	return true;
 }
 
-void write_srvs(ID3D12Resource *depth, ID3D12Resource *velocity)
+// Copies the game's own SRV descriptors into our heap.
+//
+// This deliberately does NOT recreate the views from resource pointers. ReShade never calls
+// destroy_resource_view on D3D12, so its view->resource map can return a pointer to a resource
+// the game already destroyed; passing that to CreateShaderResourceView is an access violation,
+// and the game rotates its velocity buffer constantly, so it happens within seconds. Copying
+// descriptors needs no resource pointer and no format guessing — the game already described
+// the view exactly as its own shader reads it. (docs/RESEARCH.md §2.7)
+void copy_srvs(std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor)
 {
-	D3D12_CPU_DESCRIPTOR_HANDLE base = g_state.heap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_CPU_DESCRIPTOR_HANDLE dest = g_state.heap->GetCPUDescriptorHandleForHeapStart();
 
-	// The depth resource is R32G8X24_TYPELESS; the readable plane is R32_FLOAT_X8X24_TYPELESS.
-	// This is the same view the game itself creates. (CLAUDE.md §2.4)
-	D3D12_SHADER_RESOURCE_VIEW_DESC depth_desc = {};
-	depth_desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-	depth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	depth_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	depth_desc.Texture2D.MipLevels = 1;
-	g_state.device->CreateShaderResourceView(depth, &depth_desc, base);
+	D3D12_CPU_DESCRIPTOR_HANDLE src_depth = {};
+	src_depth.ptr = static_cast<SIZE_T>(depth_descriptor);
+	g_state.device->CopyDescriptorsSimple(1, dest, src_depth,
+		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-	D3D12_CPU_DESCRIPTOR_HANDLE vel = base;
-	vel.ptr += g_state.descriptor_size;
+	dest.ptr += g_state.descriptor_size;
+	D3D12_CPU_DESCRIPTOR_HANDLE src_velocity = {};
+	src_velocity.ptr = static_cast<SIZE_T>(velocity_descriptor);
+	g_state.device->CopyDescriptorsSimple(1, dest, src_velocity,
+		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-	D3D12_SHADER_RESOURCE_VIEW_DESC vel_desc = {};
-	vel_desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
-	vel_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	vel_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	vel_desc.Texture2D.MipLevels = 1;
-	g_state.device->CreateShaderResourceView(velocity, &vel_desc, vel);
-
-	g_state.last_depth = depth;
-	g_state.last_velocity = velocity;
+	g_state.last_depth_descriptor = depth_descriptor;
+	g_state.last_velocity_descriptor = velocity_descriptor;
 }
 
 } // namespace
@@ -307,18 +304,19 @@ void shutdown()
 	g_state.device = nullptr;
 	g_state.width = 0;
 	g_state.height = 0;
-	g_state.last_depth = nullptr;
-	g_state.last_velocity = nullptr;
+	g_state.last_depth_descriptor = 0;
+	g_state.last_velocity_descriptor = 0;
 }
 
 bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in)
 {
-	if (cmd == nullptr || !is_ready() || in.depth == nullptr || in.velocity == nullptr ||
-		in.view == nullptr)
+	if (cmd == nullptr || !is_ready() || in.depth_descriptor == 0 ||
+		in.velocity_descriptor == 0 || in.view == nullptr)
 		return false;
 
-	if (in.depth != g_state.last_depth || in.velocity != g_state.last_velocity)
-		write_srvs(in.depth, in.velocity);
+	if (in.depth_descriptor != g_state.last_depth_descriptor ||
+		in.velocity_descriptor != g_state.last_velocity_descriptor)
+		copy_srvs(in.depth_descriptor, in.velocity_descriptor);
 
 	// Fill this frame's slice of the constant ring.
 	const UINT slot = g_state.frame % kFrameCount;
