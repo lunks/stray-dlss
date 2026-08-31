@@ -259,6 +259,13 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
 			"— the image will look aliased because nothing accumulates.");
 
+	bool ngx_paint = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPaint", ngx_paint);
+	taa_hook::set_ngx_paint(ngx_paint);
+	if (ngx_paint)
+		STRAY_LOG_WARN("NgxPaint is ON: the TAA output is cleared to MAGENTA instead of "
+			"evaluating. If the screen is not magenta, the output handle is wrong.");
+
 	int dry_alternate = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
 	taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));

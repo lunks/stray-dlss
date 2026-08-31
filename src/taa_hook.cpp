@@ -91,6 +91,8 @@ bool g_ngx_registers_logged = false;
 // the shader's declared register, render and output resolutions are separated — and the failure
 // is unchanged. That points at something the inputs' identity cannot explain.
 bool g_ngx_force_reset = false;
+// [STRAYDLSS] NgxPaint — clear the captured output to magenta instead of evaluating.
+bool g_ngx_paint = false;
 // Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
 // qualifying LATER — which is exactly what happened: the gate logs fired before NGX had even
 // initialised, so they proved nothing about the frames that mattered.
@@ -323,6 +325,7 @@ void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
 void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
 void set_ngx_force_reset(bool enabled) { g_ngx_force_reset = enabled; }
+void set_ngx_paint(bool enabled) { g_ngx_paint = enabled; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
 
 // True when a dry run should suppress RIGHT NOW.
@@ -1065,7 +1068,19 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									out_tex ? out_tex->width : 0, out_tex ? out_tex->height : 0,
 									out_tex ? static_cast<int>(out_tex->format) : -1);
 							}
-							const bool ok = ngx::evaluate(native, ei);
+							bool ok;
+							if (g_ngx_paint)
+							{
+								// Paint instead of evaluating: if the screen turns magenta the
+								// output handle is right and the fault is inside the evaluate;
+								// if the scene stays frozen the handle is wrong and nothing
+								// about DLSS's inputs matters yet.
+								ok = mv::paint(native, ei.output);
+							}
+							else
+							{
+								ok = ngx::evaluate(native, ei);
+							}
 							if (ok)
 							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);

@@ -67,6 +67,15 @@ ID3D12Resource *output();
 // and under vkd3d — which validates none of this — it faults instead.
 void transition_output(ID3D12GraphicsCommandList *cmd, bool to_shader_resource);
 
+// Diagnostic: clear `target` to solid magenta.
+//
+// The decisive test for "is our captured output handle actually the buffer this frame
+// displays". DLSS reports evaluate OK yet the scene stays frozen, which is consistent with
+// writing a resource nothing reads. Paint is unambiguous: a magenta screen proves the handle is
+// right and moves the fault into the evaluate; a still-frozen scene proves the handle is wrong
+// and everything downstream of it was noise.
+bool paint(ID3D12GraphicsCommandList *cmd, ID3D12Resource *target);
+
 // Allocation accounting. The GPU ran out of memory during a real run, and resource churn in
 // initialise() is the prime suspect: the render resolution is taken from whichever dispatch
 // matched, so a flapping size reallocates the heap, constant buffer and output texture. These

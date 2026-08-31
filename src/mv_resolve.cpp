@@ -42,6 +42,13 @@ struct State
 	ID3D12RootSignature *root_signature = nullptr;
 	ID3D12PipelineState *pso = nullptr;
 	ID3D12DescriptorHeap *heap = nullptr;      // shader-visible CBV/SRV/UAV
+	// ClearUnorderedAccessViewFloat needs the SAME descriptor twice: a GPU handle in a
+	// shader-visible heap currently bound on the command list, and a CPU handle in a
+	// NON-shader-visible heap. These two tiny heaps (one slot per ring frame) exist only for
+	// the paint diagnostic.
+	ID3D12DescriptorHeap *paint_heap = nullptr;     // shader-visible
+	ID3D12DescriptorHeap *paint_staging = nullptr;  // CPU-only
+	std::uint64_t paint_frame = 0;
 	ID3D12Resource *constants = nullptr;       // upload heap, kFrameCount * aligned Params
 	ID3D12Resource *out_mv = nullptr;          // R16G16_FLOAT at render resolution
 
@@ -184,6 +191,26 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 
 	g_state.descriptor_size =
 		g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	{
+		D3D12_DESCRIPTOR_HEAP_DESC paint_desc = {};
+		paint_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		paint_desc.NumDescriptors = ring::kFrameCount;
+		paint_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		hr = g_state.device->CreateDescriptorHeap(&paint_desc, IID_PPV_ARGS(&g_state.paint_heap));
+		if (FAILED(hr))
+		{
+			set_error("CreateDescriptorHeap(paint_heap)", hr);
+			return false;
+		}
+		paint_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		hr = g_state.device->CreateDescriptorHeap(&paint_desc, IID_PPV_ARGS(&g_state.paint_staging));
+		if (FAILED(hr))
+		{
+			set_error("CreateDescriptorHeap(paint_staging)", hr);
+			return false;
+		}
+	}
 
 	// Constant buffer offsets must be 256-byte aligned.
 	g_state.constant_stride = ring::aligned_constant_stride(sizeof(Params));
@@ -450,6 +477,8 @@ void shutdown()
 	release(g_state.out_mv);
 	release(g_state.constants);
 	release(g_state.heap);
+	release(g_state.paint_heap);
+	release(g_state.paint_staging);
 	release(g_state.pso);
 	release(g_state.root_signature);
 	g_state.device = nullptr;
@@ -474,6 +503,39 @@ void transition_output(ID3D12GraphicsCommandList *cmd, bool to_shader_resource)
 		? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
 		: D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 	cmd->ResourceBarrier(1, &barrier);
+}
+
+bool paint(ID3D12GraphicsCommandList *cmd, ID3D12Resource *target)
+{
+	if (cmd == nullptr || target == nullptr || !is_ready() ||
+		g_state.paint_heap == nullptr || g_state.paint_staging == nullptr)
+		return false;
+
+	// One descriptor per ring slot so an in-flight frame's descriptor is never rewritten.
+	const UINT slot = ring::slot_for_frame(g_state.paint_frame++);
+	const SIZE_T off = static_cast<SIZE_T>(slot) * g_state.descriptor_size;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu_vis = g_state.paint_heap->GetCPUDescriptorHandleForHeapStart();
+	cpu_vis.ptr += off;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_vis = g_state.paint_heap->GetGPUDescriptorHandleForHeapStart();
+	gpu_vis.ptr += off;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu_stage =
+		g_state.paint_staging->GetCPUDescriptorHandleForHeapStart();
+	cpu_stage.ptr += off;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+	uav.Format = target->GetDesc().Format;
+	uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	g_state.device->CreateUnorderedAccessView(target, nullptr, &uav, cpu_vis);
+	g_state.device->CreateUnorderedAccessView(target, nullptr, &uav, cpu_stage);
+
+	ID3D12DescriptorHeap *heaps[] = { g_state.paint_heap };
+	cmd->SetDescriptorHeaps(1, heaps);
+
+	// Magenta: unmistakable, and never produced by the game. The output is expected in
+	// UNORDERED_ACCESS here — the engine transitioned it for the dispatch we are replacing.
+	const float magenta[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+	cmd->ClearUnorderedAccessViewFloat(gpu_vis, cpu_stage, target, magenta, 0, nullptr);
+	return true;
 }
 
 bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode)

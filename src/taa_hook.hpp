@@ -66,6 +66,10 @@ void set_ngx_pass_hash(std::uint64_t hash);
 // half of DLSS away from the spatial half.
 void set_ngx_force_reset(bool enabled);
 
+// Clear the captured output to magenta instead of evaluating: proves whether the output handle
+// is the buffer the frame actually displays.
+void set_ngx_paint(bool enabled);
+
 // Alternate the named pass between suppressed and normal every N frames, so both states occur
 // within one session and are seen against similar scene content. Transitions are logged.
 void set_dry_run_alternate(std::uint32_t frames);
