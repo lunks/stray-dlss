@@ -50,6 +50,10 @@ constexpr GUID kIID_ID3D12GraphicsCommandListExt = {
 
 // Far enough into the frame loop that device and swapchain creation have fully settled.
 constexpr int kNgxInitFrame = 120;
+// If ReShade's vkd3d ext hook has still not appeared by this frame, stop waiting and bring NGX
+// up on the native device. Measured in Stray the hook is installed between device creation and
+// frame 300, so this only fires on a title (or a ReShade build) that never installs it.
+constexpr int kNgxDecisionDeadline = 900;
 
 struct State
 {
@@ -109,7 +113,7 @@ State g_state;
 //
 // Querying the NATIVE device installs nothing: it goes through vkd3d's own QueryInterface,
 // never ReShade's proxy.
-void report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
+bool report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
 {
 	// {11EA7A1A-0F6A-49BF-B612-3E30F8E201DD}
 	constexpr GUID kDeviceExt = { 0x11ea7a1a, 0x0f6a, 0x49bf,
@@ -122,7 +126,7 @@ void report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
 	{
 		STRAY_LOG_INFO("[%s] No ID3D12DeviceExt on this device (not vkd3d-proton, or too old).",
 			when);
-		return;
+		return false;
 	}
 
 	void *const slot = (*reinterpret_cast<void ***>(ext))[8]; // GetCudaSurfaceObject
@@ -154,6 +158,29 @@ void report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
 			"native-device NGX path is safe.", when, path[0] ? path : "<unknown>");
 	}
 	ext->Release();
+	return owned_by_reshade;
+}
+
+// Recovers ReShade's proxy ID3D12Device from the original one.
+//
+// ReShade stores the proxy in the original device's private data under __uuidof(D3D12Device)
+// (v6.8.0 d3d12_device.cpp:34), which is how ReShade's own extension hook gets back to it. The
+// GUID is stable across the 6.x line; if it ever changes, this returns null and we fall back to
+// the native device with a warning rather than guessing.
+ID3D12Device *reshade_proxy_device(ID3D12Device *native)
+{
+	if (native == nullptr)
+		return nullptr;
+
+	// {2523AFF4-978B-4939-BA16-8EE876A4CB2A} - ReShade's D3D12Device proxy class.
+	constexpr GUID kReShadeProxy = { 0x2523aff4, 0x978b, 0x4939,
+		{ 0xba, 0x16, 0x8e, 0xe8, 0x76, 0xa4, 0xcb, 0x2a } };
+
+	ID3D12Device *proxy = nullptr;
+	UINT size = sizeof(proxy);
+	if (FAILED(native->GetPrivateData(kReShadeProxy, &size, &proxy)) || size != sizeof(proxy))
+		return nullptr;
+	return proxy;
 }
 
 void on_init_device(reshade::api::device *device)
@@ -454,20 +481,68 @@ void on_present(
 	}
 
 	// Lazy NGX bring-up, well clear of device creation and on a frame boundary.
-	if (frame == kNgxInitFrame &&
+	//
+	// WHICH DEVICE NGX GETS IS NOT A FIXED CHOICE. Two configurations are self-consistent, and
+	// each is broken under the other's condition (CLAUDE.md, "The native-device rule has a trap"):
+	//
+	//   * hook ABSENT  -> NGX must use the NATIVE device. Its descriptors are then real vkd3d
+	//                     handles and nothing converts them.
+	//   * hook PRESENT -> NGX must use ReShade's PROXY device, so its descriptors are
+	//                     ReShade-minted and the hook's conversion is correct.
+	//
+	// Picking either one unconditionally is wrong half the time, and the failure is silent: a
+	// wrong texture sampled, no error. Measured in Stray the hook is absent at device creation
+	// and present by frame 300 — the game installs it itself — so the answer is not knowable at
+	// startup. Wait for it, and only give up at kNgxDecisionDeadline.
+	if (frame >= kNgxInitFrame &&
 		g_state.ngx_enabled.load(std::memory_order_relaxed) &&
-		!g_state.ngx_attempted.exchange(true))
+		!g_state.ngx_attempted.load(std::memory_order_relaxed))
 	{
-		ID3D12Device *device = nullptr;
+		ID3D12Device *native = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(g_state.mutex);
-			device = g_state.native_device;
+			native = g_state.native_device;
 		}
-		STRAY_LOG_INFO("Initialising NGX (frame %llu)...", static_cast<unsigned long long>(frame));
-		// Re-check here, not just at init_device: whoever installs the patch may do so at any
-		// point, and this is the moment our descriptors start mattering.
-		report_vkd3d_ext_hook(device, "pre-NGX");
-		ngx::initialise(device);
+
+		const bool hooked = report_vkd3d_ext_hook(native, "pre-NGX");
+		if (hooked || frame >= kNgxDecisionDeadline)
+		{
+			g_state.ngx_attempted.store(true, std::memory_order_relaxed);
+
+			ID3D12Device *device = native;
+			if (hooked)
+			{
+				if (ID3D12Device *proxy = reshade_proxy_device(native))
+				{
+					device = proxy;
+					STRAY_LOG_INFO("NGX will use ReShade's PROXY device (%p): the ext hook is "
+						"installed, so descriptors must be ReShade-minted for its conversion "
+						"to be correct.", static_cast<void *>(proxy));
+				}
+				else
+				{
+					STRAY_LOG_ERROR("The ext hook is installed but ReShade's proxy device could "
+						"not be recovered. Falling back to the native device — this is the "
+						"BROKEN combination and the image is expected to be wrong.");
+				}
+			}
+			else
+			{
+				STRAY_LOG_INFO("NGX will use the NATIVE device (%p): no ext hook after %d "
+					"frames, so nothing will convert our handles.",
+					static_cast<void *>(native), kNgxDecisionDeadline);
+			}
+
+			STRAY_LOG_INFO("Initialising NGX (frame %llu)...",
+				static_cast<unsigned long long>(frame));
+			ngx::initialise(device);
+		}
+		else if (frame == kNgxInitFrame)
+		{
+			STRAY_LOG_INFO("Deferring NGX: waiting to see whether ReShade's vkd3d ext hook gets "
+				"installed, which decides which device NGX must use (deadline frame %d).",
+				kNgxDecisionDeadline);
+		}
 	}
 
 	// Re-check the vkd3d ext hook periodically.
