@@ -136,11 +136,16 @@ def main():
 
     rows = []
     for i in range(count):
-        # Pan only occasionally, to sample different scenery. The PAIR itself is always taken
-        # with the camera still, because that is what makes converged frames identical.
-        if i % 4 == 0:
-            pan(pad, 0.7)
-            time.sleep(0.6)      # let the history settle before judging its stability
+        # Pan ONCE at the start to choose a viewpoint, then hold absolutely still.
+        #
+        # Panning between pairs was adding far more variance than the effect being measured: a
+        # pair caught while the camera is still settling differs enormously whatever the TAA is
+        # doing, which is why the spread reached 546..22631. With the scene fixed, everything
+        # left is temporal stability. Sampling different scenery is not needed — the comparison
+        # is a frame against itself, so the content already cancels.
+        if i == 0:
+            pan(pad, 0.8)
+            time.sleep(2.5)      # let motion stop AND the history reconverge
 
         before = set(glob.glob(os.path.join(GAME_DIR, "*.png")))
         first = shoot(kb, before)
