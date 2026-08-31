@@ -62,6 +62,10 @@ void set_dry_run_hash(std::uint64_t hash);
 // necessary but not sufficient, since several passes bind their own previous output.
 void set_ngx_pass_hash(std::uint64_t hash);
 
+// Pass InReset=1 every frame, so DLSS ignores history and motion vectors. Bisects the temporal
+// half of DLSS away from the spatial half.
+void set_ngx_force_reset(bool enabled);
+
 // Alternate the named pass between suppressed and normal every N frames, so both states occur
 // within one session and are seen against similar scene content. Transitions are logged.
 void set_dry_run_alternate(std::uint32_t frames);

@@ -522,17 +522,21 @@ def self_test():
         pass
 
     # The verdict itself, run through the real entry point on temp copies of the fakes.
-    import tempfile
+    # Output is swallowed: a deliberately-falsified inner run would otherwise print FAIL
+    # lines that read like a failing self-test.
+    import contextlib, io, tempfile
     with tempfile.TemporaryDirectory() as td:
         cp, ap = os.path.join(td, 'cache.bin'), os.path.join(td, 'arch.ushaderbytecode')
         open(cp, 'wb').write(cache); open(ap, 'wb').write(archive)
-        rc = run(cp, ap, dump_dir=os.path.join(td, 'dump'),
-                 expect_present={fnv1a64(dxbc_a), fnv1a64(dxbc_b)},
-                 expect_absent={fnv1a64(dxbc_c)})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = run(cp, ap, dump_dir=os.path.join(td, 'dump'),
+                     expect_present={fnv1a64(dxbc_a), fnv1a64(dxbc_b)},
+                     expect_absent={fnv1a64(dxbc_c)})
         assert rc == 0, "verdict failed on a correct synthetic library"
         assert sorted(os.listdir(os.path.join(td, 'dump'))) == \
             sorted([f"cs_{fnv1a64(dxbc_a):016x}.dxbc", f"cs_{fnv1a64(dxbc_b):016x}.dxbc"])
-        rc = run(cp, ap, expect_present={fnv1a64(dxbc_a)}, expect_absent={fnv1a64(dxbc_b)})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = run(cp, ap, expect_present={fnv1a64(dxbc_a)}, expect_absent={fnv1a64(dxbc_b)})
         assert rc == 3, "verdict passed although a forbidden hash was present"
     print("SELF-TEST OK: fnv1a64 vectors, LZ4 decode (+corruption), section walk (+corruption), "
           "archive walk, DXBC slicing, verdict logic")
@@ -551,12 +555,15 @@ def main(argv):
             die("--dump-dir needs a directory argument")
         del argv[i:i + 2]
     if len(argv) != 2:
-        print(__doc__.split('\n\n')[1], file=sys.stderr)
         print("usage: shaderlib_extract.py <GlobalShaderCache-PCD3D_SM5.bin> "
-              "<ShaderArchive-Global-PCD3D_SM5.ushaderbytecode> [--dump-dir DIR] | --self-test",
-              file=sys.stderr)
+              "<ShaderArchive-Global-PCD3D_SM5.ushaderbytecode> [--dump-dir DIR] | --self-test\n"
+              "(extract both files from the pak with tools/pakextract.py first; "
+              "see this file's docstring)", file=sys.stderr)
         return 2
-    return run(argv[0], argv[1], dump_dir)
+    try:
+        return run(argv[0], argv[1], dump_dir)
+    except OSError as ex:
+        die(f"cannot read input: {ex}")
 
 
 if __name__ == '__main__':

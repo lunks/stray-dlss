@@ -79,6 +79,18 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
 bool g_ngx_dims_logged = false;
 bool g_ngx_inputs_logged = false;
 bool g_ngx_registers_logged = false;
+// [STRAYDLSS] NgxForceReset — pass InReset=1 on every frame.
+//
+// The decisive bisection of DLSS itself. With reset asserted, DLSS discards its history and
+// ignores the motion vectors, so the output is essentially the current frame upscaled. If the
+// image becomes sane, the fault is in the temporal half — our motion vectors or the history
+// handling. If it stays wrong, the fault is in the spatial inputs, which would mean colour or
+// depth is still not what we think it is.
+//
+// Worth doing because every input has now been corrected on its own terms — colour comes from
+// the shader's declared register, render and output resolutions are separated — and the failure
+// is unchanged. That points at something the inputs' identity cannot explain.
+bool g_ngx_force_reset = false;
 // Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
 // qualifying LATER — which is exactly what happened: the gate logs fired before NGX had even
 // initialised, so they proved nothing about the frames that mattered.
@@ -310,6 +322,7 @@ void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hash(std::uint64_t hash) { g_dry_run_hash = hash; }
 void set_ngx_pass_hash(std::uint64_t hash) { g_ngx_pass_override = hash; }
+void set_ngx_force_reset(bool enabled) { g_ngx_force_reset = enabled; }
 void set_dry_run_alternate(std::uint32_t frames) { g_dry_run_alternate = frames; }
 
 // True when a dry run should suppress RIGHT NOW.
@@ -1028,7 +1041,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.render_height = render_h;
 							// The three signals ORed inside is_camera_cut: View.CameraCut,
 							// TemporalAAJitter.zw == .xy, and a 1x1 history/velocity dummy.
-							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
+							ei.reset = g_ngx_force_reset ||
+								ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
 
 							NGX_TRACE("evaluate colour=%p depth=%p mv=%p out=%p",

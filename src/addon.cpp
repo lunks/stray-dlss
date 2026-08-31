@@ -252,6 +252,13 @@ void on_init_device(reshade::api::device *device)
 		STRAY_LOG_INFO("DLSS will replace pass 0x%016llx ([STRAYDLSS] NgxPassHash).",
 			static_cast<unsigned long long>(ngx_pass_value));
 
+	bool ngx_force_reset = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxForceReset", ngx_force_reset);
+	taa_hook::set_ngx_force_reset(ngx_force_reset);
+	if (ngx_force_reset)
+		STRAY_LOG_WARN("NgxForceReset is ON: DLSS discards history every frame. Diagnostic only "
+			"— the image will look aliased because nothing accumulates.");
+
 	int dry_alternate = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
 	taa_hook::set_dry_run_alternate(static_cast<std::uint32_t>(dry_alternate));
