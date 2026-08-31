@@ -48,7 +48,9 @@ The human runs Stray on Linux. Proton is the target, not an afterthought.
 | GPU | NVIDIA RTX 4090 |
 | Driver | 610.43.02, open kernel modules |
 | Host | Linux 6.17.13, SteamOS guest |
-| Proton | `GE-Proton-dxvk301-ds5-clean-nowl` (vkd3d 3.0.1-era) |
+| Proton | `GE-Proton-dxvk301-ds5-clean-nowl` — the `dxvk301` names **DXVK** 3.0.1, not vkd3d |
+| vkd3d-proton | **3.1.0** (measured 2026-08-31 from the prefix's own `d3d12core.dll`) |
+| DXVK-NVAPI | **v0.9.2** (measured from the prefix's `nvapi64.dll`; `PROTON_NVIDIA_LIBS=1` selects the `nvidia-libs` build, so the one under `files/lib/wine/nvapi/` is **not** the one loaded) |
 | D3D12 layer | **vkd3d-proton** |
 | Compositor | gamescope, DRM backend, `--hdr-enabled --hdr-itm-enabled` |
 | ReShade | **6.8.0.2155**, add-on support enabled |
