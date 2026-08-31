@@ -29,18 +29,6 @@ struct ResolveInputs
 	const ue4::ViewParams *view = nullptr;
 };
 
-// Names the device to use for DESCRIPTOR work — creating our heap and copying the game's SRVs
-// into it — when it differs from the device that owns our resources.
-//
-// Under ReShade this MUST be its proxy device. ReShade's descriptor-heap proxy returns
-// bit-packed synthetic CPU handles rather than real addresses, so the game's descriptors are in
-// ReShade's space; copying them with the native device reads near-null garbage and the GPU
-// faults as soon as a dispatch samples the result. The proxy converts both sides back.
-//
-// Call before initialise(). Leaving it unset keeps everything native, which is correct when
-// there is no ReShade in the process.
-void set_descriptor_device(ID3D12Device *device);
-
 // Idempotent; safe to call every frame. Recreates its resources when the resolution changes.
 bool initialise(ID3D12Device *device, std::uint32_t render_width, std::uint32_t render_height);
 void shutdown();

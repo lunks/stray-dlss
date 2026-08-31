@@ -10,7 +10,6 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "frame_state.hpp"
-#include "mv_resolve.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
 
@@ -203,24 +202,6 @@ void on_init_device(reshade::api::device *device)
 	STRAY_LOG_INFO("init_device: ID3D12Device=%p", static_cast<void *>(native));
 
 	report_vkd3d_ext_hook(native, "init_device");
-
-	// Our motion-vector pass copies the GAME's descriptors into its own heap, and the game's
-	// CPU handles are in ReShade's space, not the driver's: ReShade's descriptor-heap proxy
-	// returns bit-packed synthetic values, not addresses (v6.8.0 d3d12_impl_device.cpp:2280).
-	// Copying them with the native device reads near-null garbage and the GPU faults the
-	// instant a dispatch samples it. Point the descriptor work at ReShade's proxy so both
-	// sides of the copy are converted; with no proxy we stay native, which is already correct.
-	if (ID3D12Device *proxy = reshade_proxy_device(native))
-	{
-		mv::set_descriptor_device(proxy);
-		STRAY_LOG_INFO("Descriptor work will go through ReShade's proxy device (%p); the game's "
-			"CPU handles are in ReShade's space, not the driver's.",
-			static_cast<void *>(proxy));
-	}
-	else
-	{
-		STRAY_LOG_INFO("No ReShade proxy device found; descriptor work stays native.");
-	}
 
 	if (native != nullptr)
 	{
