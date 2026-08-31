@@ -559,29 +559,32 @@ Hard constraints:
 
 The full detail is in `docs/RESEARCH.md`. These are the things that bite.
 
-### The screenshot channel is the only judge of the image
+### The screenshot channel, and how to use it without fooling yourself
 
-Everything else we measure says the pass *runs*; only a picture says it is *right*, and a single
-picture is not enough. `tools/screenshot-stray.sh` injects `KEY_SYSRQ` on the keyboard node
-whose `Handlers` include **`sysrq`** — a Power Button, a PC Speaker and a USB audio device all
-advertise `kbd` and injecting into those reaches nothing — and ReShade writes a PNG into the
-game directory.
+Everything else we measure says the pass *runs*; only a picture says it is *right*.
+`tools/screenshot-stray.sh` injects `KEY_SYSRQ` on the keyboard node whose `Handlers` include
+**`sysrq`** — a Power Button, a PC Speaker and a USB audio device all advertise `kbd`, and
+injecting into those reaches nothing — and ReShade writes a PNG into the game directory.
 
-**Always take a control.** Measured 2026-08-31, strongly-cyan pixels in the scene's dark left
-third (`magick … -crop 900x1440+0+0 -fx "(g>0.6 && b>0.6 && r<0.35)"`):
+**This scene animates, so a single frame proves nothing in either direction.** Measured
+2026-08-31 in the starting apartment, strongly-cyan pixels in the dark left third
+(`magick … -crop 900x1440+0+0 -fx "(g>0.6 && b>0.6 && r<0.35)"`), five frames per mode:
 
-| Frame | Mode | cyan px |
-|---|---|---|
-| control | `MvDispatch=0` | **48** |
-| A | `MvDispatch=2` | 248 |
-| B | `MvDispatch=2` | 1810 |
-| C | `MvDispatch=2` | 6054 |
+| Mode | samples | median | max |
+|---|---|---|---|
+| `MvDispatch=0` (control) | 2134, 0, 3, 503, 1879 | 503 | 2134 |
+| `MvDispatch=2` | 1140, 982, 0, 0, 72 | 72 | 1140 |
 
-**`MvDispatch=2` still corrupts the image** — small cyan blocks that move between frames, 5× to
-126× the control. The first mode-2 screenshot looked clean and led to a premature "the image is
-correct"; it was one frame near the bottom of that range, with nothing to compare against. One
-frame proves nothing: the CRT wall in that room animates, so a whole-frame pixel count is
-dominated by legitimate content. Crop to a region the control leaves dark, and compare.
+**No evidence that interception corrupts the image**; if anything the intercepted frames scored
+lower. Something in that room flickers cyan by itself, and the range is 0 → 2134 *in the control
+alone*.
+
+The trap is worth remembering because it caught this project twice in one session: one clean
+mode-2 frame produced a premature "the image is correct", and then one low control sample (48)
+produced an equally premature "it still corrupts". Both were single draws from a distribution
+spanning three orders of magnitude. **Take n ≥ 5 per mode and compare distributions**, and pick a
+crop the control leaves dark — a whole-frame count is swamped by the animated CRT wall and shows
+nothing at all.
 
 ### Two descriptor hazards that cost a day, both measured
 
