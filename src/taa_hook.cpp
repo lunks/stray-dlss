@@ -108,12 +108,6 @@ bool g_dry_run_all_logged = false;
 bool g_dry_run_mode2_logged = false;
 bool g_ngx_waiting_logged = false;
 
-bool owns_temporal_history(std::uint64_t hash)
-{
-	std::lock_guard<std::mutex> lock(g_mutex);
-	const auto it = g_roundtrip_seen.find(hash);
-	return it != g_roundtrip_seen.end() && it->second;
-}
 // Traces the first few evaluate cycles step by step. The crash follows a SUCCESSFUL evaluate
 // within about a second, the UE4 dump carries an empty callstack, and the add-on's last line is
 // simply whatever it logged before dying — so the only way to localise it is to say what we are
@@ -302,6 +296,13 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 }
 
 } // namespace
+
+bool owns_temporal_history(std::uint64_t hash)
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	const auto it = g_roundtrip_seen.find(hash);
+	return it != g_roundtrip_seen.end() && it->second;
+}
 
 const Diagnostics &diagnostics() { return g_diag; }
 

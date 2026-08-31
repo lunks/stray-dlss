@@ -142,6 +142,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/frame_state.hpp
         src/taa_hook.cpp
         src/taa_hook.hpp
+        src/pass_finder.cpp
+        src/pass_finder.hpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp
         src/d3d12_restore.cpp
