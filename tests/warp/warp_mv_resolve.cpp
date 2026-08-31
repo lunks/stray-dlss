@@ -65,6 +65,12 @@ struct Gpu
 	UINT64 fence_value = 0;
 };
 
+// Which adapter to run against. WARP is the CI default: deterministic, GPU-less, and it comes
+// with the debug layer. Passing --hardware selects the real adapter instead, which is how this
+// same binary is run under Proton on the target box to exercise vkd3d-proton and the actual
+// NVIDIA driver — the layer WARP cannot model.
+bool g_use_hardware = false;
+
 bool create_gpu(Gpu &gpu)
 {
 	// The debug layer is the entire point of this harness; without it WARP would merely run
@@ -88,9 +94,32 @@ bool create_gpu(Gpu &gpu)
 	ComPtr<IDXGIFactory4> factory;
 	HR(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)));
 
-	ComPtr<IDXGIAdapter> warp;
-	HR(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
-	HR(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&gpu.device)));
+	ComPtr<IDXGIAdapter> adapter;
+	if (g_use_hardware)
+	{
+		// First adapter that yields a D3D12 device. Under vkd3d-proton this is the real GPU.
+		for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i)
+		{
+			if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+					IID_PPV_ARGS(&gpu.device))))
+				break;
+			adapter.Reset();
+		}
+		if (!gpu.device)
+		{
+			std::printf("  no hardware D3D12 adapter available\n");
+			return false;
+		}
+
+		DXGI_ADAPTER_DESC desc = {};
+		if (adapter && SUCCEEDED(adapter->GetDesc(&desc)))
+			std::printf("  adapter: %ls (vendor 0x%04x)\n", desc.Description, desc.VendorId);
+	}
+	else
+	{
+		HR(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)));
+		HR(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&gpu.device)));
+	}
 
 	if (SUCCEEDED(gpu.device.As(&gpu.info)))
 	{
@@ -558,9 +587,14 @@ bool test_restore_preserves_game_state(Gpu &gpu)
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
-	std::printf("WARP harness for the motion-vector resolve pass\n");
+	for (int i = 1; i < argc; ++i)
+		if (std::string(argv[i]) == "--hardware")
+			g_use_hardware = true;
+
+	std::printf("D3D12 harness for the motion-vector resolve pass (%s)\n",
+		g_use_hardware ? "HARDWARE adapter" : "WARP software adapter");
 
 	Gpu gpu;
 	if (!create_gpu(gpu))
@@ -568,7 +602,7 @@ int main()
 		std::printf("could not create a WARP device\n");
 		return 1;
 	}
-	std::printf("WARP device up, debug layer %s\n", gpu.info ? "active" : "UNAVAILABLE");
+	std::printf("device up, info queue %s\n", gpu.info ? "active" : "UNAVAILABLE");
 
 	test_dispatch_is_valid(gpu);
 	test_no_allocation_churn(gpu);
