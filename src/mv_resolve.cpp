@@ -308,7 +308,7 @@ void shutdown()
 	g_state.last_velocity_descriptor = 0;
 }
 
-bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, bool dispatch)
+bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode)
 {
 	if (cmd == nullptr || !is_ready() || in.depth_descriptor == 0 ||
 		in.velocity_descriptor == 0 || in.view == nullptr)
@@ -352,9 +352,11 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, bool dispat
 		g_state.constants->GetGPUVirtualAddress() + slot * g_state.constant_stride);
 	cmd->SetComputeRootDescriptorTable(1, g_state.heap->GetGPUDescriptorHandleForHeapStart());
 
-	if (dispatch)
+	if (dispatch_mode != 0)
 	{
-		cmd->Dispatch((g_state.width + 7) / 8, (g_state.height + 7) / 8, 1);
+		const UINT gx = (dispatch_mode == 1) ? 1u : (g_state.width + 7) / 8;
+		const UINT gy = (dispatch_mode == 1) ? 1u : (g_state.height + 7) / 8;
+		cmd->Dispatch(gx, gy, 1);
 
 		// The motion vectors are read by NGX immediately afterwards, so make the write visible.
 		D3D12_RESOURCE_BARRIER uav_barrier = {};

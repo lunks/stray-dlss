@@ -34,7 +34,7 @@ bool g_restore_heaps = true;
 // [STRAYDLSS] MvRestoreState, default on.
 bool g_restore_state = true;
 // [STRAYDLSS] MvDispatch, default on. Off records our state changes but skips the GPU work.
-bool g_mv_dispatch = true;
+int g_mv_dispatch_mode = 2;
 
 // A crash-survivable breadcrumb. The Phase B path dies with an access violation after
 // surviving many frames, so the trigger is something that CHANGES rather than the first call.
@@ -199,15 +199,15 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 
 const Diagnostics &diagnostics() { return g_diag; }
 
-void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, bool dispatch)
+void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
 	g_mv_resolve_enabled = mv_resolve_enabled;
 	g_restore_heaps = restore_heaps;
 	g_restore_state = restore_state;
-	g_mv_dispatch = dispatch;
-	STRAY_LOG_INFO("MV resolve=%s heapRestore=%s stateRestore=%s dispatch=%s",
+	g_mv_dispatch_mode = dispatch_mode;
+	STRAY_LOG_INFO("MV resolve=%s heapRestore=%s stateRestore=%s dispatchMode=%d",
 		mv_resolve_enabled ? "on" : "off", restore_heaps ? "on" : "off",
-		restore_state ? "on" : "off", dispatch ? "on" : "off");
+		restore_state ? "on" : "off", dispatch_mode);
 }
 
 void dump_summary()
@@ -458,7 +458,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 				mark(4, "heaps-collected");
 
-				if (mv::record(native, inputs, g_mv_dispatch))
+				if (mv::record(native, inputs, g_mv_dispatch_mode))
 				{
 					mark(5, "recorded");
 					if (!g_resolve_ran)

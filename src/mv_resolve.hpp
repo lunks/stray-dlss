@@ -40,7 +40,10 @@ bool is_ready();
 // that follows would clobber it again anyway.
 // `dispatch` false records every state change but skips the Dispatch itself, which separates
 // "our state changes break the game" from "our GPU work breaks the game" in one run.
-bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, bool dispatch);
+// dispatch_mode: 0 skips the Dispatch entirely, 1 issues a single 8x8 group, 2 covers the
+// frame. One group still exercises the root signature, heap and shader without touching most
+// of the image, which separates "dispatching at all is wrong" from "the workload is wrong".
+bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatch_mode);
 
 // R16G16_FLOAT at render resolution. Valid after a successful record().
 ID3D12Resource *output();
