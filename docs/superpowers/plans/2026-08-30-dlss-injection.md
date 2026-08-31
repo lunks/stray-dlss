@@ -28,6 +28,77 @@
 
 ---
 
+---
+
+## REVISION 2026-08-31 — what the field work changed
+
+Phases A and B have run against the real game. Three things in the plan above are now wrong and
+are superseded by this section. The rest still stands.
+
+### 1. The TAA pass is `0x901e041a7cadc9db`, not `0x1708ec956099e259`
+
+The plan inherited the facts doc's identities, and they were backwards. The shader the plan
+treats as a "known false positive" **is** the TAA pass; the one it hooks is a reprojecting
+denoiser. Confirmed three independent ways — the shipped bytecode (`cb1[145]` and an
+`AA_UPSAMPLE`-only LDS tile), live captured bindings (a depth+stencil pair over one resource,
+and a history round-trip), and the game's own config. See `CLAUDE.md` §2.3.
+
+### 2. There is no DLAA stage, because the game already upsamples
+
+Stray ships `r.TemporalAA.Upsampling=True` and runs at `ScreenPercentage=50` on a 3840×2160
+output. The TAA pass takes 1920×1080 inputs and writes a 3840×2160 UAV. **There is no 1:1 pass
+to replace**, so the plan's "v0.1 DLAA first, isolate the plumbing" staging is not available.
+DLSS must be created 1920×1080 → 3840×2160 from the start.
+
+The intent behind that staging — prove colour/depth/MV/jitter before adding scaling — is
+preserved differently: Phase B runs the motion-vector resolve and validates it in isolation
+before NGX is introduced at all.
+
+### 3. The hard part is D3D12 state restoration, not the DLSS call
+
+Not anticipated by the plan, and it is now the critical path. Recording our own work onto the
+game's command list disturbs state that D3D12 provides no way to read back, and ReShade's
+`state_block` cannot restore all of it — it registers no `push_descriptors` or `push_constants`
+handler, so it can never replay the root CBVs UE4 binds its uniform buffers through.
+
+Measured ladder, same binary, one flag differing:
+
+| `MvResolve`/`MvDispatch` | What runs | Result |
+|---|---|---|
+| off | nothing of ours | image correct |
+| on / 0 | all our state changes, no GPU work | **image corrupted** |
+| on / 1 | plus one 8×8 group | **crash** |
+
+This is now fixed by a full native replay (`restore_game_compute_state`), plus per-frame
+descriptor versioning and deferred retirement. **Unverified against the game** — the acceptance
+test below is the gate.
+
+**This same restore is what NGX needs.** NVIDIA documents that `EvaluateFeature` clobbers
+command-list state and the caller must restore it, so Phase C inherits this work rather than
+adding to it. A separate command list is not an alternative: at the interception point the
+game's list is still recording and unsubmitted, so anything executed on the queue now would run
+before the depth and velocity writes we need to read, and D3D12 has no mid-list insertion.
+
+### Revised phases
+
+* **A — Observe.** DONE and verified. Pass identified, all bindings resolved by register, View
+  CB read, history round-trip confirmed.
+* **B — Resolve.** Code complete, crash fixed, **awaiting its acceptance test**:
+  with `MvDispatch=0` the image must render **clean, not purple** — that proves the state
+  restore. Only then enable the dispatch and check the motion field in a debug view.
+* **C — Replace.** NGX create at 1920×1080 → 3840×2160, evaluate into u0, reusing Phase B's
+  state restore. Feature flags `IsHDR | MVLowRes | DepthInverted | AutoExposure`, preset K.
+* **D — Tune.** Quality presets, and whether to override `r.ScreenPercentage` for other ratios.
+
+### What can still be verified offline
+
+Pure logic is unit-tested in CI: the velocity codec against constants read from Stray's own
+DXBC, View CB offsets, the jitter path, the structural matcher against real captured bindings,
+and the per-frame ring arithmetic. 34 cases, 790 assertions. The D3D12 and NGX surface cannot be
+tested without the machine, which is why it is kept thin.
+
+---
+
 ## Phase A — Observe
 
 Rendering is untouched throughout Phase A. The deliverable is a log that answers the open
