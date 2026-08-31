@@ -77,6 +77,7 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // sharing one meant the skip warning consumed the budget
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
+bool g_ngx_inputs_logged = false;
 // Per-stage counters for the NAMED pass. One-shot logs cannot show that a pass stops
 // qualifying LATER — which is exactly what happened: the gate logs fired before NGX had even
 // initialised, so they proved nothing about the frames that mattered.
@@ -849,9 +850,25 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						// buffer, or the 1x1 BlackDummy UE4 substitutes on a camera cut.
 						// describe() records width/height as 0 for a buffer, so this excludes
 						// those too.
+						// Find the output first: the scene colour must MATCH it.
+						//
+						// TAA reads and writes the same kind of buffer, so the scene colour has
+						// the output's exact format and dimensions. The previous test — live,
+						// 2D, at least render-size — accepted almost anything, and in the game
+						// it picked an unrelated render target: the result was recognisably a
+						// different view of the world rather than a degraded version of the
+						// right one.
+						const BoundTexture *out_tex = nullptr;
+						for (const auto &u : b.uavs)
+						{
+							if (u.slot == m.output_uav && is_resource_live(u.resource))
+								out_tex = &u;
+						}
+
 						const auto colour_candidate = [&](const BoundTexture &t) {
-							return is_resource_live(t.resource) && t.width >= render_w &&
-								t.height >= render_h && t.width > 0 && t.height > 0;
+							return out_tex != nullptr && is_resource_live(t.resource) &&
+								t.width == out_tex->width && t.height == out_tex->height &&
+								t.format == out_tex->format && t.width > 0 && t.height > 0;
 						};
 
 						std::uint64_t slot_a = 0, slot_b = 0;
@@ -962,6 +979,17 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 								static_cast<void *>(ei.output));
 							if (tracing)
 								g_named_evaluated.fetch_add(1, std::memory_order_relaxed);
+							if (!g_ngx_inputs_logged)
+							{
+								g_ngx_inputs_logged = true;
+								STRAY_LOG_INFO("DLSS inputs: colour=%p depth=%p mv=%p out=%p "
+									"(out %ux%u fmt=%d)", static_cast<void *>(ei.color),
+									static_cast<void *>(ei.depth),
+									static_cast<void *>(ei.motion_vectors),
+									static_cast<void *>(ei.output),
+									out_tex ? out_tex->width : 0, out_tex ? out_tex->height : 0,
+									out_tex ? static_cast<int>(out_tex->format) : -1);
+							}
 							const bool ok = ngx::evaluate(native, ei);
 							if (ok)
 							{
