@@ -398,7 +398,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				inputs.view = &view;
 
 				// Capture the game's heaps BEFORE our pass swaps in ours.
-				ID3D12DescriptorHeap *game_heaps[2] = {};
+				::ID3D12DescriptorHeap *game_heaps[2] = {};
 				unsigned int heap_count = 0;
 				collect_bound_heaps(cmd_list, game_heaps, &heap_count);
 

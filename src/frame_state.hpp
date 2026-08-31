@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+// Global scope on purpose: writing `struct ID3D12DescriptorHeap *` inside the namespace below
+// declares a NEW type stray_dlss::ID3D12DescriptorHeap rather than referring to the real one.
+struct ID3D12DescriptorHeap;
+
 namespace stray_dlss {
 
 TexFormat to_tex_format(reshade::api::format f);
@@ -79,7 +83,7 @@ void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *wh
 //
 // `out` must have room for 2 (D3D12 allows one CBV/SRV/UAV heap and one sampler heap).
 void collect_bound_heaps(reshade::api::command_list *cmd_list,
-                         struct ID3D12DescriptorHeap **out,
+                         ::ID3D12DescriptorHeap **out,
                          unsigned int *count);
 
 void reset_command_list_state(reshade::api::command_list *cmd_list);

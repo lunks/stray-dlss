@@ -404,7 +404,7 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 }
 
 void collect_bound_heaps(reshade::api::command_list *cmd_list,
-                         ID3D12DescriptorHeap **out,
+                         ::ID3D12DescriptorHeap **out,
                          unsigned int *count)
 {
 	*count = 0;
@@ -430,7 +430,7 @@ void collect_bound_heaps(reshade::api::command_list *cmd_list,
 			if (heap.handle == 0)
 				continue;
 
-			auto *native = reinterpret_cast<ID3D12DescriptorHeap *>(heap.handle);
+			auto *native = reinterpret_cast<::ID3D12DescriptorHeap *>(heap.handle);
 			const D3D12_DESCRIPTOR_HEAP_DESC desc = native->GetDesc();
 
 			// Only shader-visible heaps can be bound, and only one of each type at a time.
