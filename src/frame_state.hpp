@@ -104,19 +104,6 @@ void note_push_constants(
 // layout. Setting it natively re-syncs reality with both ReShade's cache and UE4's own.
 void restore_game_compute_state(reshade::api::command_list *cmd_list);
 
-// Recovers the descriptor heaps the game currently has bound, by resolving the heaps that own
-// the descriptor tables ReShade tracked for this command list.
-//
-// D3D12 has no way to read back the bound heaps, and this matters more than it sounds: after
-// our own pass swaps in a private heap, re-applying the game's descriptor TABLES without first
-// restoring the heap that owns them is an invalid binding, and UE4 dies with
-// LowLevelFatalError rather than anything diagnosable.
-//
-// `out` must have room for 2 (D3D12 allows one CBV/SRV/UAV heap and one sampler heap).
-void collect_bound_heaps(reshade::api::command_list *cmd_list,
-                         ::ID3D12DescriptorHeap **out,
-                         unsigned int *count);
-
 void reset_command_list_state(reshade::api::command_list *cmd_list);
 void forget_all_command_lists();
 
