@@ -84,38 +84,31 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
-### 0xd2e4d8c23c362ed1 is NOT the TAA — a pass can drive the image without being it
+### 0xd2e4d8c23c362ed1 IS a TAA permutation — and the "it writes depth+stencil" claim was a capture artifact
 
-Suppressing `0xd2e4d8c23c362ed1` freezes the picture, which is why it looked like the answer.
-Its full UAV set says otherwise:
+> **CORRECTED 2026-08-31 from the game's own shipped bytecode.** The offline extractor
+> (`tools/shaderlib_extract.py`, cache-only mode) finds `0xd2e4d8c23c362ed1` INSIDE the
+> FTAAStandaloneCS section of `GlobalShaderCache-PCD3D_SM5.bin` (27 cs permutations, all
+> enumerable offline), and a declaration scan of its DXBC shows **SRVs t0-t5 and exactly ONE
+> UAV, u0, plus `dcl_tgsm_structured`** — the identical shape to `0x901e041a7cadc9db`. It is
+> the `AA_UPSAMPLE` permutation selected at 2560x1440 output / 50% screen percentage.
 
-```
-u0  RGBA16_FLOAT (colour)     2560x1440
-u2  R11G11B10_FLOAT (colour)  2560x1440
-u3  R32_FLOAT_X8X24 (depth)   2560x1440     <- writes DEPTH
-u5  X32_G8X24_UINT (stencil)  2560x1440     <- writes STENCIL
-u1, u4, u6  1x1 dummies
-```
+The original section below is preserved as a lesson, because its reasoning error is the
+instructive part. The live capture reported this pass writing u2 (colour), u3 (depth) and u5
+(stencil). The shader declares none of those. **Our binding capture enumerates bound
+descriptor-TABLE slots, not shader-declared registers** — UE4 binds tables wider than any one
+shader's declarations, so "the table holds a depth UAV at u3" never meant "the shader writes
+depth". The 1x1 dummies at u1/u4/u6 in the same capture were the tell.
 
-`FTAAStandaloneCS` writes colour — one target, plus optionally a half-res copy. **It does not
-write depth or stencil.** This pass emits two colour buffers, depth and stencil: a composite or
-resolve pass, quite possibly Stray-specific.
+The observed frame corruption when replacing it ("frozen like we dropped TAA, and the cat
+sideways") had nothing to do with unreproduced outputs: it was the ext-vtable no-write bug
+(§1 resolution) — NGX was writing nothing, into any pass, at the time.
 
-Replacing it with DLSS therefore breaks the frame: we write only `u0`, so depth and stencil are
-never written and everything downstream composites against stale depth. Observed exactly that —
-"frozen like we dropped TAA, and the cat sideways".
-
-**Two lessons, both expensive:**
-
-1. **"Suppressing it freezes the image" proves a pass is ON THE DISPLAY CHAIN, not that it is the
-   TAA.** Motion blur would freeze it identically (`FMotionBlurFilterCS` is a full-res HDR compute
-   pass that runs *after* TAA — `PostProcessMotionBlur.cpp:366`), and so does any composite pass.
-   The suppression test is necessary, never sufficient.
-2. **Before replacing a pass, check EVERYTHING it writes.** A pass with more outputs than we
-   reproduce cannot be replaced at all, however well it matches on inputs. §2.3's signature only
-   examines SRVs and one output UAV; that is not enough to license suppression.
-
-The history round-trip does not rescue it either: this pass exhibits one, as do ~8 others.
+**What remains true and load-bearing:** "suppressing it freezes the picture" proves a pass is
+ON THE DISPLAY CHAIN, not that it is the TAA — motion blur or any composite pass freezes it
+identically. The suppression test is necessary, never sufficient. And before trusting any
+claim about what a pass writes, check the shader's own `dcl_uav` declarations — extractable
+offline for every global shader via `tools/shaderlib_extract.py --dump-dir`.
 
 ### The candidate set DOES contain a pass that drives the image (measured 2026-08-31)
 

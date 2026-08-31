@@ -23,19 +23,16 @@ def fstring(buf, off):
     return buf[off:off+n].decode('latin1','replace').rstrip('\x00'), off+n
 
 def decode_entry(buf, off):
-    """Returns dict with offset/size/uncompressed_size/method/blocks."""
+    """Returns dict with offset/size/uncompressed_size/method/blocks.
+
+    Field order verified against Stray's own pak by hex probe (2026-08-31): when the block-size
+    code in the flags word is 0x3F, the explicit CompressionBlockSize uint32 comes IMMEDIATELY
+    after the flags word — BEFORE Offset — not after Size. Decoding it late shifts every later
+    field and only bites on large-block entries, which is why small zlib entries extracted fine.
+    """
     v = struct.unpack_from('<I', buf, off)[0]; off += 4
     e = {}
-    if v & (1 << 31): e['offset'] = struct.unpack_from('<I', buf, off)[0]; off += 4
-    else:             e['offset'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
-    if v & (1 << 30): e['usize'] = struct.unpack_from('<I', buf, off)[0]; off += 4
-    else:             e['usize'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
     e['method'] = (v >> 23) & 0x3F
-    if e['method'] != 0:
-        if v & (1 << 29): e['size'] = struct.unpack_from('<I', buf, off)[0]; off += 4
-        else:             e['size'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
-    else:
-        e['size'] = e['usize']
     e['encrypted'] = bool(v & (1 << 22))
     nblocks = (v >> 6) & 0xFFFF
     e['block_size'] = 0
@@ -43,6 +40,15 @@ def decode_entry(buf, off):
         bs = v & 0x3F
         if bs == 0x3F: e['block_size'] = struct.unpack_from('<I', buf, off)[0]; off += 4
         else:          e['block_size'] = bs << 11
+    if v & (1 << 31): e['offset'] = struct.unpack_from('<I', buf, off)[0]; off += 4
+    else:             e['offset'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
+    if v & (1 << 30): e['usize'] = struct.unpack_from('<I', buf, off)[0]; off += 4
+    else:             e['usize'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
+    if e['method'] != 0:
+        if v & (1 << 29): e['size'] = struct.unpack_from('<I', buf, off)[0]; off += 4
+        else:             e['size'] = struct.unpack_from('<Q', buf, off)[0]; off += 8
+    else:
+        e['size'] = e['usize']
     blocks = []
     if nblocks == 1 and not e['encrypted']:
         blocks = [(0, e['size'])]
