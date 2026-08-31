@@ -137,62 +137,68 @@ Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
 not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
 
-**Primary pass, fnv1a64 over its DXBC:**
+> **CORRECTED 2026-08-30, against the live game.** The original measurement had the shader
+> identities **backwards**, and everything below supersedes it. The add-on now captures real
+> bindings per dispatch, and a separate bytecode analysis confirmed the correction
+> independently. `docs/STRAY-RENDERING-FACTS.md` is left as the historical record.
+
+**The TAA pass is:**
 
 ```
-0x1708ec956099e259
+0x901e041a7cadc9db          <-- previously mislabelled "a measured false positive"
 ```
 
-Measured bindings (compute, SM 5.0, resources 1920×1080 at measurement time):
+Captured live at 3840×2160 output. Note every input is **1920×1080**: the game already runs
+**temporal upsampling at 50% screen percentage**, so the pass is `ETAAPassConfig::MainUpsampling`,
+not `Main`.
 
-| Register | Role | Format | **[derived]** identity |
+| Register | Role | Format | Size |
 |---|---|---|---|
-| `t0` | depth | `r32_g8_typeless` | `SceneDepthTexture` |
-| `t1` | — | — | **`StencilTexture`** — same `ID3D12Resource` as t0 |
-| `t2` | velocity | `r16g16b16a16_unorm` | `GBufferVelocityTexture` |
-| `t3`/`t4` | — | — | one is `EyeAdaptationTexture` (1×1 `PF_A32B32G32R32F`) |
-| `t5`, `t6` | colour | `r16g16b16a16_float` | `InputSceneColor` + `HistoryBuffer_0`, **order unknown** |
-| `u0` | TAA output | `r16g16b16a16_float` | `OutComputeTex_0` |
-| `u1` | optional | — | `OutComputeTexDownsampled` |
+| `t0` | `EyeAdaptationTexture` | `R32G32B32A32_FLOAT` | 1×1 |
+| `t1` | `InputSceneColor` | `R16G16B16A16_FLOAT` | 1920×1080 |
+| `t2` | `SceneDepthTexture` | `R32_FLOAT_X8X24` | 1920×1080 |
+| `t3` | `GBufferVelocityTexture` | `R16G16B16A16_UNORM` | 1920×1080 |
+| `t4` | `StencilTexture` | `X32_G8X24_UINT` | **same resource as t2** |
+| `t5` | `HistoryBuffer_0` | `R16G16B16A16_FLOAT` | 1920×1080 |
+| `u0` | `OutComputeTex_0` | `R16G16B16A16_FLOAT` | **3840×2160** |
 
-**[derived]** For `ETAAPassConfig::Main` on deferred SM5 exactly six SRVs survive dead-code
-elimination — `InputSceneColor`, `SceneDepthTexture`, `GBufferVelocityTexture`, `StencilTexture`,
-`HistoryBuffer_0`, `EyeAdaptationTexture`. **No other SRV can be bound by this shader**, which is
-what pins t1/t3/t4.
+Dispatch is **480×270** = `ceil(3840/8) × ceil(2160/8)` — over the **output** rect, not the
+render rect. Matching against the render rect rejects the real pass.
 
-**[derived] Depth vs stencil, bulletproof test**: they are two SRVs over the *same* resource. With
-`r.D3D12.Depth24Bit = 0` the resource is `R32G8X24_TYPELESS`; the depth view is
-`R32_FLOAT_X8X24_TYPELESS` (→ `pInDepth`) and the stencil view is `X32_TYPELESS_G8X24_UINT`
-(ignore).
+**Why the original identification failed, and the lesson.** The old heuristic scored this
+shader `colour=1 depth=2 velocity=0` and rejected it. Both halves of that score are actually
+the TAA's *signature*: `velocity=0` because the frame it sampled was a **camera cut**, where
+UE4 substitutes the 1×1 `GSystemTextures::BlackDummy` for velocity and history; `depth=2`
+because the depth SRV and the stencil SRV are **two views of one resource**. The gate rejected
+the pass for exactly the properties that identify it. **`EyeAdaptationTexture` is also 1×1 and
+present every frame, so "any 1×1 SRV" is not a cut signal** — only the velocity and colour
+slots count.
 
-**[derived] Which colour SRV is the history — DO NOT GUESS.** Register order is an fxc
-implementation detail and the "earlier one is the scene colour" reading was explicitly refuted.
-`HistoryBuffer[0]` is literally the texture that was `u0` in the *previous* frame's TAA dispatch:
+**The strongest runtime discriminator** is the depth+stencil pair over a shared resource. No
+other pass in this title binds one resource as both `R32_FLOAT_X8X24` and `X32_G8X24_UINT`.
 
-> Cache the `ID3D12Resource*` bound to u0 each frame. Next frame, the `r16g16b16a16_float` SRV
-> whose resource equals that cached pointer is `HistoryBuffer_0`. **The other one is
-> `InputSceneColor`, and that is what goes to `pInColor`.**
+**Two convincing look-alikes, both excluded:**
 
-On a cut or first frame, history and velocity are swapped to `GSystemTextures.BlackDummy`, a **1×1**
-texture — a reliable reset signal.
+* `0x1708ec956099e259` — previously believed to be the primary TAA. It is a **reprojecting
+  denoiser** (SSR/SSGI/AO family): it reads depth and velocity and reprojects with
+  `ClipToPrevClip`, which is why its bindings look right. It declares `cb1[126]` and so never
+  indexes View row 144 (`StateFrameIndexMod8`), which **every** `FTAAStandaloneCS` permutation
+  reads — therefore it cannot be this shader. Dispatches 240×135, output 1920×1080.
+* `0x52101a15e1a0c5cc` — eleven SRVs, two UAVs, `cb1[131]`. Not TAA.
 
-**[derived] Stray runs `r.PostProcessAAQuality == 3` (Medium).** Provable: u1 exists only under
-`TAA_DOWNSAMPLE`, which requires `bDownsample` → `bUseFast` → `Medium`. So `0x1708ec956099e259` is
-the Main / Fast / Downsample permutation. Two consequences:
+**Bytecode evidence for the correction** (from the shipped DXBC, `cs_5_0`, `numthreads(8,8,1)`):
 
-1. **The in-game AA quality setting changes the shader hash.** A hash-only hook breaks silently
-   when the user raises the setting. **Match on more than the hash** — bound-resource signature
-   plus dispatch size. The Main config has at most three legal permutations.
-2. **If we skip the dispatch we MUST still produce u1** — a half-res filter of our output — or
-   downstream bloom/DOF read garbage. This is a correctness requirement, not a nicety.
+* Every `FTAAStandaloneCS` permutation must declare `cb1[145]`; only five dumped shaders do,
+  and `0x901e` is one.
+* `0x901e` declares `dcl_tgsm_structured` stride 16 count 64 — `float4[64]`, which compiles
+  only under `AA_UPSAMPLE == 1` with `TAA_SCREEN_PERCENTAGE_RANGE == 1` (input under ~71% of
+  output).
+* The upsample-only kernel constants `0.905` and `-1.9` appear 7× in `0x901e` and in no other
+  shader except its sibling permutation.
 
-**The second hash `0x52101a15e1a0c5cc`** (t0 depth, t3 velocity, t7 colour, t8 `r16g16_float`) is
-**[derived] almost certainly NOT TAA and must not be hooked**: `FTAAStandaloneCS` has no
-`R16G16_FLOAT` input in any main config. Most likely motion blur.
-
-**A measured false positive**, recorded so it is not re-discovered: `0x901e041a7cadc9db` scores
-confidence 150 on a class-quorum test with colour=1, depth=2, velocity=0. No heuristic may
-re-select it.
+**Consequence for the DLSS work.** The game is *already* upsampling 1080p→4K. DLSS should be
+created as **1920×1080 → 3840×2160** (a Performance-ratio feature), **not DLAA** — which
+inverts the plan's staging, since there is no 1:1 pass to replace.
 
 **Shader census:** 728 distinct PS/CS shaders in gameplay, `not_dxbc=0`, `dxil=0` — every one is
 **DXBC**. ~150 in the main menu, rising to ~728 on entering gameplay.

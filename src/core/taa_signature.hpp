@@ -66,16 +66,48 @@ struct MatchResult
 	std::uint32_t colour_srv_b = 0; // decided here — it needs last frame's u0 pointer
 	std::uint32_t output_uav = 0;
 	bool has_downsample_uav = false;
+
+	// The output rect, taken from the output UAV rather than assumed equal to the input. The
+	// game runs temporal upsampling, so these differ from the input extent.
+	std::uint32_t output_width = 0;
+	std::uint32_t output_height = 0;
+	bool is_upsampling = false;
+
+	// True when velocity or the history colour is the 1x1 GSystemTextures::BlackDummy, which
+	// UE4 substitutes on a camera cut or the first frame. Not a reason to reject the pass —
+	// it IS the pass, resetting. It is, however, exactly what should drive NGX InReset.
+	bool camera_cut_dummies = false;
 };
 
-// Measured shader identities. CLAUDE.md §2.3.
-constexpr std::uint64_t kTaaMainHash = 0x1708ec956099e259ull;
+// Shader identities, CORRECTED against the live game and the shipped bytecode. CLAUDE.md §2.3.
+//
+// The original measurement had these backwards, and the mistake is instructive. It scored
+// 0x901e041a7cadc9db as a false positive on "colour=1 depth=2 velocity=0" — but that is
+// exactly a camera-cut frame, where UE4 swaps velocity for the 1x1 BlackDummy, and depth
+// counts twice because the depth SRV and the stencil SRV are two views of ONE resource. Both
+// halves of the disqualifying score are in fact the TAA's own signature.
+//
+// Confirmed independently from the bytecode: every FTAAStandaloneCS permutation reads
+// View.StateFrameIndexMod8 at row 144 and so must declare cb1[145]; 0x1708ec declares
+// cb1[126] and therefore cannot be this shader at all. 0x901e additionally declares
+// dcl_tgsm_structured stride 16 count 64 (float4[64]), which only compiles under
+// AA_UPSAMPLE==1, and carries the upsample-only kernel constants 0.905 / -1.9.
+constexpr std::uint64_t kTaaMainHash = 0x901e041a7cadc9dbull;
+
+// A reprojecting denoiser (SSR/SSGI/AO family), not TAA: cb1[126], eight float SRVs, no
+// uint2 stencil view. It reads depth and velocity and reprojects with ClipToPrevClip, which
+// is why its bindings look convincing and why it was mistaken for the TAA pass.
+constexpr std::uint64_t kDenoiserLookalikeHash = 0x1708ec956099e259ull;
+
+// Also not TAA. Eleven SRVs, two UAVs, cb1[131].
 constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull;
-constexpr std::uint64_t kKnownFalsePositiveHash = 0x901e041a7cadc9dbull;
 
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)
 constexpr std::uint32_t kTaaTileSize = 8;
 
+// `view_width`/`view_height` are the RENDER rect (View.ViewSizeAndInvSize). The dispatch is
+// sized over the OUTPUT rect, which under temporal upsampling is larger, so the match is made
+// against the output UAV's own extent instead of against the render rect.
 MatchResult match_taa_dispatch(const DispatchSignature &sig,
                                std::uint32_t view_width,
                                std::uint32_t view_height);

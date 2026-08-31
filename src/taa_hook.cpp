@@ -216,7 +216,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			st.gy = y;
 		}
 
-		if (g_reported[hash] && hash != kTaaMainHash && hash != kKnownFalsePositiveHash)
+		if (g_reported[hash] && hash != kTaaMainHash && hash != kDenoiserLookalikeHash)
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -240,7 +240,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			// than only for whichever dispatch happened to be first overall.
 			if (!g_failure_dumped[hash] && g_failure_dumps < 4 &&
 				(hash == kTaaMainHash || hash == kSecondCandidateHash ||
-				 hash == kKnownFalsePositiveHash || y >= 200))
+				 hash == kDenoiserLookalikeHash || y >= 200))
 			{
 				g_failure_dumped[hash] = true;
 				++g_failure_dumps;

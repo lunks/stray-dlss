@@ -45,9 +45,8 @@ constexpr GUID kIID_ID3D12GraphicsCommandListExt = {
 };
 
 // Measured shader identities. CLAUDE.md §2.3.
-constexpr std::uint64_t kTaaMainHash = 0x1708ec956099e259ull;   // the pass we will hook
-constexpr std::uint64_t kSecondCandidateHash = 0x52101a15e1a0c5ccull; // almost certainly motion blur — do NOT hook
-constexpr std::uint64_t kKnownFalsePositiveHash = 0x901e041a7cadc9dbull; // never select this
+// Identities live in core/taa_signature.hpp, corrected against the live game. See CLAUDE.md
+// §2.3: the original measurement had them backwards.
 
 // Far enough into the frame loop that device and swapchain creation have fully settled.
 constexpr int kNgxInitFrame = 120;
@@ -228,19 +227,20 @@ void on_init_pipeline(
 		if (hash == kTaaMainHash)
 		{
 			g_state.taa_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
-			STRAY_LOG_INFO("FOUND FTAAStandaloneCS: hash=0x%016llx pipeline=0x%016llx bytes=%zu",
+			STRAY_LOG_INFO("FOUND FTAAStandaloneCS (MainUpsampling): hash=0x%016llx "
+				"pipeline=0x%016llx bytes=%zu",
 				static_cast<unsigned long long>(hash),
 				static_cast<unsigned long long>(pipeline.handle),
 				shader->code_size);
 		}
-		else if (hash == kSecondCandidateHash)
+		else if (hash == kDenoiserLookalikeHash)
 		{
-			STRAY_LOG_INFO("Saw second candidate 0x%016llx (probably motion blur) - not hooking",
+			STRAY_LOG_INFO("Saw the denoiser look-alike 0x%016llx (cb1[126], not TAA) - not hooking",
 				static_cast<unsigned long long>(hash));
 		}
-		else if (hash == kKnownFalsePositiveHash)
+		else if (hash == kSecondCandidateHash)
 		{
-			STRAY_LOG_WARN("Saw known false positive 0x%016llx - never select this",
+			STRAY_LOG_INFO("Saw 0x%016llx (11 SRVs, cb1[131], not TAA) - not hooking",
 				static_cast<unsigned long long>(hash));
 		}
 	}
