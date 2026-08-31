@@ -29,6 +29,20 @@ bool g_resolve_failed_logged = false;
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
 
+// A crash-survivable breadcrumb. The Phase B path dies with an access violation after
+// surviving many frames, so the trigger is something that CHANGES rather than the first call.
+// Writing the current step to a tiny file on every attempt means the file names the exact step
+// after the crash, instead of costing another guess-and-run cycle.
+void mark(int stage, const char *what)
+{
+	std::FILE *f = nullptr;
+	if (fopen_s(&f, "stray-dlss-stage.txt", "w") == 0 && f != nullptr)
+	{
+		std::fprintf(f, "%d %s\n", stage, what);
+		std::fclose(f); // close, not just flush: the process is about to die
+	}
+}
+
 // Per-shader outcome census. One dispatch report shows one shader; this shows the whole
 // field, which is what actually answers "does the TAA pass ever reach the resolver".
 struct HashStats
@@ -382,6 +396,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	if (g_mv_resolve_enabled &&
 		(m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only))
 	{
+		mark(1, "entered-phaseB");
 		std::uint64_t depth_descriptor = 0;
 		std::uint64_t velocity_descriptor = 0;
 		for (const auto &t : b.srvs)
@@ -396,6 +411,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// That is the pass resetting, not an error.
 		if (view_ok && depth_descriptor != 0 && velocity_descriptor != 0 && !m.camera_cut_dummies)
 		{
+			mark(2, "descriptors-found");
 			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
 			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
 
@@ -408,13 +424,18 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 				inputs.render_height = m.render_height;
 				inputs.view = &view;
 
+				mark(3, "mv-initialised");
+
 				// Capture the game's heaps BEFORE our pass swaps in ours.
 				::ID3D12DescriptorHeap *game_heaps[2] = {};
 				unsigned int heap_count = 0;
 				collect_bound_heaps(cmd_list, game_heaps, &heap_count);
 
+				mark(4, "heaps-collected");
+
 				if (mv::record(native, inputs))
 				{
+					mark(5, "recorded");
 					if (!g_resolve_ran)
 					{
 						g_resolve_ran = true;
@@ -432,6 +453,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// read. (docs/RESEARCH.md §3.5)
 					if (heap_count > 0)
 						native->SetDescriptorHeaps(heap_count, game_heaps);
+
+					mark(6, "heaps-restored");
 
 					// Deliberately NOT calling state_block::apply. UE4's D3D12 RHI sets the
 					// root signature and PSO before every draw and dispatch, so those need no
