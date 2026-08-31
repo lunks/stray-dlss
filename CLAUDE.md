@@ -84,6 +84,31 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### The §2.3 signature does not match this configuration (measured 2026-08-31)
+
+`NgxDryRun=2` suppresses **every** structurally matched pass and writes nothing. The image is
+unchanged — mean RGB `R=44 G=49 B=35`, identical to the control, and the cyan count sits inside
+the control's own 0–2134 noise band.
+
+**So none of the passes our matcher finds draws the picture.** That answers the identification
+question in one run instead of one run per candidate, and it rules out bisection as a next step.
+
+TAA is definitely running: `sg.AntiAliasingQuality` is absent from `GameUserSettings.ini`, so the
+scalability group falls back to the pak's own `r.DefaultFeature.AntiAliasing=2` (§2.3.1), and
+`sg.ResolutionQuality=100` with `SteamDeckScreenPercentage=100` confirms 1:1.
+
+**And 1:1 is the point.** Everything in §2.3 — the depth+stencil SRV pair over one resource, the
+dispatch over an output rect larger than the inputs — was measured at 3840×2160 with 50% screen
+percentage, i.e. `ETAAPassConfig::MainUpsampling`. At 1:1 the engine selects
+`ETAAPassConfig::Main`, a **different permutation** whose bindings we never characterised. The
+matcher is not broken; it is matching a shape the game no longer produces, and the passes it
+does find (which do exhibit the history round-trip) are other temporal effects.
+
+**Consequence:** §2.3's signature is configuration-specific and must be treated as such. Either
+characterise the `Main` permutation at 1:1, or drive the game back to the configuration §2.3 was
+measured in (`r.ScreenPercentage` below 100 with `r.TemporalAA.Upsampling=1`, §4) so the
+documented shape reappears. The second is cheaper and is also where DLSS SR wants to be anyway.
+
 ### DLSS runs, but into a pass that does not drive the image (measured 2026-08-31)
 
 `NgxDryRun` suppresses the pinned pass and writes **nothing** in its place. If that pass drove
