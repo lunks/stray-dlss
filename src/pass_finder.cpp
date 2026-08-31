@@ -96,6 +96,7 @@ const char *walk_format_name(TexFormat f)
 	case TexFormat::r32_float:                return "R32F";
 	case TexFormat::r16_float:                return "R16F";
 	case TexFormat::r8g8b8a8_unorm:           return "RGBA8";
+	case TexFormat::b8g8r8a8_unorm:           return "BGRA8";
 	case TexFormat::unknown:                  return "other";
 	}
 	return "?";

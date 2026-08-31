@@ -12,6 +12,7 @@
 #include "core/taa_hashes.hpp"
 #include "ext_unhook.hpp"
 #include "frame_state.hpp"
+#include "gbuffer_finder.hpp"
 #include "input_dump.hpp"
 #include "pass_finder.hpp"
 #include "shader_dump.hpp"
@@ -352,6 +353,7 @@ void on_reset_command_list(reshade::api::command_list *cmd_list)
 	reset_command_list_state(cmd_list);
 	taa_hook::forget_command_list(cmd_list);
 	pass_finder::forget_command_list(cmd_list);
+	gbuffer_finder::forget_command_list(cmd_list);
 }
 
 void on_push_constants(
@@ -503,7 +505,7 @@ bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, u
 	// recording one would enter a phantom writer into the pass finder's last-writer table.
 	pass_finder::note_dispatch(cmd_list, x, y, z);
 
-	if (shader_dump::enabled())
+	if (shader_dump::enabled() || gbuffer_finder::enabled())
 	{
 		std::uint64_t hash = 0;
 		{
@@ -517,7 +519,13 @@ bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, u
 			}
 		}
 		if (hash != 0)
-			shader_dump::note_dispatch(hash, x, y, z);
+		{
+			if (shader_dump::enabled())
+				shader_dump::note_dispatch(hash, x, y, z);
+			// The G-buffer finder's SSR-denoiser cross-check. It resolves bindings only
+			// for the one known denoiser hash, so this is a no-op for everything else.
+			gbuffer_finder::note_dispatch(cmd_list, hash);
+		}
 	}
 	// Skeleton stage: observe only. Returning true here is what will eventually suppress the
 	// engine's TAA dispatch — it is the only skip-capable event on our path.
@@ -550,6 +558,11 @@ void on_present(
 	if (pass_finder::enabled())
 		pass_finder::on_present(frame, swapchain != nullptr
 			? swapchain->get_current_back_buffer() : reshade::api::resource{ 0 });
+
+	// The G-buffer finder's frame boundary: stability accounting and the (log-only)
+	// identification report. (gbuffer_finder.hpp, DLSS-RR phase 1)
+	if (gbuffer_finder::enabled())
+		gbuffer_finder::on_present(frame);
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every 30 frames; cheap and always current.
@@ -813,16 +826,20 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 		g_state.taa_pipelines_seen.load());
 }
 
-// ---- pass-finder event handlers ----
+// ---- finder event handlers (pass finder + G-buffer finder) ----
 //
-// Registered only when [STRAYDLSS] PassFinder=1: every extra event ReShade dispatches costs
-// a call per operation even when the handler early-outs, and the finder is a diagnostic.
-// All of the skip-capable ones return false — the finder observes, never suppresses.
+// The render-target and draw events feed BOTH diagnostics and are registered when either
+// [STRAYDLSS] PassFinder=1 or [STRAYDLSS] GBufferFinder=1; the copy and execute events are
+// pass-finder-only. Conditional registration matters: every extra event ReShade dispatches
+// costs a call per operation even when the handler early-outs, and both finders are
+// diagnostics. All of the skip-capable ones return false — the finders observe, never
+// suppress.
 
 void on_pf_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
 {
 	pass_finder::note_render_targets(cmd_list, count, rtvs, dsv);
+	gbuffer_finder::note_render_targets(cmd_list, count, rtvs, dsv);
 }
 
 bool on_pf_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t count,
@@ -838,6 +855,8 @@ bool on_pf_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t coun
 		views[i] = rts[i].view;
 	pass_finder::note_render_targets(cmd_list, n, views,
 		ds != nullptr ? ds->view : reshade::api::resource_view{ 0 });
+	gbuffer_finder::note_render_targets(cmd_list, n, views,
+		ds != nullptr ? ds->view : reshade::api::resource_view{ 0 });
 	return false;
 }
 
@@ -848,6 +867,7 @@ bool on_pf_draw(reshade::api::command_list *cmd_list, uint32_t vertex_count,
 	(void)first_vertex;
 	(void)first_instance;
 	pass_finder::note_draw(cmd_list, vertex_count);
+	gbuffer_finder::note_draw(cmd_list);
 	return false;
 }
 
@@ -859,6 +879,7 @@ bool on_pf_draw_indexed(reshade::api::command_list *cmd_list, uint32_t index_cou
 	(void)vertex_offset;
 	(void)first_instance;
 	pass_finder::note_draw(cmd_list, index_count);
+	gbuffer_finder::note_draw(cmd_list);
 	return false;
 }
 
@@ -914,6 +935,9 @@ void on_pf_execute_command_list(reshade::api::command_queue *queue,
 // very long first load. Worth it while we need bytecode; wasteful otherwise, so it is a
 // switch. (docs/RESEARCH.md §2.5)
 bool g_pipeline_events_registered = false;
+// The render-target/draw events feed both finders; the copy/execute events only the pass
+// finder. Tracked separately so unregistration mirrors registration exactly.
+bool g_finder_rt_events_registered = false;
 bool g_pass_finder_events_registered = false;
 
 void register_events()
@@ -946,7 +970,16 @@ void register_events()
 	reshade::get_config_value(nullptr, "STRAYDLSS", "PassFinder", pass_finder_enabled);
 	pass_finder::set_enabled(pass_finder_enabled);
 
-	g_pipeline_events_registered = hash_shaders || shader_dump::enabled() || pass_finder_enabled;
+	// [STRAYDLSS] GBufferFinder, default OFF: log-only identification of the base pass's
+	// G-buffer targets for DLSS Ray Reconstruction (gbuffer_finder.hpp). It needs the
+	// render-target/draw events below, and the pipeline events for the SSR-denoiser
+	// cross-check's shader hash.
+	bool gbuffer_finder_enabled = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferFinder", gbuffer_finder_enabled);
+	gbuffer_finder::set_enabled(gbuffer_finder_enabled);
+
+	g_pipeline_events_registered = hash_shaders || shader_dump::enabled() ||
+		pass_finder_enabled || gbuffer_finder_enabled;
 
 	if (g_pipeline_events_registered)
 	{
@@ -969,14 +1002,18 @@ void register_events()
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 
-	if (pass_finder_enabled)
+	if (pass_finder_enabled || gbuffer_finder_enabled)
 	{
-		g_pass_finder_events_registered = true;
+		g_finder_rt_events_registered = true;
 		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
 			on_pf_bind_render_targets);
 		reshade::register_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);
 		reshade::register_event<reshade::addon_event::draw>(on_pf_draw);
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
+	}
+	if (pass_finder_enabled)
+	{
+		g_pass_finder_events_registered = true;
 		reshade::register_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
 		reshade::register_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
 		reshade::register_event<reshade::addon_event::resolve_texture_region>(
@@ -1002,6 +1039,9 @@ void unregister_events()
 			on_pf_resolve_texture_region);
 		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
 		reshade::unregister_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
+	}
+	if (g_finder_rt_events_registered)
+	{
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
 		reshade::unregister_event<reshade::addon_event::draw>(on_pf_draw);
 		reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);

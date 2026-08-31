@@ -29,6 +29,7 @@ enum class TexFormat
 	r32_float,
 	r16_float,
 	r8g8b8a8_unorm,
+	b8g8r8a8_unorm,           // UE4's PF_B8G8R8A8 — stock GBufferB/C (gbuffer_classify.hpp)
 };
 
 // True for any format DLSS will accept as pInColor: an HDR-capable float colour target.
