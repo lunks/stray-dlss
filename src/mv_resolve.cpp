@@ -37,9 +37,32 @@ struct State
 {
 	ID3D12Device *device = nullptr;
 
+	// The device used for DESCRIPTOR work: creating our heap and copying the game's SRVs into
+	// it. This is deliberately not always `device`.
+	//
+	// ReShade's D3D12 descriptor-heap proxy does NOT hand out real CPU descriptor addresses.
+	// GetCPUDescriptorHandleForHeapStart returns a bit-packed synthetic value built up from
+	// zero — heap type in bits 0-1, flags in bit 3, descriptor index in 4-27, heap index in
+	// 28-55 (v6.8.0 d3d12_impl_device.cpp:2280-2296). So every CPU handle the game holds is in
+	// ReShade's space, and feeding one to the NATIVE device's CopyDescriptorsSimple reads from
+	// a near-null address: garbage in our heap, and a GPU page fault the moment a dispatch
+	// samples it. Measured on the target as NV_ERR_NO_MEMORY followed by
+	// Xid 109 CTX SWITCH TIMEOUT, with MvDispatch=0 (no dispatch) surviving and MvDispatch=1
+	// (one 1x1 group) hanging — exactly the signature of a descriptor that is only touched
+	// when the GPU actually reads it.
+	//
+	// ReShade's proxy device converts BOTH source and destination back to original handles
+	// (d3d12_device.cpp CopyDescriptorsSimple), so doing the copy there is correct — provided
+	// our own heap is also created through the proxy, so its handles live in the same space.
+	// Left equal to `device` when there is no ReShade, where handles are already real.
+	ID3D12Device *descriptor_device = nullptr;
+
 	ID3D12RootSignature *root_signature = nullptr;
 	ID3D12PipelineState *pso = nullptr;
-	ID3D12DescriptorHeap *heap = nullptr;      // shader-visible CBV/SRV/UAV
+	ID3D12DescriptorHeap *heap = nullptr;      // shader-visible CBV/SRV/UAV (ReShade-space)
+	// The same heap unwrapped. SetDescriptorHeaps on a NATIVE command list must be given the
+	// original object, never ReShade's wrapper.
+	ID3D12DescriptorHeap *heap_native = nullptr;
 	ID3D12Resource *constants = nullptr;       // upload heap, kFrameCount * aligned Params
 	ID3D12Resource *out_mv = nullptr;          // R16G16_FLOAT at render resolution
 
@@ -173,11 +196,26 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 	heap_desc.NumDescriptors = kDescriptorCount;
 	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
-	HRESULT hr = g_state.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_state.heap));
+	HRESULT hr = g_state.descriptor_device->CreateDescriptorHeap(&heap_desc,
+		IID_PPV_ARGS(&g_state.heap));
 	if (FAILED(hr))
 	{
 		set_error("CreateDescriptorHeap", hr);
 		return false;
+	}
+
+	// Unwrap it for native binding. {7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42} is ReShade's
+	// "give me the original object" IID; without ReShade the query simply fails and the heap
+	// is already the original.
+	constexpr GUID kUnwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
+		{ 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+	g_state.heap_native = nullptr;
+	if (FAILED(g_state.heap->QueryInterface(kUnwrapped,
+			reinterpret_cast<void **>(&g_state.heap_native))) ||
+		g_state.heap_native == nullptr)
+	{
+		g_state.heap_native = g_state.heap;
+		g_state.heap_native->AddRef();
 	}
 
 	g_state.descriptor_size =
@@ -268,13 +306,13 @@ void copy_srvs(UINT slot, std::uint64_t depth_descriptor, std::uint64_t velocity
 
 	D3D12_CPU_DESCRIPTOR_HANDLE src_depth = {};
 	src_depth.ptr = static_cast<SIZE_T>(depth_descriptor);
-	g_state.device->CopyDescriptorsSimple(1, dest, src_depth,
+	g_state.descriptor_device->CopyDescriptorsSimple(1, dest, src_depth,
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
 	dest.ptr += g_state.descriptor_size;
 	D3D12_CPU_DESCRIPTOR_HANDLE src_velocity = {};
 	src_velocity.ptr = static_cast<SIZE_T>(velocity_descriptor);
-	g_state.device->CopyDescriptorsSimple(1, dest, src_velocity,
+	g_state.descriptor_device->CopyDescriptorsSimple(1, dest, src_velocity,
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
@@ -318,10 +356,20 @@ const Stats &stats()
 bool is_ready() { return g_state.pso != nullptr && g_state.out_mv != nullptr; }
 ID3D12Resource *output() { return g_state.out_mv; }
 
+void set_descriptor_device(ID3D12Device *device)
+{
+	g_state.descriptor_device = device;
+}
+
 bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 {
 	if (device == nullptr || width == 0 || height == 0)
 		return false;
+
+	// Without an explicit descriptor device we are running with no ReShade in the way (the
+	// harness, or a plain D3D12 host), where CPU handles are already real addresses.
+	if (g_state.descriptor_device == nullptr)
+		g_state.descriptor_device = device;
 
 	// GROW-ONLY. Reallocating whenever the resolution changes is what killed the machine: the
 	// render resolution comes from whichever dispatch matched, so it alternates during loading,
@@ -387,6 +435,7 @@ void shutdown()
 
 	release(g_state.out_mv);
 	release(g_state.constants);
+	release(g_state.heap_native);
 	release(g_state.heap);
 	release(g_state.pso);
 	release(g_state.root_signature);
@@ -434,7 +483,8 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	cmd->SetComputeRootSignature(g_state.root_signature);
 	cmd->SetPipelineState(g_state.pso);
 
-	ID3D12DescriptorHeap *heaps[] = { g_state.heap };
+	// The ORIGINAL heap object: a native command list must never be handed ReShade's wrapper.
+	ID3D12DescriptorHeap *heaps[] = { g_state.heap_native };
 	cmd->SetDescriptorHeaps(1, heaps);
 
 	cmd->SetComputeRootConstantBufferView(0,
