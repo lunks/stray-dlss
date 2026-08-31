@@ -17,6 +17,7 @@ std::unordered_map<reshade::api::command_list *, uint64_t> g_bound;             
 std::unordered_map<std::uint64_t, std::uint64_t> g_prev_output;                 // hash -> its u0 last frame
 std::unordered_map<std::uint64_t, std::uint32_t> g_report_count;                // hash -> reports emitted
 std::unordered_map<std::uint64_t, bool> g_steady_reported;                      // hash -> saw a non-cut frame
+std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     // hash -> round-trip already noted
 
 // Per-shader outcome census. One dispatch report shows one shader; this shows the whole
 // field, which is what actually answers "does the TAA pass ever reach the resolver".
@@ -362,12 +363,13 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		const auto prev = g_prev_output.find(hash);
-		if (prev != g_prev_output.end() && prev->second != 0)
+		if (prev != g_prev_output.end() && prev->second != 0 && !g_roundtrip_logged[hash])
 		{
 			for (const auto &t : b.srvs)
 			{
 				if (t.resource == prev->second)
 				{
+					g_roundtrip_logged[hash] = true;
 					STRAY_LOG_INFO("  HISTORY ROUND-TRIP: 0x%016llx bound last frame's u0 back "
 						"at t%u — this pass owns the temporal history",
 						static_cast<unsigned long long>(hash), t.slot);
