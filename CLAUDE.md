@@ -82,6 +82,47 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### The native-device rule has a trap, measured 2026-08-31
+
+**Two configurations are self-consistent. The one we currently ship is only safe by luck.**
+
+ReShade 6.8.0 added `source/d3d12/d3d12_extensions.cpp`. Inside its proxy's `QueryInterface`
+for `IID_ID3D12DeviceExt`/`Ext1`/`Ext2` it patches vtable slots **7/8** (and 14/15 for `Ext2`)
+of vkd3d's extension interface, so that `GetCudaTextureObject` / `GetCudaSurfaceObject` run
+their descriptor handles through `convert_to_original_cpu_descriptor_handle`. Those are the
+**CUDA texture and surface entry points — the path `nvngx_dlss.dll` takes under vkd3d.**
+
+The conversion has no release-build guard:
+
+```cpp
+const size_t heap_index = (handle.ptr >> heap_index_start) & 0xFFFFFFF;
+assert(heap_index < _descriptor_heaps.size() && _descriptor_heaps[heap_index] != nullptr);
+return { _descriptor_heaps[heap_index]->_orig_base_cpu_handle.ptr + ... };
+```
+
+A **real vkd3d handle** yields a garbage `heap_index`, an out-of-bounds read, and a handle
+pointing anywhere. DLSS then samples the wrong texture, silently. **That is what a colour cast
+looks like.**
+
+| NGX device | ext vtable patched? | Result |
+|---|---|---|
+| native (`get_native()`) | no | **works** — handles are never converted |
+| ReShade proxy | yes | **works** — ReShade minted them, so conversion is correct |
+| **native** | **yes** | **BROKEN** — real handles run through the conversion |
+
+**Measured on the RTX 4090, 2026-08-31** (`test_vkd3d_ext_hook_reachability`): vkd3d-proton uses
+a **single static vtable** for this interface, so one query against ReShade's proxy — *from
+anywhere in the process* — patches the vtable that interfaces taken straight from the **original**
+device also use. `before=…C645AD0 after=…D5680D0`, and the patched entry belongs to ReShade's
+DLL. Reachability is **HARD**.
+
+**What is still UNCONFIRMED: whether anything in the live game performs that query.** It is
+plausible — the game's own device *is* ReShade's proxy, DXVK-NVAPI is active on this machine
+(`DXVK_ENABLE_NVAPI=1`, `DXVK_NVAPI_VKREFLEX=1`), and DXVK-NVAPI queries the device it is handed
+for `ID3D12DeviceExt`. If UE4 calls any `NvAPI_D3D12_*` entry point with its device, the patch
+installs and we land in the broken row. **Do not treat §1's native-device rule as sufficient on
+its own — check the vtable at NGX init and log loudly.**
+
 Full chain, prerequisites and diagnostics: `docs/RESEARCH.md` §1.
 
 ---

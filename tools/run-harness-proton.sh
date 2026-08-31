@@ -27,6 +27,13 @@ REMOTE_DIR="/tmp/stray-dlss-harness"
 PRIVATE_COMPAT="$REMOTE_DIR/compat"                # our own prefix, NOT the game's
 EXE="${1:-}"
 
+# WITH_RESHADE=1 also stages ReShade as d3d12.dll and our add-on beside the harness, so the
+# run goes through ReShade's real proxy against real vkd3d-proton — the only place the
+# ID3D12DeviceExt vtable hook can actually be observed, since it needs vkd3d's extension
+# interface to exist at all.
+RESHADE_DLL="${RESHADE_DLL:-}"
+ADDON="${ADDON:-}"
+
 if [[ -z "$EXE" || ! -f "$EXE" ]]; then
 	echo "usage: $0 <path-to-stray-dlss-harness.exe>" >&2
 	exit 2
@@ -44,6 +51,26 @@ ssh "$HOST" "pct exec $CT -- mkdir -p $REMOTE_DIR $PRIVATE_COMPAT && \
 	pct exec $CT -- chown -R deck:deck $REMOTE_DIR && \
 	pct exec $CT -- chmod 755 $REMOTE_DIR/harness.exe"
 
+if [[ "${WITH_RESHADE:-0}" == "1" ]]; then
+	if [[ ! -f "$RESHADE_DLL" || ! -f "$ADDON" ]]; then
+		echo "WITH_RESHADE=1 needs RESHADE_DLL=<ReShade64.dll> and ADDON=<*.addon64>" >&2
+		exit 2
+	fi
+	echo "==> staging ReShade and the add-on"
+	scp -q "$RESHADE_DLL" "$HOST:/tmp/stray-dlss-stage/d3d12.dll"
+	scp -q "$ADDON" "$HOST:/tmp/stray-dlss-stage/stray-dlss.addon64"
+	ssh "$HOST" "pct push $CT /tmp/stray-dlss-stage/d3d12.dll $REMOTE_DIR/d3d12.dll && \
+		pct push $CT /tmp/stray-dlss-stage/stray-dlss.addon64 $REMOTE_DIR/stray-dlss.addon64 && \
+		pct exec $CT -- sh -c 'printf \"[GENERAL]\\nAddonPath=.\\n[ADDON]\\nAddonPath=.\\n\" > $REMOTE_DIR/ReShade.ini' && \
+		pct exec $CT -- chown -R deck:deck $REMOTE_DIR"
+	# n,b = prefer the native DLL sitting next to the exe over Wine's builtin.
+	RESHADE_ENV="WINEDLLOVERRIDES=d3d12=n,b"
+	HARNESS_ARGS="--hardware --expect-reshade"
+else
+	RESHADE_ENV=""
+	HARNESS_ARGS="--hardware"
+fi
+
 echo "==> running against the real adapter on a private Xvfb display"
 # Wine gives a console app no console here, so its stdout is lost. Redirect inside Windows
 # instead, via cmd, and read the file back. Z: maps to the container's filesystem root.
@@ -56,13 +83,18 @@ ssh "$HOST" "pct exec $CT -- setpriv --reuid=1001 --regid=1001 --clear-groups \
 		STEAM_COMPAT_CLIENT_INSTALL_PATH=/home/deck/.local/share/Steam \
 		STEAM_COMPAT_DATA_PATH=$PRIVATE_COMPAT \
 		VKD3D_DEBUG=${VKD3D_DEBUG:-none} DXVK_LOG_LEVEL=none WINEDEBUG=-all \
-		$VALIDATION_ENV \
+		$VALIDATION_ENV $RESHADE_ENV \
 		$PROTON run 'C:\\windows\\system32\\cmd.exe' /c \
 		'Z:\\tmp\\stray-dlss-harness\\harness.exe --hardware > Z:\\tmp\\stray-dlss-harness\\out.txt 2>&1' \
 	>/dev/null 2>&1 || true"
 
 echo
 ssh "$HOST" "pct exec $CT -- cat $REMOTE_DIR/out.txt 2>/dev/null" | tee /tmp/harness-hw.log
+if [[ "${WITH_RESHADE:-0}" == "1" ]]; then
+	echo
+	echo "--- add-on log ---"
+	ssh "$HOST" "pct exec $CT -- cat $REMOTE_DIR/stray-dlss.log 2>/dev/null" | tail -20
+fi
 echo
 if ! grep -q "^PASS" /tmp/harness-hw.log; then
 	echo "HARNESS DID NOT PASS on hardware" >&2
