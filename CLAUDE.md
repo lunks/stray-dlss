@@ -483,8 +483,11 @@ not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
 > ```
 >
 > The two known look-alikes were correctly **excluded** in the same run, so the exclusion rules
-> hold. **The hash is resolution-dependent — it is a permutation fingerprint, not the shader's
-> identity.** Never gate on it alone; the depth+stencil-over-one-resource signature plus a
+> hold. **The hash is a PERMUTATION fingerprint, not the shader's identity — and the permutation
+> is chosen by the upsampling ratio, not by the pixel count.** 1440p and 4K at the same screen
+> percentage share a hash and differ only in dispatch size; going from 50% to 100% flips
+> `AA_UPSAMPLE` and compiles different code. That is why `0x901e…` declares a
+> `dcl_tgsm_structured` `float4[64]` that exists only under `AA_UPSAMPLE == 1`. Never gate on it alone; the depth+stencil-over-one-resource signature plus a
 > dispatch covering the output rect is what actually identifies the pass. Also measured in the
 > same frames: the View CB appeared at **b4**, not b1, so that register is not invariant either.
 
