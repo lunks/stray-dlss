@@ -42,6 +42,13 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // sharing one meant the skip warning consumed the budget
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
+// The ONE pass DLSS is allowed to replace.
+//
+// The structural matcher legitimately matches several passes — the log shows many distinct
+// hashes reporting a history round-trip — and evaluating on each of them means suppressing
+// several of the engine's dispatches, not just its TAA. Pin to the first pass we successfully
+// evaluate and refuse every other from then on.
+std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 // Traces the first few evaluate cycles step by step. The crash follows a SUCCESSFUL evaluate
 // within about a second, the UE4 dump carries an empty callstack, and the add-on's last line is
 // simply whatever it logged before dying — so the only way to localise it is to say what we are
@@ -560,7 +567,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// Everything here is looked up by REGISTER and liveness-checked, for the
 					// same reason the resolve is: ReShade's view->resource map outlives the
 					// resource, and a dead pointer here would fault inside the driver.
-					if (g_ngx_evaluate && ngx::status().super_sampling_available)
+					const std::uint64_t pinned =
+						g_ngx_pass_hash.load(std::memory_order_relaxed);
+					if (g_ngx_evaluate && ngx::status().super_sampling_available &&
+						(pinned == 0 || pinned == hash))
 					{
 						// Decide WHICH of the two colour slots is scene colour.
 						//
@@ -693,6 +703,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							if (ok)
 							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
+								std::uint64_t expected = 0;
+								if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
+									STRAY_LOG_INFO("DLSS pinned to pass 0x%016llx; no other pass "
+										"will be replaced.",
+										static_cast<unsigned long long>(hash));
 								// Suppress the engine's own TAA dispatch for this pass.
 								//
 								// Not optional. We have just written DLSS's result into u0; if
