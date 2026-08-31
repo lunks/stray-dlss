@@ -132,7 +132,8 @@ void on_present()
 		const D3D12_RANGE read_range = { 0, static_cast<SIZE_T>(it->total_bytes) };
 		if (SUCCEEDED(it->readback->Map(0, &read_range, &data)) && data != nullptr)
 		{
-			std::FILE *f = std::fopen(it->file, "wb");
+			std::FILE *f = nullptr;
+			fopen_s(&f, it->file, "wb");
 			if (f != nullptr)
 			{
 				std::fwrite(data, 1, static_cast<size_t>(it->total_bytes), f);
