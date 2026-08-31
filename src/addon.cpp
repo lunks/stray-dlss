@@ -466,8 +466,7 @@ void on_present(
 		STRAY_LOG_INFO("Initialising NGX (frame %llu)...", static_cast<unsigned long long>(frame));
 		// Re-check here, not just at init_device: whoever installs the patch may do so at any
 		// point, and this is the moment our descriptors start mattering.
-		report_vkd3d_ext_hook(
-			reinterpret_cast<ID3D12Device *>(device->get_native()), "pre-NGX");
+		report_vkd3d_ext_hook(device, "pre-NGX");
 		ngx::initialise(device);
 	}
 
