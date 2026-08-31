@@ -139,6 +139,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/frame_state.hpp
         src/taa_hook.cpp
         src/taa_hook.hpp
+        src/mv_resolve.cpp
+        src/mv_resolve.hpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -156,7 +158,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         ngx_sdk
         ${NGX_LIBRARY}
         d3d12
-        dxgi)
+        dxgi
+        d3dcompiler)  # for D3D12SerializeRootSignature only; D3DCompile is never called
 
     target_compile_definitions(stray-dlss PRIVATE
         STRAY_DLSS_ENABLE_NGX=$<BOOL:${STRAY_DLSS_ENABLE_NGX}>)
