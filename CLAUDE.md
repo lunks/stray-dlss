@@ -118,12 +118,30 @@ anywhere in the process* — patches the vtable that interfaces taken straight f
 device also use. `before=…C645AD0 after=…D5680D0`, and the patched entry belongs to ReShade's
 DLL. Reachability is **HARD**.
 
-**What is still UNCONFIRMED: whether anything in the live game performs that query.** It is
-plausible — the game's own device *is* ReShade's proxy, DXVK-NVAPI is active on this machine
-(`DXVK_ENABLE_NVAPI=1`, `DXVK_NVAPI_VKREFLEX=1`), and DXVK-NVAPI queries the device it is handed
-for `ID3D12DeviceExt`. If UE4 calls any `NvAPI_D3D12_*` entry point with its device, the patch
-installs and we land in the broken row. **Do not treat §1's native-device rule as sufficient on
-its own — check the vtable at NGX init and log loudly.**
+**CONFIRMED IN THE LIVE GAME, 2026-08-31.** Stray itself installs the patch. Measured with our
+add-on in observation-only mode (`EnableNGX=0 MvDispatch=0 MvResolve=0`) and with the other two
+ReShade add-ons disabled, so nothing of ours and no third-party add-on is responsible:
+
+```
+[init_device] vkd3d ID3D12DeviceExt present, slot 8 unhooked (owner=d3d12core.dll) - safe.
+[frame 300]   vkd3d ID3D12DeviceExt slot 8 is HOOKED BY RESHADE (dxgi.dll).
+[frame 1200]  ... HOOKED BY RESHADE.
+[frame 3600]  ... HOOKED BY RESHADE.
+```
+
+The state **changes during the session**: clean at device creation, hooked by frame 300. A
+startup-only check reports "safe" and is wrong, which is why the check is repeated.
+
+**Therefore the shipped configuration is the broken row.** Initialising NGX with
+`device::get_native()` while the patch is installed means our real vkd3d descriptor handles are
+run through `convert_to_original_cpu_descriptor_handle`, producing a garbage heap index, an
+out-of-bounds read, and a handle pointing anywhere — a wrong texture sampled with no error.
+
+**Consequence for §1: the native-device rule is no longer sufficient on its own.** The two
+self-consistent options are native-without-patch (not achievable here — the game installs it) and
+**proxy-with-patch**, which is what ReShade 6.8.0's hook is designed for: it converts correctly
+precisely because ReShade minted the handles. Revisit the §1 mandate against this measurement
+before enabling NGX.
 
 Full chain, prerequisites and diagnostics: `docs/RESEARCH.md` §1.
 
