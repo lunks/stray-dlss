@@ -22,6 +22,14 @@ namespace stray_dlss::ue4 {
 // ---------------------------------------------------------------------------------------
 struct ViewRow
 {
+	// DERIVED, not a measured anchor: row 8 is TranslatedWorldToView in the stock
+	// VIEW_UNIFORM_BUFFER_MEMBER_TABLE layout (rows 0-27 are the matrix block:
+	// TranslatedWorldToClip 0, WorldToClip 4, TranslatedWorldToView 8, ...). The layout as
+	// a whole reproduced all seven measured anchors (CLAUDE.md §2.6), but THIS row was
+	// never individually verified — consumers must sanity-check what they read
+	// (world_to_view_rotation_plausible) and fail loudly, never silently. Used by the RR
+	// path for NoV and the DLSSD WorldToView matrix.
+	static constexpr std::uint32_t kTranslatedWorldToView = 8;       // derived, 4 rows
 	static constexpr std::uint32_t kViewToClip = 28;                 // measured
 	static constexpr std::uint32_t kViewToClipNoAA = 32;             // measured
 	static constexpr std::uint32_t kInvDeviceZToWorldZTransform = 65; // derived

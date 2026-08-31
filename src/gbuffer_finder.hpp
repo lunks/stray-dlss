@@ -57,6 +57,25 @@ void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_ha
 
 void forget_command_list(reshade::api::command_list *cmd_list);
 
+// The live identification, for the RR path. Fills A/B/C with the MOST RECENT same-shape
+// candidate's resource handles — the measured pointer rotation means a consumer must
+// re-capture every frame and still liveness-check each handle before touching it (the
+// table is from a bind earlier in the frame; the pool can have recycled it since). Returns
+// true only when the finder is enabled, a base-pass candidate's SHAPE has held for at
+// least `min_consecutive` frames, and all three of GBufferA/B/C carry their named roles
+// (an unknown slot — a licensee format — refuses loudly here rather than feeding RR a
+// guess). extent is the shared scene-buffer extent.
+struct Identification
+{
+	std::uint64_t gbuffer_a = 0;
+	std::uint64_t gbuffer_b = 0;
+	std::uint64_t gbuffer_c = 0;
+	std::uint32_t extent_width = 0;
+	std::uint32_t extent_height = 0;
+	std::uint64_t consecutive_frames = 0;
+};
+bool current_identification(Identification &out, std::uint64_t min_consecutive);
+
 // Frame boundary: merges the frame's candidates, tracks stability, and logs the
 // identification once stable (again if it changes). While no base-pass candidate is seen
 // it logs a FAILED block — first after kFailFrames, then RE-FIRING once a minute for as

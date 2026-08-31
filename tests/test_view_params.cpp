@@ -26,6 +26,22 @@ std::vector<unsigned char> make_view_buffer()
 			static_cast<float>(r * 4 + 0), static_cast<float>(r * 4 + 1),
 			static_cast<float>(r * 4 + 2), static_cast<float>(r * 4 + 3));
 
+	// TranslatedWorldToView (rows 8-11, derived): a real rotation (90 degrees about Z)
+	// with a translation row, so both the parse and the plausibility gate are exercised.
+	put4(ue4::ViewRow::kTranslatedWorldToView + 0, 0.0f, 1.0f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kTranslatedWorldToView + 1, -1.0f, 0.0f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kTranslatedWorldToView + 2, 0.0f, 0.0f, 1.0f, 0.0f);
+	put4(ue4::ViewRow::kTranslatedWorldToView + 3, 5.0f, 6.0f, 7.0f, 1.0f);
+	// ViewToClip (rows 28-31) and ViewToClipNoAA (rows 32-35): projection-shaped, with
+	// DIFFERENT diagonals so reading the wrong matrix is caught.
+	put4(ue4::ViewRow::kViewToClip + 0, 1.21f, 0.0f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewToClip + 1, 0.0f, 2.15f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewToClip + 2, 0.01f, -0.02f, 0.0f, 1.0f); // jittered off-centre terms
+	put4(ue4::ViewRow::kViewToClip + 3, 0.0f, 0.0f, 10.0f, 0.0f);
+	put4(ue4::ViewRow::kViewToClipNoAA + 0, 1.2f, 0.0f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewToClipNoAA + 1, 0.0f, 2.1f, 0.0f, 0.0f);
+	put4(ue4::ViewRow::kViewToClipNoAA + 2, 0.0f, 0.0f, 0.0f, 1.0f);
+	put4(ue4::ViewRow::kViewToClipNoAA + 3, 0.0f, 0.0f, 10.0f, 0.0f);
 	put4(ue4::ViewRow::kTemporalAAJitter, 0.001f, -0.002f, 0.003f, -0.004f);
 	put4(ue4::ViewRow::kViewRectMin, 0.0f, 0.0f, 0.0f, 0.0f);
 	put4(ue4::ViewRow::kViewSizeAndInvSize, 2560.0f, 1440.0f, 1.0f / 2560.0f, 1.0f / 1440.0f);
@@ -128,4 +144,58 @@ TEST_CASE("is_camera_cut ORs all three signals")
 
 	// Signal 3: a 1x1 history or velocity texture (BlackDummy).
 	CHECK(ue4::is_camera_cut(p, true));
+}
+
+TEST_CASE("the RR matrices parse from their rows, row-major")
+{
+	const auto buf = make_view_buffer();
+	ue4::ViewParams p;
+	REQUIRE(ue4::parse_view_params(buf.data(), buf.size(), p));
+
+	// TranslatedWorldToView: rotation rows as written, translation in row 3.
+	CHECK(p.translated_world_to_view.m[0 * 4 + 1] == doctest::Approx(1.0f));
+	CHECK(p.translated_world_to_view.m[1 * 4 + 0] == doctest::Approx(-1.0f));
+	CHECK(p.translated_world_to_view.m[2 * 4 + 2] == doctest::Approx(1.0f));
+	CHECK(p.translated_world_to_view.m[3 * 4 + 0] == doctest::Approx(5.0f));
+
+	// The two projections carry DIFFERENT diagonals — reading row 28 for row 32 (or vice
+	// versa) fails here.
+	CHECK(p.view_to_clip.m[0] == doctest::Approx(1.21f));
+	CHECK(p.view_to_clip.m[5] == doctest::Approx(2.15f));
+	CHECK(p.view_to_clip_no_aa.m[0] == doctest::Approx(1.2f));
+	CHECK(p.view_to_clip_no_aa.m[5] == doctest::Approx(2.1f));
+	// NoAA has no off-centre terms; the jittered one does.
+	CHECK(p.view_to_clip.m[2 * 4 + 0] == doctest::Approx(0.01f));
+	CHECK(p.view_to_clip_no_aa.m[2 * 4 + 0] == doctest::Approx(0.0f));
+}
+
+TEST_CASE("world_to_view_rotation_plausible gates the derived rows loudly")
+{
+	// The synthetic buffer's row 8 holds a genuine rotation: plausible.
+	const auto buf = make_view_buffer();
+	ue4::ViewParams p;
+	REQUIRE(ue4::parse_view_params(buf.data(), buf.size(), p));
+	CHECK(ue4::world_to_view_rotation_plausible(p.translated_world_to_view));
+
+	// Identity: plausible.
+	ue4::Matrix4 identity{};
+	identity.m[0] = identity.m[5] = identity.m[10] = identity.m[15] = 1.0f;
+	CHECK(ue4::world_to_view_rotation_plausible(identity));
+
+	// A scaled matrix is NOT a rotation: rows are not unit length.
+	ue4::Matrix4 scaled = identity;
+	scaled.m[0] = 2.0f;
+	CHECK_FALSE(ue4::world_to_view_rotation_plausible(scaled));
+
+	// Non-orthogonal rows (a shear) fail on the dot-product check.
+	ue4::Matrix4 shear = identity;
+	shear.m[1] = 0.2f; // row 0 leans into Y while row 1 is still Y
+	CHECK_FALSE(ue4::world_to_view_rotation_plausible(shear));
+
+	// All-zero (the wrong-row / uninitialised case) fails.
+	ue4::Matrix4 zero{};
+	CHECK_FALSE(ue4::world_to_view_rotation_plausible(zero));
+
+	// A projection matrix at the wrong row fails: its rows are nothing like unit length.
+	CHECK_FALSE(ue4::world_to_view_rotation_plausible(p.view_to_clip));
 }

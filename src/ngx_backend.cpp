@@ -6,7 +6,9 @@
 
 #include <d3d12.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #if !defined(STRAY_DLSS_ENABLE_NGX)
@@ -40,12 +42,23 @@ void set_preset(int) {}
 void release_feature() {}
 const char *last_error() { return "<ngx disabled>"; }
 
+namespace { RRStatus g_rr_status; }
+void set_rr_mode(int) {}
+int rr_mode() { return 0; }
+const RRStatus &rr_status() { return g_rr_status; }
+bool ensure_feature_rr(ID3D12GraphicsCommandList *, const FeatureDesc &) { return false; }
+bool evaluate_rr(ID3D12GraphicsCommandList *, const EvaluateInputsRR &) { return false; }
+void release_feature_rr() {}
+
 } // namespace stray_dlss::ngx
 
 #else
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+// DLSSD (Ray Reconstruction). Vendored at the same SDK tag as the import library
+// (v310.7.0); nvsdk_ngx_params_dlssd.h was fetched from that tag alongside.
+#include <nvsdk_ngx_helpers_dlssd.h>
 
 namespace stray_dlss::ngx {
 namespace {
@@ -83,6 +96,28 @@ NVSDK_NGX_Parameter *g_feature_params = nullptr;
 FeatureDesc g_feature_desc;
 char g_last_error[256] = "";
 
+// --- Ray Reconstruction state ([STRAYDLSS] NgxRR) ---
+int g_rr_mode = 0;
+RRStatus g_rr_status;
+NVSDK_NGX_Handle *g_rr_feature = nullptr;
+NVSDK_NGX_Parameter *g_rr_params = nullptr;
+FeatureDesc g_rr_desc;
+// A description that failed CreateFeature is latched and never retried per-frame: retrying
+// a failing create every frame would hitch the game for nothing and flood the log.
+FeatureDesc g_rr_failed_desc;
+bool g_rr_create_latched = false;
+// The probe's throwaway feature. Its CREATION work was recorded onto the game's command
+// list; releasing it immediately could free memory that recorded-but-unexecuted work still
+// references, so the release is deferred until the keep-alive ring says the GPU is past it.
+NVSDK_NGX_Handle *g_probe_feature = nullptr;
+NVSDK_NGX_Parameter *g_probe_params = nullptr;
+std::uint64_t g_probe_eval_frame = 0;
+// The matrices handed to the DLSSD helper live here because it passes POINTERS
+// (SetVoidPointer): the storage must outlive the EvaluateFeature call, and file statics
+// also cover a DLL that reads them later than the call itself.
+float g_rr_world_to_view[16] = {};
+float g_rr_view_to_clip[16] = {};
+
 // Resources handed to NGX, kept alive until the GPU has certainly finished with them.
 //
 // NGX holds NO references to what we pass it — the manual says so, and it makes us responsible
@@ -96,7 +131,10 @@ char g_last_error[256] = "";
 constexpr std::size_t kKeepAliveFrames = 6;
 struct KeepAlive
 {
-	ID3D12Resource *resources[4] = {};
+	// 8 slots: SR uses four (colour/depth/MV/output); RR adds the four guide textures.
+	// The three G-buffer INPUTS are not here — gbuffer_resolve's own keep-alive ring holds
+	// them across GPU execution with the same 6-frame policy (gbuffer_resolve.cpp).
+	ID3D12Resource *resources[8] = {};
 	std::uint64_t frame = 0;
 };
 std::vector<KeepAlive> g_keep_alive;
@@ -249,6 +287,49 @@ Status initialise(ID3D12Device *device)
 		g_status.feature_init_result,
 		result_name(g_status.feature_init_result));
 
+	// The DLSSD (Ray Reconstruction) capability keys — the SuperSamplingDenoising.*
+	// siblings of the SR keys (nvsdk_ngx_defs_dlssd.h). Same discipline as SR: never
+	// GetFeatureRequirements (Proton does not implement it); Available plus a successful
+	// create are the only trustworthy signals. Queried and logged unconditionally — one
+	// line, and it answers "does this stack even claim RR" without a dedicated run.
+	{
+		int rr_available = 0;
+		g_capability_params->Get(NVSDK_NGX_Parameter_SuperSamplingDenoising_Available,
+			&rr_available);
+		g_rr_status.available = rr_available > 0;
+
+		int rr_needs_driver = 0;
+		g_capability_params->Get(
+			NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &rr_needs_driver);
+		g_rr_status.needs_updated_driver = rr_needs_driver > 0;
+
+		unsigned int rr_major = 0, rr_minor = 0;
+		g_capability_params->Get(
+			NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &rr_major);
+		g_capability_params->Get(
+			NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &rr_minor);
+		g_rr_status.min_driver_major = rr_major;
+		g_rr_status.min_driver_minor = rr_minor;
+
+		unsigned int rr_init = 0;
+		g_capability_params->Get(
+			NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, &rr_init);
+		g_rr_status.feature_init_result = rr_init;
+
+		STRAY_LOG_INFO("DLSS RR (DLSSD) available=%d needs_updated_driver=%d min_driver=%u.%u "
+			"feature_init=0x%08x (%s)  [NgxRR=%d]",
+			g_rr_status.available ? 1 : 0, g_rr_status.needs_updated_driver ? 1 : 0,
+			g_rr_status.min_driver_major, g_rr_status.min_driver_minor,
+			g_rr_status.feature_init_result, result_name(g_rr_status.feature_init_result),
+			g_rr_mode);
+		if (!g_rr_status.available && g_rr_mode != 0)
+			STRAY_LOG_WARN("  RR unavailable per the capability key. On this stack that "
+				"usually means nvngx_dlssd.dll is not staged: the operator must place "
+				"nvngx_dlssd.dll next to the game executable (same place as nvngx_dlss.dll); "
+				"driver >= 535 is also required. Availability here can also be a false "
+				"negative under Proton - the create probe (NgxRR=1) is the real answer.");
+	}
+
 	return g_status;
 }
 
@@ -273,6 +354,302 @@ void release_feature()
 	g_feature_desc = FeatureDesc{};
 }
 
+namespace {
+
+// Releases the probe's throwaway feature once the keep-alive horizon says the GPU has
+// executed the command list its creation work was recorded on. Called from evaluate()'s
+// frame tick and unconditionally from release_feature_rr()/shutdown.
+void release_probe_feature(bool force)
+{
+	if (g_probe_feature == nullptr && g_probe_params == nullptr)
+		return;
+	if (!force && g_eval_frame < g_probe_eval_frame + kKeepAliveFrames)
+		return;
+	if (g_probe_feature != nullptr)
+	{
+		NVSDK_NGX_D3D12_ReleaseFeature(g_probe_feature);
+		g_probe_feature = nullptr;
+		STRAY_LOG_INFO("RR probe feature released (deferred %s).",
+			force ? "to teardown" : "past the keep-alive horizon");
+	}
+	if (g_probe_params != nullptr)
+	{
+		NVSDK_NGX_D3D12_DestroyParameters(g_probe_params);
+		g_probe_params = nullptr;
+	}
+}
+
+// The NgxRR=1 probe: one CREATE_DLSSD_EXT attempt on the same command-list path SR feature
+// creation uses, released once the GPU is past it. Runs once per session, whatever the
+// outcome — the log lines it emits are the whole product of a probe run.
+void maybe_probe_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
+{
+	if (g_rr_mode != 1 || g_rr_status.probed || cmd == nullptr)
+		return;
+	if (desc.render_width == 0 || desc.output_width == 0)
+		return;
+	g_rr_status.probed = true;
+
+	NVSDK_NGX_Result result = NVSDK_NGX_D3D12_AllocateParameters(&g_probe_params);
+	if (NVSDK_NGX_FAILED(result) || g_probe_params == nullptr)
+	{
+		g_rr_status.probe_create_result = static_cast<unsigned int>(result);
+		STRAY_LOG_ERROR("RR PROBE: AllocateParameters failed: 0x%08x (%s)",
+			static_cast<unsigned int>(result),
+			result_name(static_cast<unsigned int>(result)));
+		return;
+	}
+
+	NVSDK_NGX_DLSSD_Create_Params create = {};
+	create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+	create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
+	create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+	create.InWidth = desc.render_width;
+	create.InHeight = desc.render_height;
+	create.InTargetWidth = desc.output_width;
+	create.InTargetHeight = desc.output_height;
+	create.InPerfQualityValue =
+		desc.render_width == desc.output_width && desc.render_height == desc.output_height
+			? NVSDK_NGX_PerfQuality_Value_DLAA
+			: NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	// SR's flags minus AutoExposure: RR does not support auto-exposure and Remix masks the
+	// flag off (RESEARCH-RR-GBUFFER.md §2.1); InPreExposure still applies at evaluate.
+	create.InFeatureCreateFlags =
+		NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+
+	STRAY_LOG_WARN("RR PROBE: attempting NGX_D3D12_CREATE_DLSSD_EXT %ux%u -> %ux%u "
+		"(DLUnified, Unpacked roughness, HW depth, flags=0x%x)...",
+		create.InWidth, create.InHeight, create.InTargetWidth, create.InTargetHeight,
+		static_cast<unsigned>(create.InFeatureCreateFlags));
+
+	result = NGX_D3D12_CREATE_DLSSD_EXT(cmd, 1, 1, &g_probe_feature, g_probe_params, &create);
+	g_rr_status.probe_create_result = static_cast<unsigned int>(result);
+	g_rr_status.probe_create_ok = NVSDK_NGX_SUCCEED(result) && g_probe_feature != nullptr;
+	g_probe_eval_frame = g_eval_frame;
+
+	if (g_rr_status.probe_create_ok)
+	{
+		STRAY_LOG_WARN("RR PROBE: CreateFeature SUCCEEDED (0x%08x %s). DLSSD exists on this "
+			"stack; the feature is a throwaway and will be released shortly. NgxRR=2 is the "
+			"next step.", g_rr_status.probe_create_result,
+			result_name(g_rr_status.probe_create_result));
+	}
+	else
+	{
+		STRAY_LOG_ERROR("RR PROBE: CreateFeature FAILED: 0x%08x (%s)",
+			g_rr_status.probe_create_result,
+			result_name(g_rr_status.probe_create_result));
+		STRAY_LOG_ERROR("  FAIL_FeatureNotFound / FAIL_FeatureNotSupported here usually "
+			"means the loader could not find nvngx_dlssd.dll - the operator must stage "
+			"nvngx_dlssd.dll next to the game executable (beside nvngx_dlss.dll). "
+			"FAIL_OutOfDate means the staged DLL or driver is too old (driver >= 535). "
+			"Grep this log for 'ngx:' lines above for the DLL loader's own account.");
+		if (g_probe_params != nullptr)
+		{
+			NVSDK_NGX_D3D12_DestroyParameters(g_probe_params);
+			g_probe_params = nullptr;
+		}
+	}
+}
+
+} // namespace
+
+void set_rr_mode(int mode)
+{
+	if (mode >= 0 && mode <= 2)
+		g_rr_mode = mode;
+	else
+		STRAY_LOG_WARN("NgxRR %d invalid (0 off, 1 probe, 2 full); keeping %d.", mode, g_rr_mode);
+}
+
+int rr_mode() { return g_rr_mode; }
+const RRStatus &rr_status() { return g_rr_status; }
+
+void release_feature_rr()
+{
+	release_probe_feature(/*force=*/true);
+	if (g_rr_feature != nullptr)
+	{
+		NVSDK_NGX_D3D12_ReleaseFeature(g_rr_feature);
+		g_rr_feature = nullptr;
+	}
+	if (g_rr_params != nullptr)
+	{
+		NVSDK_NGX_D3D12_DestroyParameters(g_rr_params);
+		g_rr_params = nullptr;
+	}
+	g_rr_desc = FeatureDesc{};
+}
+
+bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
+{
+	// Same preconditions and repair as the SR ensure. Availability is deliberately NOT a
+	// gate: the capability key can be a false negative under Proton (the SR precedent),
+	// so a create attempt decides — once, then the latch.
+	ext_unhook::repair();
+	if (!g_status.initialised || cmd == nullptr)
+		return false;
+	if (desc.render_width == 0 || desc.output_width == 0)
+		return false;
+
+	const bool same = g_rr_feature != nullptr &&
+		g_rr_desc.render_width == desc.render_width &&
+		g_rr_desc.render_height == desc.render_height &&
+		g_rr_desc.output_width == desc.output_width &&
+		g_rr_desc.output_height == desc.output_height;
+	if (same)
+		return true;
+
+	const bool same_failed = g_rr_create_latched &&
+		g_rr_failed_desc.render_width == desc.render_width &&
+		g_rr_failed_desc.render_height == desc.render_height &&
+		g_rr_failed_desc.output_width == desc.output_width &&
+		g_rr_failed_desc.output_height == desc.output_height;
+	if (same_failed)
+		return false; // already failed at this size and logged; SR carries the frame
+
+	release_feature_rr();
+
+	NVSDK_NGX_Result result = NVSDK_NGX_D3D12_AllocateParameters(&g_rr_params);
+	if (NVSDK_NGX_FAILED(result) || g_rr_params == nullptr)
+	{
+		set_error("RR AllocateParameters", result);
+		return false;
+	}
+
+	const bool is_dlaa = desc.render_width == desc.output_width &&
+		desc.render_height == desc.output_height;
+
+	NVSDK_NGX_DLSSD_Create_Params create = {};
+	create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+	// Unpacked: gbuffer_resolve emits a standalone R16F roughness (and also packs .w of the
+	// normals texture, so Packed is one enum flip away if the observation run prefers it).
+	create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
+	// HW reversed-Z with DepthInverted, per the staged plan (RESEARCH-RR-GBUFFER.md §4.4
+	// step 7); the UE plugin's linear-depth substitution is the documented fallback if RR
+	// misbehaves on it.
+	create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+	create.InWidth = desc.render_width;
+	create.InHeight = desc.render_height;
+	create.InTargetWidth = desc.output_width;
+	create.InTargetHeight = desc.output_height;
+	create.InPerfQualityValue = is_dlaa
+		? NVSDK_NGX_PerfQuality_Value_DLAA
+		: NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	// SR's flags minus AutoExposure (RR ignores auto-exposure; Remix masks it off —
+	// RESEARCH-RR-GBUFFER.md §2.1). Preset: Default — the RR guide recommends games stick
+	// to Preset_Default (the defs only bless D and E as named alternates), so no
+	// RayReconstruction.Hint.Render.Preset.* key is set.
+	create.InFeatureCreateFlags =
+		NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+
+	result = NGX_D3D12_CREATE_DLSSD_EXT(cmd, 1, 1, &g_rr_feature, g_rr_params, &create);
+	if (NVSDK_NGX_FAILED(result) || g_rr_feature == nullptr)
+	{
+		set_error("RR CreateFeature", result);
+		STRAY_LOG_ERROR("  RR create failed at this size; latched - SR carries every frame "
+			"until the size changes. If the result is FeatureNotFound/NotSupported, stage "
+			"nvngx_dlssd.dll next to the game executable.");
+		release_feature_rr();
+		g_rr_failed_desc = desc;
+		g_rr_create_latched = true;
+		return false;
+	}
+
+	g_rr_desc = desc;
+	g_rr_create_latched = false;
+	g_last_error[0] = 0;
+	STRAY_LOG_INFO("DLSS RR feature created: %ux%u -> %ux%u, %s, preset=Default, flags=0x%x "
+		"(DLUnified, Unpacked roughness, HW depth)",
+		desc.render_width, desc.render_height, desc.output_width, desc.output_height,
+		is_dlaa ? "DLAA" : "MaxQuality",
+		static_cast<unsigned>(create.InFeatureCreateFlags));
+	return true;
+}
+
+bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
+{
+	ext_unhook::repair();
+	if (g_rr_feature == nullptr || g_rr_params == nullptr || cmd == nullptr)
+		return false;
+	if (in.base.color == nullptr || in.base.depth == nullptr ||
+		in.base.motion_vectors == nullptr || in.base.output == nullptr ||
+		in.diffuse_albedo == nullptr || in.specular_albedo == nullptr ||
+		in.normals_roughness == nullptr || in.roughness == nullptr)
+	{
+		std::snprintf(g_last_error, sizeof(g_last_error),
+			"evaluate_rr: a required resource is null");
+		return false;
+	}
+
+	NVSDK_NGX_D3D12_DLSSD_Eval_Params eval = {};
+	eval.pInColor = in.base.color;
+	eval.pInOutput = in.base.output;
+	eval.pInDepth = in.base.depth;
+	eval.pInMotionVectors = in.base.motion_vectors;
+	eval.pInDiffuseAlbedo = in.diffuse_albedo;
+	eval.pInSpecularAlbedo = in.specular_albedo;
+	eval.pInNormals = in.normals_roughness;
+	eval.pInRoughness = in.roughness;
+
+	// Identical semantics to the SR evaluate: jitter straight through, render-res subrect,
+	// pixel-space MVs so scale stays 1 (the helper maps 0 to 1 itself, but explicit is
+	// louder), pre-exposure from View row 135.y.
+	eval.InJitterOffsetX = in.base.jitter_x;
+	eval.InJitterOffsetY = in.base.jitter_y;
+	eval.InRenderSubrectDimensions.Width = in.base.render_width;
+	eval.InRenderSubrectDimensions.Height = in.base.render_height;
+	eval.InReset = in.base.reset ? 1 : 0;
+	eval.InMVScaleX = 1.0f;
+	eval.InMVScaleY = 1.0f;
+	eval.InPreExposure = in.base.pre_exposure;
+	eval.InFrameTimeDeltaInMsec = in.frame_time_delta_ms;
+
+	if (in.have_matrices)
+	{
+		// The helper passes these as void POINTERS; file-static storage outlives the call
+		// (and any later read the DLL might make). Row-major, straight from the View CB.
+		std::memcpy(g_rr_world_to_view, in.world_to_view, sizeof(g_rr_world_to_view));
+		std::memcpy(g_rr_view_to_clip, in.view_to_clip, sizeof(g_rr_view_to_clip));
+		eval.pInWorldToViewMatrix = g_rr_world_to_view;
+		eval.pInViewToClipMatrix = g_rr_view_to_clip;
+	}
+
+	const NVSDK_NGX_Result result =
+		NGX_D3D12_EVALUATE_DLSSD_EXT(cmd, g_rr_feature, g_rr_params, &eval);
+	if (NVSDK_NGX_FAILED(result))
+	{
+		set_error("RR EvaluateFeature", result);
+		return false;
+	}
+
+	// Keep the SR quartet AND the four guides alive past GPU execution; the G-buffer
+	// inputs are held by gbuffer_resolve's own ring.
+	KeepAlive ka;
+	ka.frame = g_eval_frame;
+	ka.resources[0] = in.base.color;
+	ka.resources[1] = in.base.depth;
+	ka.resources[2] = in.base.motion_vectors;
+	ka.resources[3] = in.base.output;
+	ka.resources[4] = in.diffuse_albedo;
+	ka.resources[5] = in.specular_albedo;
+	ka.resources[6] = in.normals_roughness;
+	ka.resources[7] = in.roughness;
+	for (ID3D12Resource *r : ka.resources)
+		if (r != nullptr)
+			r->AddRef();
+	g_keep_alive.push_back(ka);
+
+	++g_eval_frame;
+	release_keep_alive(/*all=*/false);
+	release_probe_feature(/*force=*/false);
+	return true;
+}
+
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 {
 	// CreateFeature builds NGX's cubin descriptor objects; undo ReShade's ext-vtable patch
@@ -282,6 +659,10 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 		return false;
 	if (desc.render_width == 0 || desc.output_width == 0)
 		return false;
+
+	// The NgxRR=1 probe rides the SR ensure path: same command list, same real dimensions,
+	// ext hook just repaired. One attempt per session; SR proceeds regardless.
+	maybe_probe_rr(cmd, desc);
 
 	const bool same = g_feature != nullptr &&
 		g_feature_desc.render_width == desc.render_width &&
@@ -408,13 +789,15 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 
 	++g_eval_frame;
 	release_keep_alive(/*all=*/false);
+	release_probe_feature(/*force=*/false);
 	return true;
 }
 
 void shutdown(ID3D12Device *device)
 {
-	// The feature goes first, before the capability parameters and the shutdown itself. The
+	// The features go first, before the capability parameters and the shutdown itself. The
 	// caller is responsible for the GPU already being idle.
+	release_feature_rr();
 	release_feature();
 	if (g_capability_params != nullptr)
 	{

@@ -1,5 +1,8 @@
 #include "taa_hook.hpp"
 
+#include "gbuffer_finder.hpp"
+#include "gbuffer_resolve.hpp"
+
 #include "frame_state.hpp"
 #include "log.hpp"
 #include "input_dump.hpp"
@@ -38,6 +41,10 @@ bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
 // player sees, so it is opt-in and separate from EnableNGX (which only brings NGX up).
 bool g_ngx_evaluate = false;
+// [STRAYDLSS] NgxRR (taa_hook.hpp). Mode 2 turns the evaluate below RR-first.
+std::atomic<int> g_ngx_rr_mode{ 0 };
+std::atomic<std::uint32_t> g_rr_evaluates{ 0 };
+std::atomic<std::uint32_t> g_rr_fallbacks{ 0 };
 // [STRAYDLSS] NgxDryRun. Suppresses the pinned pass's engine dispatch WITHOUT running DLSS, so
 // nothing writes u0 at all.
 //
@@ -209,7 +216,7 @@ const char *verdict_name(MatchVerdict v)
 	return "?";
 }
 
-const char *tex_format_name(TexFormat f)
+const char *hook_format_name(TexFormat f)
 {
 	switch (f)
 	{
@@ -224,9 +231,159 @@ const char *tex_format_name(TexFormat f)
 	case TexFormat::r32_float:                return "R32_FLOAT";
 	case TexFormat::r16_float:                return "R16_FLOAT";
 	case TexFormat::r8g8b8a8_unorm:           return "R8G8B8A8_UNORM";
+	case TexFormat::b8g8r8a8_unorm:           return "B8G8R8A8_UNORM";
 	case TexFormat::unknown:                  return "other";
 	}
 	return "?";
+}
+
+// The RR-first evaluate ([STRAYDLSS] NgxRR=2). Everything is fetched fresh per frame and
+// every missing precondition returns false so the caller falls back to the SR evaluate —
+// SR is the safety net EVERY frame, never just at startup. Log-once flags keep the paste
+// readable; the rr/fallback counters carry the rates.
+bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *native,
+                     const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
+                     const ue4::ViewParams &view, std::uint64_t eval_no)
+{
+	static bool s_no_ident_logged = false;
+	static bool s_rotation_logged = false;
+	static bool s_resolve_failed_logged = false;
+	static bool s_rr_ok_logged = false;
+	static bool s_rr_fail_logged = false;
+
+	// The identification must be stable AND re-captured per frame: the measured pointer
+	// rotation means yesterday's — even last frame's — pointers are not this frame's.
+	// (gbuffer_finder.hpp)
+	gbuffer_finder::Identification id;
+	if (!gbuffer_finder::current_identification(id, 30))
+	{
+		if (!s_no_ident_logged)
+		{
+			s_no_ident_logged = true;
+			STRAY_LOG_INFO("RR: no stable G-buffer identification yet (GBufferFinder); SR "
+				"carries the frames until one holds 30 frames. This line logs once.");
+		}
+		return false;
+	}
+
+	// Liveness BEFORE any dereference, per the §5 discipline — the pool can have destroyed
+	// a G-buffer between its bind and this dispatch (save-load transitions measured doing
+	// exactly this to depth/velocity).
+	if (!is_resource_live(id.gbuffer_a) || !is_resource_live(id.gbuffer_b) ||
+		!is_resource_live(id.gbuffer_c))
+		return false;
+
+	// The DERIVED View rows 8-10 must actually hold a rotation before anything trusts
+	// them (gbuffer_resolve.hpp). A wrong matrix biases specular albedo silently — the
+	// §0.2 class of failure — so implausible rows mean SR, loudly, once.
+	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
+	{
+		if (!s_rotation_logged)
+		{
+			s_rotation_logged = true;
+			const float *m = view.translated_world_to_view.m;
+			STRAY_LOG_ERROR("RR: View rows 8-10 (TranslatedWorldToView, DERIVED layout) do "
+				"not hold a rotation - SR carries the frames while this holds. Rows:");
+			STRAY_LOG_ERROR("  [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] "
+				"[%.4f %.4f %.4f %.4f]",
+				m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+			STRAY_LOG_ERROR("  If these look like another row's data, the derived row-8 "
+				"claim is wrong and needs re-deriving before RR can work.");
+		}
+		return false;
+	}
+
+	auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
+	if (!gbr::initialise(native_device, ei.render_width, ei.render_height))
+		return false;
+
+	gbr::ResolveInputs gi;
+	gi.gbuffer_a = id.gbuffer_a;
+	gi.gbuffer_b = id.gbuffer_b;
+	gi.gbuffer_c = id.gbuffer_c;
+	gi.render_width = ei.render_width;
+	gi.render_height = ei.render_height;
+	gi.view_rect_min[0] = view.view_rect_min.x;
+	gi.view_rect_min[1] = view.view_rect_min.y;
+	// ViewToClipNoAA diagonal (row 32, measured): the jitter-free projection terms the
+	// NoV ray math needs. Row-major m[r*4+c].
+	gi.proj00 = view.view_to_clip_no_aa.m[0];
+	gi.proj11 = view.view_to_clip_no_aa.m[5];
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			gi.world_to_view[r][c] = view.translated_world_to_view.m[r * 4 + c];
+
+	if (!gbr::record(native, gi, /*dispatch_mode=*/2))
+	{
+		if (!s_resolve_failed_logged)
+		{
+			s_resolve_failed_logged = true;
+			STRAY_LOG_ERROR("RR: gbuffer_resolve record failed (%s); SR carries the frames. "
+				"This line logs once.", gbr::last_error());
+		}
+		return false;
+	}
+
+	// Guides were just written as UAVs; NGX reads them as shader resources.
+	gbr::transition_outputs(native, /*to_shader_resource=*/true);
+
+	bool ok = false;
+	if (ngx::ensure_feature_rr(native, fd))
+	{
+		ngx::EvaluateInputsRR er;
+		er.base = ei;
+		er.diffuse_albedo = gbr::diffuse_albedo();
+		er.specular_albedo = gbr::specular_albedo();
+		er.normals_roughness = gbr::normals_roughness();
+		er.roughness = gbr::roughness();
+		// WorldToView = rows 8-11 (derived, rotation-checked above); ViewToClip =
+		// ViewToClipNoAA rows 32-35 (measured) — jitter reaches NGX separately, so the
+		// unjittered projection is the consistent pairing. Both row-major, as stored.
+		std::memcpy(er.world_to_view, view.translated_world_to_view.m,
+			sizeof(er.world_to_view));
+		std::memcpy(er.view_to_clip, view.view_to_clip_no_aa.m, sizeof(er.view_to_clip));
+		er.have_matrices = true;
+		er.frame_time_delta_ms = view.delta_time * 1000.0f;
+
+		ok = ngx::evaluate_rr(native, er);
+
+		if (ok && input_dump::wants(eval_no))
+		{
+			// The guide-dump channel: the same readback path as the colour/depth dumps,
+			// for the offline B/C-order and encoding eyeball check. All four are in
+			// NON_PIXEL_SHADER_RESOURCE here (transitioned above).
+			auto *dev = reinterpret_cast<ID3D12Device *>(device->get_native());
+			input_dump::capture(dev, native, er.normals_roughness,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_normals", eval_no);
+			input_dump::capture(dev, native, er.roughness,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_roughness", eval_no);
+			input_dump::capture(dev, native, er.diffuse_albedo,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_diffuse", eval_no);
+			input_dump::capture(dev, native, er.specular_albedo,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_specular", eval_no);
+		}
+
+		if (ok && !s_rr_ok_logged)
+		{
+			s_rr_ok_logged = true;
+			STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u with guides "
+				"(A=%p B=%p C=%p swapBC=%d). SR remains the per-frame fallback.",
+				ei.render_width, ei.render_height, fd.output_width, fd.output_height,
+				reinterpret_cast<void *>(id.gbuffer_a),
+				reinterpret_cast<void *>(id.gbuffer_b),
+				reinterpret_cast<void *>(id.gbuffer_c), gbr::bc_swapped() ? 1 : 0);
+		}
+		if (!ok && !s_rr_fail_logged)
+		{
+			s_rr_fail_logged = true;
+			STRAY_LOG_ERROR("DLSS RR evaluate FAILED (%s); SR carries the frames. This "
+				"line logs once.", ngx::last_error());
+		}
+	}
+
+	// Back to UAV for the next frame's resolve, evaluate or not.
+	gbr::transition_outputs(native, /*to_shader_resource=*/false);
+	return ok;
 }
 
 // Reads the View constant buffer at the moment of the dispatch. It must be read here, at
@@ -280,10 +437,10 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 
 	for (const auto &t : b.srvs)
 		STRAY_LOG_INFO("  t%-2u res=0x%016llx %-26s %ux%u", t.slot,
-			static_cast<unsigned long long>(t.resource), tex_format_name(t.format), t.width, t.height);
+			static_cast<unsigned long long>(t.resource), hook_format_name(t.format), t.width, t.height);
 	for (const auto &t : b.uavs)
 		STRAY_LOG_INFO("  u%-2u res=0x%016llx %-26s %ux%u", t.slot,
-			static_cast<unsigned long long>(t.resource), tex_format_name(t.format), t.width, t.height);
+			static_cast<unsigned long long>(t.resource), hook_format_name(t.format), t.width, t.height);
 
 	if (m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only)
 		STRAY_LOG_INFO("  resolved: depth=t%u stencil=t%u velocity=t%u colour=t%u,t%u out=u%u ds=%d",
@@ -335,6 +492,12 @@ bool owns_temporal_history(std::uint64_t hash)
 const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
+void set_ngx_rr(int mode) { g_ngx_rr_mode.store(mode, std::memory_order_relaxed); }
+void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
+{
+	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
+	sr_fallbacks = g_rr_fallbacks.load(std::memory_order_relaxed);
+}
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count)
 {
@@ -1126,7 +1289,22 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							}
 							else
 							{
-								ok = ngx::evaluate(native, ei);
+								// RR-first when [STRAYDLSS] NgxRR=2; SR is the safety net
+								// for ANY missing precondition, every frame.
+								ok = false;
+								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)
+								{
+									ok = try_evaluate_rr(device, native, ei, fd, view,
+										eval_no);
+									if (ok)
+										g_rr_evaluates.fetch_add(1,
+											std::memory_order_relaxed);
+									else
+										g_rr_fallbacks.fetch_add(1,
+											std::memory_order_relaxed);
+								}
+								if (!ok)
+									ok = ngx::evaluate(native, ei);
 							}
 							if (ok)
 							{

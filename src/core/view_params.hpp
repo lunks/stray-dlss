@@ -29,6 +29,16 @@ struct Matrix4
 struct ViewParams
 {
 	Matrix4 clip_to_prev_clip{};
+	// TranslatedWorldToView (rows 8-11) — DERIVED layout, not a measured anchor
+	// (ue4_view.hpp). The RR path needs its upper 3x3 (a rotation) for NoV and passes the
+	// whole matrix as DLSSD's WorldToView; both consumers gate on
+	// world_to_view_rotation_plausible first.
+	Matrix4 translated_world_to_view{};
+	// ViewToClip (rows 28-31) and ViewToClipNoAA (rows 32-35) — row 28/32 are measured
+	// anchors (CLAUDE.md §2.6). NoAA is the jitter-free projection: jitter reaches NGX
+	// separately as JitterOffset, so the unjittered matrix is the consistent one to pass.
+	Matrix4 view_to_clip{};
+	Matrix4 view_to_clip_no_aa{};
 	Float4 temporal_aa_jitter{};  // (CurX, CurY, PrevX, PrevY) in clip/NDC units
 	Float4 view_rect_min{};
 	Float4 view_size_and_inv_size{};
@@ -56,5 +66,13 @@ Float2 ngx_jitter_offset(const ViewParams &p);
 // UE4's bCameraCut is `!InputHistory.IsValid() || View.bCameraCut`, and the history-invalid
 // half never reaches the View buffer — hence the third argument. (CLAUDE.md §2.8)
 bool is_camera_cut(const ViewParams &p, bool history_or_velocity_is_1x1);
+
+// Whether translated_world_to_view's upper 3x3 looks like the rigid rotation it must be:
+// rows unit-length, mutually orthogonal. This is the loud-failure gate on the DERIVED row-8
+// layout claim (ue4_view.hpp): if the rows hold anything else — the wrong rows, a scaled
+// matrix, garbage — this returns false and the RR path must fall back rather than feed NGX
+// a silently wrong NoV. Tolerance is loose (1e-2) because the buffer carries float32 of a
+// double-precision engine transform.
+bool world_to_view_rotation_plausible(const Matrix4 &translated_world_to_view);
 
 } // namespace stray_dlss::ue4

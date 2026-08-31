@@ -41,6 +41,20 @@ bool parse_view_params(const void *data, std::size_t size, ViewParams &out)
 		out.clip_to_prev_clip.m[r * 4 + 3] = row.w;
 	}
 
+	const auto read_matrix = [&](std::uint32_t base_row, Matrix4 &m) {
+		for (std::uint32_t r = 0; r < 4; ++r)
+		{
+			const Float4 row = read_float4(data, base_row + r);
+			m.m[r * 4 + 0] = row.x;
+			m.m[r * 4 + 1] = row.y;
+			m.m[r * 4 + 2] = row.z;
+			m.m[r * 4 + 3] = row.w;
+		}
+	};
+	read_matrix(ViewRow::kTranslatedWorldToView, out.translated_world_to_view);
+	read_matrix(ViewRow::kViewToClip, out.view_to_clip);
+	read_matrix(ViewRow::kViewToClipNoAA, out.view_to_clip_no_aa);
+
 	out.temporal_aa_jitter = read_float4(data, ViewRow::kTemporalAAJitter);
 	out.view_rect_min = read_float4(data, ViewRow::kViewRectMin);
 	out.view_size_and_inv_size = read_float4(data, ViewRow::kViewSizeAndInvSize);
@@ -85,6 +99,28 @@ bool view_params_plausible(const ViewParams &p)
 Float2 ngx_jitter_offset(const ViewParams &p)
 {
 	return Float2{ p.temporal_aa_params.z, p.temporal_aa_params.w };
+}
+
+bool world_to_view_rotation_plausible(const Matrix4 &m)
+{
+	// Upper 3x3, row-major (m[r*4+c]): each row unit length, rows mutually orthogonal.
+	constexpr float kTol = 1e-2f;
+	for (int r = 0; r < 3; ++r)
+	{
+		const float len2 = m.m[r * 4 + 0] * m.m[r * 4 + 0] +
+			m.m[r * 4 + 1] * m.m[r * 4 + 1] + m.m[r * 4 + 2] * m.m[r * 4 + 2];
+		if (std::fabs(len2 - 1.0f) > kTol)
+			return false;
+	}
+	for (int a = 0; a < 3; ++a)
+		for (int b = a + 1; b < 3; ++b)
+		{
+			const float dot = m.m[a * 4 + 0] * m.m[b * 4 + 0] +
+				m.m[a * 4 + 1] * m.m[b * 4 + 1] + m.m[a * 4 + 2] * m.m[b * 4 + 2];
+			if (std::fabs(dot) > kTol)
+				return false;
+		}
+	return true;
 }
 
 bool is_camera_cut(const ViewParams &p, bool history_or_velocity_is_1x1)

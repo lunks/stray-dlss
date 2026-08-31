@@ -13,6 +13,7 @@
 #include "ext_unhook.hpp"
 #include "frame_state.hpp"
 #include "gbuffer_finder.hpp"
+#include "gbuffer_resolve.hpp"
 #include "input_dump.hpp"
 #include "pass_finder.hpp"
 #include "shader_dump.hpp"
@@ -243,6 +244,32 @@ void on_init_device(reshade::api::device *device)
 	bool ngx_evaluate = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
+	// stack (one CreateFeature attempt, released; SR keeps running), 2 = full RR-first
+	// evaluate with per-frame SR fallback. Both non-zero modes still require EnableNGX=1
+	// and NgxEvaluate=1 — the probe rides the SR feature-creation path and mode 2 rides
+	// the SR evaluate site.
+	int ngx_rr = 0;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxRR", ngx_rr);
+	ngx::set_rr_mode(ngx_rr);
+	taa_hook::set_ngx_rr(ngx_rr);
+	if (ngx_rr == 1)
+		STRAY_LOG_WARN("NgxRR=1 (PROBE): one DLSSD create attempt will run at the first SR "
+			"feature creation and log every result code by name. Needs EnableNGX=1 and "
+			"NgxEvaluate=1; nvngx_dlssd.dll must be staged next to the game executable.");
+	else if (ngx_rr == 2)
+		STRAY_LOG_WARN("NgxRR=2 (FULL): Ray Reconstruction replaces the SR evaluate when "
+			"the G-buffer identification is stable; SR is the per-frame fallback. Grep for "
+			"'DLSS RR' and 'RR:' lines.");
+
+	// [STRAYDLSS] GBufferSwapBC: the B/C content-check flip (gbuffer_resolve.hpp). The B/C
+	// slot order is unverified by content until the guide dump says otherwise; this flips
+	// which identified resource feeds which role, no rebuild.
+	bool swap_bc = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferSwapBC", swap_bc);
+	if (swap_bc || ngx_rr == 2)
+		gbr::set_bc_swapped(swap_bc); // logs its state; skipped when RR is off and unswapped
 
 	int ngx_dry_run = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
@@ -785,6 +812,12 @@ void on_present(
 		taa_hook::resolve_counters(attempts, skipped);
 		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,
 			skipped, attempts ? (100.0 * skipped / attempts) : 0.0);
+
+		std::uint32_t rr_ok = 0, rr_fallback = 0;
+		taa_hook::rr_counters(rr_ok, rr_fallback);
+		if (rr_ok + rr_fallback > 0)
+			STRAY_LOG_INFO("[%s] RR evaluates=%u SR fallbacks=%u (%.1f%% RR)", when, rr_ok,
+				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
 	}
 
 	// Report the add-on-level capability verdict once, after enough frames that the game has
@@ -1045,6 +1078,19 @@ void register_events()
 	// cross-check's shader hash.
 	bool gbuffer_finder_enabled = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferFinder", gbuffer_finder_enabled);
+	{
+		// NgxRR=2 consumes the finder's identification (taa_hook::try_evaluate_rr), so the
+		// finder must observe even when GBufferFinder was not set explicitly. Read here as
+		// well as in on_init_device because event registration happens first.
+		int ngx_rr_for_finder = 0;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxRR", ngx_rr_for_finder);
+		if (ngx_rr_for_finder == 2 && !gbuffer_finder_enabled)
+		{
+			gbuffer_finder_enabled = true;
+			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2 needs the G-buffer "
+				"identification it produces.");
+		}
+	}
 	gbuffer_finder::set_enabled(gbuffer_finder_enabled);
 
 	g_pipeline_events_registered = hash_shaders || shader_dump::enabled() ||

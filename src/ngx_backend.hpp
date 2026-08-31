@@ -85,4 +85,66 @@ void release_feature();
 // The most recent failure, for reporting without another round trip.
 const char *last_error();
 
+// --- Ray Reconstruction (DLSSD, NVSDK_NGX_Feature_RayReconstruction = 13) ---
+//
+// Staged behind [STRAYDLSS] NgxRR (0 = off, SR unchanged; 1 = PROBE; 2 = FULL). The probe
+// answers "does DLSSD exist under vkd3d on this stack" in one run: it reads the
+// SuperSamplingDenoising.* capability keys (nvsdk_ngx_defs_dlssd.h — the DLSSD siblings
+// of the SR availability keys; NOT GetFeatureRequirements, which Proton does not
+// implement) and attempts one NGX_D3D12_CREATE_DLSSD_EXT on the same command-list path SR
+// feature creation uses, releasing the throwaway feature once the GPU has certainly
+// executed its creation work. SR keeps running throughout.
+
+struct RRStatus
+{
+	bool available = false;             // SuperSamplingDenoising.Available
+	bool needs_updated_driver = false;
+	unsigned int min_driver_major = 0;
+	unsigned int min_driver_minor = 0;
+	unsigned int feature_init_result = 0; // SuperSamplingDenoising.FeatureInitResult
+	bool probed = false;                // the create probe has run (either way)
+	bool probe_create_ok = false;
+	unsigned int probe_create_result = 0;
+};
+
+void set_rr_mode(int mode); // 0 off, 1 probe, 2 full — set once at init, like set_preset
+int rr_mode();
+const RRStatus &rr_status();
+
+// Creates (or size-recreates) the RR feature. Same contract as ensure_feature, plus a
+// failure latch: a description that failed to create is not retried every frame — the
+// caller falls back to SR and the log says so once.
+bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
+
+struct EvaluateInputsRR
+{
+	// The SR input set, identical semantics (colour/depth/MV/output, jitter straight from
+	// TemporalAAParams.zw, render rect, reset, pre-exposure).
+	EvaluateInputs base;
+
+	// The four RR guides, from gbuffer_resolve's outputs (formats documented there):
+	ID3D12Resource *diffuse_albedo = nullptr;    // RGBA8_UNORM, linear
+	ID3D12Resource *specular_albedo = nullptr;   // RGBA8_UNORM, linear
+	ID3D12Resource *normals_roughness = nullptr; // RGBA16F, xyz signed world normal
+	ID3D12Resource *roughness = nullptr;         // R16F (Roughness_Mode_Unpacked reads this)
+
+	// Row-major matrices for the DLSSD helper's void-pointer parameters. WorldToView is
+	// View.TranslatedWorldToView (rows 8-11 — DERIVED layout, caller must have passed
+	// world_to_view_rotation_plausible); ViewToClip is ViewToClipNoAA (row 32, measured —
+	// jitter reaches NGX separately, so the unjittered projection is the consistent one).
+	// Optional: the official UE plugin ships NEITHER matrix, so absence only degrades
+	// reflection reprojection, never the evaluate.
+	float world_to_view[16] = {};
+	float view_to_clip[16] = {};
+	bool have_matrices = false;
+
+	// View.DeltaTime in milliseconds, when known; the header says it helps the DLL scale
+	// denoising with object speed. 0 = not provided.
+	float frame_time_delta_ms = 0.0f;
+};
+
+bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in);
+
+void release_feature_rr();
+
 } // namespace stray_dlss::ngx

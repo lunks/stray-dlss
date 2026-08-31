@@ -124,6 +124,12 @@ bool g_first_candidate_logged = false;
 // which phase 3's capture design needs to know.
 std::uint64_t g_pointer_rotation_frames = 0; // stable-shape frames where any pointer changed
 GBufferClassification g_current;
+// The freshest accepted candidate, updated at BIND time (g_current only updates at
+// present): the base pass binds early in the frame and the TAA hook consumes late in the
+// SAME frame, so this table's pointers are one bind old, not one frame old — the smallest
+// staleness window the recorder can offer. current_identification() serves from here.
+GBufferClassification g_latest;
+bool g_have_latest = false;
 bool g_have_current = false;
 std::uint64_t g_consecutive = 0;
 bool g_reported_current = false;
@@ -374,6 +380,8 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 		}
 		else
 		{
+			g_latest = cls; // freshest pointers for current_identification()
+			g_have_latest = true;
 			ListRecord &lr = g_lists[cmd_list];
 			lr.pending = std::move(cls);
 			lr.has_pending = true;
@@ -438,6 +446,38 @@ void forget_command_list(reshade::api::command_list *cmd_list)
 		flush_pending_locked(it->second);
 		g_lists.erase(it);
 	}
+}
+
+bool current_identification(Identification &out, std::uint64_t min_consecutive)
+{
+	if (!g_enabled)
+		return false;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (!g_have_current || !g_have_latest || g_consecutive < min_consecutive)
+		return false;
+	// The stability claim belongs to the SHAPE tracked at present time; the pointers come
+	// from the freshest bind. A shape change between them invalidates the pairing.
+	if (!same_shape(g_latest, g_current))
+		return false;
+
+	Identification id;
+	for (const auto &t : g_latest.targets)
+	{
+		switch (t.role)
+		{
+		case GBufferRole::gbuffer_a: id.gbuffer_a = t.tex.resource; break;
+		case GBufferRole::gbuffer_b: id.gbuffer_b = t.tex.resource; break;
+		case GBufferRole::gbuffer_c: id.gbuffer_c = t.tex.resource; break;
+		default: break;
+		}
+	}
+	if (id.gbuffer_a == 0 || id.gbuffer_b == 0 || id.gbuffer_c == 0)
+		return false; // a role went unknown (licensee format) - refuse, never guess
+	id.extent_width = g_latest.extent_width;
+	id.extent_height = g_latest.extent_height;
+	id.consecutive_frames = g_consecutive;
+	out = id;
+	return true;
 }
 
 void on_present(std::uint64_t frame)

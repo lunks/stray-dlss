@@ -53,6 +53,13 @@ void dump_summary();
 // [STRAYDLSS] NgxEvaluate. Separate from EnableNGX, which only brings NGX up: this is the
 // first switch that changes what the player sees, so it is opt-in on its own.
 void set_ngx_evaluate(bool enabled);
+// [STRAYDLSS] NgxRR: 0 off (SR unchanged), 1 probe (ngx_backend runs it), 2 full — the
+// RR-first evaluate with per-frame SR fallback. Mirrors ngx::set_rr_mode; the hook keeps
+// its own copy so the dispatch path never calls into ngx for a flag.
+void set_ngx_rr(int mode);
+// How often the RR path actually evaluated versus fell back to SR — the one number that
+// says whether RR is carrying frames. Reported periodically by the add-on.
+void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks);
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the
 // visible image at all. An identical-looking DLSS frame is otherwise ambiguous.
