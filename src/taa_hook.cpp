@@ -42,6 +42,16 @@ bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE f
                                      // sharing one meant the skip warning consumed the budget
                                      // and the successful evaluate never reported at all
 bool g_ngx_dims_logged = false;
+// Traces the first few evaluate cycles step by step. The crash follows a SUCCESSFUL evaluate
+// within about a second, the UE4 dump carries an empty callstack, and the add-on's last line is
+// simply whatever it logged before dying — so the only way to localise it is to say what we are
+// about to do, every time, until we have seen it survive.
+std::atomic<int> g_ngx_trace_budget{ 24 };
+#define NGX_TRACE(fmt, ...) \
+	do { \
+		if (g_ngx_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) \
+			STRAY_LOG_INFO("  ngx-trace: " fmt, ##__VA_ARGS__); \
+	} while (0)
 // [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
 // machine without a rebuild, which is a slow round trip.
 bool g_mv_resolve_enabled = true;
@@ -638,6 +648,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							// Our resolve just wrote the motion vectors as a UAV; NGX reads
 							// them as a shader resource. Without this the state is simply
 							// wrong, and vkd3d validates none of it. (CLAUDE.md §3)
+							NGX_TRACE("barrier mv -> SRV");
 							mv::transition_output(native, /*to_shader_resource=*/true);
 
 							ngx::EvaluateInputs ei;
@@ -655,10 +666,16 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
 
+							NGX_TRACE("evaluate colour=%p depth=%p mv=%p out=%p",
+								static_cast<void *>(ei.color), static_cast<void *>(ei.depth),
+								static_cast<void *>(ei.motion_vectors),
+								static_cast<void *>(ei.output));
 							const bool ok = ngx::evaluate(native, ei);
+							NGX_TRACE("evaluate returned %d", ok ? 1 : 0);
 
 							// Back to UAV for next frame's resolve.
 							mv::transition_output(native, /*to_shader_resource=*/false);
+							NGX_TRACE("barrier mv -> UAV done");
 							if (!g_ngx_logged_once)
 							{
 								g_ngx_logged_once = true;
@@ -702,7 +719,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// natively. Both faults were silent, and together they are the corruption.
 					if (g_restore_state)
 					{
+						NGX_TRACE("restore begin");
 						restore_game_compute_state(cmd_list);
+						NGX_TRACE("restore done");
 						mark(6, "state-restored");
 					}
 				}
