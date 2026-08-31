@@ -84,6 +84,29 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### How to test a temporal pass honestly (the method, after three false starts)
+
+Three things each defeated an earlier attempt, and all three must be handled together:
+
+1. **A stationary camera hides everything.** With nothing moving, TAA's history is converged and
+   suppressing the pass looks identical to leaving it in. `tools/screenshot-stray.sh` now pans
+   the right stick (`ABS_RX` on "Microsoft X-Box 360 pad 0") before capturing; `PAN=0` restores
+   the old behaviour.
+2. **A moving camera makes runs incomparable**, because the scene changes too. So compare
+   *within* one session: `DryRunAlternate=<frames>` flips the named pass between suppressed and
+   normal, logging `ALT PHASE SUPPRESSING/normal at frame N` so a screenshot's timestamp
+   identifies its state.
+3. **Mean RGB and cyan counts are the wrong metrics** for this. Use high-frequency energy —
+   `magick shot.png -colorspace gray -morphology Convolve Laplacian:0 -format
+   "%[fx:standard_deviation]"` — since aliasing raises it and temporal accumulation lowers it.
+
+**First measurement with all three in place, and it is INCONCLUSIVE.** Suppressing
+`0x8978e4e6431cacb3`, HF energy ×10⁵: suppressed `9044, 10490, 11252, 12567, 10722` (mean 10815)
+versus normal `12087, 21619, 12939` (mean 15548). The suppressed frames score *lower*, which is
+backwards for removing an anti-aliasing pass — but one normal sample (21619) dominates its group
+and the within-group spread is wider than the difference. **n = 5 and 3 is not enough. Take 20+
+per phase before drawing any conclusion.**
+
 ### A STATIC SCENE INVALIDATES EVERY TEMPORAL TEST — read this before trusting the two below
 
 The launch script drives the cat to gameplay and then stops, so every screenshot taken this
