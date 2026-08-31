@@ -68,6 +68,15 @@ struct Gpu
 	ComPtr<ID3D12Fence> fence;
 	ComPtr<ID3D12InfoQueue> info;
 	UINT64 fence_value = 0;
+
+	// The command list our resolve pass is given.
+	//
+	// In the game, taa_hook always hands mv::record the NATIVE list (cmd_list->get_native()),
+	// and the pass binds the unwrapped descriptor heap to match. Heap and command list must be
+	// in the SAME space: give a native list ReShade's wrapper, or a proxy list the original,
+	// and recording fails — Close() returns E_INVALIDARG. So under ReShade the harness unwraps
+	// its list too, or it would be testing a combination production never produces.
+	ComPtr<ID3D12GraphicsCommandList> resolve_list;
 };
 
 // Which adapter to run against. WARP is the CI default: deterministic, GPU-less, and it comes
@@ -307,7 +316,7 @@ bool test_dispatch_is_valid(Gpu &gpu)
 	in.render_height = kH;
 	in.view = &view;
 
-	check(stray_dlss::mv::record(gpu.list.Get(), in, 2), "record() issued the dispatch");
+	check(stray_dlss::mv::record(gpu.resolve_list.Get(), in, 2), "record() issued the dispatch");
 	if (!flush(gpu))
 		return false;
 
@@ -356,7 +365,7 @@ bool test_no_allocation_churn(Gpu &gpu)
 		in.render_height = h;
 		in.view = &view;
 
-		stray_dlss::mv::record(gpu.list.Get(), in, 1);
+		stray_dlss::mv::record(gpu.resolve_list.Get(), in, 1);
 
 		if ((i % 20) == 19 && !flush(gpu))
 			return false;
@@ -582,7 +591,7 @@ bool test_restore_preserves_game_state(Gpu &gpu)
 	in.render_width = 1920;
 	in.render_height = 1080;
 	in.view = &view;
-	stray_dlss::mv::record(gpu.list.Get(), in, 2);
+	stray_dlss::mv::record(gpu.resolve_list.Get(), in, 2);
 
 	// The restore, exactly as the add-on performs it: heaps first (the ReShade half, done here
 	// natively because the harness has no ReShade), then the native replay under test.
@@ -892,6 +901,24 @@ int main(int argc, char **argv)
 		std::printf("could not create a WARP device\n");
 		return 1;
 	}
+	// Match production: the resolve pass is always given the native list.
+	// {7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42} is ReShade's "give me the original object" IID;
+	// without ReShade it simply fails and the list is already the original.
+	{
+		constexpr GUID kUnwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
+			{ 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+		if (FAILED(gpu.list->QueryInterface(kUnwrapped,
+				reinterpret_cast<void **>(gpu.resolve_list.GetAddressOf()))) ||
+			gpu.resolve_list == nullptr)
+		{
+			gpu.resolve_list = gpu.list;
+		}
+		else
+		{
+			std::printf("unwrapped the command list for the resolve pass, as the game does\n");
+		}
+	}
+
 	std::printf("device up, info queue %s\n", gpu.info ? "active" : "UNAVAILABLE");
 
 	test_validation_catches_wrong_root_parameter_type(gpu);
