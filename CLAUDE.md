@@ -84,6 +84,39 @@ makes ordinary D3D12 descriptors — so `ID3D12Resource` being a `VkImage` under
 * Detect vkd3d for free: `QueryInterface(IID_ID3D12GraphicsCommandListExt,
   77a86b09-2bea-4801-b89a-37648e104af1)` on the native command list. ReShade uses this itself.
 
+### 0xd2e4d8c23c362ed1 is NOT the TAA — a pass can drive the image without being it
+
+Suppressing `0xd2e4d8c23c362ed1` freezes the picture, which is why it looked like the answer.
+Its full UAV set says otherwise:
+
+```
+u0  RGBA16_FLOAT (colour)     2560x1440
+u2  R11G11B10_FLOAT (colour)  2560x1440
+u3  R32_FLOAT_X8X24 (depth)   2560x1440     <- writes DEPTH
+u5  X32_G8X24_UINT (stencil)  2560x1440     <- writes STENCIL
+u1, u4, u6  1x1 dummies
+```
+
+`FTAAStandaloneCS` writes colour — one target, plus optionally a half-res copy. **It does not
+write depth or stencil.** This pass emits two colour buffers, depth and stencil: a composite or
+resolve pass, quite possibly Stray-specific.
+
+Replacing it with DLSS therefore breaks the frame: we write only `u0`, so depth and stencil are
+never written and everything downstream composites against stale depth. Observed exactly that —
+"frozen like we dropped TAA, and the cat sideways".
+
+**Two lessons, both expensive:**
+
+1. **"Suppressing it freezes the image" proves a pass is ON THE DISPLAY CHAIN, not that it is the
+   TAA.** Motion blur would freeze it identically (`FMotionBlurFilterCS` is a full-res HDR compute
+   pass that runs *after* TAA — `PostProcessMotionBlur.cpp:366`), and so does any composite pass.
+   The suppression test is necessary, never sufficient.
+2. **Before replacing a pass, check EVERYTHING it writes.** A pass with more outputs than we
+   reproduce cannot be replaced at all, however well it matches on inputs. §2.3's signature only
+   examines SRVs and one output UAV; that is not enough to license suppression.
+
+The history round-trip does not rescue it either: this pass exhibits one, as do ~8 others.
+
 ### The candidate set DOES contain a pass that drives the image (measured 2026-08-31)
 
 Suppressing **every** relaxed candidate (`NgxDryRun=3`: any dispatch with a depth SRV, a
