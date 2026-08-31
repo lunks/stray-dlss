@@ -48,7 +48,8 @@ add_library(stray_dlss_core STATIC
     src/core/view_params.cpp
     src/core/view_params.hpp
     src/core/taa_signature.cpp
-    src/core/taa_signature.hpp)
+    src/core/taa_signature.hpp
+    src/core/ring.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -209,7 +210,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_core.cpp
         tests/test_view_params.cpp
-        tests/test_taa_signature.cpp)
+        tests/test_taa_signature.cpp
+        tests/test_ring.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

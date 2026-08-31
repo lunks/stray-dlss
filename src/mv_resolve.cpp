@@ -1,5 +1,6 @@
 #include "mv_resolve.hpp"
 
+#include "core/ring.hpp"
 #include "core/view_params.hpp"
 #include "log.hpp"
 
@@ -26,15 +27,11 @@ struct Params
 };
 static_assert(sizeof(Params) % 16 == 0, "constant buffer must be 16-byte aligned");
 
-// Descriptor table layout: t0 depth, t1 velocity, u0 output.
-constexpr UINT kDescriptorsPerFrame = 3;
-
-// Everything the CPU writes per frame is versioned this many times, because dispatches recorded
-// one or two frames ago may still be executing and reading it. The constant buffer always was;
-// the DESCRIPTORS were not, which meant rewriting slots the GPU was concurrently consuming.
-constexpr UINT kFrameCount = 3;
-
-constexpr UINT kDescriptorCount = kDescriptorsPerFrame * kFrameCount;
+// The versioning arithmetic lives in core/ring.hpp so it can be unit-tested; getting a slot
+// offset wrong corrupts silently rather than failing.
+constexpr UINT kDescriptorsPerFrame = ring::kDescriptorsPerFrame;
+constexpr UINT kFrameCount = ring::kFrameCount;
+constexpr UINT kDescriptorCount = ring::kDescriptorCount;
 
 struct State
 {
@@ -48,7 +45,7 @@ struct State
 
 	UINT descriptor_size = 0;
 	UINT constant_stride = 0;
-	UINT frame = 0;
+	std::uint64_t frame = 0;
 
 	std::uint32_t width = 0;
 	std::uint32_t height = 0;
@@ -67,7 +64,7 @@ struct State
 		ID3D12DescriptorHeap *heap = nullptr;
 		ID3D12Resource *constants = nullptr;
 		ID3D12Resource *out_mv = nullptr;
-		UINT retire_frame = 0;
+		std::uint64_t retire_frame = 0;
 	};
 	std::vector<Retired> retired;
 
@@ -183,7 +180,7 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 		g_state.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
 	// Constant buffer offsets must be 256-byte aligned.
-	g_state.constant_stride = (sizeof(Params) + 255) & ~255u;
+	g_state.constant_stride = ring::aligned_constant_stride(sizeof(Params));
 
 	D3D12_HEAP_PROPERTIES upload = {};
 	upload.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -241,7 +238,7 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 	for (UINT f = 0; f < kFrameCount; ++f)
 	{
 		D3D12_CPU_DESCRIPTOR_HANDLE uav = base;
-		uav.ptr += static_cast<SIZE_T>(f * kDescriptorsPerFrame + 2) * g_state.descriptor_size;
+		uav.ptr += ring::descriptor_offset_in_slot(f, 2, g_state.descriptor_size);
 		g_state.device->CreateUnorderedAccessView(g_state.out_mv, nullptr, &uav_desc, uav);
 	}
 
@@ -262,7 +259,7 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 void copy_srvs(UINT slot, std::uint64_t depth_descriptor, std::uint64_t velocity_descriptor)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE dest = g_state.heap->GetCPUDescriptorHandleForHeapStart();
-	dest.ptr += static_cast<SIZE_T>(slot) * kDescriptorsPerFrame * g_state.descriptor_size;
+	dest.ptr += ring::descriptor_offset(slot, g_state.descriptor_size);
 
 	D3D12_CPU_DESCRIPTOR_HANDLE src_depth = {};
 	src_depth.ptr = static_cast<SIZE_T>(depth_descriptor);
@@ -282,7 +279,7 @@ void retire_expired()
 {
 	for (auto it = g_state.retired.begin(); it != g_state.retired.end();)
 	{
-		if (g_state.frame < it->retire_frame + kFrameCount * 2)
+		if (!ring::is_safe_to_release(g_state.frame, it->retire_frame))
 		{
 			++it;
 			continue;
@@ -372,7 +369,7 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 		return false;
 
 	// This frame's slice of every per-frame resource.
-	const UINT slot = g_state.frame % kFrameCount;
+	const UINT slot = ring::slot_for_frame(g_state.frame);
 	g_state.frame++;
 
 	// Unconditionally, every frame. See the note on the removed descriptor cache.
@@ -393,9 +390,9 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	D3D12_RANGE no_read = { 0, 0 };
 	if (FAILED(g_state.constants->Map(0, &no_read, &mapped)) || mapped == nullptr)
 		return false;
-	std::memcpy(static_cast<uint8_t *>(mapped) + slot * g_state.constant_stride, &params, sizeof(params));
-	D3D12_RANGE written = { slot * g_state.constant_stride,
-	                        slot * g_state.constant_stride + sizeof(params) };
+	const std::size_t cb_offset = ring::constant_offset(slot, g_state.constant_stride);
+	std::memcpy(static_cast<uint8_t *>(mapped) + cb_offset, &params, sizeof(params));
+	D3D12_RANGE written = { cb_offset, cb_offset + sizeof(params) };
 	g_state.constants->Unmap(0, &written);
 
 	// The game's depth and velocity are in NON_PIXEL_SHADER_RESOURCE for its own TAA dispatch,
@@ -407,9 +404,9 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	cmd->SetDescriptorHeaps(1, heaps);
 
 	cmd->SetComputeRootConstantBufferView(0,
-		g_state.constants->GetGPUVirtualAddress() + slot * g_state.constant_stride);
+		g_state.constants->GetGPUVirtualAddress() + cb_offset);
 	D3D12_GPU_DESCRIPTOR_HANDLE table = g_state.heap->GetGPUDescriptorHandleForHeapStart();
-	table.ptr += static_cast<UINT64>(slot) * kDescriptorsPerFrame * g_state.descriptor_size;
+	table.ptr += ring::descriptor_offset(slot, g_state.descriptor_size);
 	cmd->SetComputeRootDescriptorTable(1, table);
 
 	if (dispatch_mode != 0)
