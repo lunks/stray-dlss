@@ -35,6 +35,8 @@ struct Diagnostics
 	bool view_seen = false;
 };
 
+void configure(bool mv_resolve_enabled);
+
 const Diagnostics &diagnostics();
 
 // Dumps the per-shader outcome census. Call once, after gameplay has been running a while.

@@ -25,6 +25,9 @@ std::unordered_map<std::uint64_t, bool> g_steady_reported;                      
 std::unordered_map<std::uint64_t, bool> g_roundtrip_logged;                     // hash -> round-trip already noted
 bool g_resolve_ran = false;
 bool g_resolve_failed_logged = false;
+// [STRAYDLSS] MvResolve, default on. A switch so the pass can be bisected on the target
+// machine without a rebuild, which is a slow round trip.
+bool g_mv_resolve_enabled = true;
 
 // Per-shader outcome census. One dispatch report shows one shader; this shows the whole
 // field, which is what actually answers "does the TAA pass ever reach the resolver".
@@ -160,6 +163,13 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 } // namespace
 
 const Diagnostics &diagnostics() { return g_diag; }
+
+void configure(bool mv_resolve_enabled)
+{
+	g_mv_resolve_enabled = mv_resolve_enabled;
+	STRAY_LOG_INFO("MV resolve pass is %s ([STRAYDLSS] MvResolve)",
+		mv_resolve_enabled ? "ENABLED" : "disabled");
+}
 
 void dump_summary()
 {
@@ -369,7 +379,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	// Still returns false at the end, so the engine's TAA runs as normal and the image is
 	// unchanged. This exists to get the resolve executing and provably correct before anything
 	// depends on its output.
-	if (m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only)
+	if (g_mv_resolve_enabled &&
+		(m.verdict == MatchVerdict::hash_and_structural || m.verdict == MatchVerdict::structural_only))
 	{
 		ID3D12Resource *depth_res = nullptr;
 		ID3D12Resource *velocity_res = nullptr;
@@ -422,8 +433,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					if (heap_count > 0)
 						native->SetDescriptorHeaps(heap_count, game_heaps);
 
-					if (auto *tracked = cmd_list->get_private_data<state_tracking>())
-						tracked->apply(cmd_list);
+					// Deliberately NOT calling state_block::apply. UE4's D3D12 RHI sets the
+					// root signature and PSO before every draw and dispatch, so those need no
+					// restoring; re-binding its tracked descriptor tables here re-applies
+					// possibly-stale bindings for no benefit. The descriptor heaps are the one
+					// thing the RHI caches and would not re-set, so they are the one thing
+					// restored.
 				}
 				else if (!g_resolve_failed_logged)
 				{

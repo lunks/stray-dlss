@@ -122,6 +122,10 @@ void on_init_device(reshade::api::device *device)
 	STRAY_LOG_INFO("NGX is %s ([STRAYDLSS] EnableNGX). It initialises lazily on frame %d, "
 		"never during device init.",
 		enable_ngx ? "ENABLED" : "disabled", kNgxInitFrame);
+
+	bool mv_resolve = true;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "MvResolve", mv_resolve);
+	taa_hook::configure(mv_resolve);
 }
 
 void on_destroy_device(reshade::api::device *device)
