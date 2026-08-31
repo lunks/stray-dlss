@@ -31,6 +31,8 @@ bool g_mv_resolve_enabled = true;
 // [STRAYDLSS] MvRestoreHeaps, default on. A switch so the heap restore can be A/B'd against
 // the crash without another build-and-deploy cycle.
 bool g_restore_heaps = true;
+// [STRAYDLSS] MvRestoreState, default on.
+bool g_restore_state = true;
 
 // A crash-survivable breadcrumb. The Phase B path dies with an access violation after
 // surviving many frames, so the trigger is something that CHANGES rather than the first call.
@@ -195,13 +197,14 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 
 const Diagnostics &diagnostics() { return g_diag; }
 
-void configure(bool mv_resolve_enabled, bool restore_heaps)
+void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state)
 {
 	g_mv_resolve_enabled = mv_resolve_enabled;
 	g_restore_heaps = restore_heaps;
-	STRAY_LOG_INFO("MV resolve pass is %s ([STRAYDLSS] MvResolve); heap restore is %s "
-		"([STRAYDLSS] MvRestoreHeaps)",
-		mv_resolve_enabled ? "ENABLED" : "disabled", restore_heaps ? "ENABLED" : "disabled");
+	g_restore_state = restore_state;
+	STRAY_LOG_INFO("MV resolve=%s heapRestore=%s stateRestore=%s",
+		mv_resolve_enabled ? "on" : "off", restore_heaps ? "on" : "off",
+		restore_state ? "on" : "off");
 }
 
 void dump_summary()
@@ -475,12 +478,20 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 					mark(6, "heaps-restored");
 
-					// Deliberately NOT calling state_block::apply. UE4's D3D12 RHI sets the
-					// root signature and PSO before every draw and dispatch, so those need no
-					// restoring; re-binding its tracked descriptor tables here re-applies
-					// possibly-stale bindings for no benefit. The descriptor heaps are the one
-					// thing the RHI caches and would not re-set, so they are the one thing
-					// restored.
+					// Restore the rest of the state too, heaps first.
+					//
+					// The earlier reasoning that UE4 re-sets the root signature and PSO before
+					// every dispatch was wrong: its D3D12 RHI CACHES what it believes is
+					// currently bound and skips redundant sets, so changing them behind its
+					// back leaves that cache lying and the next draw uses ours. With our own
+					// access violation now fixed, the remaining crash sits entirely inside the
+					// game, which is what a state desync looks like.
+					if (g_restore_state)
+					{
+						if (auto *tracked = cmd_list->get_private_data<state_tracking>())
+							tracked->apply(cmd_list);
+						mark(7, "state-restored");
+					}
 				}
 				else if (!g_resolve_failed_logged)
 				{

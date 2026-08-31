@@ -127,7 +127,9 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "MvResolve", mv_resolve);
 	bool restore_heaps = true;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "MvRestoreHeaps", restore_heaps);
-	taa_hook::configure(mv_resolve, restore_heaps);
+	bool restore_state = true;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "MvRestoreState", restore_state);
+	taa_hook::configure(mv_resolve, restore_heaps, restore_state);
 }
 
 void on_destroy_device(reshade::api::device *device)
