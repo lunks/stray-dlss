@@ -279,6 +279,15 @@ void on_init_device(reshade::api::device *device)
 			resolve_at_ssd ? "SSD-dispatch (content-alive)" : "TAA-hook (A/B mode)",
 			resolve_at_ssd ? "ssd" : "taa");
 
+	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
+	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
+	bool resolve_only = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferResolveOnly", resolve_only);
+	taa_hook::set_gbuffer_resolve_only(resolve_only);
+	if (resolve_only && ngx_rr == 2)
+		STRAY_LOG_WARN("GBufferResolveOnly=1: RR evaluate disabled; guide records (and "
+			"dumps) still run at the SSD trigger. SR carries every frame.");
+
 	// [STRAYDLSS] GBufferSwapBC: the B/C content-check flip (gbuffer_resolve.hpp). The B/C
 	// slot order is unverified by content until the guide dump says otherwise; this flips
 	// which identified resource feeds which role, no rebuild.

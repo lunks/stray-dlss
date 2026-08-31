@@ -59,6 +59,7 @@ enum RrRefusalIndex
 	kRrCreateFailed = 7,
 	kRrEvaluateFailed = 8,
 	kRrGuidesStale = 9, // GBufferResolveAt=ssd: no guide record landed this frame
+	kRrResolveOnly = 10, // GBufferResolveOnly=1: the evaluate is deliberately skipped
 };
 std::atomic<std::uint32_t> g_rr_refusals[kRrRefusalCount] = {};
 // Successful gbuffer_resolve records under RR — the guide-dump key. Keyed on RECORDS, not
@@ -281,10 +282,23 @@ std::atomic<bool> g_resolve_at_ssd{ true };
 // be on different command lists), but the evaluate only proceeds after observing
 // g_guides_frame == this frame under the mutex, which orders the state transitions the
 // same way queue submission orders the GPU work.
+// Consume-side ordering basis (why list B may read what list A produced, with no fence of
+// our own): the TAA dispatch's colour input transitively depends on the SSD pass's output
+// (lighting composites the denoised signal), so UE has already ordered the SSD list's
+// execution — whatever queue it recorded on — before the TAA list runs; on one queue,
+// submission order does the same. The evaluate additionally consumes ONLY guides whose
+// record completed THIS frame (frame tag + ready flag below), so a torn or failed record
+// can never be read.
 std::mutex g_rr_guides_mutex;
 std::uint64_t g_guides_frame = ~0ull;
+bool g_guides_ready = false;  // set when THIS frame's record fully completed
 bool g_guides_in_srv = false;
 gbuffer_finder::Identification g_guides_id;
+
+// [STRAYDLSS] GBufferResolveOnly: the isolation instrument — record (and dump) the guides
+// at the SSD trigger but skip the RR evaluate entirely, SR carrying every frame. One run
+// with this on isolates record-side faults from evaluate-side faults.
+std::atomic<bool> g_rr_resolve_only{ false };
 
 // One first-occurrence line per refusal reason, with specifics — plus the indexed
 // counters, so the periodic line carries rates and the log carries the story.
@@ -360,6 +374,20 @@ bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *nati
 				is_resource_live(id.gbuffer_b) ? 1 : 0,
 				reinterpret_cast<void *>(id.gbuffer_c),
 				is_resource_live(id.gbuffer_c) ? 1 : 0, id.age_frames);
+		return false;
+	}
+
+	// The identified extent must COVER the render rect (suspect (b) of the wedge round):
+	// the resolve indexes A/B/C at ViewRectMin + thread id across the render rect, and a
+	// smaller texture turns those loads into out-of-bounds reads — zeros, i.e. unlit-
+	// decoded garbage guides. Menu and gameplay measured equal so far (1920x1080), but a
+	// mismatch must refuse loudly, not resolve garbage.
+	if (id.extent_width < render_w || id.extent_height < render_h)
+	{
+		if (rr_refuse(kRrResolveFailed))
+			STRAY_LOG_WARN("RR: identified G-buffer extent %ux%u does not cover the render "
+				"rect %ux%u - refusing to resolve (would read out of bounds). First "
+				"occurrence only.", id.extent_width, id.extent_height, render_w, render_h);
 		return false;
 	}
 
@@ -492,12 +520,19 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 		return;
 
 	// First sighting per frame only — the family dispatches several times (SSR/SSGI/AO
-	// instances), and one record per frame is both sufficient and cheapest.
+	// instances), and one record per frame is both sufficient and cheapest. The frame is
+	// CLAIMED here, before any recording: two family dispatches on concurrently-recording
+	// lists would otherwise both pass a check-at-success latch and interleave two sets of
+	// state transitions across two lists — undefined transition ordering, the Xid-109
+	// shape. Claiming first means a failed record forfeits the frame (guides_ready stays
+	// false and the evaluate refuses) rather than risking a second, racing attempt.
 	const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
 		if (g_guides_frame == frame)
 			return;
+		g_guides_frame = frame;
+		g_guides_ready = false;
 	}
 
 	DispatchBindings b;
@@ -540,12 +575,21 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 	auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
 	gbuffer_finder::Identification id;
 	if (!record_guides(device, native, render_w, render_h, view, id))
-		return; // the reason was counted and logged inside
+		return; // the reason was counted and logged inside; the frame stays claimed-not-ready
+
+	// THE WEDGE FIX (attempt 4, Xid 109 minutes into an RR menu session): record_guides
+	// just changed root signature, PSO, heaps and root parameters on the GAME'S list — and
+	// unlike the TAA site, the game's dispatch here is NOT suppressed: the SSD pass
+	// proceeds on this list. Without restoring, it ran with OUR compute state — our shader
+	// under its group counts, its own output never written, its root state corrupted for
+	// everything downstream of it on this list. Restore replays the game's captured root
+	// state natively, exactly as the TAA site does after NGX clobbers it.
+	restore_game_compute_state(cmd_list);
 
 	{
 		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		g_guides_frame = frame;
 		g_guides_id = id;
+		g_guides_ready = true;
 	}
 
 	static std::atomic<int> s_trigger_logged{ 0 };
@@ -568,6 +612,19 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 {
 	static bool s_rr_ok_logged = false;
 
+	// The isolation instrument: guides record (and dump) at the SSD trigger, the evaluate
+	// is skipped, SR carries every frame. Counted under its own reason so the periodic
+	// line stays self-consistent.
+	if (g_rr_resolve_only.load(std::memory_order_relaxed))
+	{
+		if (rr_refuse(kRrResolveOnly))
+			STRAY_LOG_WARN("GBufferResolveOnly=1: guides record at the SSD trigger and "
+				"dump as usual; the RR evaluate is SKIPPED and SR carries every frame. "
+				"Isolation instrument - record-side faults reproduce, evaluate-side "
+				"faults cannot.");
+		return false;
+	}
+
 	gbuffer_finder::Identification id;
 	if (g_resolve_at_ssd.load(std::memory_order_relaxed))
 	{
@@ -575,7 +632,10 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-			if (g_guides_frame == frame && g_guides_in_srv)
+			// Frame tag AND ready AND state: a claimed-but-failed record (ready false), a
+			// stale frame, or guides not left in SRV all refuse — the evaluate can never
+			// consume a torn record.
+			if (g_guides_frame == frame && g_guides_ready && g_guides_in_srv)
 			{
 				id = g_guides_id;
 				have_guides = true;
@@ -780,6 +840,10 @@ void set_gbuffer_resolve_at(bool at_ssd)
 {
 	g_resolve_at_ssd.store(at_ssd, std::memory_order_relaxed);
 }
+void set_gbuffer_resolve_only(bool resolve_only)
+{
+	g_rr_resolve_only.store(resolve_only, std::memory_order_relaxed);
+}
 void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 {
 	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
@@ -788,7 +852,7 @@ void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
 const char *const kRrRefusalNames[kRrRefusalCount] = {
 	"not-armed", "no-candidate", "stale-bind", "roles-missing", "liveness",
 	"rows-implausible", "resolve-failed", "create-failed", "evaluate-failed",
-	"guides-stale",
+	"guides-stale", "resolve-only",
 };
 void rr_refusal_counters(std::uint32_t out[kRrRefusalCount])
 {
