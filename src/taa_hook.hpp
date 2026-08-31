@@ -51,7 +51,8 @@ void set_ngx_evaluate(bool enabled);
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the
 // visible image at all. An identical-looking DLSS frame is otherwise ambiguous.
-void set_ngx_dry_run(bool enabled);
+// 0 = off, 1 = suppress only the pinned pass, 2 = suppress every structurally matched pass.
+void set_ngx_dry_run(int mode);
 
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 

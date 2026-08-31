@@ -232,7 +232,7 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
 
-	bool ngx_dry_run = false;
+	int ngx_dry_run = 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
 	taa_hook::set_ngx_dry_run(ngx_dry_run);
 	if (ngx_dry_run)

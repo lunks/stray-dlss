@@ -44,7 +44,12 @@ bool g_ngx_evaluate = false;
 // visibly breaks, the pass we replace really does drive the picture and DLSS's result is being
 // used. If the image is unchanged, the pass is irrelevant and evaluating into it proves nothing
 // — which is exactly the ambiguity an identical-looking DLSS frame leaves open.
-bool g_ngx_dry_run = false;
+// 0 = off, 1 = suppress only the pinned pass, 2 = suppress EVERY pass we structurally match.
+//
+// Mode 2 is the stronger experiment and comes first: if suppressing everything we match still
+// leaves the image unchanged, the matcher never sees the pass that draws the picture, and
+// bisecting candidates one at a time would be wasted effort.
+int g_ngx_dry_run = 0;
 bool g_ngx_logged_once = false;      // the evaluate result
 bool g_ngx_skip_logged = false;      // why we did not evaluate — a SEPARATE flag, because
                                      // sharing one meant the skip warning consumed the budget
@@ -263,7 +268,7 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
-void set_ngx_dry_run(bool enabled) { g_ngx_dry_run = enabled; }
+void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 
 void configure(bool mv_resolve_enabled, bool restore_heaps, bool restore_state, int dispatch_mode)
 {
@@ -604,9 +609,20 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						STRAY_LOG_INFO("DLSS is waiting for a pass to prove it owns the temporal "
 							"history before replacing anything.");
 					}
-					// Dry run: suppress the pinned pass and write nothing, to see whether it
-					// drives the visible image at all.
-					if (g_ngx_dry_run && eligible)
+					// Dry run. Mode 2 suppresses everything we match; mode 1 only the pinned
+					// pass. Either way nothing is written in its place.
+					if (g_ngx_dry_run == 2)
+					{
+						if (!g_ngx_waiting_logged)
+						{
+							g_ngx_waiting_logged = true;
+							STRAY_LOG_WARN("DRY RUN (all): suppressing EVERY structurally matched "
+								"pass and writing nothing. If the image is unchanged, the matcher "
+								"never sees the pass that draws the picture.");
+						}
+						suppress_engine_dispatch = true;
+					}
+					else if (g_ngx_dry_run == 1 && eligible)
 					{
 						std::uint64_t expected = 0;
 						if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
