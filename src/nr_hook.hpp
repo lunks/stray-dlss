@@ -101,6 +101,10 @@ struct Counters
 	std::uint32_t last_backbuffer_binds = 0; // back-buffer RTV binds in the previous frame
 	std::uint32_t max_backbuffer_binds = 0;
 	std::uint32_t frames_without_boundary = 0;
+	// Swapchain back-buffer identities cached. ZERO in `preui` mode means the boundary can never
+	// match and NR can never fire — a distinct failure from "the game never binds the back
+	// buffer", and one that would otherwise look identical in the log.
+	std::uint32_t back_buffers_known = 0;
 	std::uint64_t staging_bytes = 0;
 };
 

@@ -132,6 +132,38 @@ float bt709_luminance(Float3 c);
 // `neuralRenderingProxyScale` does.
 float proxy_scale(float paper_white, float fallback_paper_white);
 
+// The same scale, with the engine's exposure folded in — `trackAutoExposure` from the reference,
+// which we DROPPED in the port and which turns out to matter a great deal here.
+//
+// WHY. The reference (`rtx_neural_rendering.h:137-140`) defaults `trackAutoExposure` to TRUE and
+// multiplies the proxy scale by its tonemapper's live exposure, so the soft-clip knee follows
+// scene brightness. We hardcoded a static constant instead. Stray's scene colour at the TAA hook
+// carries UE4's pre-exposure — measured live at 0.056 (CLAUDE.md §2.6, View row 135.y) — so the
+// signal has to be lifted by roughly 1/0.056 ~= 18 to land anywhere near the 0.75 knee. The user
+// hand-dialled `NgxNRPaperWhiteScale` to about 0.1, an effective scale near 10x: the same order of
+// magnitude, arrived at by eye. That is a person compensating manually for a term the code should
+// be supplying.
+//
+// And it is a real bug rather than a missing nicety, because PRE-EXPOSURE MOVES WITH THE SCENE. A
+// paper white tuned in Stray's dark starting apartment is wrong in a brighter area, and there is
+// no single constant that is right in both.
+//
+// THE ASYMMETRY WORTH NOT RE-LITIGATING: the SR path's exposure goes through NGX
+// (`InPreExposure`, the exposure texture, the AutoExposure flag) and is therefore at the
+// runtime's mercy — the texture mode was measured INERT for us, and the NR codec is reported to
+// ignore `DLSS.Pre.Exposure` outright. This scale is OUR OWN shader arithmetic, a multiply inside
+// a dispatch we record. The runtime cannot ignore it. That is why this is expected to work where
+// the SR exposure attempt did not.
+//
+// `exposure_factor` is View row 135.z, `OneOverPreExposure`. A non-finite or non-positive value
+// means the View CB was not readable this frame, and a frame with no usable View data must NOT
+// produce a wild multiplier — it falls back to the static scale. The product is clamped to
+// [kScaleMin, kScaleMax] exactly as the static scale is.
+//
+// POST-TONEMAP SITES MUST NOT USE THIS. Their image is already tonemapped and display-referred;
+// there is no pre-exposure left to undo, so tracking there would be actively wrong.
+float proxy_scale_tracked(float paper_white, float fallback_paper_white, float exposure_factor);
+
 // --- the two halves of the codec ---
 
 // `proxy = SrgbEncode(SoftClip(max(rgb, 0) * scale))`.

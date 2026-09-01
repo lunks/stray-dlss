@@ -426,3 +426,46 @@ TEST_CASE("Rec.709 luminance uses the standard weights")
 	CHECK(near(bt709_luminance(rgb(1.0f, 1.0f, 1.0f)), 1.0f));
 	CHECK(bt709_luminance(rgb(0.0f, 0.0f, 0.0f)) == 0.0f);
 }
+
+TEST_CASE("tracked exposure folds the engine's OneOverPreExposure into the proxy scale")
+{
+	// THE MEASUREMENT THIS ENCODES. Stray's scene colour at the TAA hook carries UE4's
+	// pre-exposure, measured live at 0.056 (CLAUDE.md §2.6, View row 135.y), so
+	// OneOverPreExposure is about 17.86. With paper white left at its neutral 1.0 the static
+	// scale is 1.0 and tracking alone lifts the signal by that factor — the same order of
+	// magnitude as the ~10x the user reached by hand-dialling NgxNRPaperWhiteScale to 0.1.
+	CHECK(near(proxy_scale_tracked(1.0f, 1.0f, 1.0f / 0.056f), 1.0f / 0.056f, 1e-3f));
+
+	// It is a plain product with the static scale, so the knob still works on top of it.
+	CHECK(near(proxy_scale_tracked(2.0f, 1.0f, 4.0f), 2.0f));
+	CHECK(near(proxy_scale_tracked(0.1f, 1.0f, 2.0f), 20.0f, 1e-3f));
+
+	// An exposure factor of exactly 1.0 must be the untracked answer, bit for bit — otherwise
+	// turning tracking on would silently change a tuned configuration.
+	for (const float pw : { 0.05f, 0.5f, 1.0f, 1.605f, 16.0f })
+		CHECK(proxy_scale_tracked(pw, 1.0f, 1.0f) == proxy_scale(pw, 1.0f));
+}
+
+TEST_CASE("a frame with no readable View CB falls back to the static scale, never a wild one")
+{
+	// A non-finite or non-positive exposure means the View constant buffer was not readable this
+	// frame. Multiplying by it would put the network at an arbitrary operating point with no
+	// diagnostic at all — the silent-wrong-image class this project exists to avoid.
+	const float expected = proxy_scale(0.5f, 1.0f);
+	CHECK(proxy_scale_tracked(0.5f, 1.0f, 0.0f) == expected);
+	CHECK(proxy_scale_tracked(0.5f, 1.0f, -3.0f) == expected);
+	CHECK(proxy_scale_tracked(0.5f, 1.0f, std::numeric_limits<float>::quiet_NaN()) == expected);
+	CHECK(proxy_scale_tracked(0.5f, 1.0f, std::numeric_limits<float>::infinity()) == expected);
+}
+
+TEST_CASE("the tracked scale is clamped to the same bounds as the static one")
+{
+	// The product can leave the range the static scale is bounded to, and the division in the
+	// decode is by exactly this value — so the clamp has to survive the multiply.
+	CHECK(proxy_scale_tracked(0.01f, 1.0f, 1e12f) == kScaleMax);
+	CHECK(proxy_scale_tracked(64.0f, 1.0f, 1e-12f) == kScaleMin);
+	// A product that overflows to infinity is not a clamp case, it is a "we have no answer"
+	// case, and it falls back rather than pinning to the ceiling.
+	CHECK(proxy_scale_tracked(0.01f, 1.0f, std::numeric_limits<float>::max()) ==
+		proxy_scale(0.01f, 1.0f));
+}

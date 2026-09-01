@@ -112,6 +112,25 @@ float proxy_scale(float paper_white, float fallback_paper_white)
 	return scale;
 }
 
+float proxy_scale_tracked(float paper_white, float fallback_paper_white, float exposure_factor)
+{
+	const float static_scale = proxy_scale(paper_white, fallback_paper_white);
+	// A frame whose View constant buffer could not be read hands us nothing usable here. Falling
+	// back to the static scale keeps the codec in a known operating point; multiplying by a
+	// garbage value would put the network somewhere arbitrary with no diagnostic.
+	if (!std::isfinite(exposure_factor) || exposure_factor <= 0.0f)
+		return static_scale;
+
+	float scale = static_scale * exposure_factor;
+	if (!std::isfinite(scale))
+		return static_scale;
+	if (scale < kScaleMin)
+		scale = kScaleMin;
+	if (scale > kScaleMax)
+		scale = kScaleMax;
+	return scale;
+}
+
 Float3 encode(Float3 source, float scale)
 {
 	// A pixel the engine already broke must not reach the network, and must not reach the

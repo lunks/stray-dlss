@@ -216,6 +216,8 @@ struct NrUiState
 	bool  auto_mask = true;
 	bool  ui_correction = true;
 	float paper_white = 1.0f;
+	// The reference's `trackAutoExposure`, default TRUE there and here. See ngx_nr.hpp.
+	bool  track_exposure = true;
 	float color_strength = 1.0f;
 	float transfer_strength = 1.0f;
 	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
@@ -244,6 +246,7 @@ void apply_nr_ui()
 		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
 		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
 	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
+	nr::set_track_exposure(g_nr_ui.track_exposure);
 	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
 
 	// Branch flip, then the global axis flips on top of both.
@@ -475,6 +478,13 @@ void on_init_device(reshade::api::device *device)
 	// input, the encoded proxy and the neural output luminance over one crop on one line, and
 	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
+	// [STRAYDLSS] NgxNRTrackExposure, default ON: multiply the codec's proxy scale by the
+	// engine's OneOverPreExposure so the soft-clip knee follows scene brightness. We dropped this
+	// in the port; without it there is no single paper white that is right in both a dark room
+	// and a bright street, because UE4's pre-exposure moves with the scene. (ngx_nr.hpp)
+	int nr_track_exposure = g_nr_ui.track_exposure ? 1 : 0;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTrackExposure", nr_track_exposure);
+	g_nr_ui.track_exposure = nr_track_exposure != 0;
 	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
 	// the escape hatch for a colour cast. 1 takes the network's colour too.
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
@@ -492,11 +502,13 @@ void on_init_device(reshade::api::device *device)
 	{
 		STRAY_LOG_WARN("NgxNR=1: DLSS Neural Rendering (feature 18) topology=%s "
 			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f "
-			"paperWhite=%.4f colorStrength=%.2f transferStrength=%.2f. "
-			"Grep 'NR' lines, and 'NR CODEC LUMINANCE' for the one that picks paperWhite.",
+			"paperWhite=%.4f trackExposure=%d colorStrength=%.2f transferStrength=%.2f. "
+			"Grep 'NR' lines, 'NR codec scale' for the paperWhite x exposure decomposition, and "
+			"'NR CODEC LUMINANCE' for the one that picks paperWhite.",
 			nr_sr_shaped ? "sr-shaped" : "post-process",
 			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale,
-			nr_paper_white, nr_color_strength, nr_transfer_strength);
+			nr_paper_white, g_nr_ui.track_exposure ? 1 : 0, nr_color_strength,
+			nr_transfer_strength);
 		if (nr_sr_shaped)
 			STRAY_LOG_ERROR("NgxNRTopology=sr is INCOMPATIBLE with the HDR colour codec and NR "
 				"will refuse every frame ('codec-topology'). The codec's residual transfer needs "
@@ -1263,9 +1275,10 @@ void draw_nr_controls()
 			static_cast<unsigned long long>(hc.triggered),
 			static_cast<unsigned long long>(hc.applied));
 		if (hook == nrplan::HookMode::preui)
-			ImGui::Text("  back-buffer RTV binds: last %u  max %u  (NgxNRPreUiBind), "
-				"frames with no boundary %u",
-				hc.last_backbuffer_binds, hc.max_backbuffer_binds, hc.frames_without_boundary);
+			ImGui::Text("  back buffers known %u | RTV binds: last %u  max %u "
+				"(NgxNRPreUiBind), frames with no boundary %u",
+				hc.back_buffers_known, hc.last_backbuffer_binds, hc.max_backbuffer_binds,
+				hc.frames_without_boundary);
 		else
 			ImGui::Text("  reshade_begin_effects fired %llu times%s",
 				static_cast<unsigned long long>(hc.begin_effects_seen),
@@ -1301,6 +1314,11 @@ void draw_nr_controls()
 	// carries UE4's pre-exposure. The soft clip saturates at an input near 3.474, so there is no
 	// point going far above that.
 	changed |= ImGui::SliderFloat("Paper white", &g_nr_ui.paper_white, 0.01f, 8.0f, "%.3f");
+	// With tracking ON the engine's OneOverPreExposure supplies the ~18x this scene needs, so
+	// paper white should sit near 1.0; with it OFF the user has to supply that factor by hand,
+	// which is how ~0.1 came to look best. Read the "NR codec scale" line to see the split.
+	changed |= ImGui::Checkbox("Track engine exposure (TAA site only)",
+		&g_nr_ui.track_exposure);
 	// 0 keeps the ORIGINAL's chromaticity and carries only the network's luminance change — the
 	// escape hatch for a colour cast.
 	changed |= ImGui::SliderFloat("Colour strength", &g_nr_ui.color_strength, 0.0f, 1.0f, "%.2f");
@@ -1347,6 +1365,8 @@ void draw_nr_controls()
 	if (ImGui::Button("Save to ReShade.ini"))
 	{
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTrackExposure",
+			g_nr_ui.track_exposure ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
 			g_nr_ui.transfer_strength);

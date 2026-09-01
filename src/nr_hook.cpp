@@ -580,12 +580,12 @@ void on_present(std::uint64_t frame)
 		off += n;
 	}
 	STRAY_LOG_INFO("NR HOOK [%s] frame %llu: triggered=%llu applied=%llu | %s | "
-		"backBufferRtvBinds last=%u max=%u (NgxNRPreUiBind=%u) framesWithoutBoundary=%u | "
-		"beginEffectsSeen=%llu | staging %llu bytes",
+		"backBuffersKnown=%u backBufferRtvBinds last=%u max=%u (NgxNRPreUiBind=%u) "
+		"framesWithoutBoundary=%u | beginEffectsSeen=%llu | staging %llu bytes",
 		nrplan::hook_mode_name(mode), static_cast<unsigned long long>(frame),
 		static_cast<unsigned long long>(c.triggered), static_cast<unsigned long long>(c.applied),
 		reasons[0] != 0 ? reasons : "no refusals",
-		c.last_backbuffer_binds, c.max_backbuffer_binds,
+		c.back_buffers_known, c.last_backbuffer_binds, c.max_backbuffer_binds,
 		g_preui_ordinal.load(std::memory_order_relaxed), c.frames_without_boundary,
 		static_cast<unsigned long long>(c.begin_effects_seen),
 		static_cast<unsigned long long>(c.staging_bytes));
@@ -594,6 +594,13 @@ void on_present(std::uint64_t frame)
 	// `!is_loading() && !_techniques.empty()` (v6.8.0 runtime.cpp:737, and again at :3810), so a
 	// preset with NO effect files loaded never fires reshade_begin_effects and `present` mode is
 	// silently inert. Say so rather than let it read as "NR is broken".
+	// The `preui` twin of that failure: with no cached back-buffer identities the identity test
+	// can never match, so the hook is inert for a reason that has nothing to do with the ordinal.
+	if (mode == nrplan::HookMode::preui && c.back_buffers_known == 0)
+		STRAY_LOG_ERROR("NgxNRHook=preui but NO swapchain back-buffer identities are cached, so "
+			"the render-target identity test can never match and NR will never fire. "
+			"addon_event::init_swapchain either did not fire or reported zero buffers.");
+
 	if (mode == nrplan::HookMode::present && c.begin_effects_seen == 0)
 		STRAY_LOG_ERROR("NgxNRHook=present but reshade_begin_effects has NEVER fired. ReShade "
 			"only renders effects when at least one effect file is LOADED (v6.8.0 "
@@ -744,6 +751,10 @@ Counters counters()
 	c.last_backbuffer_binds = g_last_binds.load(std::memory_order_relaxed);
 	c.max_backbuffer_binds = g_max_binds.load(std::memory_order_relaxed);
 	c.frames_without_boundary = g_frames_without_boundary.load(std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(g_swapchain_mutex);
+		c.back_buffers_known = static_cast<std::uint32_t>(g_back_buffers.size());
+	}
 	c.staging_bytes = g_staging.texture != nullptr ? g_staging.bytes : 0;
 	return c;
 }

@@ -47,6 +47,7 @@ void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
 void set_codec_tuning(float, float, float) {}
+void set_track_exposure(bool) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
 void shutdown() {}
@@ -178,6 +179,8 @@ float g_mvec_scale_override = 0.0f;
 float g_paper_white = 1.0f;
 float g_color_strength = 1.0f;
 float g_transfer_strength = 1.0f;
+// Default ON, matching the reference's own `trackAutoExposure` default. See ngx_nr.hpp.
+bool g_track_exposure = true;
 // NR's OWN temporal accumulation is keyed on the COLOUR grid, so nothing in the feature notices
 // when the GUIDE grid moves underneath it — and ours moves whenever the screen percentage does
 // (1920x1080 guides at 50%, 2688x1512 at 70%, both of which this project runs). The reference
@@ -800,6 +803,8 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 
 void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
 
+void set_track_exposure(bool enabled) { g_track_exposure = enabled; }
+
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
 {
 	g_paper_white = paper_white;
@@ -997,7 +1002,32 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		if (!nrp::initialise(device, in.image, cw, ch))
 			return refuse(kRefCodecFailed, nrp::last_error());
 
-		codec_scale = nrc::proxy_scale(g_paper_white, 1.0f);
+		// TRACKED EXPOSURE. `1.0f` is the fallback paper white, not an exposure — see
+		// nrc::proxy_scale's signature.
+		const float static_scale = nrc::proxy_scale(g_paper_white, 1.0f);
+		codec_scale = g_track_exposure
+			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, in.one_over_pre_exposure)
+			: static_scale;
+
+		// The decomposition, once. When the user reports "paper white 0.1 looks best", this line
+		// is what says whether tracking has made 1.0 the new correct value.
+		static bool s_scale_logged = false;
+		if (!s_scale_logged)
+		{
+			s_scale_logged = true;
+			STRAY_LOG_WARN("NR codec scale: paperWhite=%.4f -> staticScale=%.4f x exposure=%.4f "
+				"(View row 135.z OneOverPreExposure; tracking=%s%s) = EFFECTIVE %.4f. The 0.75 "
+				"soft-clip knee is what this has to land the frame near. Stray's scene colour "
+				"here carries UE4's pre-exposure (~0.056 measured), so an untracked scale near "
+				"1.0 shows the network a nearly black image — which is why hand-dialling paper "
+				"white to ~0.1 looked best before this existed.",
+				static_cast<double>(g_paper_white), static_cast<double>(static_scale),
+				static_cast<double>(in.one_over_pre_exposure),
+				g_track_exposure ? "on" : "OFF",
+				g_track_exposure && !(in.one_over_pre_exposure > 0.0f)
+					? ", but the View CB was unreadable so the STATIC scale was used" : "",
+				static_cast<double>(codec_scale));
+		}
 		if (!nrp::record_encode(cmd, in.image, cw, ch, codec_scale, g_color_strength,
 				g_transfer_strength))
 			return refuse(kRefCodecFailed, nrp::last_error());
@@ -1118,7 +1148,9 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		else
 			STRAY_LOG_INFO("NR params [site=post-tonemap]: HDR CODEC BYPASSED (the image is "
 				"already display-referred; encoding it again would apply the tone transfer "
-				"twice) — Color=%p is the back-buffer copy ITSELF (%ux%u); Depth=%p (%ux%u) "
+				"twice, and there is no pre-exposure left to undo, so NgxNRPaperWhiteScale and "
+				"NgxNRTrackExposure are both inert here) — Color=%p is the back-buffer copy "
+				"ITSELF (%ux%u); Depth=%p (%ux%u) "
 				"MVec=%p (%ux%u, scale %.3f/%.3f = colour/guide) Output=%p (%ux%u) "
 				"depthInverted=1 reset=%d intensity=%.2f uiCorrection=%u",
 				static_cast<void *>(colour), cw, ch,

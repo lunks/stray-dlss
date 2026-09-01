@@ -111,6 +111,22 @@ void set_warmup_frames(unsigned int frames);
 //                    the untouched original; 0 is an EXACT bypass, bit for bit.
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
 
+// [STRAYDLSS] NgxNRTrackExposure, default ON — the reference's `trackAutoExposure`
+// (rtx_neural_rendering.h:137-140), which defaults to true and which we dropped in the port.
+//
+// With it on, the codec's effective scale is the static proxy_scale(paperWhite) MULTIPLIED by the
+// engine's OneOverPreExposure (View row 135.z), so the soft-clip knee follows scene brightness
+// instead of sitting wherever a constant put it. Stray's scene colour at the TAA hook carries
+// UE4's pre-exposure (measured 0.056 live), and the user hand-dialled NgxNRPaperWhiteScale to
+// ~0.1 — an effective scale near 10x, the same order as 1/0.056 ~= 18. That is a person supplying
+// this term manually, and it cannot be right in two differently-lit areas at once, because
+// pre-exposure moves with the scene.
+//
+// TAA SITE ONLY. Post-tonemap the image is already display-referred with no pre-exposure left to
+// undo, and the codec is bypassed there entirely. Math, clamps and the SR-exposure asymmetry:
+// src/core/nr_codec.hpp above proxy_scale_tracked.
+void set_track_exposure(bool enabled);
+
 // WHERE the call comes from. One NR path, two call sites, and the difference between them is
 // entirely the colour pipeline — so it is a parameter rather than a second copy of this module.
 enum class Site
@@ -159,6 +175,12 @@ struct ApplyInputs
 	bool reset = false;
 
 	Site site = Site::taa_dispatch;
+
+	// View row 135.z, `OneOverPreExposure`, already parsed by core/view_params.cpp. Used only by
+	// the TAA site's codec, and only when NgxNRTrackExposure is on. <= 0 or non-finite means the
+	// View constant buffer was not readable this frame, and the codec falls back to its static
+	// scale rather than multiplying by a garbage value.
+	float one_over_pre_exposure = 0.0f;
 
 	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from output/render", which
 	// is what the TAA site does. The post-tonemap sites pass the ratio their own gate computed,

@@ -2018,6 +2018,12 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										ni.output_width = fd.output_width;
 										ni.output_height = fd.output_height;
 										ni.reset = ei.reset;
+										// View row 135.z. Only the TAA site's codec consumes it,
+										// and only when NgxNRTrackExposure is on; a frame whose
+										// View CB did not decode leaves it 0 and the codec falls
+										// back to its static scale.
+										ni.one_over_pre_exposure =
+											view_ok ? view.one_over_pre_exposure : 0.0f;
 										nr::apply(reinterpret_cast<ID3D12Device *>(
 											device->get_native()), native, ni);
 									}
