@@ -1154,6 +1154,112 @@ upscales by definition and cannot accept an input larger than its output. The ma
 rejects it, now on the view-rect lower bound ("dispatch covers less than the view rect -
 downsampling, not TAA upscaling"). 70% is the highest working setting and is sharper than 50%.
 
+### DLSS Neural Rendering (feature 18): the identity check, solved (measured 2026-08-31)
+
+Two independent walls stand between a ReShade add-on and NGX feature 18. Both are now
+characterised, and the second is the interesting one.
+
+**Wall 1 — the NGX core will not route feature 18.** Asking `nvngx.dll` for it returns
+`FAIL_OutOfDate` no matter how the snippet is staged, because the core resolves only
+driver-shipped snippets and this runtime is a leaked pre-release build. The way through is to
+**drive the snippet through its own `NVSDK_NGX_D3D12_*` exports** and bypass the core entirely.
+Only four are required — `Init_Ext`, `CreateFeature`, `EvaluateFeature`, `ReleaseFeature`; the
+parameter-block exports are absent from the snippet and must come from the core.
+
+**Wall 2 — the snippet checks who loaded it, and the test is a SUBSTRING.** It calls
+`GetModuleFileNameW` on its caller and requires the answer to **contain the substring
+`nvngx.dll`**. Measured, by patching the snippet's own `GetModuleFileNameW` import (IAT patch)
+and answering differently:
+
+| Reported identity | Contains `nvngx.dll`? | Snippet behaviour |
+|---|---|---|
+| `stray-dlss.addon64` (pass-through) | no | **one** query, then immediate `FAIL_PlatformError` |
+| `…\nvngx_dlssnr.dll` (its own path) | **no** — `nvngx_dlssnr.dll` does not contain it | rejected |
+| `…\nvngx.dll` | yes | **three** queries, interrogates a **second** module, no error |
+
+That is also why RTX Remix ships its shim as **`remix_nvngx.dll`** — the name contains the
+substring. `NgxNRIdentity=nvngx` is therefore the default; the other modes exist only to
+reproduce the measurement.
+
+**Load and initialise are separate states, and initialising at device creation stalls the
+game.** RenoDX's own strings say the runtime is *"pre-loaded at device init"* and initialised
+*"lazily on first evaluate"* — two states, not one. We had collapsed them into a single eager
+call inside `on_init_device`, and the measured consequence is unambiguous: the ReShade log
+**stops mid-`Init_Ext`**, immediately after `CreateDXGIFactory1`, with neither a success nor an
+error line after it. Loading a 165 MB neural DLL is cheap memory work; *initialising* it during
+D3D12 device creation is not, and it is the leading suspect for two `GPU_IS_LOST` events that
+each needed a host power-cycle.
+
+So: `LoadLibrary` + export resolution + the IAT patch at device init
+(`[STRAYDLSS] NgxNRPreload`, default ON, no GPU contact); `Init_Ext` and the feature create on
+first use, behind `[STRAYDLSS] NgxNRWarmupFrames` (default 60 — deliberately more conservative
+than RenoDX, whose behaviour is effectively 1; set 0 to match them exactly). `apply()` is only
+reached after a successful SR/RR evaluate, so the warmup counts frames in which the device,
+queue and swapchain demonstrably worked.
+
+### The DLSSNR snippet is ARCHITECTURE-GATED, and Ada support is a 13.5 MB graft
+
+`~/Downloads/dlssnr-remix/patch_dlssnr.py` (signature-driven, survives build offset changes)
+documents two gates inside `nvngx_dlssnr.dll`:
+
+* **Gate 1** — the `MinHWArchitecture` constant reported by the four `*_GetFeatureRequirements`
+  entry points. **Irrelevant to us:** Proton does not implement `GetFeatureRequirements` and we
+  drive the snippet directly, so nothing ever reads it.
+* **Gate 2** — an architecture switch inside `*_CreateFeature`, defaulting to a
+  `"Unsupported GPU architecture"` log site. This one decides whether `CreateFeature` succeeds.
+
+Arch ids: `0x160` Turing, `0x170` Ampere, `0x180` Hopper, **`0x190` Ada (RTX 40)**, `0x1a0`
+Blackwell DC, `0x1b0` Blackwell2 (RTX 50).
+
+**Patching the gates is NOT sufficient, and the script says so:** *"no sm_89 cubins in this file
+— Ada (RTX 40) will pass the gates and then fail at kernel load."* Gate-only patching therefore
+buys a successful `CreateFeature` and a successful-looking `EvaluateFeature` with no SASS behind
+it — the silent-wrong-image failure mode this project exists to avoid.
+
+**Measured 2026-08-31 across the three copies on the box (all exactly 165,840,496 bytes):**
+
+| Copy | cubin SASS | gate 1 | gate 2 (Ada) |
+|---|---|---|---|
+| `SL 2.13/` (pristine) | **sm_120 only** | 4× `0x1b0` | **block** |
+| `Downloads/` | sm_120 + **sm_89** | 3× `0x1b0`, 1× `0x190` | ALLOW (stub rewritten) |
+| `dlssnr-remix/` | sm_120 + **sm_89** | 4× `0x190` | ALLOW (stub rewritten) |
+
+The two patched copies differ from pristine by **13,555,158 bytes** — a wholesale substitution
+of zstd cubin payload, i.e. real Ada SASS grafted in at constant file size, not a relabelling of
+Blackwell kernels. They differ **from each other by exactly 3 bytes**, all gate-1 constants, so
+**they are functionally identical for our direct-snippet path**; swapping between them cannot
+change anything. Only the pristine `SL 2.13` copy is genuinely unusable on Ada.
+
+Ada's rewritten gate-2 stub lands on the **same** target as Blackwell2 (`0x180017f2b`), so arch
+selection past that point must happen by cubin lookup rather than by branch.
+
+### NR runs, and then the GPU leaves the bus — a GSP crash, not an Xid (measured 2026-08-31)
+
+First fully working NR session: `Init_Ext SUCCEEDED` → `feature 18 CREATED` → `NR VALIDATED` →
+`applied=965 refused=64` (every refusal the warmup). It ran **~48 s / ~2800 frames at 57.6 fps**,
+showed **red noise over the whole screen**, then the card vanished.
+
+**The lazy-init change did NOT prevent the loss**, which refutes the earlier "initialising at
+device creation causes the GPU losses" hypothesis — it is the **evaluate**. What lazy init *did*
+fix is the startup stall: gameplay in 34 s, where the eager build left the ReShade log stopped
+mid-`Init_Ext`.
+
+**`dmesg` carries NO Xid whatsoever.** Every line is `_issueRpcAndWait: rpcSendMessage failed
+with status 0x0000000f` and `rpcRmApiFree_GSP: GspRmFree failed` — GSP-firmware RPC failure. The
+`gmmu_walk.c` / `mmu_walk.c` assertions and `mmuWalkUnmap: Failed to unmap VA Range` lines are
+**teardown after the fact**: their status is already `0x0f` = `NV_ERR_GPU_IS_LOST`. Read the
+first NVRM line, not the loudest one. A GSP crash and an Xid 109 CTX SWITCH TIMEOUT are
+different failures and must not be triaged as one.
+
+**Open, and the whole problem:** the output was `max luminance 0.002709` over the validation
+crop — barely above the `1e-5` degeneracy threshold, i.e. very nearly black — while the screen
+showed red noise. Leading suspects, in order: the parameters we never set (RenoDX ships
+`NRPaperWhiteScale=1.605`, `NRDepthMode=2`, `NRPreset=1`, `NRAutoMask`, `NRUICorrection`,
+`NREnableUpscaling=0`, `NRSkinStructure=1.33`; we set only intensity/localTone/localStructure),
+and the **resolution mismatch** — we hand it 3840x2160 colour with 1920x1080 depth and motion
+vectors, and if the runtime indexes depth at output resolution that is both the garbage image
+and a plausible fault.
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
