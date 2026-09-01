@@ -76,6 +76,15 @@ bool has_shutdown1();
 
 const char *last_error();
 
+// The two callbacks the snippet expects its HOST (normally nvngx.dll) to install through the
+// parameter block: DLSSNRComputeScalingRatioCallback and DLSSNRGetStatsCallback. Both live
+// inside the snippet at fixed offsets and are not exported, so they can only be resolved by RVA
+// — and only after a layout check proves the RVA map matches this build. Return nullptr when
+// the check failed, in which case the caller must not set the parameters at all: a null
+// function pointer in the block is worse than an absent one.
+void *compute_scaling_ratio_callback();
+void *get_stats_callback();
+
 // Dumps how many identity queries the snippet made and what it asked about. Safe any time.
 void log_identity_calls();
 

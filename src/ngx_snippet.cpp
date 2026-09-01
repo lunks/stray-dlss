@@ -239,7 +239,59 @@ bool resolve(T &fn, const char *name, int &missing)
 	return true;
 }
 
+// --- the two host callbacks, resolved by RVA (dxvk-remix aa90a180 / NGXNeuralRenderingDispatch)
+//
+// The snippet expects its HOST (normally nvngx.dll) to hand it two function pointers through the
+// parameter block: DLSSNRComputeScalingRatioCallback and DLSSNRGetStatsCallback. Both live
+// INSIDE the snippet at fixed offsets and are not exported, so the only way to supply them is by
+// RVA. Leaving them null is what nothing else does.
+//
+// An RVA into a leaked binary is only safe with a version check, so this reproduces the
+// reference's: two EXPORTED symbols must land on their expected offsets before any unexported
+// offset is trusted. Verified against our own staged runtime — 0x251a0 resolves to
+// NVSDK_NGX_VULKAN_Init_Ext2 and 0x24b70 to NVSDK_NGX_VULKAN_CreateFeature1 — so this map was
+// derived from exactly the build we load. The Vulkan symbols are the anchors even though we
+// drive the D3D12 entry points: they are what the reference pinned, and a matching pair proves
+// the layout regardless of which backend we then call.
+constexpr std::size_t kInitExportRva = 0x251a0;   // NVSDK_NGX_VULKAN_Init_Ext2
+constexpr std::size_t kCreateExportRva = 0x24b70; // NVSDK_NGX_VULKAN_CreateFeature1
+constexpr std::size_t kComputeScalingRatioRva = 0x248c0;
+constexpr std::size_t kGetStatsRva = 0x12e80;
+
+void *g_compute_scaling_ratio = nullptr;
+void *g_get_stats = nullptr;
+
+// Resolves the two callbacks, but only if the layout check passes. Never fatal: a snippet whose
+// layout we do not recognise simply runs without them, exactly as it did before.
+void resolve_host_callbacks()
+{
+	auto *base = reinterpret_cast<unsigned char *>(g_module);
+	auto *init_export = reinterpret_cast<unsigned char *>(
+		reinterpret_cast<void *>(::GetProcAddress(g_module, "NVSDK_NGX_VULKAN_Init_Ext2")));
+	auto *create_export = reinterpret_cast<unsigned char *>(
+		reinterpret_cast<void *>(::GetProcAddress(g_module, "NVSDK_NGX_VULKAN_CreateFeature1")));
+
+	if (init_export != base + kInitExportRva || create_export != base + kCreateExportRva)
+	{
+		STRAY_LOG_WARN("NR: snippet layout does NOT match the known 310.8.0 map "
+			"(Init_Ext2 at +0x%zx, CreateFeature1 at +0x%zx expected). The two host callbacks "
+			"stay unset — an unverified RVA into a leaked DLL is not a risk worth taking.",
+			kInitExportRva, kCreateExportRva);
+		return;
+	}
+
+	g_compute_scaling_ratio = base + kComputeScalingRatioRva;
+	g_get_stats = base + kGetStatsRva;
+	STRAY_LOG_WARN("NR: snippet layout VERIFIED against the known 310.8.0 map; host callbacks "
+		"resolved (computeScalingRatio=+0x%zx getStats=+0x%zx). These are what nvngx.dll would "
+		"normally install; without them the snippet has no host.",
+		kComputeScalingRatioRva, kGetStatsRva);
+}
+
 } // namespace
+
+void *compute_scaling_ratio_callback() { return g_compute_scaling_ratio; }
+void *get_stats_callback() { return g_get_stats; }
 
 const char *identity_name()
 {
@@ -347,6 +399,7 @@ bool load(const char *utf8_path)
 	resolve(g_create_feature, "NVSDK_NGX_D3D12_CreateFeature", missing);
 	resolve(g_evaluate_feature, "NVSDK_NGX_D3D12_EvaluateFeature", missing);
 	resolve(g_release_feature, "NVSDK_NGX_D3D12_ReleaseFeature", missing);
+	resolve_host_callbacks();
 
 	// OPTIONAL: preferred when present, but their absence must not abort anything.
 	// Shutdown1 is optional-but-preferred; without it we simply skip the snippet's own
