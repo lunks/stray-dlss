@@ -688,8 +688,8 @@ a third time by a recomputation that reproduced all seven measured anchors exact
 | `ViewSizeAndInvSize` | 130 | 2080 | measured |
 | `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 | measured — **decoy**, reads `(1,1,1,1)` |
 | `BufferSizeAndInvSize` | 132 | 2112 | [derived] |
-| `PreExposure` | 135.y | 2164 | [derived], corroborated by the SR path |
-| `OneOverPreExposure` | 135.z | 2168 | [derived] — **HARD**: assigned as `1.f / PreExposure` on the adjacent source line |
+| `PreExposure` | 135.y | 2164 | **MEASURED 2026-09-01** — see the row-135 self-check below |
+| `OneOverPreExposure` | 135.z | 2168 | **MEASURED 2026-09-01**; also assigned as `1.f / PreExposure` on the adjacent source line |
 | `NearPlane` | 142.x | 2272 | [derived] |
 | `DeltaTime` | 143.x | 2288 | [derived] |
 | `CameraCut` | 145.x | 2320 | [derived] |
@@ -727,6 +727,30 @@ not use them.**
 
 `ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
 analysis**, no reflection names involved.
+
+#### Row 135 validates itself, and it did — MEASURED 2026-09-01
+
+The retraction below asks for both halves of the pre-exposure pair to be read in ONE `memcpy`
+rather than compared across log lines. That diagnostic shipped and fired in the live game:
+
+```
+View row 135 (one read): x=1.40129846e-45 y=0.451940 z=2.212684 w=0
+  | y*z=1.000000        (want 1.0)
+  | x denormal=1        (want 1, it is an int32 MSAA count reinterpreted as float)
+  | w==0=1              (want 1, it is padding)
+```
+
+**All three independent predictions hold from a single read, so `kPreExposureRow` is the right
+offset and the mapping is now HARD, not [derived].** `y*z == 1.0` exactly is the strong one: it
+is true by construction (`SceneRendering.cpp:1563-1564`) and could not survive a wrong offset.
+`x` being the denormal `1.40129846e-45` is `int32 NumSceneColorMSAASamples == 1` reinterpreted,
+and `w` is exactly 0.0 padding — three different data types landing where predicted.
+
+Measured in the same session, PreExposure moved **1.000 -> 4.881 -> 0.051 -> 0.452** across
+menu, camera cut and gameplay. That is a ~95x swing, and it is independent support for keeping
+`NgxNRTrackExposure` on with a long time constant: no fixed codec scale can be right across
+that range.
+
 
 Traps:
 
