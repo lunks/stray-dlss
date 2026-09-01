@@ -388,10 +388,24 @@ void on_init_device(reshade::api::device *device)
 			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f. "
 			"Grep 'NR' lines.", nr_sr_shaped ? "sr-shaped" : "post-process",
 			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale);
-		// MUST precede NVSDK_NGX_D3D12_Init_* — the runtime is pre-loaded at device init.
-		// (docs/RESEARCH-RENODX-DLSS5.md §3.2). This also resolves the snippet's own NGX
-		// exports and patches its GetModuleFileNameW import, then initialises it directly.
-		nr::load_runtime(native);
+		// [STRAYDLSS] NgxNRPreload, default ON: LoadLibrary + export resolution + the
+		// identity IAT patch at device init — matching RenoDX's "signed NR runtime
+		// (nvngx_dlssnr.dll) pre-loaded at device init". All of it is pure memory work with
+		// no GPU contact. Init_Ext and the feature create are NOT done here: they move to
+		// first use behind the warmup gate (see ngx_nr.hpp), because initialising a leaked
+		// pre-release snippet during device creation is both a startup stall and the leading
+		// suspect for two measured GPU_IS_LOST events. RenoDX's own fallback string ("will
+		// retry lazily on first evaluate") confirms load and init are independent states.
+		bool nr_preload = true;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreload", nr_preload);
+		int nr_warmup = 60;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRWarmupFrames", nr_warmup);
+		nr::set_warmup_frames(nr_warmup < 0 ? 0u : static_cast<unsigned int>(nr_warmup));
+		STRAY_LOG_INFO("NR: preload=%d warmupFrames=%d (RenoDX initialises on the FIRST "
+			"evaluate; we wait longer on purpose after two GPU_IS_LOST events).",
+			nr_preload ? 1 : 0, nr_warmup);
+		if (nr_preload)
+			nr::preload();
 	}
 
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip

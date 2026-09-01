@@ -20,7 +20,7 @@ namespace stray_dlss::nr {
 
 const char *const kNrRefusalNames[kNrRefusalCount] = {
 	"dll-missing", "create-failed", "evaluate-failed", "degenerate-output",
-	"bad-inputs", "alloc-failed", "validating",
+	"bad-inputs", "alloc-failed", "validating", "warmup",
 };
 
 } // namespace stray_dlss::nr
@@ -36,7 +36,8 @@ void set_dll_path(const char *) {}
 void set_topology(Topology) {}
 void set_tuning(float, float, float) {}
 void set_mvec_scale_override(float) {}
-bool load_runtime(ID3D12Device *) { return false; }
+bool preload() { return false; }
+void set_warmup_frames(unsigned int) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
 void shutdown() {}
@@ -103,6 +104,7 @@ enum
 	kRefBadInputs,
 	kRefAllocFailed,
 	kRefValidating,
+	kRefWarmup,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -139,8 +141,16 @@ char g_last_error[256] = "";
 
 // The snippet module is owned by src/ngx_snippet.cpp; this only records that the load was
 // attempted and succeeded, so apply() can tell "never loaded" from "loaded but not initialised".
-bool g_runtime_loaded = false;
-bool g_runtime_tried = false;
+bool g_runtime_loaded = false;   // snippet::load succeeded (exports resolved, IAT patched)
+bool g_load_tried = false;       // snippet::load has been attempted (never retried)
+bool g_init_tried = false;       // Init_Ext has been attempted (never retried)
+// Successful SR/RR evaluates observed. apply() is ONLY reached after a successful evaluate, so
+// counting calls here counts exactly the frames in which the device, queue and swapchain
+// demonstrably worked — which is the health signal the warmup gate wants.
+std::uint64_t g_sr_evaluates_seen = 0;
+// 60: deliberately more conservative than RenoDX, which initialises on the FIRST evaluate.
+// Two measured GPU_IS_LOST events justify the margin; it costs one second of gameplay.
+unsigned int g_warmup_frames = 60;
 
 NVSDK_NGX_Handle *g_feature = nullptr;
 NVSDK_NGX_Parameter *g_params = nullptr;
@@ -626,11 +636,16 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 		out[i] = g_refusals[i].load(std::memory_order_relaxed);
 }
 
-bool load_runtime(ID3D12Device *device)
+void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
+
+// The CHEAP half: LoadLibrary + export resolution + the identity IAT patch. No GPU contact, no
+// Init_Ext. Safe to call at device init, but off by default — see ngx_nr.hpp for why the init
+// half is deferred instead.
+static bool load_snippet_once()
 {
-	if (!g_enabled || g_runtime_tried)
+	if (!g_enabled || g_load_tried)
 		return g_runtime_loaded;
-	g_runtime_tried = true;
+	g_load_tried = true;
 
 	// Load the snippet and resolve ITS OWN NGX exports (src/ngx_snippet.hpp). Also patches the
 	// snippet's GetModuleFileNameW import so its identity queries are observable.
@@ -643,6 +658,15 @@ bool load_runtime(ID3D12Device *device)
 			"SR/RR are unaffected.", g_last_error);
 		return false;
 	}
+	return true;
+}
+
+// The EXPENSIVE half, deliberately deferred to a healthy steady state (ngx_nr.hpp).
+static bool init_snippet_once(ID3D12Device *device)
+{
+	if (g_init_tried)
+		return g_use_direct;
+	g_init_tried = true;
 
 	// Initialise the snippet through its OWN Init_Ext, not the NGX core. This is the whole
 	// point: the core resolves only driver-shipped snippets, so asking it for feature 18
@@ -663,7 +687,7 @@ bool load_runtime(ID3D12Device *device)
 		g_use_direct = false;
 		// Stay "loaded": the core path is still worth attempting, and its failure is itself
 		// the evidence that the direct path is the only viable one.
-		return true;
+		return false;
 	}
 
 	g_use_direct = true;
@@ -673,12 +697,49 @@ bool load_runtime(ID3D12Device *device)
 	return true;
 }
 
+bool preload()
+{
+	if (!g_enabled)
+		return false;
+	STRAY_LOG_INFO("NR: snippet PRE-LOAD at device init ([STRAYDLSS] NgxNRPreload): "
+		"LoadLibrary, export resolution and the identity IAT patch only — all pure memory "
+		"work, no GPU contact. Init_Ext is deferred to first use.");
+	return load_snippet_once();
+}
+
 bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInputs &in)
 {
 	if (!g_enabled)
 		return false;
+
+	// apply() is only reached AFTER a successful SR/RR evaluate, so every call here is one
+	// frame in which the device, queue and swapchain demonstrably worked. That makes this the
+	// right place both to count warmup and to do first-use initialisation.
+	++g_sr_evaluates_seen;
+
+	// WARMUP GATE. RenoDX initialises on the first evaluate ("will retry lazily on first
+	// evaluate"); we deliberately wait longer. Two GPU losses (GPU_IS_LOST, host power-cycle
+	// each time) have been measured in sessions that touched this runtime early, so a margin
+	// of demonstrably healthy frames before a leaked pre-release DLL contacts the GPU is us
+	// being more conservative than RenoDX ON PURPOSE — not a guess about their behaviour.
+	if (g_sr_evaluates_seen < g_warmup_frames)
+		return refuse(kRefWarmup, "waiting out the NR warmup window before initialising the "
+			"runtime.");
+
+	// FIRST USE: load (if not pre-loaded) and initialise, exactly once. Both halves latch, so
+	// a failure never retries per frame.
+	if (!g_load_tried)
+		load_snippet_once();
 	if (!g_runtime_loaded)
 		return refuse(kRefDllMissing, "nvngx_dlssnr.dll was never loaded.");
+	if (!g_init_tried)
+	{
+		STRAY_LOG_WARN("NR: warmup complete (%llu SR evaluates) — initialising the NR runtime "
+			"now (lazy, first use).",
+			static_cast<unsigned long long>(g_sr_evaluates_seen));
+		init_snippet_once(device);
+	}
+
 	if (device == nullptr || cmd == nullptr || in.image == nullptr || in.depth == nullptr ||
 		in.motion_vectors == nullptr || in.render_width == 0 || in.output_width == 0)
 		return refuse(kRefBadInputs, "a required resource or dimension was missing.");
@@ -905,6 +966,12 @@ void shutdown()
 	release_feature();
 	release(g_validate_readback);
 	release(g_nr_output);
+	// A snippet that was loaded but never initialised is a NORMAL, safe resting state — RenoDX
+	// says as much in its own words ("nvngx_dlssnr.dll was loaded but never initialized;
+	// leaving it mapped"). Say so calmly rather than treating it as a fault.
+	if (g_runtime_loaded && !g_use_direct)
+		STRAY_LOG_INFO("NR: the snippet was loaded but never initialised; leaving it mapped.");
+
 	// The snippet module is deliberately NOT FreeLibrary'd: it may still hold references, and
 	// unloading a 165 MB neural DLL under a live device is not worth the teardown risk. Its
 	// own Shutdown1 is likewise skipped — the caller tears the device down immediately after.

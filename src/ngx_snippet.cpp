@@ -37,7 +37,7 @@ wchar_t g_exe_path[kPathChars] = {};
 char g_last_error[256] = "";
 bool g_available = false;
 
-Identity g_identity = Identity::passthrough;
+Identity g_identity = Identity::nvngx_like; // see the header: the substring finding
 
 PFN_Init_Ext g_init_ext = nullptr;
 PFN_AllocParams g_alloc_params = nullptr;

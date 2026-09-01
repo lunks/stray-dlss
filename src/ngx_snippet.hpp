@@ -28,13 +28,27 @@ struct ID3D12GraphicsCommandList;
 
 namespace stray_dlss::snippet {
 
-// What our GetModuleFileNameW hook reports back to the snippet.
+// THE IDENTITY CHECK, SOLVED (measured 2026-09, live):
+//
+// The runtime requires the module path it is told about to CONTAIN THE SUBSTRING "nvngx.dll".
+// Evidence: with pass-through (our real 'stray-dlss.addon64') it made exactly ONE query and
+// failed immediately with FAIL_PlatformError; answering with a path ending in "\nvngx.dll" it
+// makes MULTIPLE queries, goes on to interrogate a SECOND module, and proceeds with no
+// PlatformError.
+//
+// This is the answer to "why can't a ReShade add-on just drive DLSS Neural Rendering": the
+// snippet refuses to run unless it believes it was loaded by NVIDIA's own nvngx host. It is
+// also exactly why RTX Remix names its shim remix_nvngx.dll — that filename CONTAINS
+// "nvngx.dll" — and why naming a path after the snippet itself does NOT work:
+// "nvngx_dlssnr.dll" does not contain the substring "nvngx.dll".
+//
+// Hence nvngx_like is the DEFAULT. The other modes are kept for diagnosis.
 enum class Identity
 {
-	passthrough,  // default: forward to the real API, change nothing, just log
-	snippet_path, // always the snippet's own full path
-	nvngx_like,   // the snippet's directory but named "nvngx.dll"
-	exe_path,     // the game executable's path
+	passthrough,  // forward to the real API, change nothing, just log (diagnostic)
+	snippet_path, // the snippet's own full path — does NOT satisfy the check; diagnostic only
+	nvngx_like,   // DEFAULT: the snippet's directory but named "nvngx.dll"
+	exe_path,     // the game executable's path (diagnostic)
 };
 
 void set_identity(Identity identity);
