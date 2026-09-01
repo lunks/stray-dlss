@@ -57,12 +57,13 @@ void set_tuning(float intensity, float local_tone_strength, float local_structur
 // Overrides the motion-vector scale handed to NR; <= 0 means "derive from the topology".
 void set_mvec_scale_override(float scale);
 
-// LoadLibrary the staged nvngx_dlssnr.dll. MUST be called at device init, BEFORE
-// NVSDK_NGX_D3D12_Init_* (§3.2: the addon pre-loads it at device creation). Logs the exact
-// path tried and whether the load succeeded — a missing or blocked DLL must be unmistakable.
-// Returns false and records last_error() on failure; NR then stays off for the session.
-// OPTIONAL, [STRAYDLSS] NgxNRPreload (default OFF): LoadLibrary the snippet and resolve its
-// exports at device init. This is the cheap half only — it NEVER calls Init_Ext.
+// [STRAYDLSS] NgxNRPreload (default ON): LoadLibrary the staged nvngx_dlssnr.dll, resolve its
+// exports and patch its GetModuleFileNameW import, at device init. This is the CHEAP half only
+// — it never calls Init_Ext and never touches the GPU. It matches RenoDX's own description,
+// "signed NR runtime (nvngx_dlssnr.dll) pre-loaded at device init"
+// (docs/RESEARCH-RENODX-DLSS5.md §3.2). Logs the exact path tried and whether the load
+// succeeded — a missing or blocked DLL must be unmistakable. Returns false and records
+// last_error() on failure; NR then stays off for the session.
 //
 // Why the split, and why init is lazy: initialising a leaked pre-release NGX snippet during
 // D3D12 device creation is both a measurable startup stall (a 165 MB DLL plus a GPU-touching
@@ -70,13 +71,13 @@ void set_mvec_scale_override(float scale);
 // each time). Device-init is the least settled moment in the D3D12 lifecycle; RenoDX's own
 // string says only that the runtime is "pre-loaded" there, never that it is INITIALISED there.
 // Deferring the init to a demonstrably healthy steady state is strictly safer and costs
-// nothing, so by default nothing at all happens at device init.
+// nothing, so device init does the memory work only and never contacts the GPU.
 bool preload();
 
 // How many successful SR/RR evaluates must pass before the NR runtime is initialised
-// ([STRAYDLSS] NgxNRWarmupFrames, default 120). apply() is only reached after a successful
-// evaluate, so this counts exactly the frames where the device, queue and swapchain have
-// demonstrably worked.
+// ([STRAYDLSS] NgxNRWarmupFrames, default 60; set 0 to reproduce RenoDX exactly). apply() is
+// only reached after a successful evaluate, so this counts exactly the frames in which the
+// device, queue and swapchain have demonstrably worked.
 void set_warmup_frames(unsigned int frames);
 
 struct ApplyInputs

@@ -369,10 +369,10 @@ void on_init_device(reshade::api::device *device)
 	nr::set_tuning(nr_intensity, nr_local_tone, nr_local_structure);
 
 	// [STRAYDLSS] NgxNRIdentity: what our GetModuleFileNameW hook reports to the snippet —
-	// "passthrough" (default: answer truthfully, only log), "snippet", "nvngx", "exe". The
-	// runtime interrogates module identity and we do not know what it demands, so the default
-	// changes nothing and the logged call trace is the diagnostic.
-	char nr_identity[24] = "passthrough";
+	// "nvngx" (default), "passthrough", "snippet", "exe". The runtime requires the reported
+	// path to CONTAIN the substring "nvngx.dll" (src/ngx_snippet.hpp records the measurement),
+	// so "nvngx" is the only mode that gets past its identity check; the rest are diagnostic.
+	char nr_identity[24] = "nvngx";
 	size_t nr_identity_size = sizeof(nr_identity);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIdentity", nr_identity,
 		&nr_identity_size);
