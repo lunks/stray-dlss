@@ -9,8 +9,8 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
 * **Adaptive triggers: WORKING**, driven from the game's own scratch signals, using the
   values the game itself authored. See §6. The game drives **each trigger separately** —
   see §8.
-* **Haptics: WORKING**, playing the game's own VIBE waveforms as amplitude envelopes
-  through `scePadSetVibration`, at the level the game asks for. See §9.
+* **Haptics: WORKING, as real waveforms on the voice coils** — the native DualSense
+  mechanism, not motor emulation. See §12, which supersedes the envelope approach in §9.
 * **Controller speaker: WORKING**, playing the game's own `_CONTROL` assets on the pad's
   Windows audio endpoint, with the game's own +5 dB trim. See §10.
 * **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
@@ -478,3 +478,119 @@ Everything measured above is unchanged and is what the plugin implements. Three 
 
 **None of the plugin has been run.** `mods/StrayDualSense/README.md` lists what is unverified
 and in what order to check it.
+
+
+---
+
+## 12. Coil haptics: the one byte that changes everything — HARD
+
+**MEASURED WORKING 2026-09-01.** The game's VIBE waveforms play on the DualSense's voice
+coils as audio, which is what they were authored for. Everything in §9 about envelopes,
+normalisation and master gain was compensating for a limitation that no longer applies.
+
+### Why every audio attempt failed until now
+
+The coils were in **rumble-emulation mode the whole time**. DualSense USB output report
+`0x02`, byte 1 is `valid_flag0`:
+
+| bit | meaning |
+|---|---|
+| 0 | `COMPATIBLE_VIBRATION` |
+| 1 | `HAPTICS_SELECT` |
+| 2 / 3 | right / left trigger FFB data is valid |
+| 4 / 5 | audio volume / audio path is valid |
+| 6 / 7 | mic LED / mute |
+
+With bit 0 set, the firmware **synthesises rumble on the coils** from the two motor
+amplitude bytes — so the actuators are busy emulating motors and audio sent to them goes
+nowhere. Nothing in libScePad ever clears it, because libScePad has no haptic-audio API
+(all 25 exports enumerated; only `scePadSetVibration` and `scePadSetVibrationMode` relate
+to haptics at all).
+
+**Write an output report whose `valid_flag0` does NOT claim compatible-vibration, and the
+coils take the waveform.** Values cross-checked against `EDSVibrationMode` in
+`rafaelvaloto/Dualsense-Multiplatform` (MIT): `DefaultRumble = 0xFF`,
+`HapticsRumble = 0xFC`.
+
+### The trap that cost two rounds: these are VALIDITY claims, not a mode
+
+Re-asserting `0xFC` every 2 s **broke the adaptive triggers** — first they stopped
+resisting, then they latched on permanently after a bump. `0xFC` has bits 2 and 3 set,
+which declares *"this report contains valid trigger FFB data"*, and we were sending
+**zeros** for it. Whether an effect was cleared or frozen depended on whether our write or
+libScePad's landed last.
+
+**Claim only the bits you actually supply.** We send `valid_flag0 = 0x00`: it asserts
+nothing, and critically does not re-assert compatible-vibration, which is all that is
+needed. `[STRAYDLSS] hapflag <hex>` overrides it live.
+
+The mode must be **re-asserted** (every 2 s, and immediately before each waveform):
+libScePad writes its own output reports for triggers and rumble, and those carry the same
+flag byte, so a single write at startup is undone the moment the game touches the pad.
+
+### The assets say what the hardware is
+
+| | channels | rate |
+|---|---|---|
+| `*_VIBE` (haptic) | **stereo** (64 of 67) | 48 kHz |
+| `*_CONTROL` (speaker) | mono | 44.1 kHz |
+
+The DualSense has **two coils** (one per grip) and **one speaker**. The haptic assets are
+stereo for exactly that reason: left channel drives the left grip. Feed them to the
+endpoint's **RL/RR** at 48 kHz float32 — its native mix format, so nothing is resampled.
+`tools/dualsense/wavegen.sh` produces them.
+
+### `scePadSetVibration` cannot carry a waveform — HARD, from the disassembly
+
+At RVA `0xDC50` it reads **exactly two bytes** and nothing else:
+
+```asm
+movzbl (%rdi),%r8d        ; byte 0
+movzbl 0x1(%rdi),%edx     ; byte 1
+call   0x18000a8d0        ; -> writes them to report offsets 3 and 4
+```
+
+The callee stores them at report offsets **3 (right)** and **4 (left)** — the classic motor
+fields. No length, no buffer, and the read is unconditional, so `scePadSetVibrationMode`
+cannot change it. This also confirms `{large, small}` == `{left, right}`.
+
+### What was measured and is NOT the answer
+
+Recorded so nobody re-runs them: the coils are **not** reachable via ALSA channels 2/3,
+**not** via the WASAPI rear pair while in emulation mode, and there is **no** second
+DualSense render endpoint in any device state (all 9 enumerated). Every one of those
+negatives was a symptom of the mode bit, not of the audio path.
+
+
+### Loops come from the asset, never from the caller — HARD
+
+Looping every haptic makes a bump buzz forever: a 0.24 s impact retriggers several times a
+second. UE4 only serializes `bLooping` when TRUE, so its presence in a SoundWave's name
+table IS the flag — **22 of 63** VIBE assets loop (`CatPurr2`, `Rain_Loop`, `Scratch`; the
+impacts do not). `tools/dualsense/wavegen.sh` and the extraction step emit
+`haptic_loops.txt`; the shim consults it and **the asset overrides whatever the caller
+asks for**.
+
+### Still not honoured, and known
+
+* **Fades.** `StartPS5Vibration` passes `FadeInTime` (the purr's is 1.0 s) and
+  `StopPS5Vibration` passes `FadeOutTime`; we start and stop abruptly. libScePad has no
+  fade API, but on the coil path we generate the samples so this is only a gain ramp.
+* **Concurrent haptics do not mix.** One playback slot: a new waveform supersedes the
+  current one. On PS5 they sum on the coils (rain + purr + footstep).
+* **The authored trigger effect.** `HKPlayerController::m_scratchablePS5TriggerEffect` is a
+  `PS5TriggerEffectData {Mode, Value1, Value2, Value3}` and we send a fixed
+  `Feedback{pos 0, str 2}` instead. Sony's Feedback command takes two parameters, so the
+  shape is right for that mode — but the mode itself is assumed, not read. **An attempt to
+  read it via `FindFirstOf` inside the publish path broke the triggers entirely and was
+  reverted**; the shim still accepts the six-field state file, so only the Lua side needs
+  redoing, and off the hot path.
+
+### The game never calls `scePadSetTriggerEffect` — HARD, measured
+
+Count is **0** across a session with triggers working. The PS5 paths are platform-gated and
+the native side never reaches the pad, which is why a pak mod calling `SetPS5TriggersState`
+also did nothing. **There is no call to pass through; the shim must synthesise it.** The
+proxy is otherwise a pure pass-through: all 25 exports forward unmodified, and only
+`scePadOpen` (records the handle) and `scePadSetVibrationMode` (logs) have custom wrappers,
+both still forwarding unchanged.

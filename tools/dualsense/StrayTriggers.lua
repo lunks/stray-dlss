@@ -61,6 +61,24 @@ local function describe(a)
     if out == "?" then pcall(function() if a.GetFullName then out = a:GetFullName() end end) end
     return out
 end
+-- Argument shapes differ between the plain and OnAudioComponent variants:
+--   StartPS5Vibration(SoundVibration, FadeInTime, Level)
+--   StartPS5VibrationOnAudioComponent(AudioComponent, SoundVibration, FadeInTime, Level, VibrationComponent)
+-- So locate the sound by what it resolves to, and the level as the last numeric argument.
+local function findSound(A)
+    for i = 2, A.n do
+        local d = describe(A[i])
+        if type(d) == "string" and d:find("SoundWave") then return d end
+    end
+    return nil
+end
+local function findLevel(A)
+    for i = A.n, 2, -1 do
+        local v; pcall(function() v = A[i]:get() end)
+        if type(v) == "number" then return v, true end
+    end
+    return 1.0, false
+end
 local GAIN = 1.0    -- master volume lives in the shim ("gain" cmd), tunable live
 local function padVibrationEnabled()
     local ok, v = pcall(function()
@@ -86,44 +104,79 @@ local function shortName(full)
     local n = tostring(full):match("([%w_]+)%.[%w_]+$") or tostring(full):match("([%w_]+)$")
     return n
 end
+playingComponent = nil   -- which AudioComponent owns the current haptic, if any
 sideOn = {[0] = 0, [1] = 0}   -- per-side trigger state; the game sets each separately
 local vibN = 0
-want(PC .. "StartPS5Vibration", "StartPS5Vibration", function(...)
+local function startVibration(...)
     local A = table.pack(...)
+    local viaComponent = false
+    pcall(function()
+        for i = 2, A.n do
+            local d = describe(A[i])
+            if type(d) == "string" and d:find("AudioComponent") then viaComponent = true break end
+        end
+    end)
     pcall(function()
         vibN = vibN + 1
-        -- Log EVERY argument raw. "level=255" was ambiguous: it could be a real 1.0 or the
-        -- fallback used when the argument is absent, and those need different fixes.
         local parts = {}
         for i = 2, A.n do
             local v; pcall(function() v = A[i]:get() end)
             local d = v
-            if type(v) == "userdata" then d = describe(A[i]) end
+            if type(v) == "userdata" or v == nil then d = describe(A[i]) end
             parts[#parts+1] = string.format("arg%d=%s(%s)", i, tostring(d), type(v))
         end
-        log(string.format("VIB START #%d nargs=%d %s", vibN, A.n, table.concat(parts, " ")))
-
-        local full = describe(A[2])
-        local name = shortName(full)
-        -- Take the LAST numeric argument as Level; nil (absent) is distinct from 0.
-        local lv, lvSeen = nil, false
-        for i = A.n, 3, -1 do
-            local v; pcall(function() v = A[i]:get() end)
-            if type(v) == "number" then lv = v lvSeen = true break end
+        local comp = nil
+        for i = 2, A.n do
+            local d = describe(A[i])
+            if type(d) == "string" and d:find("AudioComponent") then comp = d break end
         end
-        if not lvSeen then lv = 1.0 end
+        playingComponent = comp          -- nil for the non-component path
+        local full = findSound(A)
+        local name = full and shortName(full)
+        local lv, seen = findLevel(A)
+        -- Component-attached vibrations carry their level in the submix send (constant 1.0
+        -- per PS5VibrationAttenuation), not in this argument, which measures 0.0 for rain.
+        if viaComponent and lv <= 0.0 then lv = 1.0 end   -- component level lives in the submix send
         local amp = math.floor(math.max(0, math.min(1, lv)) * 255 * GAIN)
-        log(string.format("   -> play %s level=%.3f amp=%d seen=%s", tostring(name), lv, amp, tostring(lvSeen)))
+        log(string.format("VIB START #%d nargs=%d component=%s %s",
+            vibN, A.n, tostring(viaComponent), table.concat(parts, " ")))
+        log(string.format("   -> %s level=%.3f amp=%d seen=%s",
+            tostring(name), lv, amp, tostring(seen)))
         if not padVibrationEnabled() then
             log("VIB suppressed: PadVibrationEnabled is off")
-            vibecmd("stop")
+            vibecmd("hapstop")
         elseif name then
-            vibecmd(string.format("play %s %d 1", name, amp))
+            vibecmd(string.format("hap %s %d 1", name, amp))
+        end
+    end)
+end
+want(PC .. "StartPS5Vibration", "StartPS5Vibration", startVibration)
+want(PC .. "StartPS5VibrationOnAudioComponent", "StartPS5VibrationOnAudioComponent", startVibration)
+want(PC .. "StopPS5VibrationOnAudioComponent", "StopPS5VibrationOnAudioComponent", function(...)
+    local A = table.pack(...)
+    pcall(function()
+        local comp = nil
+        for i = 2, A.n do
+            local d = describe(A[i])
+            if type(d) == "string" and d:find("AudioComponent") then comp = d break end
+        end
+        -- Only the component that is actually playing may stop it.
+        if playingComponent and comp == playingComponent then
+            log("VIB STOP (component) " .. tostring(comp))
+            playingComponent = nil
+            vibecmd("hapstop")
         end
     end)
 end)
+want(PC .. "SetPS5VibrationLevelOnAudioComponent", "SetPS5VibrationLevelOnAudioComponent", function(...)
+    local A = table.pack(...)
+    pcall(function()
+        local lv = findLevel(A)
+        vibecmd(string.format("haplevel %d", math.floor(math.max(0, math.min(1, lv)) * 255 * GAIN)))
+    end)
+end)
 want(PC .. "StopPS5Vibration", "StopPS5Vibration", function()
-    pcall(function() log("VIB STOP"); vibecmd("stop") end)
+    pcall(function() log("VIB STOP (global)"); playingComponent = nil; vibecmd("hapstop") end)
 end)
 want(PC .. "SetPS5VibrationLevel", "SetPS5VibrationLevel", function(...)
     local B = table.pack(...)          -- varargs must be captured OUTSIDE the pcall
@@ -132,7 +185,7 @@ want(PC .. "SetPS5VibrationLevel", "SetPS5VibrationLevel", function(...)
     pcall(function()
         if A.n >= 2 then
             local lv = tonumber(tostring(A[2]:get())) or 1.0
-            vibecmd(string.format("level %d", math.floor(math.max(0, math.min(1, lv)) * 255 * GAIN)))
+            vibecmd(string.format("haplevel %d", math.floor(math.max(0, math.min(1, lv)) * 255 * GAIN)))
         end
     end)
 end)
@@ -143,14 +196,9 @@ end)
 local function startControllerSound(...)
     local A = table.pack(...)          -- capture OUTSIDE the pcall (varargs)
     pcall(function()
-        local full = describe(A[2])
-        local name = shortName(full)
-        local lv, seen = nil, false
-        for i = A.n, 3, -1 do
-            local v; pcall(function() v = A[i]:get() end)
-            if type(v) == "number" then lv = v seen = true break end
-        end
-        if not seen then lv = 1.0 end
+        local full = findSound(A)
+        local name = full and shortName(full)
+        local lv, seen = findLevel(A)
         local amp = math.floor(math.max(0, math.min(1, lv)) * 255)
         log(string.format("SPK START sound=%s -> spk %s level=%.3f amp=%d",
             full, tostring(name), lv, amp))
@@ -170,8 +218,7 @@ want(PC .. "SetPS5ControllerSoundLevel", "SetPS5ControllerSoundLevel", function(
         end
     end)
 end)
-want(PC .. "StartPS5VibrationOnAudioComponent", "StartPS5VibrationOnAudioComponent",
-    function() pcall(function() log("VIB-BP >>> StartPS5VibrationOnAudioComponent") end) end)
+
 
 -- STEP 2: live platform override
 local plat = 0
