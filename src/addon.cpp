@@ -221,6 +221,7 @@ struct NrUiState
 	float color_strength = 1.0f;
 	float transfer_strength = 1.0f;
 	bool  smooth_exposure = true;     // the toggle; when off the rate is forced to 1.0
+	float scale_reset_tol = 0.15f;    // ratio drift before NR's history is discarded; 0 = never
 	float exposure_smoothing = 0.05f; // per-frame weight of the new exposure sample; 1.0 = off
 	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
 	int   mv_convention = 0;  // index into kMvConventions
@@ -252,6 +253,7 @@ void apply_nr_ui()
 	// The checkbox is the A/B; the slider only matters while it is on. Forcing exactly 1.0 when
 	// off reproduces the unsmoothed behaviour bit for bit rather than approximately.
 	nr::set_exposure_smoothing(g_nr_ui.smooth_exposure ? g_nr_ui.exposure_smoothing : 1.0f);
+	nr::set_scale_reset_tolerance(g_nr_ui.scale_reset_tol);
 	nr::set_track_exposure(g_nr_ui.track_exposure);
 	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
 
@@ -501,6 +503,8 @@ void on_init_device(reshade::api::device *device)
 		g_nr_ui.transfer_strength);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
 		g_nr_ui.exposure_smoothing);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRScaleResetTolerance",
+		g_nr_ui.scale_reset_tol);
 	int nr_smooth = g_nr_ui.smooth_exposure ? 1 : 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSmoothExposure", nr_smooth);
 	g_nr_ui.smooth_exposure = nr_smooth != 0;
@@ -1343,8 +1347,14 @@ void draw_nr_controls()
 	if (g_nr_ui.smooth_exposure)
 	{
 		ImGui::SameLine();
-		changed |= ImGui::SliderFloat("rate", &g_nr_ui.exposure_smoothing, 0.01f, 1.0f, "%.3f");
+		changed |= ImGui::SliderFloat("rate", &g_nr_ui.exposure_smoothing, 0.002f, 1.0f, "%.4f");
 	}
+	// How far the scale may drift before NR's history is thrown away. Measured live: the
+	// exposure factor swings ~20% during normal play, so a tight tolerance resets the history
+	// many times a minute — which is its own flicker source. 0 disables the latch entirely and
+	// lets the history ride through the drift instead.
+	changed |= ImGui::SliderFloat("Scale reset tol (0=never)", &g_nr_ui.scale_reset_tol, 0.0f,
+		2.0f, "%.2f");
 
 	// THE MOTION KNOB. Our motion vectors are render-resolution (1920x1080) while the colour is
 	// the output rect (3840x2160). Whether the runtime wants them in the guide's own pixels
@@ -1396,6 +1406,8 @@ void draw_nr_controls()
 			g_nr_ui.transfer_strength);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
 			g_nr_ui.exposure_smoothing);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRScaleResetTolerance",
+			g_nr_ui.scale_reset_tol);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSmoothExposure",
 			g_nr_ui.smooth_exposure ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
