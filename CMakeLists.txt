@@ -62,7 +62,11 @@ add_library(stray_dlss_core STATIC
     src/core/nr_hook_plan.hpp
     src/core/nr_history_plan.cpp
     src/core/nr_history_plan.hpp
-    src/core/ring.hpp)
+    src/core/ring.hpp
+    src/host/ini.cpp
+    src/host/ini.hpp
+    src/host/config.cpp
+    src/host/config.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -143,6 +147,9 @@ if(STRAY_DLSS_BUILD_ADDON)
 
     add_library(stray-dlss SHARED
         src/addon.cpp
+        src/backend_reshade/reshade_config.cpp
+        src/backend_reshade/reshade_log.cpp
+        src/backend_reshade/reshade_host.hpp
         src/log.cpp
         src/log.hpp
         src/ngx_backend.cpp
@@ -306,7 +313,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_codec.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_history_plan.cpp
-        tests/test_ring.cpp)
+        tests/test_ring.cpp
+        tests/test_ini.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

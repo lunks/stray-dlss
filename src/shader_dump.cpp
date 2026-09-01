@@ -2,7 +2,7 @@
 
 #include "log.hpp"
 
-#include "reshade_all.hpp"
+#include "host/config.hpp"
 
 #include <windows.h>
 
@@ -29,9 +29,7 @@ void initialise()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 
-	bool enable = false;
-	reshade::get_config_value(nullptr, kConfigSection, "DumpShaders", enable);
-	g_enabled = enable;
+	g_enabled = host::cfg::get_bool("DumpShaders", false);
 
 	if (!g_enabled)
 	{

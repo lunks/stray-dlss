@@ -1,7 +1,5 @@
 #include "log.hpp"
 
-#include "reshade_all.hpp"
-
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
@@ -11,7 +9,7 @@ namespace {
 
 std::mutex g_mutex;
 std::FILE *g_file = nullptr;
-bool g_reshade_ready = false;
+ExternalSink g_external = nullptr;
 
 const char *level_tag(Level level)
 {
@@ -49,10 +47,10 @@ void shutdown_file_sink()
 	}
 }
 
-void enable_reshade_sink()
+void set_external_sink(ExternalSink sink)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
-	g_reshade_ready = true;
+	g_external = sink;
 }
 
 void write(Level level, const char *message)
@@ -65,12 +63,8 @@ void write(Level level, const char *message)
 		std::fflush(g_file); // the interesting failures are the ones that crash next
 	}
 
-	if (g_reshade_ready)
-	{
-		char prefixed[2048];
-		std::snprintf(prefixed, sizeof(prefixed), "[stray-dlss] %s", message);
-		reshade::log::message(static_cast<reshade::log::level>(level), prefixed);
-	}
+	if (g_external != nullptr)
+		g_external(level, message);
 }
 
 void writef(Level level, const char *format, ...)

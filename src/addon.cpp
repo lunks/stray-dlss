@@ -26,6 +26,8 @@
 #include "taa_hook.hpp"
 
 #include "reshade_all.hpp"
+#include "backend_reshade/reshade_host.hpp"
+#include "host/config.hpp"
 
 #include <descriptor_tracking.hpp>
 #include <state_tracking.hpp>
@@ -306,24 +308,24 @@ void on_init_device(reshade::api::device *device)
 
 	// Deliberately NOT initialising NGX here. See State::ngx_enabled.
 	bool enable_ngx = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "EnableNGX", enable_ngx);
+	enable_ngx = host::cfg::get_bool("EnableNGX", enable_ngx);
 	g_state.ngx_enabled.store(enable_ngx, std::memory_order_relaxed);
 	STRAY_LOG_INFO("NGX is %s ([STRAYDLSS] EnableNGX). It initialises lazily on frame %d, "
 		"never during device init.",
 		enable_ngx ? "ENABLED" : "disabled", kNgxInitFrame);
 
 	bool mv_resolve = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MvResolve", mv_resolve);
+	mv_resolve = host::cfg::get_bool("MvResolve", mv_resolve);
 	bool restore_heaps = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MvRestoreHeaps", restore_heaps);
+	restore_heaps = host::cfg::get_bool("MvRestoreHeaps", restore_heaps);
 	bool restore_state = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MvRestoreState", restore_state);
+	restore_state = host::cfg::get_bool("MvRestoreState", restore_state);
 	int mv_dispatch_mode = 2;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MvDispatch", mv_dispatch_mode);
+	mv_dispatch_mode = host::cfg::get_int("MvDispatch", mv_dispatch_mode);
 	taa_hook::configure(mv_resolve, restore_heaps, restore_state, mv_dispatch_mode);
 
 	bool ngx_evaluate = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
+	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
 
 	// [STRAYDLSS] PerfLog, default ON: frame-time + our-CPU-share reports every 600 presents.
@@ -331,7 +333,7 @@ void on_init_device(reshade::api::device *device)
 	// per-call timers only on the few size-gated dispatches) and a perf report nobody enabled
 	// is a wasted round trip. Set 0 to silence it.
 	bool perf_log = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "PerfLog", perf_log);
+	perf_log = host::cfg::get_bool("PerfLog", perf_log);
 	perf::set_enabled(perf_log);
 
 	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
@@ -340,7 +342,7 @@ void on_init_device(reshade::api::device *device)
 	// and NgxEvaluate=1 — the probe rides the SR feature-creation path and mode 2 rides
 	// the SR evaluate site.
 	int ngx_rr = 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxRR", ngx_rr);
+	ngx_rr = host::cfg::get_int("NgxRR", ngx_rr);
 	ngx::set_rr_mode(ngx_rr);
 	taa_hook::set_ngx_rr(ngx_rr);
 	if (ngx_rr == 1)
@@ -362,9 +364,7 @@ void on_init_device(reshade::api::device *device)
 	// at the TAA hook the G-buffer objects are alive but their CONTENT is recycled);
 	// "taa" keeps the old in-hook record for A/B measurement.
 	char resolve_at[16] = "ssd";
-	size_t resolve_at_size = sizeof(resolve_at);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferResolveAt", resolve_at,
-		&resolve_at_size);
+	host::cfg::get_string("GBufferResolveAt", resolve_at, sizeof(resolve_at));
 	const bool resolve_at_ssd = std::strcmp(resolve_at, "taa") != 0;
 	taa_hook::set_gbuffer_resolve_at(resolve_at_ssd);
 	if (ngx_rr == 2)
@@ -383,9 +383,7 @@ void on_init_device(reshade::api::device *device)
 	// for the red/cyan single-pixel pops: bright neon highlights mis-weighted by DLSS's
 	// own exposure estimate in a dark scene.
 	char exposure_mode[16] = "auto";
-	size_t exposure_mode_size = sizeof(exposure_mode);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxExposure", exposure_mode,
-		&exposure_mode_size);
+	host::cfg::get_string("NgxExposure", exposure_mode, sizeof(exposure_mode));
 	const bool exposure_texture = std::strcmp(exposure_mode, "texture") == 0;
 	ngx::set_exposure_from_texture(exposure_texture);
 	STRAY_LOG_INFO("DLSS exposure source: %s ([STRAYDLSS] NgxExposure=auto|texture).",
@@ -399,7 +397,7 @@ void on_init_device(reshade::api::device *device)
 	// (0.25 / 4.0) must move the image if the exposure texture reaches DLSS's math. Only
 	// meaningful under NgxExposure=texture; 1.0 is behaviourally identical to before.
 	float exposure_scale = 1.0f;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxExposureScale", exposure_scale);
+	exposure_scale = host::cfg::get_float("NgxExposureScale", exposure_scale);
 	ngx::set_exposure_scale(exposure_scale);
 	if (exposure_texture)
 		STRAY_LOG_INFO("DLSS InExposureScale = %.4f ([STRAYDLSS] NgxExposureScale). The "
@@ -412,20 +410,17 @@ void on_init_device(reshade::api::device *device)
 	// NgxNRDll); on a 4090 it must be an Ada-patched build.
 	// (docs/RESEARCH-RENODX-DLSS5.md §2.1-§3.2)
 	bool ngx_nr = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNR", ngx_nr);
+	ngx_nr = host::cfg::get_bool("NgxNR", ngx_nr);
 	nr::set_enabled(ngx_nr);
 
 	// [STRAYDLSS] NgxSnippetPath: extra directory for NGX's own snippet search (additive to
 	// its default application-directory search). Must be set before ngx::initialise.
 	char snippet_path[480] = "";
-	size_t snippet_path_size = sizeof(snippet_path);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxSnippetPath", snippet_path,
-		&snippet_path_size);
+	host::cfg::get_string("NgxSnippetPath", snippet_path, sizeof(snippet_path));
 	ngx::set_snippet_path(snippet_path);
 
 	char nr_dll[480] = "";
-	size_t nr_dll_size = sizeof(nr_dll);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRDll", nr_dll, &nr_dll_size);
+	host::cfg::get_string("NgxNRDll", nr_dll, sizeof(nr_dll));
 	nr::set_dll_path(nr_dll);
 
 	// [STRAYDLSS] NgxNRTopology: "post" (default) = feature 18 post-processes our already
@@ -433,24 +428,22 @@ void on_init_device(reshade::api::device *device)
 	// itself. Both readings of the study are plausible (§0.1 vs §2.3), so both are reachable
 	// and the active one is logged.
 	char nr_topology[16] = "post";
-	size_t nr_topology_size = sizeof(nr_topology);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTopology", nr_topology,
-		&nr_topology_size);
+	host::cfg::get_string("NgxNRTopology", nr_topology, sizeof(nr_topology));
 	const bool nr_sr_shaped = std::strcmp(nr_topology, "sr") == 0;
 	nr::set_topology(nr_sr_shaped ? nr::Topology::sr_shaped : nr::Topology::post_process);
 
 	// Live quality knobs (the study's DLSSNR.* tuning parameters, §2.2).
 	// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values rather than a neutral 1.0 — we
 	// follow their configuration instead of inventing one.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", g_nr_ui.local_structure);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure", g_nr_ui.skin_structure);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
+	g_nr_ui.intensity = host::cfg::get_float("NgxNRIntensity", g_nr_ui.intensity);
+	g_nr_ui.local_tone = host::cfg::get_float("NgxNRLocalTone", g_nr_ui.local_tone);
+	g_nr_ui.local_structure = host::cfg::get_float("NgxNRLocalStructure", g_nr_ui.local_structure);
+	g_nr_ui.skin_structure = host::cfg::get_float("NgxNRSkinStructure", g_nr_ui.skin_structure);
+	g_nr_ui.preset = host::cfg::get_int("NgxNRPreset", g_nr_ui.preset);
 	int nr_auto_mask = g_nr_ui.auto_mask ? 1 : 0;
 	int nr_ui_correction = g_nr_ui.ui_correction ? 1 : 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask", nr_auto_mask);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection", nr_ui_correction);
+	nr_auto_mask = host::cfg::get_int("NgxNRAutoMask", nr_auto_mask);
+	nr_ui_correction = host::cfg::get_int("NgxNRUICorrection", nr_ui_correction);
 	g_nr_ui.auto_mask = nr_auto_mask != 0;
 	g_nr_ui.ui_correction = nr_ui_correction != 0;
 	const float nr_intensity = g_nr_ui.intensity;
@@ -462,16 +455,14 @@ void on_init_device(reshade::api::device *device)
 	// path to CONTAIN the substring "nvngx.dll" (src/ngx_snippet.hpp records the measurement),
 	// so "nvngx" is the only mode that gets past its identity check; the rest are diagnostic.
 	char nr_identity[24] = "nvngx";
-	size_t nr_identity_size = sizeof(nr_identity);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIdentity", nr_identity,
-		&nr_identity_size);
+	host::cfg::get_string("NgxNRIdentity", nr_identity, sizeof(nr_identity));
 	snippet::set_identity_from_string(nr_identity);
 
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", g_nr_ui.mvec_scale);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MVConvention", g_nr_ui.mv_convention);
+	g_nr_ui.mvec_scale = host::cfg::get_float("NgxNRMVecScale", g_nr_ui.mvec_scale);
+	g_nr_ui.mv_convention = host::cfg::get_int("MVConvention", g_nr_ui.mv_convention);
 	int mv_ix = 0, mv_iy = 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MVInvertX", mv_ix);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "MVInvertY", mv_iy);
+	mv_ix = host::cfg::get_int("MVInvertX", mv_ix);
+	mv_iy = host::cfg::get_int("MVInvertY", mv_iy);
 	g_nr_ui.mv_invert_x = mv_ix != 0;
 	g_nr_ui.mv_invert_y = mv_iy != 0;
 	const float nr_mvec_scale = g_nr_ui.mvec_scale;
@@ -493,27 +484,24 @@ void on_init_device(reshade::api::device *device)
 	// small, which is the direction our failure points. Do not guess: the codec logs the colour
 	// input, the encoded proxy and the neural output luminance over one crop on one line, and
 	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
+	g_nr_ui.paper_white = host::cfg::get_float("NgxNRPaperWhiteScale", g_nr_ui.paper_white);
 	// [STRAYDLSS] NgxNRTrackExposure, default ON: multiply the codec's proxy scale by the
 	// engine's OneOverPreExposure so the soft-clip knee follows scene brightness. We dropped this
 	// in the port; without it there is no single paper white that is right in both a dark room
 	// and a bright street, because UE4's pre-exposure moves with the scene. (ngx_nr.hpp)
 	int nr_track_exposure = g_nr_ui.track_exposure ? 1 : 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTrackExposure", nr_track_exposure);
+	nr_track_exposure = host::cfg::get_int("NgxNRTrackExposure", nr_track_exposure);
 	g_nr_ui.track_exposure = nr_track_exposure != 0;
 	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
 	// the escape hatch for a colour cast. 1 takes the network's colour too.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
+	g_nr_ui.color_strength = host::cfg::get_float("NgxNRColorStrength", g_nr_ui.color_strength);
 	// A global lerp back toward the untouched original; 0 is an EXACT bit-for-bit bypass, which
 	// makes it the honest A/B against "NR off" without changing anything else.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
-		g_nr_ui.transfer_strength);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
-		g_nr_ui.exposure_smoothing);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRScaleResetTolerance",
-		g_nr_ui.scale_reset_tol);
+	g_nr_ui.transfer_strength = host::cfg::get_float("NgxNRTransferStrength", g_nr_ui.transfer_strength);
+	g_nr_ui.exposure_smoothing = host::cfg::get_float("NgxNRExposureSmoothing", g_nr_ui.exposure_smoothing);
+	g_nr_ui.scale_reset_tol = host::cfg::get_float("NgxNRScaleResetTolerance", g_nr_ui.scale_reset_tol);
 	int nr_smooth = g_nr_ui.smooth_exposure ? 1 : 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSmoothExposure", nr_smooth);
+	nr_smooth = host::cfg::get_int("NgxNRSmoothExposure", nr_smooth);
 	g_nr_ui.smooth_exposure = nr_smooth != 0;
 	g_nr_ui.enabled = ngx_nr;
 	apply_nr_ui();
@@ -546,9 +534,9 @@ void on_init_device(reshade::api::device *device)
 		// suspect for two measured GPU_IS_LOST events. RenoDX's own fallback string ("will
 		// retry lazily on first evaluate") confirms load and init are independent states.
 		bool nr_preload = true;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreload", nr_preload);
+		nr_preload = host::cfg::get_bool("NgxNRPreload", nr_preload);
 		int nr_warmup = 60;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRWarmupFrames", nr_warmup);
+		nr_warmup = host::cfg::get_int("NgxNRWarmupFrames", nr_warmup);
 		nr::set_warmup_frames(nr_warmup < 0 ? 0u : static_cast<unsigned int>(nr_warmup));
 		STRAY_LOG_INFO("NR: preload=%d warmupFrames=%d (RenoDX initialises on the FIRST "
 			"evaluate; we wait longer on purpose after two GPU_IS_LOST events).",
@@ -560,7 +548,7 @@ void on_init_device(reshade::api::device *device)
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
 	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
 	bool resolve_only = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferResolveOnly", resolve_only);
+	resolve_only = host::cfg::get_bool("GBufferResolveOnly", resolve_only);
 	taa_hook::set_gbuffer_resolve_only(resolve_only);
 	if (resolve_only && ngx_rr == 2)
 		STRAY_LOG_WARN("GBufferResolveOnly=1: RR evaluate disabled; guide records (and "
@@ -570,18 +558,16 @@ void on_init_device(reshade::api::device *device)
 	// slot order is unverified by content until the guide dump says otherwise; this flips
 	// which identified resource feeds which role, no rebuild.
 	bool swap_bc = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferSwapBC", swap_bc);
+	swap_bc = host::cfg::get_bool("GBufferSwapBC", swap_bc);
 	if (swap_bc || ngx_rr == 2)
 		gbr::set_bc_swapped(swap_bc); // logs its state; skipped when RR is off and unswapped
 
 	int ngx_dry_run = 0;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDryRun", ngx_dry_run);
+	ngx_dry_run = host::cfg::get_int("NgxDryRun", ngx_dry_run);
 	taa_hook::set_ngx_dry_run(ngx_dry_run);
 
 	char dry_hash[384] = "";
-	size_t dry_hash_size = sizeof(dry_hash);
-	const bool dry_hash_read =
-		reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunHash", dry_hash, &dry_hash_size);
+	const bool dry_hash_read = host::cfg::get_string("DryRunHash", dry_hash, sizeof(dry_hash));
 	std::uint64_t dry_hashes[16];
 	std::size_t dry_hash_count = 0;
 	std::uint64_t dry_hash_value = 0; // first entry, for the existing log line
@@ -602,8 +588,8 @@ void on_init_device(reshade::api::device *device)
 	// Diagnostic for the config mystery measured 2026-08-31: values present in the ini's
 	// [STRAYDLSS] section read back empty while sibling keys work. This logs what the API
 	// actually returned so one pasted log settles it.
-	STRAY_LOG_INFO("config probe: DryRunHash read=%d size=%zu raw='%.48s' parsed=%zu",
-		dry_hash_read ? 1 : 0, dry_hash_size, dry_hash, dry_hash_count);
+	STRAY_LOG_INFO("config probe: DryRunHash read=%d raw='%.48s' parsed=%zu",
+		dry_hash_read ? 1 : 0, dry_hash, dry_hash_count);
 
 	// stray-dlss-dryrun.txt beside the game overrides BOTH dry-run settings, bypassing
 	// ReShade's config entirely: `alternate=<frames>` on one line, one hash per line
@@ -650,17 +636,15 @@ void on_init_device(reshade::api::device *device)
 			dry_hash_count);
 
 	char ngx_pass[32] = "";
-	size_t ngx_pass_size = sizeof(ngx_pass);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPassHash", ngx_pass, &ngx_pass_size);
+	host::cfg::get_string("NgxPassHash", ngx_pass, sizeof(ngx_pass));
 	const std::uint64_t ngx_pass_value = std::strtoull(ngx_pass, nullptr, 0);
 	taa_hook::set_ngx_pass_hash(ngx_pass_value);
 	if (ngx_pass_value != 0)
 		STRAY_LOG_INFO("DLSS will replace pass 0x%016llx ([STRAYDLSS] NgxPassHash).",
 			static_cast<unsigned long long>(ngx_pass_value));
 
-	int ngx_preset = 0;
-	if (reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPreset", ngx_preset) &&
-		ngx_preset != 0)
+	const int ngx_preset = host::cfg::get_int("NgxPreset", 0);
+	if (ngx_preset != 0)
 	{
 		ngx::set_preset(ngx_preset);
 		STRAY_LOG_INFO("NgxPreset=%d requested ([STRAYDLSS] NgxPreset; 10=J 11=K 12=L 13=M).",
@@ -668,29 +652,28 @@ void on_init_device(reshade::api::device *device)
 	}
 
 	bool ext_unhook_enabled = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "ExtUnhook", ext_unhook_enabled);
+	ext_unhook_enabled = host::cfg::get_bool("ExtUnhook", ext_unhook_enabled);
 	ext_unhook::set_enabled(ext_unhook_enabled);
 	if (!ext_unhook_enabled)
 		STRAY_LOG_WARN("ExtUnhook=0: ReShade's vkd3d ext-vtable patch will NOT be undone before "
 			"NGX calls; expect the frozen-output failure while anything queries the proxy.");
 
 	bool dump_inputs = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDumpInputs", dump_inputs);
+	dump_inputs = host::cfg::get_bool("NgxDumpInputs", dump_inputs);
 	input_dump::set_enabled(dump_inputs);
 	if (dump_inputs)
 		STRAY_LOG_WARN("NgxDumpInputs is ON: the DLSS colour/depth inputs and output are dumped "
 			"to straydlss_*.bin at evaluates 600 and 900.");
 
 	bool ngx_paint = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxPaint", ngx_paint);
+	ngx_paint = host::cfg::get_bool("NgxPaint", ngx_paint);
 	taa_hook::set_ngx_paint(ngx_paint);
 	if (ngx_paint)
 		STRAY_LOG_WARN("NgxPaint is ON: the TAA output is cleared to MAGENTA instead of "
 			"evaluating. If the screen is not magenta, the output handle is wrong.");
 
-	int dry_alternate = 0;
-	const bool alt_read =
-		reshade::get_config_value(nullptr, "STRAYDLSS", "DryRunAlternate", dry_alternate);
+	const bool alt_read = host::cfg::has("DryRunAlternate");
+	const int dry_alternate = host::cfg::get_int("DryRunAlternate", 0);
 	STRAY_LOG_INFO("config probe: DryRunAlternate read=%d value=%d",
 		alt_read ? 1 : 0, dry_alternate);
 	if (dry_alternate > 0) // never zero a file-based override with an absent ini key
@@ -1057,8 +1040,7 @@ void on_present(
 			// it can be forced either way from the ini.
 			char device_pref[16] = "auto";
 			size_t device_pref_size = sizeof(device_pref);
-			reshade::get_config_value(nullptr, "STRAYDLSS", "NgxDevice", device_pref,
-				&device_pref_size);
+			host::cfg::get_string("NgxDevice", device_pref, sizeof(device_pref));
 			const bool force_native = std::strcmp(device_pref, "native") == 0;
 			const bool force_proxy = std::strcmp(device_pref, "proxy") == 0;
 
@@ -1731,14 +1713,14 @@ void register_events()
 	reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
 
 	bool hash_shaders = true;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "HashShaders", hash_shaders);
+	hash_shaders = host::cfg::get_bool("HashShaders", hash_shaders);
 
 	// [STRAYDLSS] PassFinder, default OFF: dataflow identification of the TAA pass — the
 	// bounded walk backwards from the tonemapper (core/pass_walk.hpp), proven in CI and here
 	// only LOGGING its verdict against the live game. It attributes events by shader hash,
 	// so enabling it forces the pipeline events (and their PSO-cache cost) on.
 	bool pass_finder_enabled = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "PassFinder", pass_finder_enabled);
+	pass_finder_enabled = host::cfg::get_bool("PassFinder", pass_finder_enabled);
 	pass_finder::set_enabled(pass_finder_enabled);
 
 	// [STRAYDLSS] GBufferFinder, default OFF: log-only identification of the base pass's
@@ -1746,13 +1728,13 @@ void register_events()
 	// render-target/draw events below, and the pipeline events for the SSR-denoiser
 	// cross-check's shader hash.
 	bool gbuffer_finder_enabled = false;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "GBufferFinder", gbuffer_finder_enabled);
+	gbuffer_finder_enabled = host::cfg::get_bool("GBufferFinder", gbuffer_finder_enabled);
 	{
 		// NgxRR=2 consumes the finder's identification (taa_hook::try_evaluate_rr), so the
 		// finder must observe even when GBufferFinder was not set explicitly. Read here as
 		// well as in on_init_device because event registration happens first.
 		int ngx_rr_for_finder = 0;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxRR", ngx_rr_for_finder);
+		ngx_rr_for_finder = host::cfg::get_int("NgxRR", ngx_rr_for_finder);
 		if ((ngx_rr_for_finder == 2 || ngx_rr_for_finder == 3) && !gbuffer_finder_enabled)
 		{
 			gbuffer_finder_enabled = true;
@@ -1804,19 +1786,18 @@ void register_events()
 	// The whole argument for moving it — and what each site costs — is in src/nr_hook.hpp.
 	{
 		char nr_hook[16] = "taa";
-		size_t nr_hook_size = sizeof(nr_hook);
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRHook", nr_hook, &nr_hook_size);
+		host::cfg::get_string("NgxNRHook", nr_hook, sizeof(nr_hook));
 		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
 		nrhook::set_hook_mode(mode);
 
 		int preui_bind = 2;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreUiBind", preui_bind);
+		preui_bind = host::cfg::get_int("NgxNRPreUiBind", preui_bind);
 		nrhook::set_preui_bind_ordinal(preui_bind < 0 ? 0u : static_cast<unsigned int>(preui_bind));
 
 		// Shared with the TAA path; only consulted on `preui`, which records onto the GAME's
 		// command list. Re-read here for the same reason the mode is.
 		bool restore_state = true;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "RestoreState", restore_state);
+		restore_state = host::cfg::get_bool("RestoreState", restore_state);
 		nrhook::set_restore_state(restore_state);
 
 		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
@@ -1857,7 +1838,7 @@ void register_events()
 		// back at present. Read alongside the hook mode because it is only meaningful for one of
 		// them, and inert (loudly) for the other two. Full argument: src/nr_history.hpp.
 		bool restore_history = false;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreHistory", restore_history);
+		restore_history = host::cfg::get_bool("NgxNRRestoreHistory", restore_history);
 		nrhist::set_enabled(restore_history);
 		nrhist::set_site(mode);
 		g_nr_ui.restore_history = restore_history;
@@ -1867,7 +1848,7 @@ void register_events()
 		// keeps the derived default (0xC0 = NON_PIXEL|PIXEL_SHADER_RESOURCE); the derivation is
 		// in src/nr_history.cpp and is echoed in full on the first restore.
 		int restore_state_bits = 0;
-		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreState", restore_state_bits);
+		restore_state_bits = host::cfg::get_int("NgxNRRestoreState", restore_state_bits);
 		nrhist::set_image_state_at_present(restore_state_bits <= 0
 			? 0u : static_cast<unsigned int>(restore_state_bits));
 

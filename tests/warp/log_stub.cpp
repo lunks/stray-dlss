@@ -10,7 +10,7 @@ namespace stray_dlss::log {
 
 void init_file_sink() {}
 void shutdown_file_sink() {}
-void enable_reshade_sink() {}
+void set_external_sink(ExternalSink) {}
 
 void write(Level level, const char *message)
 {
