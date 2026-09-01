@@ -688,8 +688,8 @@ a third time by a recomputation that reproduced all seven measured anchors exact
 | `ViewSizeAndInvSize` | 130 | 2080 | measured |
 | `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 | measured — **decoy**, reads `(1,1,1,1)` |
 | `BufferSizeAndInvSize` | 132 | 2112 | [derived] |
-| `PreExposure` | 135.y | 2164 | [derived] |
-| `OneOverPreExposure` | 135.z | 2168 | [derived] |
+| `PreExposure` | 135.y | 2164 | [derived], **corroborated** — the SR path has used it correctly for a long time |
+| ~~`OneOverPreExposure`~~ | ~~135.z~~ | ~~2168~~ | **WRONG — measured 2026-09-01, do not use** |
 | `NearPlane` | 142.x | 2272 | [derived] |
 | `DeltaTime` | 143.x | 2288 | [derived] |
 | `CameraCut` | 145.x | 2320 | [derived] |
@@ -697,6 +697,24 @@ a third time by a recomputation that reproduced all seven measured anchors exact
 
 Everything we need is in a single **2448-byte prefix**. **Rows beyond 152 were not verified — do
 not use them.**
+
+> **ROW 135.z IS NOT `OneOverPreExposure`. Measured live 2026-09-01 and it is not close.** In one
+> frame row 135.y read **0.456** while row 135.z read **6.6794**. Those are supposed to be
+> reciprocals; their product is **3.05**, not 1. Whatever 135.z holds, it is not the inverse
+> pre-exposure, and the NR codec was multiplying its proxy scale by it — roughly 3x too large.
+> That is what "track exposure is broken" looked like from the outside.
+>
+> **Derive the reciprocal from 135.y instead of reading a second row.** It is self-consistent by
+> construction and drops a dependency on an unverified offset entirely, which is strictly better
+> than hunting for the right one. 135.y is the corroborated half of the pair: the SR path has fed
+> it to `InPreExposure` correctly for a long time.
+>
+> **The general lesson: two [derived] rows that are supposed to be related give you a free
+> self-check — use it.** A reciprocal pair whose product is not 1, or a matrix row that is not
+> unit-length, costs nothing to test and catches exactly this class of silent offset error.
+> `ue4::pre_exposure_plausible` does that here, checked at the point of USE rather than in
+> `view_params_plausible` — that gate governs the whole DLSS path, so folding an unverified-row
+> check into it would disable upscaling outright if the offset were ever wrong.
 
 `ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
 analysis**, no reflection names involved.
