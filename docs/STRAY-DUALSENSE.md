@@ -672,3 +672,33 @@ the trigger state write when the effect reader was added below `publish`. The fi
 syntactically perfect, so the syntax gate passes it. This is the same declaration-order
 mistake the C shim hit five times, except C fails at compile time and Lua does not:
 **declare before use, and check it explicitly.**
+
+
+### The full controller-sound census — HARD, pak-wide
+
+Selecting by **sound class** across all 7,608 `Sound/` headers in the pak (never by folder):
+
+| class | SoundWaves | of which loop |
+|---|---|---|
+| `SCLASS_controller` (speaker, mono 44.1 kHz) | **4** | 2 |
+| `SCLASS_controllerVibration` (coils, stereo 48 kHz) | **66** | 23 |
+
+Every other sound class in the game was enumerated; nothing else routes to the controller.
+Every speaker sound has a coil twin of identical duration (backpack on/off, purr, zurg) — the
+paired speaker+haptic design found for the purr is how all four work.
+
+**A folder-scoped extraction silently missed two coil assets** that live outside
+`Sound/SFX/controllers/`: `character/sentinel/TazerElectricity_VIBE` (one-shot, 0.71 s) and
+`gpe/window/window_oneWay_squeak_VIBE` (loops, 0.34 s). Both found only by the class scan.
+
+Names are not a reliable signal for anything:
+
+* `Elevator_loop_VIBE` (30 s) and `WagonEndingStop_VIBE` (28 s) do **not** loop — `bLooping`
+  is false; the game plays them once. Looping on the name would have run both forever.
+* `strongLight_refilled` has no `_VIBE` suffix and is on the coil class. A suffix-based
+  extractor would have missed it.
+
+`tools/dualsense/extract_assets.sh` therefore selects by class pak-wide and takes each asset's
+real name from the pak path recorded in its `.json`, and `wavegen.sh` regenerates from a clean
+work dir (a stale one once carried the three speaker files into `haptic/`) and refuses to run
+without its `ue4_soundwave_extract.py` sibling rather than dying on an import mid-copy.

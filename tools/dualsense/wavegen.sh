@@ -4,7 +4,7 @@
 #
 #   $GAME/haptic/<name>.f32     stereo float32 @ 48 kHz  — the VIBE assets, for the two coils
 #   $GAME/spk/<name>.f32        mono   float32 @ 48 kHz  — the _CONTROL assets, for the speaker
-#   $GAME/haptic_loops.txt      VIBE assets whose SoundWave carries bLooping (22 of 63)
+#   $GAME/haptic_loops.txt      coil assets whose SoundWave carries bLooping (23 of 66, pak-wide)
 #   $GAME/spk_loops.txt         _CONTROL assets whose SoundWave carries bLooping
 #
 # These are NOT envelopes. The coils take the waveform itself once the controller is put into
@@ -27,7 +27,19 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${WORK:-/tmp/scepad}"
 GAME="${GAME:-/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64}"
+
+# read_names() and the ADPCM purr decode both come from this sibling; without it the loop-list
+# step dies on an import mid-run, after files have already been copied. Fail before doing anything.
+if [ ! -f "$HERE/ue4_soundwave_extract.py" ]; then
+  echo "wavegen.sh: ue4_soundwave_extract.py must sit beside this script (looked in $HERE)" >&2
+  exit 1
+fi
+
+# Regenerate from scratch. A stale $WORK/hap from an earlier run once carried three _CONTROL
+# files into $GAME/haptic/ - the split below is only correct over a clean work dir.
+rm -rf "$WORK/hap" "$WORK/spk"
 mkdir -p "$WORK/hap" "$WORK/spk" "$GAME/haptic" "$GAME/spk"
+rm -f "$GAME"/haptic/*_CONTROL.f32
 
 nh=0; ns=0
 for f in "$WORK"/vibe/ogg/*.ogg; do
