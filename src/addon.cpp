@@ -1432,15 +1432,39 @@ void draw_nr_controls()
 	// RenoDX ships NRLocalTone=1.74, so the range has to reach it comfortably. Despite the name
 	// this is the STYLE BLEND WEIGHT, not a tone control.
 	changed |= ImGui::SliderFloat("Local tone", &g_nr_ui.local_tone, 0.0f, 2.0f, "%.2f");
+	// 1.0 is the snippet's own fallback. Same auto-mask gate as skin structure: with UseAutoMask
+	// off, the snippet forces this to -1 internally and the slider does nothing at all — which is
+	// why the gate is surfaced right below rather than buried in the ini.
 	changed |= ImGui::SliderFloat("Local structure", &g_nr_ui.local_structure, 0.0f, 2.0f, "%.2f");
 	// -1 is a sentinel meaning "use local structure", so the range deliberately reaches it.
-	// RenoDX ships NRSkinStructure=1.33. -1 is a SENTINEL meaning "inherit local structure" (the
-	// reference's default), so the range keeps reaching it — 0 is not the neutral value here.
-	changed |= ImGui::SliderFloat("Skin structure", &g_nr_ui.skin_structure, -1.0f, 2.0f, "%.2f");
+	// SkinStructureStrength has three regimes and a bare slider hides two of them, so surface the
+	// sentinel as a checkbox the way RenoDX does:
+	//   negative  -> "inherit localStructureStrength" (the reference's DEFAULT)
+	//   0.0       -> NOT neutral: it flattens skin structure
+	//   > 0       -> independent strength
+	// Both gated on UseAutoMask with no ControlMask bound; with the auto mask off the snippet
+	// forces BOTH structure strengths to -1 internally and neither does anything.
+	bool skin_matches_local = g_nr_ui.skin_structure < 0.0f;
+	if (ImGui::Checkbox("Skin structure: match local", &skin_matches_local))
+	{
+		// Leaving "match" restores a usable independent value rather than dropping to 0.0, which
+		// would silently flatten skin structure and read as "the control does nothing".
+		g_nr_ui.skin_structure = skin_matches_local ? -1.0f : 1.33f;
+		changed = true;
+	}
+	if (!skin_matches_local)
+	{
+		changed |= ImGui::SliderFloat("Skin structure (0 = off)", &g_nr_ui.skin_structure, 0.0f,
+			2.0f, "%.2f");
+	}
 	// 310.8 ships one weight set registered as preset 1 and falls back to it for every other
 	// value, so this is expected to change nothing — exposed to confirm that rather than assume.
 	changed |= ImGui::SliderInt("Preset", &g_nr_ui.preset, 0, 4);
-	changed |= ImGui::Checkbox("Auto mask", &g_nr_ui.auto_mask);
+	// GATES BOTH STRUCTURE STRENGTHS. Reference: "with it disabled the snippet forces
+	// localStructureStrength and skinStructureStrength to -1 and neither does anything."
+	changed |= ImGui::Checkbox("Auto mask (gates both structure sliders)", &g_nr_ui.auto_mask);
+	if (!g_nr_ui.auto_mask)
+		ImGui::TextUnformatted("  ^ off: the structure sliders above do nothing");
 	ImGui::SameLine();
 	changed |= ImGui::Checkbox("UI correction", &g_nr_ui.ui_correction);
 
