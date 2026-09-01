@@ -83,6 +83,15 @@ add_library(stray_dlss_core STATIC
     src/intercept/types.hpp
     src/intercept/backend.hpp
     src/intercept/backend.cpp
+    src/core/va_map.cpp
+    src/core/va_map.hpp
+    src/core/heap_math.cpp
+    src/core/heap_math.hpp
+    src/core/root_signature_walk.cpp
+    src/core/root_signature_walk.hpp
+    # The differential observer's comparison is pure; its live half is plain C++ too.
+    src/app/diff_observer.cpp
+    src/app/diff_observer.hpp
     # The file sink is plain stdio and lives here so the seam can log under every host. The
     # WARP harness links its own log_stub.cpp first, so the archive member is never pulled.
     src/log.cpp
@@ -381,7 +390,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_history_plan.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp
-        tests/test_intercept_types.cpp)
+        tests/test_intercept_types.cpp
+        tests/test_native_core.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

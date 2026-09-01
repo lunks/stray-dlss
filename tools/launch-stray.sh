@@ -19,6 +19,7 @@ STATUS="$GAME_DIR/stray-dlss-status.txt"
 APPID=1332010
 
 BTN_SOUTH=304          # X on a DualSense, A in X360 mapping — "confirm"
+KEY_ENTER=28           # the keyboard's "confirm", for when Steam Input is off
 PAD_NAME="Microsoft X-Box 360 pad 0"
 
 PRESS_INPUT=1
@@ -62,6 +63,16 @@ restart_steam() {
     done
     log "  Steam did not come back within 120s"
     return 1
+}
+
+# The keyboard whose Handlers include `sysrq` — the one that reaches the game
+# (tools/screenshot-stray.sh). Used when Steam Input is OFF for this title
+# (UseSteamControllerConfig=0 in localconfig.vdf, measured 2026-09-01 after the DualSense
+# work, which needs the game to see the real pad): then no X360 node ever appears and the
+# menu is driven with Enter instead of X.
+find_keyboard_node() {
+    awk '/^H: Handlers=/ && /sysrq/ { if (match($0, /event[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit } }' \
+        /proc/bus/input/devices
 }
 
 find_pad_node() {
@@ -178,20 +189,31 @@ fi
 # presents), so the node is routinely not there yet at this point. Poll for it: measured
 # 2026-09-01, an immediate lookup failed on a box whose DualSense was connected all along.
 PAD_NODE=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 10); do
     PAD_NODE=$(find_pad_node)
     [ -n "$PAD_NODE" ] && break
     game_running || { log "FAILED: the game exited while waiting for the pad node."; exit 1; }
     sleep 2
 done
+INPUT_KIND=pad
+INPUT_NODE="$PAD_NODE"
+INPUT_CODE=$BTN_SOUTH
 if [ -z "$PAD_NODE" ]; then
-    log "FAILED: could not find the '$PAD_NAME' node within 120s."
-    log "  Steam Input creates it when the game starts; check /proc/bus/input/devices"
-    exit 1
+    KBD_NODE=$(find_keyboard_node)
+    if [ -z "$KBD_NODE" ]; then
+        log "FAILED: no '$PAD_NAME' node within 20s and no sysrq-capable keyboard node either."
+        log "  Steam Input creates the pad node when it is enabled for the title; check /proc/bus/input/devices"
+        exit 1
+    fi
+    log "No '$PAD_NAME' node (Steam Input off for this title?); driving the menu with Enter on /dev/input/$KBD_NODE"
+    INPUT_KIND=key
+    INPUT_NODE="$KBD_NODE"
+    INPUT_CODE=$KEY_ENTER
+else
+    log "Pad node: /dev/input/$PAD_NODE"
 fi
-log "Pad node: /dev/input/$PAD_NODE"
 
-log "Pressing X every 0.5s until the shader census says we are in game"
+log "Pressing $([ "$INPUT_KIND" = pad ] && echo X || echo Enter) every 0.5s until the shader census says we are in game"
 deadline=$(( $(date +%s) + TIMEOUT ))
 last_census=-1
 
@@ -212,7 +234,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         exit 0
     fi
 
-    python3 "$INJECT" pad "/dev/input/$PAD_NODE" "$BTN_SOUTH" 60 >/dev/null 2>&1
+    python3 "$INJECT" "$INPUT_KIND" "/dev/input/$INPUT_NODE" "$INPUT_CODE" 60 >/dev/null 2>&1
     sleep 0.5
 done
 
