@@ -1296,6 +1296,47 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### The u0-feedback diagnosis is REFUTED by experiment (measured 2026-09-01)
+
+I argued at length that the SSR artefact was NR's residual re-entering the engine's temporal
+history, because `u0` is both the scene colour and the next frame's history
+(`TemporalAA.cpp:696`), and built `NgxNRRestoreHistory` to close that loop: snapshot `u0` after
+the SR evaluate, let the frame display the NR image, restore the pristine copy at present so the
+next frame's history never sees NR.
+
+**It works exactly as designed, and the artefact is unchanged.**
+
+```
+NR HISTORY frame 45000: snapshots=27848 restores=27848 harmfulMisses=0 overwritten=0
+                        scratch 3840x2160 fmt=10 created, no refusals
+```
+
+Snapshots and restores perfectly paired across 27,848 frames, zero harmful misses, zero
+refusals. **The test was valid and the result is negative: the feedback loop is not the cause.**
+
+**The counters are why this is a result rather than a shrug.** "I turned it on and saw no change"
+is worthless if the feature quietly refused — which is exactly how a mis-stated resource state or
+an unflushed command list would have presented. Instrumenting the thing that could silently
+no-op turned an ambiguous non-observation into a clean refutation. Build the counter before you
+need it.
+
+**What the evidence now points at instead** — and note it explains every earlier negative at
+once. SSR is composited into scene colour BEFORE our hook, so by the time NR sees it a reflection
+is just pixels. NR then reprojects its own temporal history using the motion vectors we supply,
+which describe **the surface's** motion, reconstructed from depth. A reflection does not move
+with its surface — it moves with the reflected geometry, often in the opposite direction. So NR
+fetches history from the wrong place for exactly those pixels, every frame the camera moves.
+
+That survives both hook sites (they share the motion vectors), the codec, the exposure work and
+the history restore, because none of them change what the vectors say about a reflective surface.
+It is also why the artefact concentrates on dark wet ground: that content is largely reflection.
+
+**UE 4.27 cannot fix this for us.** Correct reflection motion vectors would need the reflected
+geometry's motion, which the velocity buffer does not carry. The reference does not hit it
+because its guides come from a path tracer that writes dense, correct vectors. **Treat
+"temporal network + screen-space reflections" as a structural mismatch, not an open bug** — the
+available moves are reducing NR's strength on that content, disabling SSR, or accepting it.
+
 ### The SSR fade and most of the flicker: resolved, cause not fully isolated (2026-09-01)
 
 The long-running "reflections and fine detail fade over tens of seconds, then recover" stopped
