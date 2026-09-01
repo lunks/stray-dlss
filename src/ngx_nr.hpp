@@ -118,7 +118,7 @@ void shutdown();
 const char *last_error();
 
 // Telemetry for the periodic report: how often NR replaced the image versus refused, and why.
-constexpr int kNrRefusalCount = 8;
+constexpr int kNrRefusalCount = 9;
 extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();

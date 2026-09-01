@@ -20,7 +20,7 @@ namespace stray_dlss::nr {
 
 const char *const kNrRefusalNames[kNrRefusalCount] = {
 	"dll-missing", "create-failed", "evaluate-failed", "degenerate-output",
-	"bad-inputs", "alloc-failed", "validating", "warmup",
+	"bad-inputs", "alloc-failed", "validating", "warmup", "mipped-input",
 };
 
 } // namespace stray_dlss::nr
@@ -119,6 +119,7 @@ enum
 	kRefAllocFailed,
 	kRefValidating,
 	kRefWarmup,
+	kRefMippedInput,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -444,6 +445,19 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 	// NGX writes its output as a UAV; missing the flag can yield a black result with no error
 	// at all. (docs/RESEARCH.md §3.5)
 	tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	// NEVER inherit the engine image's mip chain, array size or sample count. `tex = src` used
+	// to copy all three, and a MIPPED neural output is a documented GPU hang: the community
+	// D3D12 port reports DXGI_ERROR_DEVICE_HUNG a few seconds after the neural pass starts, on
+	// two separate attempts to make a mipped texture acceptable, and concludes the code behind
+	// the check genuinely cannot handle a mip chain. That is our exact symptom — NR ran ~48s
+	// and then the GPU left the bus. The runtime wants a plain, typed, single-subresource 2D
+	// texture, so build one rather than mirroring whatever UE4 happened to allocate.
+	tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	tex.MipLevels = 1;
+	tex.DepthOrArraySize = 1;
+	tex.SampleDesc.Count = 1;
+	tex.SampleDesc.Quality = 0;
+	tex.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
 	const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_nr_output));
@@ -456,8 +470,12 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 	g_nr_format = src.Format;
 	g_nr_width = w;
 	g_nr_height = h;
-	STRAY_LOG_INFO("NR: neural output texture %ux%u fmt=%d created (matches the engine output, "
-		"so the copy-back is a plain CopyResource).", w, h, static_cast<int>(src.Format));
+	STRAY_LOG_INFO("NR: neural output texture %ux%u fmt=%d created as single-mip/single-slice "
+		"(engine image had mips=%u arraySize=%u samples=%u — a mipped neural output is a "
+		"documented DEVICE_HUNG, so those are never inherited).",
+		w, h, static_cast<int>(src.Format), static_cast<unsigned int>(src.MipLevels),
+		static_cast<unsigned int>(src.DepthOrArraySize),
+		static_cast<unsigned int>(src.SampleDesc.Count));
 	return true;
 }
 
@@ -786,6 +804,18 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (colour == nullptr)
 		return refuse(kRefBadInputs, "no colour input for the selected topology.");
 
+	// A mipped / arrayed / multisampled colour input is the one hazard we cannot fix by
+	// allocating our own texture, and feeding one is a documented DXGI_ERROR_DEVICE_HUNG rather
+	// than an error return. Refuse it loudly: a log line costs a frame, a hung GPU costs the
+	// user a power cycle. (CLAUDE.md §0.2 — prefer a loud failure.)
+	{
+		const D3D12_RESOURCE_DESC cd = colour->GetDesc();
+		if (cd.MipLevels != 1 || cd.DepthOrArraySize != 1 || cd.SampleDesc.Count != 1)
+			return refuse(kRefMippedInput,
+				"the colour input is not a plain single-mip, single-slice, non-MSAA 2D texture; "
+				"handing one to the neural runtime hangs the GPU instead of returning an error.");
+	}
+
 	// The result goes to OUR texture, never straight over the engine's output.
 	if (!ensure_output_texture(device, in.image))
 		return refuse(kRefAllocFailed, g_last_error);
@@ -800,16 +830,16 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	const std::uint32_t cw = post ? in.output_width : in.render_width;
 	const std::uint32_t ch = post ? in.output_height : in.render_height;
 
-	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels. Under post-process
-	// the colour they must move is the OUTPUT rect, so they need the output/render ratio;
-	// under sr-shaped the colour is already render-res, so the scale is 1. Neither reading is
-	// documented for this leaked runtime — hence the override knob and this log line.
+	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels.
+	//
+	// The scale is 1.0, NOT the output/render ratio. We previously sent 2.0 under post-process,
+	// reasoning that MVs in render pixels must be stretched to move an output-res image — but
+	// the MVecSubrect{Width,Height} we set alongside them ALREADY declare the vectors' own rect
+	// as 1920x1080, so the ratio was being applied twice. Every reference integration of this
+	// runtime (dxvk-remix's NGXNeuralRenderingContext among them) sets MVecScaleX/Y to 1.0 and
+	// expects motion in pixels of the guide's own subrect. `[STRAYDLSS] NgxNRMVecScale`
+	// overrides it, because this is measured behaviour for a leaked runtime, not a spec.
 	float scale_x = 1.0f, scale_y = 1.0f;
-	if (post && in.render_width > 0 && in.render_height > 0)
-	{
-		scale_x = static_cast<float>(in.output_width) / static_cast<float>(in.render_width);
-		scale_y = static_cast<float>(in.output_height) / static_cast<float>(in.render_height);
-	}
 	if (g_mvec_scale_override > 0.0f)
 		scale_x = scale_y = g_mvec_scale_override;
 
