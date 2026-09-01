@@ -216,6 +216,7 @@ struct NrUiState
 	float paper_white = 1.0f;
 	float color_strength = 1.0f;
 	float transfer_strength = 1.0f;
+	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
 };
 NrUiState g_nr_ui;
 
@@ -228,6 +229,7 @@ void apply_nr_ui()
 		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
 		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
 	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
+	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
 }
 
 void on_init_device(reshade::api::device *device)
@@ -422,9 +424,8 @@ void on_init_device(reshade::api::device *device)
 		&nr_identity_size);
 	snippet::set_identity_from_string(nr_identity);
 
-	float nr_mvec_scale = 0.0f;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", nr_mvec_scale);
-	nr::set_mvec_scale_override(nr_mvec_scale);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", g_nr_ui.mvec_scale);
+	const float nr_mvec_scale = g_nr_ui.mvec_scale;
 
 	// The HDR colour codec (src/core/nr_codec.hpp). NOT optional and not a quality knob: feature
 	// 18 is a display-referred image network, our hook point carries raw unbounded pre-exposed
@@ -1246,6 +1247,16 @@ void draw_nr_controls()
 	changed |= ImGui::SliderFloat("Transfer strength", &g_nr_ui.transfer_strength, 0.0f, 1.0f,
 		"%.2f");
 
+	// THE MOTION KNOB. Our motion vectors are render-resolution (1920x1080) while the colour is
+	// the output rect (3840x2160). Whether the runtime wants them in the guide's own pixels
+	// (1.0, since MVecSubrectWidth/Height already declare that rect) or in colour pixels (2.0)
+	// is NOT documented for this leaked runtime, and it is exactly the kind of error that looks
+	// perfect on a still frame and noisy in motion — a still frame needs no reprojection at all.
+	// 0 means "use the built-in default"; try 1.0 against 2.0 while panning the camera.
+	ImGui::Separator();
+	ImGui::TextUnformatted("Motion");
+	changed |= ImGui::SliderFloat("MVec scale (0=auto)", &g_nr_ui.mvec_scale, 0.0f, 4.0f, "%.2f");
+
 	ImGui::Separator();
 	ImGui::TextUnformatted("Network");
 	changed |= ImGui::SliderFloat("Intensity", &g_nr_ui.intensity, 0.0f, 2.0f, "%.2f");
@@ -1278,6 +1289,7 @@ void draw_nr_controls()
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure",
 			g_nr_ui.skin_structure);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", g_nr_ui.mvec_scale);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask",
 			g_nr_ui.auto_mask ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection",
@@ -1322,9 +1334,10 @@ void draw_status(reshade::api::effect_runtime *runtime)
 	ImGui::Text("Addon events:   bind_pipeline=%s push_descriptors=%s",
 		g_state.saw_bind_pipeline.load() ? "yes" : "no",
 		g_state.saw_push_descriptors.load() ? "yes" : "no");
-}
 
+	ImGui::Separator();
 	draw_nr_controls();
+}
 
 void draw_osd(reshade::api::effect_runtime *runtime)
 {
