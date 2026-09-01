@@ -24,6 +24,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -208,6 +209,28 @@ bool flush(Gpu &gpu)
 	HR(gpu.allocator->Reset());
 	HR(gpu.list->Reset(gpu.allocator.Get(), nullptr));
 	return true;
+}
+
+// A plain default-heap buffer, for the object-model probes below. Nothing is ever written to
+// it; only its identity and its vtable matter.
+ComPtr<ID3D12Resource> create_buffer(Gpu &gpu, UINT64 size,
+	D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT)
+{
+	D3D12_HEAP_PROPERTIES hp = {};
+	hp.Type = heap_type;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = size; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	const D3D12_RESOURCE_STATES state = heap_type == D3D12_HEAP_TYPE_UPLOAD
+		? D3D12_RESOURCE_STATE_GENERIC_READ
+		: heap_type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+		                                        : D3D12_RESOURCE_STATE_COMMON;
+	ComPtr<ID3D12Resource> res;
+	if (FAILED(gpu.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state,
+			nullptr, IID_PPV_ARGS(&res))))
+		return nullptr;
+	return res;
 }
 
 // Stand-ins for the game's depth and velocity targets, with SRVs in a NON-shader-visible heap
@@ -1501,6 +1524,179 @@ bool test_copy_from_shader_visible_source(Gpu &gpu)
 	return true;
 }
 
+// ---- object-model probes for the native backend (docs/superpowers/plans/2026-09-01, Task 1) ----
+//
+// The native backend patches vtable SLOTS. That only reaches every object of a class if the
+// runtime shares ONE vtable across them, which vkd3d-proton (C, CONST_VTBL structs) almost
+// certainly does and Microsoft's runtime may not. Measured on both, never assumed: the answer
+// decides whether slot patching is the installation strategy at all (assessment §1.2, §8.3).
+//
+// Neither probe asserts. The value IS the measurement, and it is recorded in
+// docs/STRAY-RENDERING-FACTS.md from the box run.
+namespace {
+
+void *vtable_of(IUnknown *o)
+{
+	return o != nullptr ? *reinterpret_cast<void **>(o) : nullptr;
+}
+
+// ReShade's proxies answer this IID with the object they wrap (the reachability probe above
+// relies on the same GUID). Off ReShade it simply fails and the object is its own original.
+IUnknown *unwrap(IUnknown *o)
+{
+	constexpr GUID kUnwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
+		{ 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+	IUnknown *orig = nullptr;
+	if (o != nullptr && SUCCEEDED(o->QueryInterface(kUnwrapped, reinterpret_cast<void **>(&orig))))
+		return orig;
+	return nullptr;
+}
+
+} // namespace
+
+bool test_static_vtables(Gpu &gpu)
+{
+	std::printf("\n[test] whether vtables are shared across objects of a class\n");
+
+	ComPtr<ID3D12CommandAllocator> alloc;
+	ComPtr<ID3D12GraphicsCommandList> list_a, list_b;
+	if (FAILED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+		FAILED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list_a))) ||
+		FAILED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list_b))))
+	{
+		fail("could not create two command lists");
+		return false;
+	}
+	list_a->Close();
+	list_b->Close();
+
+	D3D12_COMMAND_QUEUE_DESC qd = {};
+	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+	ComPtr<ID3D12CommandQueue> queue_b;
+	if (FAILED(gpu.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_b))))
+	{
+		fail("could not create a second command queue");
+		return false;
+	}
+
+	ComPtr<ID3D12Resource> res_a = create_buffer(gpu, 256), res_b = create_buffer(gpu, 256);
+	if (!res_a || !res_b)
+	{
+		fail("could not create two buffers");
+		return false;
+	}
+
+	// A second device on the same adapter. Microsoft's runtime hands back the EXISTING device
+	// for an adapter; vkd3d-proton creates another. Both are fine: distinct=0 means the
+	// comparison is trivially true, and that is reported rather than hidden.
+	ComPtr<IUnknown> adapter_unk;
+	ComPtr<ID3D12Device> device_b;
+	{
+		LUID luid = gpu.device->GetAdapterLuid();
+		ComPtr<IDXGIFactory4> factory;
+		ComPtr<IDXGIAdapter> adapter;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+			SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))))
+			D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_b));
+	}
+
+	const bool list_static   = vtable_of(list_a.Get()) == vtable_of(list_b.Get());
+	const bool queue_static  = vtable_of(gpu.queue.Get()) == vtable_of(queue_b.Get());
+	const bool res_static    = vtable_of(res_a.Get()) == vtable_of(res_b.Get());
+	const bool device_static = device_b && vtable_of(gpu.device.Get()) == vtable_of(device_b.Get());
+	const bool device_distinct = device_b && device_b.Get() != gpu.device.Get();
+
+	std::printf("  vtable-static: list=%d queue=%d resource=%d device=%d (second device %s)\n",
+		list_static, queue_static, res_static, device_static,
+		!device_b ? "not created" : device_distinct ? "distinct object" : "SAME object");
+	std::printf("  vtables: list=%p/%p queue=%p/%p resource=%p/%p device=%p/%p\n",
+		vtable_of(list_a.Get()), vtable_of(list_b.Get()),
+		vtable_of(gpu.queue.Get()), vtable_of(queue_b.Get()),
+		vtable_of(res_a.Get()), vtable_of(res_b.Get()),
+		vtable_of(gpu.device.Get()), vtable_of(device_b.Get()));
+
+	// Under ReShade the objects above are its C++ proxies, whose vtables are trivially shared.
+	// The question is about the RUNTIME underneath, so repeat it on the unwrapped originals.
+	if (running_under_reshade())
+	{
+		ComPtr<IUnknown> la(unwrap(list_a.Get())), lb(unwrap(list_b.Get()));
+		ComPtr<IUnknown> qa(unwrap(gpu.queue.Get())), qb(unwrap(queue_b.Get()));
+		ComPtr<IUnknown> da(unwrap(gpu.device.Get())), db(unwrap(device_b.Get()));
+		std::printf("  under ReShade, unwrapped originals: list=%s queue=%s device=%s\n",
+			(la && lb) ? (vtable_of(la.Get()) == vtable_of(lb.Get()) ? "1" : "0") : "n/a",
+			(qa && qb) ? (vtable_of(qa.Get()) == vtable_of(qb.Get()) ? "1" : "0") : "n/a",
+			(da && db) ? (vtable_of(da.Get()) == vtable_of(db.Get()) ? "1" : "0") : "n/a");
+	}
+	std::printf("  (recorded, not asserted)\n");
+	return true;
+}
+
+// Whether ID3D12Object::SetPrivateDataInterface releases the interface when the object dies.
+// That final Release is the destruction callback the native backend keys resource liveness on
+// (assessment §1.4). Documented D3D12 behaviour on Microsoft's runtime; vkd3d-proton is the
+// question, and it is answered by the box run.
+namespace {
+
+struct Sentinel : IUnknown
+{
+	std::atomic<ULONG> refs{ 1 };
+	bool *fired;
+	explicit Sentinel(bool *f) : fired(f) {}
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **out) override
+	{
+		if (out == nullptr)
+			return E_POINTER;
+		if (riid == __uuidof(IUnknown))
+		{
+			*out = this;
+			AddRef();
+			return S_OK;
+		}
+		*out = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+	ULONG STDMETHODCALLTYPE Release() override
+	{
+		const ULONG r = --refs;
+		if (r == 0)
+		{
+			*fired = true;
+			delete this;
+		}
+		return r;
+	}
+};
+
+} // namespace
+
+bool test_private_data_release_on_destroy(Gpu &gpu)
+{
+	std::printf("\n[test] whether private-data interfaces are released at object destruction\n");
+	static const GUID kTag = { 0x5d1e9c30, 0x7a4b, 0x4e02,
+		{ 0x9b, 0x1f, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77 } };
+
+	bool fired = false;
+	bool fired_early = false;
+	{
+		ComPtr<ID3D12Resource> res = create_buffer(gpu, 256);
+		if (!res)
+		{
+			fail("could not create a buffer");
+			return false;
+		}
+		Sentinel *s = new Sentinel(&fired);
+		const HRESULT hr = res->SetPrivateDataInterface(kTag, s);
+		s->Release(); // the object now holds the only reference
+		std::printf("  SetPrivateDataInterface hr=0x%08x\n", static_cast<unsigned>(hr));
+		fired_early = fired; // must still be false: the resource is alive
+	} // res destroyed here
+	std::printf("  private-data-release: fired=%d (fired_before_destroy=%d)\n",
+		fired ? 1 : 0, fired_early ? 1 : 0);
+	std::printf("  (recorded, not asserted)\n");
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -1538,6 +1734,8 @@ int main(int argc, char **argv)
 	test_reshade_restore_call_pattern(gpu);
 	test_vkd3d_ext_hook_reachability(gpu);
 	test_copy_from_shader_visible_source(gpu);
+	test_static_vtables(gpu);
+	test_private_data_release_on_destroy(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");
