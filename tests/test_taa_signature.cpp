@@ -381,3 +381,51 @@ TEST_CASE("the eye-adaptation finder: t0 by register, structural fallback, dummi
 	CHECK(stray_dlss::find_eye_adaptation_srv(none) == 0);
 	CHECK(stray_dlss::find_eye_adaptation_srv({}) == 0);
 }
+
+// The bogus passes a live session actually offered to CreateFeature (measured 2026-09-01):
+// 248x248, 1016x1016 (twice) and 1024x407 alongside the correct 1920x1080 — 4 of 11 creations.
+// Each cost an NGX feature create/release, i.e. a frame spike, and put a differently-oriented
+// view of the scene on the display chain, which the user saw as "a flipped version of the
+// scene". A cubemap face and a reflection capture both look structurally like the TAA pass;
+// what they cannot fake is the primary view's aspect ratio and upscale factor.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("a square render target upscaled to 16:9 is not the primary view")
+{
+	// 1016x1016 -> 3840x2160: the aspect ratio is off by 78%.
+	auto sig = make_stray_taa(1016, 1016, 3840, 2160);
+	sig.group_count_x = (3840 + kTaaTileSize - 1) / kTaaTileSize;
+	sig.group_count_y = (2160 + kTaaTileSize - 1) / kTaaTileSize;
+	CHECK(match_taa_dispatch(sig, 1016, 1016).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("an absurd upscale factor is not the primary view")
+{
+	// 248x248 -> 3840x2160 is 15.5x linear. DLSS's most aggressive mode is 3x.
+	auto sig = make_stray_taa(248, 248, 3840, 2160);
+	sig.group_count_x = (3840 + kTaaTileSize - 1) / kTaaTileSize;
+	sig.group_count_y = (2160 + kTaaTileSize - 1) / kTaaTileSize;
+	CHECK(match_taa_dispatch(sig, 248, 248).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("an off-aspect render target is not the primary view")
+{
+	// 1024x407 -> 3840x2160: 2.52:1 against 1.78:1.
+	auto sig = make_stray_taa(1024, 407, 3840, 2160);
+	sig.group_count_x = (3840 + kTaaTileSize - 1) / kTaaTileSize;
+	sig.group_count_y = (2160 + kTaaTileSize - 1) / kTaaTileSize;
+	CHECK(match_taa_dispatch(sig, 1024, 407).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("the ratios this project actually runs still pass the aspect and scale gates")
+{
+	// 50%, 70% and DLAA must be untouched by the new gates.
+	const std::uint32_t rects[3][2] = { { 1920, 1080 }, { 2688, 1512 }, { 3840, 2160 } };
+	for (const auto &rr : rects)
+	{
+		auto sig = make_stray_taa(rr[0], rr[1], 3840, 2160);
+		sig.group_count_x = (3840 + kTaaTileSize - 1) / kTaaTileSize;
+		sig.group_count_y = (2160 + kTaaTileSize - 1) / kTaaTileSize;
+		CHECK(match_taa_dispatch(sig, rr[0], rr[1]).verdict != MatchVerdict::no_match);
+	}
+}

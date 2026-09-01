@@ -248,6 +248,39 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 	r.render_width = depth->width;
 	r.render_height = depth->height;
 
+	// A REAL primary-view upscale preserves the aspect ratio and lands inside DLSS's supported
+	// range. Measured 2026-09-01: without these two tests the matcher accepted cubemap faces and
+	// reflection captures — one live session offered CreateFeature 248x248, 1016x1016 (twice)
+	// and 1024x407 alongside the correct 1920x1080, i.e. 4 of 11 creations were bogus. Each one
+	// cost an NGX feature create/release (a frame spike) and put a differently-oriented view of
+	// the scene on the display chain, which the user saw as "a flipped version of the scene"
+	// with a hitch. A square render target upscaled to 16:9 is not the main view, and
+	// 3840/248 = 15.5x is not an upscale any DLSS quality mode performs.
+	if (r.render_width != 0 && r.render_height != 0 && r.output_width != 0 && r.output_height != 0)
+	{
+		const double render_aspect =
+			static_cast<double>(r.render_width) / static_cast<double>(r.render_height);
+		const double output_aspect =
+			static_cast<double>(r.output_width) / static_cast<double>(r.output_height);
+		// 4% covers UE4's 8-pixel tile quantisation of the render rect at every ratio this
+		// project runs; a genuine mismatch (1:1 against 16:9) is off by 78%.
+		if (render_aspect > output_aspect * 1.04 || render_aspect < output_aspect * 0.96)
+		{
+			r.reason = "render and output aspect ratios differ - a cubemap face or a "
+			           "reflection capture, not the primary view";
+			return r;
+		}
+		// DLSS's most aggressive mode is Ultra Performance at 3x linear. Anything beyond that
+		// is not a quality mode, it is a different pass entirely. The upper bound is deliberately
+		// loose (3.5) so a future mode does not silently break the primary path.
+		const double scale = static_cast<double>(r.output_width) / static_cast<double>(r.render_width);
+		if (scale > 3.5)
+		{
+			r.reason = "upscale factor exceeds anything DLSS performs - not the primary view";
+			return r;
+		}
+	}
+
 	// On a camera cut UE4 swaps velocity and the history colour for the 1x1 BlackDummy.
 	// EyeAdaptationTexture is ALSO 1x1 and is present on every frame, so a blanket "any 1x1
 	// SRV" test reports a cut every frame — only the velocity and colour slots count.
