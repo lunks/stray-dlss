@@ -14,7 +14,18 @@
 
 cbuffer Params : register(b0)
 {
-	float4x4 ClipToPrevClip;   // row-major, built from jitter-free (NoAA) matrices
+	// ROW_MAJOR IS LOAD-BEARING. HLSL packs constant-buffer matrices COLUMN-major by default and
+	// we do not compile with /Zpr, so without this qualifier fxc reads our row-major upload
+	// transposed — `mul(v, M)` then computes v * transpose(M). The camera-reconstruction branch
+	// below silently produced wrong previous-clip positions for every pixel UE4's sparse velocity
+	// buffer did not write, i.e. all static geometry.
+	//
+	// Why it hid for so long: with a still camera ClipToPrevClip is essentially the IDENTITY, and
+	// a transposed identity is still the identity. So still frames were correct and only camera
+	// MOTION exposed it — measured as flickering while moving, moire on the in-game LCD panels,
+	// and shadows breaking up during movement and re-forming on stop. One bug, three symptoms,
+	// all of them motion-only.
+	row_major float4x4 ClipToPrevClip; // row-major, built from jitter-free (NoAA) matrices
 	float2   RenderSize;       // View.ViewSizeAndInvSize.xy
 	float2   ViewRectMin;      // View.ViewRectMin.xy
 	float2   BufferSize;       // View.BufferSizeAndInvSize.xy
@@ -26,9 +37,13 @@ cbuffer Params : register(b0)
 	// current-minus-previous, but one of those is [derived], not measured. So expose it rather
 	// than argue about it — the injector plugins all ship this as a switch for the same reason.
 	// (1,1) is the current behaviour.
+	// A/B for the row_major fix above: non-zero reproduces the OLD transposed behaviour, so the
+	// two can be compared live in one session instead of across builds.
+	float    LegacyTransposedClip;
+	float    Pad0;
 	float2   SparseSign;       // multiplies the decoded moving-object velocity
 	float2   CameraSign;       // multiplies the reconstructed camera motion
-	float2   Padding;
+	float4   Padding;
 };
 
 Texture2D<float>    SceneDepth  : register(t0); // R32_FLOAT_X8X24 view, reversed-Z
@@ -79,7 +94,11 @@ void main(uint3 tid : SV_DispatchThreadID)
 		// branch and the decoded branch are already jitter-free. (docs/RESEARCH.md §4.7)
 		const float device_z = SceneDepth.Load(int3(buffer_pos, 0));
 		const float4 this_clip = float4(screen_pos, device_z, 1.0f);
-		const float4 prev_clip = mul(this_clip, ClipToPrevClip);
+		// Row-vector convention against a row-major matrix. mul(M, v) is the transpose and is
+		// exactly what the missing row_major qualifier used to produce.
+		const float4 prev_clip = LegacyTransposedClip != 0.0f
+			? mul(ClipToPrevClip, this_clip)
+			: mul(this_clip, ClipToPrevClip);
 
 		if (prev_clip.w > 0.0f)
 		{

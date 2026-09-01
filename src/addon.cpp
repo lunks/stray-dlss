@@ -224,6 +224,7 @@ struct NrUiState
 	int   mv_convention = 0;  // index into kMvConventions
 	bool  mv_invert_x = false;
 	bool  mv_invert_y = false;
+	bool  mv_legacy_clip = false; // reproduce the pre-row_major transposed camera branch
 };
 
 // Which branch of the resolve gets its sign flipped. UE4's velocity buffer is sparse, so the
@@ -257,6 +258,7 @@ void apply_nr_ui()
 	const float sp = flip_sparse ? -1.0f : 1.0f;
 	const float cm = flip_camera ? -1.0f : 1.0f;
 	mv::set_signs(sp * gx, sp * gy, cm * gx, cm * gy);
+	mv::set_legacy_transposed_clip(g_nr_ui.mv_legacy_clip);
 }
 
 void on_init_device(reshade::api::device *device)
@@ -1339,6 +1341,10 @@ void draw_nr_controls()
 	// isolated to NR, and an improvement may show up in both.
 	changed |= ImGui::Combo("MV convention", &g_nr_ui.mv_convention, kMvConventions,
 		static_cast<int>(std::size(kMvConventions)));
+	// The row_major fix: ON reproduces the OLD transposed camera branch, so the two can be
+	// compared live. Static frames look identical either way (ClipToPrevClip is ~identity with
+	// a still camera, and a transposed identity is still the identity) — judge this while MOVING.
+	changed |= ImGui::Checkbox("Legacy transposed ClipToPrevClip", &g_nr_ui.mv_legacy_clip);
 	changed |= ImGui::Checkbox("Invert MV X", &g_nr_ui.mv_invert_x);
 	ImGui::SameLine();
 	changed |= ImGui::Checkbox("Invert MV Y", &g_nr_ui.mv_invert_y);
