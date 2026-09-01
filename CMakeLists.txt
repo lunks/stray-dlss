@@ -47,6 +47,7 @@ add_library(stray_dlss_core STATIC
     src/core/fnv1a.hpp
     src/core/view_params.cpp
     src/core/view_params.hpp
+    src/core/dlss_quality.cpp
     src/core/taa_signature.cpp
     src/core/taa_signature.hpp
     src/core/pass_walk.cpp
@@ -293,6 +294,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_core.cpp
         tests/test_view_params.cpp
+        tests/test_dlss_quality.cpp
         tests/test_taa_signature.cpp
         tests/test_pass_walk.cpp
         tests/test_gbuffer_classify.cpp

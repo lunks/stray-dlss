@@ -1,5 +1,6 @@
 #include "ngx_backend.hpp"
 
+#include "core/dlss_quality.hpp"
 #include "ext_unhook.hpp"
 
 #include "log.hpp"
@@ -814,11 +815,26 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 	// Render == output means DLAA. Stray currently renders 1:1, so that is the mode we get;
 	// the same code covers the upsampling case when screen percentage is turned down.
-	const bool is_dlaa = desc.render_width == desc.output_width &&
-		desc.render_height == desc.output_height;
-	const NVSDK_NGX_PerfQuality_Value quality = is_dlaa
-		? NVSDK_NGX_PerfQuality_Value_DLAA
-		: NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	// DERIVED from the actual ratio, never hardcoded. NGX picks its internal reconstruction
+	// parameters from InPerfQualityValue, so declaring a mode whose ratio does not match the
+	// rect we hand it tells DLSS to expect a different sample count than it gets. This was
+	// MaxQuality at every ratio, which at 50% screen percentage (a true 2.0x = Performance) was
+	// two modes off — and very nearly right at 70% (1.43x), consistent with the measured
+	// observation that 70% looks sharper than 50%. (CLAUDE.md §5 required deriving it.)
+	const DlssQuality derived = dlss_quality_for(desc.render_width, desc.render_height,
+		desc.output_width, desc.output_height);
+	const bool is_dlaa = derived == DlssQuality::dlaa;
+	NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	switch (derived)
+	{
+	case DlssQuality::dlaa: quality = NVSDK_NGX_PerfQuality_Value_DLAA; break;
+	case DlssQuality::max_quality: quality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+	case DlssQuality::balanced: quality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+	case DlssQuality::max_performance: quality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+	case DlssQuality::ultra_performance:
+		quality = NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+		break;
+	}
 
 	const int preset = g_preset;
 
@@ -865,7 +881,7 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	g_last_error[0] = 0;
 	STRAY_LOG_INFO("DLSS feature created: %ux%u -> %ux%u, %s, preset=%d, flags=0x%x",
 		desc.render_width, desc.render_height, desc.output_width, desc.output_height,
-		is_dlaa ? "DLAA" : "MaxQuality", preset,
+		dlss_quality_name(derived), preset,
 		static_cast<unsigned>(create.InFeatureCreateFlags));
 	return true;
 }
