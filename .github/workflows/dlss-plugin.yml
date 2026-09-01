@@ -179,6 +179,29 @@ jobs:
             Copy-Item -Recurse $src $dst
           }
 
+          # The public mirror is from 2026-07-01 and RE-UE4SS at UE4SS_SHA (2026-08-31) has
+          # since grown a .jmap reflection dumper (commit 5fe9328d) whose one source needs
+          # deps/first/Unreal/include/Unreal/ScriptContainerLayout.hpp, which the mirror lacks.
+          # MEASURED: the UE4SS target fails on exactly that include and nothing else. The
+          # dumper's whole public API is one function (JMapGenerator.hpp: generate_jmap), so
+          # on the mirror route it is replaced by a stub that refuses loudly. Our mod never
+          # calls it; the DLL we link against is otherwise the pinned tree.
+          if (-not $env:UEPSEUDO_PAT -and -not (Test-Path 'RE-UE4SS/deps/first/Unreal/include/Unreal/ScriptContainerLayout.hpp')) {
+            Write-Host "::warning::deps/first/Unreal from the mirror lacks Unreal/ScriptContainerLayout.hpp; stubbing UE4SS's JMapGenerator (generate_jmap) so UE4SS.dll still links. The .jmap dumper is unavailable in this build."
+            Set-Content RE-UE4SS/UE4SS/src/JMapGenerator/JMapGenerator.cpp @(
+              '// STUB written by stray-dlss CI (.github/workflows/dlss-plugin.yml): the public UEPseudo',
+              '// mirror predates Unreal/ScriptContainerLayout.hpp. The real generator is 5fe9328d.',
+              '#include <JMapGenerator/JMapGenerator.hpp>',
+              '#include <DynamicOutput/DynamicOutput.hpp>',
+              'namespace RC::JMapGenerator',
+              '{',
+              '    auto generate_jmap(bool, bool) -> void',
+              '    {',
+              '        Output::send<LogLevel::Error>(STR("generate_jmap: unavailable in this UE4SS build (stray-dlss CI stub; UEPseudo mirror lacks ScriptContainerLayout.hpp)\n"));',
+              '    }',
+              '}')
+          }
+
           # Whichever route was taken, the header a C++ mod cannot build without must exist.
           foreach ($h in @('RE-UE4SS/UE4SS/include/Mod/CppUserModBase.hpp',
                            'RE-UE4SS/deps/first/Unreal/include/Unreal/UObjectGlobals.hpp',
