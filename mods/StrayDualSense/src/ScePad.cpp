@@ -1,6 +1,7 @@
 #include "ScePad.hpp"
 
 #include "Log.hpp"
+#include "Platform.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,21 +12,25 @@
 namespace sds {
 namespace {
 
-// Precise signatures rather than the old shim's generic 4x uint64 thunk. The shim's
-// `long long` return over an int32 API left the upper half undefined; it only worked because
-// every test was `== 0`.
-using PFN_scePadGetHandle              = int32_t(__cdecl*)(int32_t userId, int32_t type, int32_t index);
-using PFN_scePadSetTriggerEffect       = int32_t(__cdecl*)(int32_t handle, const void* param);
-using PFN_scePadSetVibration           = int32_t(__cdecl*)(int32_t handle, const void* param);
+// Precise signatures rather than the shim's generic 4x uint64 thunk. The shim's `long long`
+// return over an int32 API left the upper half undefined; it only worked because every test
+// was `== 0`.
+using PFN_scePadGetHandle                = int32_t(__cdecl*)(int32_t userId, int32_t type, int32_t index);
+using PFN_scePadSetTriggerEffect         = int32_t(__cdecl*)(int32_t handle, const void* param);
 using PFN_scePadGetControllerInformation = int32_t(__cdecl*)(int32_t handle, void* info);
-using PFN_scePadGetTriggerEffectState  = int32_t(__cdecl*)(int32_t handle, void* state);
+using PFN_scePadGetTriggerEffectState    = int32_t(__cdecl*)(int32_t handle, void* state);
 
-HMODULE                              g_lib = nullptr;
-PFN_scePadGetHandle                  g_getHandle = nullptr;
-PFN_scePadSetTriggerEffect           g_setTriggerEffect = nullptr;
-PFN_scePadSetVibration               g_setVibration = nullptr;
-PFN_scePadGetControllerInformation   g_getInfo = nullptr;
-PFN_scePadGetTriggerEffectState      g_getTriggerState = nullptr;
+HMODULE                            g_lib              = nullptr;
+PFN_scePadGetHandle                g_getHandle        = nullptr;
+PFN_scePadSetTriggerEffect         g_setTriggerEffect = nullptr;
+PFN_scePadGetControllerInformation g_getInfo          = nullptr;
+PFN_scePadGetTriggerEffectState    g_getTriggerState  = nullptr;
+
+template <typename Fn>
+Fn Resolve(const char* name)
+{
+    return reinterpret_cast<Fn>(reinterpret_cast<void*>(::GetProcAddress(g_lib, name)));
+}
 
 void HexDump(const uint8_t* p, size_t n, char* out, size_t outSize)
 {
@@ -54,33 +59,21 @@ bool ScePad::Bind()
     if (g_lib == nullptr)
         return false;
 
-    g_getHandle        = reinterpret_cast<PFN_scePadGetHandle>(
-                             reinterpret_cast<void*>(::GetProcAddress(g_lib, "scePadGetHandle")));
-    g_setTriggerEffect = reinterpret_cast<PFN_scePadSetTriggerEffect>(
-                             reinterpret_cast<void*>(::GetProcAddress(g_lib, "scePadSetTriggerEffect")));
-    g_setVibration     = reinterpret_cast<PFN_scePadSetVibration>(
-                             reinterpret_cast<void*>(::GetProcAddress(g_lib, "scePadSetVibration")));
-    g_getInfo          = reinterpret_cast<PFN_scePadGetControllerInformation>(
-                             reinterpret_cast<void*>(::GetProcAddress(g_lib, "scePadGetControllerInformation")));
-    g_getTriggerState  = reinterpret_cast<PFN_scePadGetTriggerEffectState>(
-                             reinterpret_cast<void*>(::GetProcAddress(g_lib, "scePadGetTriggerEffectState")));
+    g_getHandle        = Resolve<PFN_scePadGetHandle>("scePadGetHandle");
+    g_setTriggerEffect = Resolve<PFN_scePadSetTriggerEffect>("scePadSetTriggerEffect");
+    g_getInfo          = Resolve<PFN_scePadGetControllerInformation>("scePadGetControllerInformation");
+    g_getTriggerState  = Resolve<PFN_scePadGetTriggerEffectState>("scePadGetTriggerEffectState");
 
     wchar_t path[MAX_PATH]{};
     ::GetModuleFileNameW(g_lib, path, MAX_PATH);
-    char narrow[MAX_PATH]{};
-    ::WideCharToMultiByte(CP_UTF8, 0, path, -1, narrow, MAX_PATH, nullptr, nullptr);
-
-    SDS_LOG_INFO("libScePad.dll found at %s", narrow);
-    SDS_LOG_INFO("  scePadGetHandle=%p setTriggerEffect=%p setVibration=%p "
-                 "getControllerInformation=%p getTriggerEffectState=%p",
-                 reinterpret_cast<void*>(g_getHandle),
-                 reinterpret_cast<void*>(g_setTriggerEffect),
-                 reinterpret_cast<void*>(g_setVibration),
-                 reinterpret_cast<void*>(g_getInfo),
-                 reinterpret_cast<void*>(g_getTriggerState));
+    SDS_LOG_INFO("libScePad.dll found at %s", Narrow(path).c_str());
+    SDS_LOG_INFO("  scePadGetHandle=%p setTriggerEffect=%p getControllerInformation=%p "
+                 "getTriggerEffectState=%p",
+                 reinterpret_cast<void*>(g_getHandle), reinterpret_cast<void*>(g_setTriggerEffect),
+                 reinterpret_cast<void*>(g_getInfo), reinterpret_cast<void*>(g_getTriggerState));
 
     // GetHandle and GetControllerInformation are required: without both we cannot tell an
-    // occupied slot from an empty one, and picking blindly is exactly the bug being fixed.
+    // occupied slot from an empty one, and picking blindly is exactly the bug being avoided.
     if (g_getHandle == nullptr || g_getInfo == nullptr)
     {
         SDS_LOG_ERROR("libScePad.dll is mapped but scePadGetHandle/"
@@ -157,8 +150,7 @@ bool ScePad::SelectPad(int forceUserId)
         SDS_LOG_INFO("pad slot %d: handle=0x%X info-ret=0x%08X connected=%u connectedCount=%u "
                      "type=%u class=%u density=%.2f touch=%ux%u dz=%u/%u raw=%s",
                      user, static_cast<unsigned>(h), static_cast<unsigned>(info.result),
-                     info.connected,
-                     info.connectedCount, info.connectionType, info.deviceClass,
+                     info.connected, info.connectedCount, info.connectionType, info.deviceClass,
                      static_cast<double>(info.pixelDensity), info.touchpadWidth,
                      info.touchpadHeight, info.deadZoneLeft, info.deadZoneRight, hex);
 
@@ -172,8 +164,6 @@ bool ScePad::SelectPad(int forceUserId)
 
     if (bestHandle == 0)
     {
-        // Loud, and specifically about the thing that is most likely wrong: Steam's global
-        // PlayStation Controller Support hides the pad from libScePad (§4/§7).
         SDS_LOG_ERROR("no pad slot reports connected=1. Every slot handed back a handle and "
                       "an all-zero information struct. Check that Steam's *global* "
                       "PlayStation Controller Support is OFF and that the DualSense is "
@@ -205,52 +195,24 @@ bool ScePad::RefreshIfLost()
     return SelectPad(0);
 }
 
-bool ScePad::SetTriggers(bool left, bool right, uint8_t position, uint8_t strength)
+bool ScePad::SetTriggers(const uint8_t param[kTriggerParamSize], bool left, bool right,
+                         const TriggerEffect& effect)
 {
     const int32_t h = Handle();
     if (g_setTriggerEffect == nullptr || h <= 0)
         return false;
 
-    // ScePadTriggerEffectParam, from the game's own construction site (§3):
-    //   +0x00 triggerMask   +0x08 cmd0.mode   +0x10 cmd0 data
-    //                       +0x40 cmd1.mode   +0x48 cmd1 data     (command stride 0x38)
-    // Four other strides were rejected with 0x80920001 INVALID_ARG; this one is accepted.
-    // The block is ~120 bytes; 256 zeroed is slack.
-    alignas(16) uint8_t param[256]{};
-
-    // BOTH triggers stay addressed. Dropping a side from the mask leaves it stuck at whatever
-    // the previous call set — that is the §8 trap.
-    param[0x00] = 0x03;
-
-    const uint32_t modeL = left  ? static_cast<uint32_t>(TriggerMode::Feedback)
-                                 : static_cast<uint32_t>(TriggerMode::Off);
-    const uint32_t modeR = right ? static_cast<uint32_t>(TriggerMode::Feedback)
-                                 : static_cast<uint32_t>(TriggerMode::Off);
-    std::memcpy(param + 0x08, &modeL, sizeof(modeL));
-    param[0x10] = position;
-    param[0x11] = strength;
-    std::memcpy(param + 0x40, &modeR, sizeof(modeR));
-    param[0x48] = position;
-    param[0x49] = strength;
-
     const int32_t r = g_setTriggerEffect(h, param);
     if (r == 0) m_trigOk.fetch_add(1, std::memory_order_relaxed);
     else        m_trigFail.fetch_add(1, std::memory_order_relaxed);
 
-    SDS_LOG_INFO("TRIGGERS L=%d R=%d pos=%u str=%u handle=0x%X -> 0x%08X (ok=%lu fail=%lu)",
-                 left ? 1 : 0, right ? 1 : 0, position, strength, static_cast<unsigned>(h),
-                 static_cast<unsigned>(r), TriggerOk(), TriggerFail());
-    return r == 0;
-}
-
-bool ScePad::SetVibration(uint8_t large, uint8_t small)
-{
-    const int32_t h = Handle();
-    if (g_setVibration == nullptr || h <= 0)
-        return false;
-    const uint8_t param[2] = { large, small };
-    const int32_t r = g_setVibration(h, param);
-    if (r != 0) m_vibeFail.fetch_add(1, std::memory_order_relaxed);
+    const SonyTriggerMode sony = ToSonyMode(effect.mode);
+    SDS_LOG_INFO("TRIGGERS %s L2=%d R2=%d game=%d(%s) sony=%u(%s) v=%u/%u/%u handle=0x%X "
+                 "-> 0x%08X (ok=%lu fail=%lu)",
+                 (left || right) ? "ENGAGE " : "release", left ? 1 : 0, right ? 1 : 0,
+                 effect.mode, GameModeName(effect.mode), static_cast<unsigned>(sony),
+                 SonyModeName(sony), effect.value1, effect.value2, effect.value3,
+                 static_cast<unsigned>(h), static_cast<unsigned>(r), TriggerOk(), TriggerFail());
     return r == 0;
 }
 
@@ -265,37 +227,6 @@ bool ScePad::GetTriggerState(uint32_t& outLeft, uint32_t& outRight)
     outLeft  = st[0];
     outRight = st[1];
     return r == 0;
-}
-
-std::wstring GameBinariesDir()
-{
-    wchar_t path[MAX_PATH]{};
-    const DWORD n = ::GetModuleFileNameW(nullptr, path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-        return {};
-    std::wstring s(path, n);
-    const size_t slash = s.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-        return {};
-    return s.substr(0, slash + 1);
-}
-
-std::wstring ModuleDir(void* addressInsideThisModule)
-{
-    HMODULE self = nullptr;
-    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                              reinterpret_cast<LPCWSTR>(addressInsideThisModule), &self))
-        return {};
-    wchar_t path[MAX_PATH]{};
-    const DWORD n = ::GetModuleFileNameW(self, path, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-        return {};
-    std::wstring s(path, n);
-    const size_t slash = s.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-        return {};
-    return s.substr(0, slash + 1);
 }
 
 } // namespace sds

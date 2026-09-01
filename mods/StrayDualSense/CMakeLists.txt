@@ -16,8 +16,8 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(StrayDualSense
-    VERSION 0.1.0
-    DESCRIPTION "DualSense adaptive triggers, haptics and controller speaker for Stray"
+    VERSION 0.2.0
+    DESCRIPTION "DualSense adaptive triggers, coil haptics and controller speaker for Stray"
     LANGUAGES CXX)
 
 option(STRAY_DS_WERROR "Treat warnings as errors" ON)
@@ -31,21 +31,31 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------------------
-# Pure logic. No Windows, no UE4SS, no pad. This is the only part CI can PROVE.
+# Pure logic. No Windows, no UE4SS, no pad. This is the only part CI can PROVE:
+#   AssetName      "SoundWave /Game/.../X.X" -> "X"
+#   TriggerEffect  the game<->Sony enum translation and the ScePadTriggerEffectParam layout
+#   LoopList       the game's own bLooping flags, parsed from haptic_loops.txt / spk_loops.txt
+#   Fade           the FadeInTime / FadeOutTime gain ramps
 # ---------------------------------------------------------------------------------------
 add_library(straydualsense_core STATIC
     src/AssetName.cpp
-    src/AssetName.hpp)
+    src/AssetName.hpp
+    src/Fade.hpp
+    src/LoopList.cpp
+    src/LoopList.hpp
+    src/TriggerEffect.cpp
+    src/TriggerEffect.hpp)
 target_include_directories(straydualsense_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
-add_executable(straydualsense_tests tests/test_asset_name.cpp)
-target_link_libraries(straydualsense_tests PRIVATE straydualsense_core)
-target_compile_options(straydualsense_tests PRIVATE ${SDS_WARN})
-
 enable_testing()
-add_test(NAME asset_name COMMAND straydualsense_tests)
+foreach(t asset_name trigger_effect loop_list fade)
+    add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
+    target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
+    target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
+    add_test(NAME ${t} COMMAND straydualsense_test_${t})
+endforeach()
 
 # ---------------------------------------------------------------------------------------
 # The plugin DLL. Only when a parent has already brought in RE-UE4SS.
@@ -67,22 +77,31 @@ endif()
 add_library(StrayDualSense SHARED
     src/AssetName.cpp
     src/AssetName.hpp
+    src/AudioPlayer.cpp
+    src/AudioPlayer.hpp
     src/Config.cpp
     src/Config.hpp
-    src/Haptics.cpp
-    src/Haptics.hpp
+    src/Fade.hpp
+    src/HidMode.cpp
+    src/HidMode.hpp
     src/Log.cpp
     src/Log.hpp
+    src/LoopList.cpp
+    src/LoopList.hpp
     src/Mod.cpp
+    src/Platform.cpp
+    src/Platform.hpp
     src/Runtime.cpp
     src/Runtime.hpp
     src/ScePad.cpp
     src/ScePad.hpp
-    src/Speaker.cpp
-    src/Speaker.hpp
+    src/TriggerEffect.cpp
+    src/TriggerEffect.hpp
     src/Triggers.cpp
     src/Triggers.hpp
-    src/Version.hpp)
+    src/Version.hpp
+    src/Wasapi.cpp
+    src/Wasapi.hpp)
 
 target_include_directories(StrayDualSense PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -95,9 +114,10 @@ target_compile_features(StrayDualSense PRIVATE cxx_std_23)
 # Unreal/File/DynamicOutput/fmt/imgui transitives with it. Never name UE4SS.lib directly.
 target_link_libraries(StrayDualSense PRIVATE UE4SS)
 
-# ole32 : CoCreateInstance / PropVariantClear / CoTaskMemFree for the WASAPI speaker path
-# winmm : timeBeginPeriod, so the 5 ms haptic envelope step is not quantised to ~15.6 ms
-target_link_libraries(StrayDualSense PRIVATE ole32 winmm)
+# ole32    : CoCreateInstance / PropVariantClear / CoTaskMemFree for the WASAPI paths
+# setupapi : SetupDiGetClassDevs / EnumDeviceInterfaces / GetDeviceInterfaceDetail (HidMode)
+# hid      : HidD_GetHidGuid / HidD_GetAttributes / HidD_GetPreparsedData / HidP_GetCaps
+target_link_libraries(StrayDualSense PRIVATE ole32 setupapi hid)
 
 target_compile_options(StrayDualSense PRIVATE ${SDS_WARN})
 target_compile_definitions(StrayDualSense PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

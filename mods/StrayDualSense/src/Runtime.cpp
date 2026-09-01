@@ -2,44 +2,24 @@
 
 #include "AssetName.hpp"
 #include "Log.hpp"
+#include "Platform.hpp"
 #include "Version.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <algorithm>
-#include <chrono>
+#include <vector>
 
 namespace sds {
 namespace {
 
-uint64_t NowMs()
-{
-    return static_cast<uint64_t>(::GetTickCount64());
-}
-
-bool DirectoryExists(const std::wstring& path)
-{
-    const DWORD a = ::GetFileAttributesW(path.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
-}
-
-std::wstring Widen(const std::string& s)
-{
-    if (s.empty()) return {};
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring w(static_cast<size_t>(n - 1), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
-    return w;
-}
-
 // Resolve a configured relative directory against the game's Binaries/Win64 first (where the
 // assets are generated) and the mod's own directory second. Never hardcoded; always logged,
-// because "the envelope was not found" and "we looked in the wrong place" are the same
-// symptom otherwise.
-std::wstring ResolveAssetDir(const std::string& configured, const std::wstring& gameDir,
-                             const std::wstring& modDir, const char* what)
+// because "the asset was not found" and "we looked in the wrong place" are the same symptom
+// otherwise.
+std::wstring ResolveDir(const std::string& configured, const std::wstring& gameDir,
+                        const std::wstring& modDir, const char* what)
 {
     const std::wstring rel = Widen(configured);
     const bool absolute = rel.size() > 1 && (rel[1] == L':' || rel[0] == L'\\' || rel[0] == L'/');
@@ -51,9 +31,8 @@ std::wstring ResolveAssetDir(const std::string& configured, const std::wstring& 
                      DirectoryExists(p) ? 1 : 0);
         return p;
     }
-
     const std::wstring a = gameDir + rel + L"\\";
-    const std::wstring b = modDir  + rel + L"\\";
+    const std::wstring b = modDir + rel + L"\\";
     const bool aOk = DirectoryExists(a);
     const bool bOk = DirectoryExists(b);
     SDS_LOG_INFO("assets: %s candidates: [game] %ls exists=%d | [mod] %ls exists=%d",
@@ -61,7 +40,7 @@ std::wstring ResolveAssetDir(const std::string& configured, const std::wstring& 
     if (aOk) return a;
     if (bOk) return b;
     SDS_LOG_ERROR("assets: neither candidate for '%s' exists. Generate them with "
-                  "tools/dualsense/extract_assets.sh and envgen.sh.", what);
+                  "tools/dualsense/extract_assets.sh and wavegen.sh.", what);
     return a;   // keep the game-dir path so the per-asset error names the expected location
 }
 
@@ -73,7 +52,51 @@ Runtime& Rt()
     return instance;
 }
 
-void Runtime::Startup(void* addressInsideThisModule)
+bool Runtime::LoadLoopList(LoopList& list, const std::string& fileName, const char* what)
+{
+    // Game dir first, mod dir second — the same order as the asset directories.
+    for (const std::wstring& dir : { m_gameDir, m_modDir })
+    {
+        if (dir.empty()) continue;
+        const std::wstring   path = dir + Widen(fileName);
+        std::vector<uint8_t> bytes;
+        if (!ReadWholeFile(path, bytes))
+            continue;
+        list.Parse(std::string(bytes.begin(), bytes.end()));
+        SDS_LOG_INFO("loops: %s -> %ls (%zu looping asset(s))", what, path.c_str(), list.Count());
+        return true;
+    }
+    return false;
+}
+
+void Runtime::LoadLoopLists()
+{
+    if (!LoadLoopList(m_hapticLoops, m_config.hapticLoopsFile, "haptic"))
+    {
+        // Loud: without the list every asset is a one-shot, so the purr and the rain stop after
+        // one pass. That is the safe direction (a bump cannot buzz forever) but it is wrong.
+        SDS_LOG_ERROR("loops: haptic '%s' not found in the game dir or the mod dir. EVERY haptic "
+                      "asset will play as a ONE-SHOT; loops (purr, rain, scratch) will end after "
+                      "one pass. Generate it with tools/dualsense/extract_assets.sh + wavegen.sh.",
+                      m_config.hapticLoopsFile.c_str());
+    }
+    if (!LoadLoopList(m_spkLoops, m_config.spkLoopsFile, "spk"))
+    {
+        // extract_assets.sh writes ONE list covering every controller-class SoundWave, both
+        // families; wavegen.sh splits it. Accept the combined list rather than silencing the
+        // purr's loop over a missing split file.
+        if (LoadLoopList(m_spkLoops, m_config.hapticLoopsFile, "spk (from the combined haptic list)"))
+            SDS_LOG_INFO("loops: '%s' absent; the speaker is using '%s', which lists every "
+                         "controller-class asset", m_config.spkLoopsFile.c_str(),
+                         m_config.hapticLoopsFile.c_str());
+        else
+            SDS_LOG_ERROR("loops: spk '%s' not found (nor '%s'). EVERY speaker asset will play "
+                          "as a ONE-SHOT; the purr will end after one pass.",
+                          m_config.spkLoopsFile.c_str(), m_config.hapticLoopsFile.c_str());
+    }
+}
+
+void Runtime::Startup(const void* addressInsideThisModule)
 {
     if (m_started.load(std::memory_order_acquire))
         return;
@@ -81,8 +104,8 @@ void Runtime::Startup(void* addressInsideThisModule)
     m_gameDir = GameBinariesDir();
     m_modDir  = ModuleDir(addressInsideThisModule);
 
-    // The log goes next to the game binaries, alongside scepad_shim.log's old home and
-    // stray-dlss.log, because that is the directory the user already collects from.
+    // The log goes next to the game binaries, alongside stray-dlss.log, because that is the
+    // directory the user already collects from.
     const std::wstring logDir = m_gameDir.empty() ? m_modDir : m_gameDir;
     Log::Open(logDir + L"stray-dualsense.log", LogLevel::Info);
 
@@ -90,42 +113,36 @@ void Runtime::Startup(void* addressInsideThisModule)
     SDS_LOG_INFO("  game binaries dir: %ls", m_gameDir.c_str());
     SDS_LOG_INFO("  mod dir          : %ls", m_modDir.c_str());
 
-    // Config next to the mod DLL first (where an installer would put it), then the game dir.
     m_configPath = m_modDir + L"StrayDualSense.ini";
     if (!m_config.Load(m_configPath))
     {
         const std::wstring alt = logDir + L"StrayDualSense.ini";
         if (m_config.Load(alt))
-        {
             m_configPath = alt;
-            SDS_LOG_INFO("config: loaded %ls", m_configPath.c_str());
-        }
         else
-        {
-            SDS_LOG_INFO("config: no StrayDualSense.ini found (looked next to the mod DLL and "
-                         "in the game directory); using built-in defaults, which are the "
-                         "values the working two-part mod shipped");
-        }
+            SDS_LOG_INFO("config: no StrayDualSense.ini next to the mod DLL or in the game "
+                         "directory; using built-in defaults");
     }
-    else
-    {
-        SDS_LOG_INFO("config: loaded %ls", m_configPath.c_str());
-    }
+    if (!m_configPath.empty())
+        SDS_LOG_INFO("config: %ls", m_configPath.c_str());
     Log::SetMinLevel(m_config.logLevel);
     m_config.LogSummary("loaded");
 
     if (!m_config.enabled)
-    {
-        SDS_LOG_WARN("Enabled=0 in the config: hooks will still register but nothing will be "
-                     "sent to the pad.");
-    }
+        SDS_LOG_WARN("Enabled=0: hooks will still register but nothing reaches the pad.");
 
-    m_vibeDir = ResolveAssetDir(m_config.vibeDir, m_gameDir, m_modDir, "vibe");
-    m_spkDir  = ResolveAssetDir(m_config.spkDir,  m_gameDir, m_modDir, "spk");
+    m_hapticDir = ResolveDir(m_config.hapticDir, m_gameDir, m_modDir, "haptic");
+    m_spkDir    = ResolveDir(m_config.spkDir,    m_gameDir, m_modDir, "spk");
+    LoadLoopLists();
 
+    m_hidMode.Start(m_config);
     m_triggers.Start(m_pad, m_config);
-    m_haptics.Start(m_pad, m_config, m_vibeDir);
-    m_speaker.Start(m_config, m_spkDir);
+    // The coil path re-asserts waveform mode right before every waveform: libScePad's own
+    // trigger reports carry the same flag byte and may have flipped it back since the last
+    // periodic write (§12).
+    m_haptics.Start(kCoilRoute, m_config.endpointMatch, m_hapticDir,
+                    [this] { m_hidMode.AssertNow("before waveform"); });
+    m_speaker.Start(kSpeakerRoute, m_config.endpointMatch, m_spkDir, nullptr);
 
     m_padThreadRunning.store(true, std::memory_order_release);
     m_padThread = std::thread(&Runtime::PadThreadMain, this);
@@ -147,7 +164,8 @@ void Runtime::Shutdown()
 
     m_haptics.Shutdown();
     m_speaker.Shutdown();
-    m_triggers.Shutdown();   // last: it releases the triggers on the way out
+    m_triggers.Shutdown();   // releases the triggers on the way out
+    m_hidMode.Shutdown();    // hands the coils back to rumble emulation
 
     LogStatus();
     Log::Close();
@@ -157,7 +175,7 @@ void Runtime::PadThreadMain()
 {
     // libScePad is DELAY-loaded (import #9), so at mod init it is usually not mapped yet.
     // Poll until it is; log the wait so "nothing happened" is never mysterious.
-    int  waited = 0;
+    int  waited    = 0;
     bool announced = false;
     while (m_padThreadRunning.load(std::memory_order_acquire))
     {
@@ -188,8 +206,7 @@ void Runtime::PadThreadMain()
             m_pad.RefreshIfLost();
         }
 
-        const DWORD sleepMs = static_cast<DWORD>(
-            std::max(0.25f, m_config.padPollSeconds) * 1000.0f);
+        const DWORD sleepMs = static_cast<DWORD>(std::max(0.25f, m_config.padPollSeconds) * 1000.0f);
         for (DWORD slept = 0; slept < sleepMs && m_padThreadRunning.load(std::memory_order_acquire);
              slept += 100)
             ::Sleep(100);
@@ -220,20 +237,51 @@ void Runtime::Tick()
 
 void Runtime::LogStatus()
 {
-    SDS_LOG_INFO("STATUS pad=%s(user=%d handle=0x%X) trig[events=%lu transmits=%lu ok=%lu "
-                 "fail=%lu L=%d R=%d] vibe[starts=%lu played=%lu done=%lu missing=%lu "
-                 "capped=%lu now='%s'] spk[starts=%lu missing=%lu fail=%lu endpoint=%d]",
-                 m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(),
-                 static_cast<unsigned>(m_pad.Handle()),
+    const TriggerEffect fx = m_triggers.Effect();
+    SDS_LOG_INFO("STATUS pad=%s(user=%d handle=0x%X) hid[open=%d writes=%lu fail=%lu] "
+                 "trig[events=%lu tx=%lu ok=%lu fail=%lu L=%d R=%d effect=%d/%u/%u/%u %s] "
+                 "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
+                 "compStops ok=%lu ignored=%lu padVibe=%d] "
+                 "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s']",
+                 m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
+                 m_hidMode.Opened() ? 1 : 0, m_hidMode.Writes(), m_hidMode.Failures(),
                  m_triggerEvents.load(), m_triggers.Transmits(), m_pad.TriggerOk(),
                  m_pad.TriggerFail(), m_triggers.Left() ? 1 : 0, m_triggers.Right() ? 1 : 0,
+                 fx.mode, fx.value1, fx.value2, fx.value3,
+                 m_effectFromGame.load() ? "(game)" : "(FALLBACK)",
                  m_vibrationStarts.load(), m_haptics.Started(), m_haptics.Finished(),
-                 m_haptics.Missing(), m_haptics.Capped(), m_haptics.CurrentName().c_str(),
-                 m_speakerStarts.load(), m_speaker.Missing(), m_speaker.Failures(),
-                 m_speaker.EndpointFound() ? 1 : 0);
+                 m_haptics.Missing(), m_haptics.Failures(), m_haptics.EndpointFound() ? 1 : 0,
+                 m_haptics.CurrentName().c_str(), m_componentStopsHonoured.load(),
+                 m_componentStopsIgnored.load(), m_padVibrationEnabled.load() ? 1 : 0,
+                 m_speakerStarts.load(), m_speaker.Started(), m_speaker.Missing(),
+                 m_speaker.Failures(), m_speaker.EndpointFound() ? 1 : 0,
+                 m_speaker.CurrentName().c_str());
 }
 
 // ---- game intent ----------------------------------------------------------------------
+
+void Runtime::OnTriggerEffectRead(const TriggerEffect& effect, bool ok)
+{
+    if (!ok)
+    {
+        if (!m_effectFromGame.load())
+            SDS_LOG_WARN("trigger effect: m_scratchablePS5TriggerEffect could not be read; "
+                         "using the FALLBACK game-space effect %d(%s) v=%u/%u/%u",
+                         kFallbackTriggerEffect.mode, GameModeName(kFallbackTriggerEffect.mode),
+                         kFallbackTriggerEffect.value1, kFallbackTriggerEffect.value2,
+                         kFallbackTriggerEffect.value3);
+        return;
+    }
+    const TriggerEffect previous = m_triggers.Effect();
+    if (!m_effectFromGame.exchange(true) || previous != effect)
+    {
+        SDS_LOG_INFO("trigger effect (authored by the game): mode=%d(%s) v1=%u v2=%u v3=%u -> "
+                     "Sony %s%s", effect.mode, GameModeName(effect.mode), effect.value1,
+                     effect.value2, effect.value3, SonyModeName(ToSonyMode(effect.mode)),
+                     IsKnownGameMode(effect.mode) ? "" : "  [UNKNOWN game mode, mapped to Feedback]");
+    }
+    m_triggers.SetEffect(effect);
+}
 
 void Runtime::OnTriggerActivated(bool state, int side)
 {
@@ -246,7 +294,8 @@ void Runtime::OnTriggerActivated(bool state, int side)
                       "parameter read is WRONG; ignoring.", side);
         return;
     }
-    SDS_LOG_DEBUG("SetPS5TriggerActivated state=%d side=%d", state ? 1 : 0, side);
+    SDS_LOG_INFO("SetPS5TriggerActivated state=%d side=%d(%s)", state ? 1 : 0, side,
+                 side == 0 ? "Left" : "Right");
     if (!m_config.enabled || !m_config.triggers)
         return;
     m_triggers.SetSide(static_cast<TriggerSide>(side), state);
@@ -263,31 +312,81 @@ void Runtime::OnAfterUseDone()
     m_triggers.ReleaseAll();
 }
 
-void Runtime::OnStartVibration(const std::string& assetFullName, float level, bool levelSeen)
+void Runtime::OnStartVibration(const VibrationStart& s)
 {
     m_vibrationStarts.fetch_add(1, std::memory_order_relaxed);
-    const std::string name = ShortAssetName(assetFullName);
-    // An absent Level and a Level of 0 need different fixes, so they are distinguished
-    // rather than both collapsing to a fallback (the old Lua mod's `lvSeen`).
-    const float useLevel = levelSeen ? level : 1.0f;
-    SDS_LOG_INFO("StartPS5Vibration asset='%s' -> '%s' level=%.3f (seen=%d)",
-                 assetFullName.c_str(), name.c_str(), static_cast<double>(useLevel),
-                 levelSeen ? 1 : 0);
+    const std::string name         = ShortAssetName(s.soundFullName);
+    const bool        viaComponent = !s.componentFullName.empty();
+
+    // An absent Level and a Level of 0 need different fixes, so they are distinguished. And
+    // component-attached vibrations arrive with Level=0.0: their level lives in the submix
+    // send (PS5VibrationAttenuation: bAttenuate=False, send constant 1.0), so 0 on that path
+    // means 1.0.
+    float level = s.levelSeen ? s.level : 1.0f;
+    if (viaComponent && level <= 0.0f)
+        level = 1.0f;
+
+    const bool loop = m_hapticLoops.Contains(name);   // the ASSET decides, never the caller
+    SDS_LOG_INFO("StartPS5Vibration%s '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f loop=%d(asset)%s%s",
+                 viaComponent ? "OnAudioComponent" : "", s.soundFullName.c_str(), name.c_str(),
+                 static_cast<double>(level), s.levelSeen ? 1 : 0, static_cast<double>(s.fadeIn),
+                 loop ? 1 : 0, viaComponent ? " component=" : "",
+                 viaComponent ? s.componentFullName.c_str() : "");
+
+    {
+        std::lock_guard<std::mutex> lock(m_componentMutex);
+        m_playingComponent = s.componentFullName;   // empty on the plain path
+    }
+
     if (!m_config.enabled || !m_config.haptics)
         return;
     if (name.empty())
     {
         SDS_LOG_ERROR("StartPS5Vibration: could not derive an asset name from '%s'",
-                      assetFullName.c_str());
+                      s.soundFullName.c_str());
         return;
     }
-    m_haptics.Play(name, useLevel, m_config.hapticLoop);
+    if (!m_padVibrationEnabled.load(std::memory_order_relaxed))
+    {
+        SDS_LOG_INFO("haptics: '%s' suppressed, PadVibrationEnabled is off", name.c_str());
+        m_haptics.Stop(0.0f);
+        return;
+    }
+    m_haptics.Play(name, level, s.fadeIn, loop);
 }
 
-void Runtime::OnStopVibration()
+void Runtime::OnStopVibration(float fadeOut)
 {
-    SDS_LOG_INFO("StopPS5Vibration");
-    m_haptics.Stop();
+    SDS_LOG_INFO("StopPS5Vibration fadeOut=%.2f (global)", static_cast<double>(fadeOut));
+    {
+        std::lock_guard<std::mutex> lock(m_componentMutex);
+        m_playingComponent.clear();
+    }
+    m_haptics.Stop(fadeOut);
+}
+
+void Runtime::OnStopVibrationOnComponent(const std::string& componentFullName, float fadeOut)
+{
+    // ~700 calls a session, most of them housekeeping for components that are not playing.
+    // Only the owner of the haptic in flight may stop it.
+    bool owner = false;
+    {
+        std::lock_guard<std::mutex> lock(m_componentMutex);
+        owner = !m_playingComponent.empty() && m_playingComponent == componentFullName;
+        if (owner)
+            m_playingComponent.clear();
+    }
+    if (!owner)
+    {
+        m_componentStopsIgnored.fetch_add(1, std::memory_order_relaxed);
+        SDS_LOG_DEBUG("StopPS5VibrationOnAudioComponent ignored: '%s' is not the playing "
+                      "component", componentFullName.c_str());
+        return;
+    }
+    m_componentStopsHonoured.fetch_add(1, std::memory_order_relaxed);
+    SDS_LOG_INFO("StopPS5VibrationOnAudioComponent fadeOut=%.2f (owner) %s",
+                 static_cast<double>(fadeOut), componentFullName.c_str());
+    m_haptics.Stop(fadeOut);
 }
 
 void Runtime::OnSetVibrationLevel(float level)
@@ -296,29 +395,31 @@ void Runtime::OnSetVibrationLevel(float level)
     m_haptics.SetLevel(level);
 }
 
-void Runtime::OnStartControllerSound(const std::string& assetFullName, float level, bool levelSeen)
+void Runtime::OnStartControllerSound(const std::string& soundFullName, float level,
+                                     bool levelSeen, float fadeIn)
 {
     m_speakerStarts.fetch_add(1, std::memory_order_relaxed);
-    const std::string name = ShortAssetName(assetFullName);
-    const float useLevel = levelSeen ? level : 1.0f;
-    SDS_LOG_INFO("StartPS5ControllerSound asset='%s' -> '%s' level=%.3f (seen=%d)",
-                 assetFullName.c_str(), name.c_str(), static_cast<double>(useLevel),
-                 levelSeen ? 1 : 0);
+    const std::string name     = ShortAssetName(soundFullName);
+    const float       useLevel = levelSeen ? level : 1.0f;
+    const bool        loop     = m_spkLoops.Contains(name);
+    SDS_LOG_INFO("StartPS5ControllerSound '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f loop=%d(asset)",
+                 soundFullName.c_str(), name.c_str(), static_cast<double>(useLevel),
+                 levelSeen ? 1 : 0, static_cast<double>(fadeIn), loop ? 1 : 0);
     if (!m_config.enabled || !m_config.speaker)
         return;
     if (name.empty())
     {
         SDS_LOG_ERROR("StartPS5ControllerSound: could not derive an asset name from '%s'",
-                      assetFullName.c_str());
+                      soundFullName.c_str());
         return;
     }
-    m_speaker.Play(name, useLevel, m_config.speakerLoop);
+    m_speaker.Play(name, useLevel, fadeIn, loop);
 }
 
-void Runtime::OnStopControllerSound()
+void Runtime::OnStopControllerSound(float fadeOut)
 {
-    SDS_LOG_INFO("StopPS5ControllerSound");
-    m_speaker.Stop();
+    SDS_LOG_INFO("StopPS5ControllerSound fadeOut=%.2f", static_cast<double>(fadeOut));
+    m_speaker.Stop(fadeOut);
 }
 
 void Runtime::OnSetControllerSoundLevel(float level)
@@ -328,7 +429,12 @@ void Runtime::OnSetControllerSoundLevel(float level)
 
 void Runtime::OnPadVibrationEnabled(bool enabled)
 {
-    m_haptics.SetPadVibrationEnabled(enabled);
+    const bool was = m_padVibrationEnabled.exchange(enabled, std::memory_order_relaxed);
+    if (was == enabled)
+        return;
+    SDS_LOG_INFO("haptics: PadVibrationEnabled -> %d", enabled ? 1 : 0);
+    if (!enabled)
+        m_haptics.Stop(0.0f);
 }
 
 void Runtime::NoteHookRegistered(const char* name)

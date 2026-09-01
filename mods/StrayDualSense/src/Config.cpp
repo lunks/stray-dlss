@@ -7,7 +7,6 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 
 namespace sds {
@@ -46,6 +45,22 @@ LogLevel ParseLevel(const std::string& v, LogLevel fallback)
     return fallback;
 }
 
+float ParseFloat(const std::string& v, float fallback)
+{
+    char* end = nullptr;
+    const double d = std::strtod(v.c_str(), &end);
+    return (end == v.c_str()) ? fallback : static_cast<float>(d);
+}
+
+// Accepts "0x00", "00", "0", "252".
+int ParseByte(const std::string& v, int fallback)
+{
+    char* end = nullptr;
+    const long n = std::strtol(v.c_str(), &end, 0);
+    if (end == v.c_str() || n < 0 || n > 255) return fallback;
+    return static_cast<int>(n);
+}
+
 uint64_t FileWriteTime(const std::wstring& path)
 {
     WIN32_FILE_ATTRIBUTE_DATA d{};
@@ -77,30 +92,27 @@ bool Config::Load(const std::wstring& path)
         const std::string key = Lower(Trim(s.substr(0, eq)));
         const std::string val = Trim(s.substr(eq + 1));
 
-        if      (key == "enabled")            enabled          = ParseBool(val, enabled);
-        else if (key == "loglevel")           logLevel         = ParseLevel(val, logLevel);
-        else if (key == "paduserid")          padUserId        = std::atoi(val.c_str());
-        else if (key == "padpollseconds")     padPollSeconds   = static_cast<float>(std::atof(val.c_str()));
-        else if (key == "triggers")           triggers         = ParseBool(val, triggers);
-        else if (key == "triggerposition")    triggerPosition  = static_cast<uint8_t>(std::clamp(std::atoi(val.c_str()), 0, 9));
-        else if (key == "triggerstrength")    triggerStrength  = static_cast<uint8_t>(std::clamp(std::atoi(val.c_str()), 0, 8));
-        else if (key == "triggerreadback")    triggerReadback  = ParseBool(val, triggerReadback);
-        else if (key == "haptics")            haptics          = ParseBool(val, haptics);
-        else if (key == "hapticgain")         hapticGain       = std::clamp(std::atoi(val.c_str()), 0, 255);
-        else if (key == "envelopestepms")     envelopeStepMs   = std::clamp(std::atoi(val.c_str()), 1, 100);
-        else if (key == "maxenvelopesteps")   maxEnvelopeSteps = std::max(1, std::atoi(val.c_str()));
-        else if (key == "hapticloop")         hapticLoop       = ParseBool(val, hapticLoop);
-        else if (key == "speaker")            speaker          = ParseBool(val, speaker);
-        else if (key == "speakerboost")       speakerBoost     = static_cast<float>(std::atof(val.c_str()));
-        else if (key == "speakerdevicematch") speakerDeviceMatch = val;
-        else if (key == "speakerassetrate")   speakerAssetRate = std::max(1, std::atoi(val.c_str()));
-        else if (key == "speakerloop")        speakerLoop      = ParseBool(val, speakerLoop);
-        else if (key == "vibedir")            vibeDir          = val;
-        else if (key == "spkdir")             spkDir           = val;
-        else if (key == "hookretryseconds")   hookRetrySeconds = static_cast<float>(std::atof(val.c_str()));
-        else if (key == "statusseconds")      statusSeconds    = static_cast<float>(std::atof(val.c_str()));
-        else if (key == "configreloadseconds") configReloadSeconds = static_cast<float>(std::atof(val.c_str()));
-        else SDS_LOG_WARN("config: ignoring unknown key '%s'", key.c_str());
+        if      (key == "enabled")                enabled                = ParseBool(val, enabled);
+        else if (key == "loglevel")               logLevel               = ParseLevel(val, logLevel);
+        else if (key == "paduserid")              padUserId              = std::clamp(std::atoi(val.c_str()), 0, 4);
+        else if (key == "padpollseconds")         padPollSeconds         = ParseFloat(val, padPollSeconds);
+        else if (key == "triggers")               triggers               = ParseBool(val, triggers);
+        else if (key == "triggerreadback")        triggerReadback        = ParseBool(val, triggerReadback);
+        else if (key == "haptics")                haptics                = ParseBool(val, haptics);
+        else if (key == "hapticvalidflag0")       hapticValidFlag0       = ParseByte(val, hapticValidFlag0);
+        else if (key == "hapticreassertseconds")  hapticReassertSeconds  = ParseFloat(val, hapticReassertSeconds);
+        else if (key == "speaker")                speaker                = ParseBool(val, speaker);
+        else if (key == "endpointmatch")          endpointMatch          = val;
+        else if (key == "hapticdir")              hapticDir              = val;
+        else if (key == "spkdir")                 spkDir                 = val;
+        else if (key == "hapticloopsfile")        hapticLoopsFile        = val;
+        else if (key == "spkloopsfile")           spkLoopsFile           = val;
+        else if (key == "hookretryseconds")       hookRetrySeconds       = ParseFloat(val, hookRetrySeconds);
+        else if (key == "statusseconds")          statusSeconds          = ParseFloat(val, statusSeconds);
+        else if (key == "configreloadseconds")    configReloadSeconds    = ParseFloat(val, configReloadSeconds);
+        else SDS_LOG_WARN("config: ignoring unknown key '%s' (the envelope-era keys HapticGain, "
+                          "HapticLoop, SpeakerBoost, VibeDir, TriggerPosition/Strength no longer "
+                          "exist)", key.c_str());
     }
     std::fclose(f);
     m_lastWriteTime = FileWriteTime(path);
@@ -115,36 +127,32 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     if (t == 0 || t == m_lastWriteTime)
         return false;
 
-    // Only the live fields are taken. Pad selection and the device match are read once at
-    // startup by threads that are already running; silently "reloading" them would leave the
-    // log claiming one thing and the runtime doing another.
     Config fresh;
     fresh.m_lastWriteTime = m_lastWriteTime;
     if (!fresh.Load(path))
         return false;
 
-    if (fresh.padUserId != padUserId || fresh.speakerDeviceMatch != speakerDeviceMatch ||
-        fresh.vibeDir != vibeDir || fresh.spkDir != spkDir)
+    if (fresh.padUserId != padUserId || fresh.endpointMatch != endpointMatch ||
+        fresh.hapticDir != hapticDir || fresh.spkDir != spkDir ||
+        fresh.hapticLoopsFile != hapticLoopsFile || fresh.spkLoopsFile != spkLoopsFile)
     {
-        SDS_LOG_WARN("config: PadUserId / SpeakerDeviceMatch / VibeDir / SpkDir changed but "
-                     "are NOT hot-reloadable. Relaunch the game for those to take effect.");
+        SDS_LOG_WARN("config: PadUserId / EndpointMatch / HapticDir / SpkDir / *LoopsFile "
+                     "changed but are NOT hot-reloadable. Relaunch the game for those.");
     }
 
-    enabled          = fresh.enabled;
-    logLevel         = fresh.logLevel;
-    triggers         = fresh.triggers;
-    triggerPosition  = fresh.triggerPosition;
-    triggerStrength  = fresh.triggerStrength;
-    triggerReadback  = fresh.triggerReadback;
-    haptics          = fresh.haptics;
-    hapticGain       = fresh.hapticGain;
-    hapticLoop       = fresh.hapticLoop;
-    speaker          = fresh.speaker;
-    speakerBoost     = fresh.speakerBoost;
-    speakerLoop      = fresh.speakerLoop;
-    statusSeconds    = fresh.statusSeconds;
-    configReloadSeconds = fresh.configReloadSeconds;
-    m_lastWriteTime  = fresh.m_lastWriteTime;
+    // Scalars only: the strings above are read by running threads without a lock.
+    enabled               = fresh.enabled;
+    logLevel              = fresh.logLevel;
+    padPollSeconds        = fresh.padPollSeconds;
+    triggers              = fresh.triggers;
+    triggerReadback       = fresh.triggerReadback;
+    haptics               = fresh.haptics;
+    hapticValidFlag0      = fresh.hapticValidFlag0;
+    hapticReassertSeconds = fresh.hapticReassertSeconds;
+    speaker               = fresh.speaker;
+    statusSeconds         = fresh.statusSeconds;
+    configReloadSeconds   = fresh.configReloadSeconds;
+    m_lastWriteTime       = fresh.m_lastWriteTime;
 
     Log::SetMinLevel(logLevel);
     LogSummary("reloaded");
@@ -153,14 +161,14 @@ bool Config::ReloadIfChanged(const std::wstring& path)
 
 void Config::LogSummary(const char* what) const
 {
-    SDS_LOG_INFO("config %s: enabled=%d triggers=%d(pos=%u str=%u readback=%d) "
-                 "haptics=%d(gain=%d step=%dms cap=%d loop=%d) speaker=%d(boost=%.4f loop=%d match='%s') "
-                 "padUserId=%d vibeDir='%s' spkDir='%s'",
-                 what, enabled ? 1 : 0, triggers ? 1 : 0, triggerPosition, triggerStrength,
-                 triggerReadback ? 1 : 0, haptics ? 1 : 0, hapticGain, envelopeStepMs,
-                 maxEnvelopeSteps, hapticLoop ? 1 : 0, speaker ? 1 : 0,
-                 static_cast<double>(speakerBoost), speakerLoop ? 1 : 0,
-                 speakerDeviceMatch.c_str(), padUserId, vibeDir.c_str(), spkDir.c_str());
+    SDS_LOG_INFO("config %s: enabled=%d triggers=%d(readback=%d) haptics=%d(validFlag0=0x%02X "
+                 "reassert=%.1fs) speaker=%d endpoint='%s' padUserId=%d hapticDir='%s' "
+                 "spkDir='%s' loops='%s'/'%s'",
+                 what, enabled ? 1 : 0, triggers ? 1 : 0, triggerReadback ? 1 : 0,
+                 haptics ? 1 : 0, static_cast<unsigned>(hapticValidFlag0),
+                 static_cast<double>(hapticReassertSeconds), speaker ? 1 : 0,
+                 endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
+                 hapticLoopsFile.c_str(), spkLoopsFile.c_str());
 }
 
 } // namespace sds

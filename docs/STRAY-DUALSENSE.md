@@ -479,6 +479,29 @@ Everything measured above is unchanged and is what the plugin implements. Three 
 **None of the plugin has been run.** `mods/StrayDualSense/README.md` lists what is unverified
 and in what order to check it.
 
+### REWRITTEN 2026-09-01 to §12/§13 — the shim is the reference the plugin was extracted from
+
+The plugin above was built two design generations ago, on §9's envelope model
+(`scePadSetVibration` fed RMS envelopes, per-file normalisation, a master gain, a 5 ms loop).
+§12 made all of that dead: the API reads two bytes and cannot carry a waveform, and the coils
+take real audio once the HID mode byte stops claiming compatible-vibration. §13 changed the
+trigger data from constants to the game's authored struct with an enum translation.
+
+`mods/StrayDualSense/` now implements §12/§13, and the relationship between the two trees is:
+
+* **`tools/dualsense/libScePad_shim.c` + `StrayTriggers.lua` are the REFERENCE
+  IMPLEMENTATION.** They are what was measured working on hardware, experiments and all
+  (`open_pad_hid()` / `set_valid_flag0()`, `hap_play()`, `asset_loops()`, the Lua's
+  `findSound` / `findLevel` / `playingComponent`). When the plugin and the shim disagree, the
+  shim is the one that was seen to work.
+* **The plugin is that design with the experiments removed:** no endpoint/container probes,
+  no tone tests, no envelope path, no heuristic trigger, no command files, no `libScePad_orig`
+  rename. What it adds over the shim is only what §12 lists as "still not honoured": fades
+  (`FadeInTime` / `FadeOutTime` as gain ramps) — and, from the earlier plugin, pad selection
+  by the `connected` byte.
+* **Still not done in either:** concurrent haptics do not mix (one playback slot per route;
+  a new waveform supersedes the current one, where PS5 sums rain + purr + footstep).
+
 
 ---
 

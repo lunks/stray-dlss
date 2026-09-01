@@ -4,8 +4,10 @@ name: StrayDualSense plugin
 # MSVC, no game, no pad (CLAUDE.md §0). This workflow is the ONLY build. It is staged
 # cheapest-first so a typo is caught in seconds rather than after a 20-minute SDK build.
 #
-#   1. tests    the pure-logic test, the one thing provable without hardware
-#   2. mingw    proves the Win32 half (pad, WASAPI, threads) COMPILES AND LINKS, with no SDK
+#   1. tests    the pure-logic tests (asset names, trigger enum translation + param block,
+#               loop list, fade ramps), the one thing provable without hardware
+#   2. mingw    proves the Win32 half (pad, HID mode byte, WASAPI, threads) COMPILES AND
+#               LINKS, with no SDK
 #   3. plugin   the artifact; builds RE-UE4SS from source and links against it
 #
 # Lane 2 is a proxy, not the product: mingw is not MSVC and the plugin MUST be MSVC-built,
@@ -91,7 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/obj
-          for f in AssetName Config Haptics Log Runtime ScePad Speaker Triggers; do
+          for f in AssetName AudioPlayer Config HidMode Log LoopList Platform Runtime ScePad \
+                   TriggerEffect Triggers Wasapi; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
               -Isrc -c "src/$f.cpp" -o "/tmp/obj/$f.o"
@@ -103,17 +106,22 @@ jobs:
           // half surfaces here rather than as a DLL that will not load in the game.
           extern "C" __declspec(dllexport) void sds_stub_entry()
           {
-              sds::Rt().Startup(reinterpret_cast<void*>(&sds_stub_entry));
+              sds::Rt().Startup(reinterpret_cast<const void*>(&sds_stub_entry));
               sds::Rt().Tick();
+              sds::Rt().OnTriggerEffectRead(sds::kFallbackTriggerEffect, true);
               sds::Rt().OnTriggerActivated(true, 0);
               sds::Rt().OnUseStarted();
               sds::Rt().OnAfterUseDone();
-              sds::Rt().OnStartVibration("SoundWave /G/Scratch_VIBE.Scratch_VIBE", 1.0f, true);
+              sds::VibrationStart v;
+              v.soundFullName = "SoundWave /G/Scratch_VIBE.Scratch_VIBE";
+              v.level = 1.0f; v.levelSeen = true; v.fadeIn = 1.0f;
+              sds::Rt().OnStartVibration(v);
               sds::Rt().OnSetVibrationLevel(0.5f);
-              sds::Rt().OnStopVibration();
-              sds::Rt().OnStartControllerSound("SoundWave /G/a_CONTROL.a_CONTROL", 1.0f, true);
+              sds::Rt().OnStopVibrationOnComponent("AudioComponent /G/x", 0.0f);
+              sds::Rt().OnStopVibration(0.5f);
+              sds::Rt().OnStartControllerSound("SoundWave /G/a_CONTROL.a_CONTROL", 1.0f, true, 0.0f);
               sds::Rt().OnSetControllerSoundLevel(0.5f);
-              sds::Rt().OnStopControllerSound();
+              sds::Rt().OnStopControllerSound(0.0f);
               sds::Rt().OnPadVibrationEnabled(true);
               sds::Rt().Shutdown();
           }
@@ -121,8 +129,15 @@ jobs:
           STUB
           x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror -Isrc -shared \
             -o /tmp/obj/stub.dll /tmp/obj/stub.cpp /tmp/obj/*.o \
-            -lole32 -loleaut32 -lwinmm -luuid -static-libgcc -static-libstdc++
+            -lole32 -loleaut32 -luuid -lsetupapi -lhid -static-libgcc -static-libstdc++
           ls -la /tmp/obj/stub.dll
+          # The imports the design depends on must be THERE: the HID mode byte is the single
+          # most important thing in the plugin, and a build that silently dropped HidMode
+          # would still link.
+          x86_64-w64-mingw32-objdump -p /tmp/obj/stub.dll > /tmp/obj/imports.txt
+          for sym in HidD_GetAttributes SetupDiGetClassDevsW CoCreateInstance; do
+            grep -q "$sym" /tmp/obj/imports.txt || { echo "missing import: $sym"; exit 1; }
+          done
 
   plugin:
     name: Plugin DLL (Windows, MSVC)

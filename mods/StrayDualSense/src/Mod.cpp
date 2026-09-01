@@ -7,21 +7,24 @@
 //
 // PROVENANCE of every SDK call below, read out of RE-UE4SS at commit 68caddcf (the build on
 // the target box) and out of a public vendored copy of its private `deps/first/Unreal`
-// submodule at the same tree:
+// submodule at the same tree. HARD = read in the header. UNCONFIRMED = plausible from the
+// tree but not yet compiled by CI or run in the game.
 //
-//   CppUserModBase, on_unreal_init/on_update/on_program_start   UE4SS/include/Mod/CppUserModBase.hpp   HARD
-//   start_mod / uninstall_mod resolved by literal name          UE4SS/src/Mod/CppMod.cpp               HARD
+//   CppUserModBase, on_unreal_init/on_update                 UE4SS/include/Mod/CppUserModBase.hpp   HARD
+//   start_mod / uninstall_mod resolved by literal name       UE4SS/src/Mod/CppMod.cpp               HARD
 //   UObjectGlobals::RegisterHook(UFunction*, pre, post, void*)
-//     -> std::pair<int,int>                                     Unreal/UObjectGlobals.hpp              HARD
+//     -> std::pair<int,int>                                  Unreal/UObjectGlobals.hpp              HARD
 //   UnrealScriptFunctionCallable =
-//     std::function<void(Context&, void*)>                      Unreal/UFunctionStructs.hpp            HARD
-//   ctx.TheStack.Locals() -> uint8*                             Unreal/FFrame.hpp                      HARD
-//   UStruct::ForEachProperty() -> TFieldRange<FProperty>        Unreal/CoreUObject/UObject/Class.hpp   HARD
-//   FProperty::GetOffset_ForInternal / HasAnyPropertyFlags      Unreal/CoreUObject/UObject/UnrealType.hpp HARD
-//   CPF_Parm / CPF_ReturnParm                                   Unreal/UnrealFlags.hpp                 HARD
-//   FBoolProperty::GetPropertyValueInContainer                  Unreal/CoreUObject/UObject/UnrealType.hpp HARD
-//   UObjectGlobals::FindFirstOf / StaticFindObject              Unreal/UObjectGlobals.hpp              HARD
-//   UObject::GetPropertyByNameInChain / GetFullName             Unreal/UObject.hpp                     HARD
+//     std::function<void(Context&, void*)>                   Unreal/UFunctionStructs.hpp            HARD
+//   ctx.TheStack.Locals() -> uint8*                          Unreal/FFrame.hpp                      HARD
+//   UStruct::ForEachProperty() -> TFieldRange<FProperty>     Unreal/CoreUObject/UObject/Class.hpp   HARD
+//   FProperty::GetOffset_ForInternal / GetSize / IsA<>       Unreal/CoreUObject/UObject/UnrealType.hpp HARD
+//   CPF_Parm / CPF_ReturnParm                                Unreal/UnrealFlags.hpp                 HARD
+//   FBoolProperty::GetPropertyValueInContainer               Unreal/CoreUObject/UObject/UnrealType.hpp HARD
+//   UObjectGlobals::FindFirstOf / StaticFindObject           Unreal/UObjectGlobals.hpp              HARD
+//   UObject::GetPropertyByNameInChain / GetFullName          Unreal/UObject.hpp                     HARD
+//   FStructProperty::GetStruct() -> UScriptStruct*           Unreal/Property/FStructProperty.hpp    UNCONFIRMED
+//   UScriptStruct is-a UStruct (so ForEachProperty applies)  Unreal/UScriptStruct.hpp               UNCONFIRMED
 //
 // What is NOT verified is that any of it BEHAVES as intended in the game. See README.md.
 
@@ -34,9 +37,11 @@
 #include <Mod/CppUserModBase.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Unreal/Property/FStructProperty.hpp>
 #include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
+#include <Unreal/UScriptStruct.hpp>
 #include <Unreal/UnrealFlags.hpp>
 
 #include <chrono>
@@ -50,15 +55,18 @@
 
 #include "Log.hpp"
 #include "Runtime.hpp"
+#include "TriggerEffect.hpp"
 #include "Version.hpp"
 
 namespace {
 
 using RC::Unreal::FBoolProperty;
 using RC::Unreal::FProperty;
+using RC::Unreal::FStructProperty;
 using RC::Unreal::UFunction;
 using RC::Unreal::UnrealScriptFunctionCallableContext;
 using RC::Unreal::UObject;
+using RC::Unreal::UScriptStruct;
 
 // ---------------------------------------------------------------------------------------
 // Small string helpers. Our own logger is narrow (the user greps it next to ReShade's log);
@@ -82,11 +90,11 @@ RC::StringType Widen(const std::string& s)
     return out;
 }
 
-// Everything that reaches UE4SS's console goes through here, for two reasons. The text is a
-// finished string rather than a fmt format string, so a stray '{' in a game asset name cannot
-// become a format error; and Output::send THROWS when no output device is open
-// (Output.hpp: THROW_INTERNAL_FILE_ERROR "there were no opened devices"), which must never be
-// the thing that kills the mod. The file log is the real one.
+// Everything that reaches UE4SS's console goes through here. The text is a finished string
+// rather than a fmt format string, so a stray '{' in a game asset name cannot become a format
+// error; and Output::send THROWS when no output device is open (Output.hpp:
+// THROW_INTERNAL_FILE_ERROR "there were no opened devices"), which must never be the thing
+// that kills the mod. The file log is the real one.
 void Say(const RC::StringType& line)
 {
     try
@@ -95,64 +103,12 @@ void Say(const RC::StringType& line)
     }
     catch (...)
     {
-        // No output device open yet, or UE4SS is tearing down. The file log already has it.
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Parameter binding.
-//
-// Params are read through the UFunction's OWN reflection rather than a hand-declared struct
-// laid over TheStack.Locals(). It costs a little more SDK surface and buys two things this
-// project cares about more: the layout cannot be silently wrong, and the discovered layout is
-// LOGGED, so one pasted log answers "did we read the right bytes" without another round trip.
-//
-// The failure this guards against is concrete: SetPS5TriggerActivated's second argument is
-// the SIDE, and reading it wrongly leaves one trigger hardened forever (§8).
-// ---------------------------------------------------------------------------------------
-enum class ParamKind : uint8_t { Unknown, Bool, UInt8, Int32, Int64, Float, Double, Object };
-
-const char* KindName(ParamKind k)
+bool Contains(const std::string& haystack, const char* needle)
 {
-    switch (k)
-    {
-    case ParamKind::Bool:   return "bool";
-    case ParamKind::UInt8:  return "uint8/enum";
-    case ParamKind::Int32:  return "int32";
-    case ParamKind::Int64:  return "int64";
-    case ParamKind::Float:  return "float";
-    case ParamKind::Double: return "double";
-    case ParamKind::Object: return "object";
-    case ParamKind::Unknown:
-    default:                return "raw";
-    }
-}
-
-struct Param
-{
-    std::string    name;
-    int32_t        offset   = 0;
-    int32_t        size     = 0;         // the property's own size, from reflection
-    ParamKind      kind     = ParamKind::Unknown;
-    FBoolProperty* boolProp = nullptr;   // bitfield-correct bool reads
-    bool           isReturn = false;
-};
-
-ParamKind ClassifyProperty(FProperty* prop)
-{
-    // Ordered most-derived first where it matters; FByteProperty covers TEnumAsByte, which is
-    // what EPS5TriggersSide is expected to be.
-    if (prop->IsA<RC::Unreal::FBoolProperty>())   return ParamKind::Bool;
-    if (prop->IsA<RC::Unreal::FByteProperty>())   return ParamKind::UInt8;
-    if (prop->IsA<RC::Unreal::FIntProperty>())    return ParamKind::Int32;
-    if (prop->IsA<RC::Unreal::FInt64Property>())  return ParamKind::Int64;
-    if (prop->IsA<RC::Unreal::FFloatProperty>())  return ParamKind::Float;
-    if (prop->IsA<RC::Unreal::FDoubleProperty>()) return ParamKind::Double;
-    if (prop->IsA<RC::Unreal::FObjectProperty>()) return ParamKind::Object;
-    // Anything else — an FEnumProperty for a UE `enum class`, most plausibly EPS5TriggersSide —
-    // is read by its reflected SIZE instead. Refusing here would turn a perfectly readable
-    // 1-byte enum into a hard "NOT touching the triggers".
-    return ParamKind::Unknown;
+    return haystack.find(needle) != std::string::npos;
 }
 
 bool EqualsNoCase(const std::string& a, const char* b)
@@ -167,71 +123,140 @@ bool EqualsNoCase(const std::string& a, const char* b)
     return i == a.size() && b[i] == '\0';
 }
 
-struct HookInfo
-{
-    RC::StringType path;              // owned: HookInfo outlives every lookup
-    const char*    shortName = nullptr;
-    RC::Unreal::UnrealScriptFunctionCallable callback;
+// ---------------------------------------------------------------------------------------
+// Reflected fields. Used for both UFunction parameters and the members of the authored
+// trigger-effect struct, because the failure mode is the same in both: a wrong offset is a
+// silently wrong byte. Everything discovered is LOGGED so one pasted log answers "did we read
+// the right bytes".
+// ---------------------------------------------------------------------------------------
+enum class FieldKind : uint8_t { Unknown, Bool, UInt8, Int32, Int64, Float, Double, Object };
 
-    bool                registered = false;
-    std::pair<int, int> ids{};
-    UFunction*          function = nullptr;
-    std::vector<Param>  params;
+const char* KindName(FieldKind k)
+{
+    switch (k)
+    {
+    case FieldKind::Bool:   return "bool";
+    case FieldKind::UInt8:  return "uint8/enum";
+    case FieldKind::Int32:  return "int32";
+    case FieldKind::Int64:  return "int64";
+    case FieldKind::Float:  return "float";
+    case FieldKind::Double: return "double";
+    case FieldKind::Object: return "object";
+    case FieldKind::Unknown:
+    default:                return "raw";
+    }
+}
+
+struct Field
+{
+    std::string    name;
+    int32_t        offset   = 0;
+    int32_t        size     = 0;
+    FieldKind      kind     = FieldKind::Unknown;
+    FBoolProperty* boolProp = nullptr;   // bitfield-correct bool reads
+    bool           isReturn = false;
 };
 
-// By NAME first, then by POSITION among the non-return params — which is exactly what the Lua
-// mod did with A[2] and A[3]. Position rather than kind, because EPS5TriggersSide may reflect as
-// an FEnumProperty rather than an FByteProperty and a kind-filtered fallback would miss it.
-const Param* FindParam(const HookInfo& hook, const char* name, size_t ordinal)
+FieldKind Classify(FProperty* prop)
 {
-    for (const Param& p : hook.params)
-        if (!p.isReturn && EqualsNoCase(p.name, name))
-            return &p;
-    size_t seen = 0;
-    for (const Param& p : hook.params)
+    // FByteProperty covers TEnumAsByte; a UE `enum class` reflects as FEnumProperty, which we
+    // do not classify and instead read by its reflected SIZE (see ReadInt).
+    if (prop->IsA<RC::Unreal::FBoolProperty>())   return FieldKind::Bool;
+    if (prop->IsA<RC::Unreal::FByteProperty>())   return FieldKind::UInt8;
+    if (prop->IsA<RC::Unreal::FIntProperty>())    return FieldKind::Int32;
+    if (prop->IsA<RC::Unreal::FInt64Property>())  return FieldKind::Int64;
+    if (prop->IsA<RC::Unreal::FFloatProperty>())  return FieldKind::Float;
+    if (prop->IsA<RC::Unreal::FDoubleProperty>()) return FieldKind::Double;
+    if (prop->IsA<RC::Unreal::FObjectProperty>()) return FieldKind::Object;
+    return FieldKind::Unknown;
+}
+
+// Walk a UStruct's properties into Fields. `paramsOnly` keeps CPF_Parm members only, which
+// excludes a Blueprint function's LOCAL variables (they live in the same list and would
+// otherwise shift the ordinals).
+std::vector<Field> DescribeFields(RC::Unreal::UStruct* owner, bool paramsOnly, const char* what)
+{
+    std::vector<Field> fields;
+    if (owner == nullptr)
+        return fields;
+
+    std::string summary;
+    for (FProperty* prop : owner->ForEachProperty())
     {
-        if (p.isReturn) continue;
+        if (paramsOnly && !prop->HasAnyPropertyFlags(RC::Unreal::CPF_Parm))
+            continue;
+        Field f;
+        f.name     = Narrow(prop->GetName());
+        f.offset   = prop->GetOffset_ForInternal();
+        f.size     = prop->GetSize();
+        f.kind     = Classify(prop);
+        f.isReturn = prop->HasAnyPropertyFlags(RC::Unreal::CPF_ReturnParm);
+        if (f.kind == FieldKind::Bool)
+            f.boolProp = static_cast<FBoolProperty*>(prop);
+
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s%s:%s[%d]@%d%s", summary.empty() ? "" : ", ",
+                      f.name.c_str(), KindName(f.kind), f.size, f.offset, f.isReturn ? "(ret)" : "");
+        summary += buf;
+        fields.push_back(std::move(f));
+    }
+    // This line is the whole point of reading reflectively: it says exactly which bytes we
+    // will read, so a layout surprise is visible in one pasted log.
+    SDS_LOG_INFO("  fields of %s: %s", what, summary.empty() ? "(none)" : summary.c_str());
+    return fields;
+}
+
+const Field* FindByName(const std::vector<Field>& fields, const char* name)
+{
+    for (const Field& f : fields)
+        if (!f.isReturn && EqualsNoCase(f.name, name))
+            return &f;
+    return nullptr;
+}
+
+// By NAME first, then by POSITION among the non-return params — what the working Lua mod did
+// with A[2] and A[3].
+const Field* FindByNameOrOrdinal(const std::vector<Field>& fields, const char* name, size_t ordinal)
+{
+    if (const Field* f = FindByName(fields, name))
+        return f;
+    size_t seen = 0;
+    for (const Field& f : fields)
+    {
+        if (f.isReturn) continue;
         if (seen++ == ordinal)
-            return &p;
+            return &f;
     }
     return nullptr;
 }
 
-const Param* FirstOfKind(const HookInfo& hook, ParamKind kind)
+bool ReadBool(const Field* f, uint8_t* base, bool& out)
 {
-    for (const Param& p : hook.params)
-        if (!p.isReturn && p.kind == kind)
-            return &p;
-    return nullptr;
-}
-
-bool ReadBool(const Param* p, uint8_t* base, bool& out)
-{
-    if (p == nullptr || base == nullptr) return false;
-    if (p->kind == ParamKind::Bool && p->boolProp != nullptr)
+    if (f == nullptr || base == nullptr) return false;
+    if (f->kind == FieldKind::Bool && f->boolProp != nullptr)
     {
         // Handles both a native bool and a `uint8 bFoo : 1` bitfield.
-        out = p->boolProp->GetPropertyValueInContainer(base);
+        out = f->boolProp->GetPropertyValueInContainer(base);
         return true;
     }
-    if (p->kind == ParamKind::UInt8) { out = *(base + p->offset) != 0; return true; }
+    if (f->kind == FieldKind::UInt8) { out = *(base + f->offset) != 0; return true; }
     return false;
 }
 
-bool ReadInt(const Param* p, uint8_t* base, int64_t& out)
+bool ReadInt(const Field* f, uint8_t* base, int64_t& out)
 {
-    if (p == nullptr || base == nullptr) return false;
-    uint8_t* at = base + p->offset;
-    switch (p->kind)
+    if (f == nullptr || base == nullptr) return false;
+    uint8_t* at = base + f->offset;
+    switch (f->kind)
     {
-    case ParamKind::UInt8: out = *at; return true;
-    case ParamKind::Int32: { int32_t v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
-    case ParamKind::Int64: { int64_t v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
-    case ParamKind::Bool:  { bool b = false; if (!ReadBool(p, base, b)) return false; out = b ? 1 : 0; return true; }
-    case ParamKind::Unknown:
+    case FieldKind::UInt8: out = *at; return true;
+    case FieldKind::Int32: { int32_t v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
+    case FieldKind::Int64: { int64_t v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
+    case FieldKind::Bool:  { bool b = false; if (!ReadBool(f, base, b)) return false; out = b ? 1 : 0; return true; }
+    case FieldKind::Unknown:
         // Size-driven fallback: an FEnumProperty carries no kind we classify, but its width is
         // reflected and an enum is just an unsigned integer of that width.
-        switch (p->size)
+        switch (f->size)
         {
         case 1: out = *at; return true;
         case 2: { uint16_t v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
@@ -243,58 +268,98 @@ bool ReadInt(const Param* p, uint8_t* base, int64_t& out)
     }
 }
 
-bool ReadFloat(const Param* p, uint8_t* base, float& out)
+bool ReadFloat(const Field* f, uint8_t* base, float& out)
 {
-    if (p == nullptr || base == nullptr) return false;
-    uint8_t* at = base + p->offset;
-    if (p->kind == ParamKind::Float)  { float  v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
-    if (p->kind == ParamKind::Double) { double v; std::memcpy(&v, at, sizeof(v)); out = static_cast<float>(v); return true; }
+    if (f == nullptr || base == nullptr) return false;
+    uint8_t* at = base + f->offset;
+    if (f->kind == FieldKind::Float)  { float  v; std::memcpy(&v, at, sizeof(v)); out = v; return true; }
+    if (f->kind == FieldKind::Double) { double v; std::memcpy(&v, at, sizeof(v)); out = static_cast<float>(v); return true; }
     return false;
 }
 
-UObject* ReadObject(const Param* p, uint8_t* base)
+UObject* ReadObject(const Field* f, uint8_t* base)
 {
-    if (p == nullptr || base == nullptr || p->kind != ParamKind::Object) return nullptr;
+    if (f == nullptr || base == nullptr || f->kind != FieldKind::Object) return nullptr;
     UObject* obj = nullptr;
-    std::memcpy(&obj, base + p->offset, sizeof(obj));
+    std::memcpy(&obj, base + f->offset, sizeof(obj));
     return obj;
 }
 
-// The asset argument, as a full name. Empty if there is no object param or it is null.
-std::string ObjectArgFullName(const HookInfo& hook, uint8_t* base)
+// ---------------------------------------------------------------------------------------
+// Argument discovery BY TYPE, not by position.
+//
+// The two hook shapes put the sound in different slots:
+//   StartPS5Vibration(SoundVibration, FadeInTime, Level)
+//   StartPS5VibrationOnAudioComponent(AudioComponent, SoundVibration, FadeInTime, Level,
+//                                     VibrationComponent)
+// Position-guessing was wrong three separate times in this project. So: the sound is the
+// object argument that RESOLVES to a SoundWave, the component is the one that resolves to an
+// AudioComponent, and the level is the LAST float argument (FadeInTime precedes Level).
+// Names are honoured first when the reflected parameter carries the expected one.
+// ---------------------------------------------------------------------------------------
+struct ResolvedArgs
 {
-    const Param* p = nullptr;
-    for (const char* candidate : { "SoundVibration", "Sound", "SoundWave", "AudioComponent" })
-    {
-        for (const Param& q : hook.params)
-            if (!q.isReturn && EqualsNoCase(q.name, candidate) && q.kind == ParamKind::Object)
-                p = &q;
-        if (p != nullptr) break;
-    }
-    if (p == nullptr) p = FirstOfKind(hook, ParamKind::Object);
-    UObject* obj = ReadObject(p, base);
-    if (obj == nullptr)
-        return {};
-    return Narrow(obj->GetFullName());
-}
+    std::string soundFullName;
+    std::string componentFullName;
+    float       level      = 1.0f;
+    bool        levelSeen  = false;
+    float       fadeIn     = 0.0f;
+    float       fadeOut    = 0.0f;
+    std::string description;   // every argument, for the log
+};
 
-// StartPS5Vibration(SoundVibration, FadeInTime, Level). "Absent" and "0.0" need different
-// fixes, so they are distinguished rather than both collapsing to a fallback — that is the
-// `lvSeen` flag the working Lua mod carried.
-bool LevelArg(const HookInfo& hook, uint8_t* base, float& out)
+ResolvedArgs ResolveArgs(const std::vector<Field>& fields, uint8_t* base)
 {
-    const Param* named = nullptr;
-    for (const Param& p : hook.params)
-        if (!p.isReturn && EqualsNoCase(p.name, "Level"))
-            named = &p;
-    if (ReadFloat(named, base, out))
-        return true;
-    // Fall back to the LAST float parameter, which is what the Lua mod did.
-    const Param* last = nullptr;
-    for (const Param& p : hook.params)
-        if (!p.isReturn && (p.kind == ParamKind::Float || p.kind == ParamKind::Double))
-            last = &p;
-    return ReadFloat(last, base, out);
+    ResolvedArgs r;
+    std::vector<float> floats;
+    for (const Field& f : fields)
+    {
+        if (f.isReturn) continue;
+        char buf[200];
+        if (f.kind == FieldKind::Object)
+        {
+            UObject* obj = ReadObject(&f, base);
+            const std::string full = obj != nullptr ? Narrow(obj->GetFullName()) : std::string("null");
+            if (obj != nullptr)
+            {
+                if (r.soundFullName.empty() && Contains(full, "SoundWave"))
+                    r.soundFullName = full;
+                else if (r.componentFullName.empty() && Contains(full, "AudioComponent"))
+                    r.componentFullName = full;
+            }
+            std::snprintf(buf, sizeof(buf), " %s=%s", f.name.c_str(), full.c_str());
+        }
+        else if (f.kind == FieldKind::Float || f.kind == FieldKind::Double)
+        {
+            float v = 0.0f;
+            ReadFloat(&f, base, v);
+            floats.push_back(v);
+            std::snprintf(buf, sizeof(buf), " %s=%.3f", f.name.c_str(), static_cast<double>(v));
+        }
+        else
+        {
+            int64_t v = 0;
+            const bool ok = ReadInt(&f, base, v);
+            std::snprintf(buf, sizeof(buf), " %s=%s%lld", f.name.c_str(), ok ? "" : "?",
+                          static_cast<long long>(v));
+        }
+        r.description += buf;
+    }
+
+    // Level: by name, else the last float. Fade-in: by name, else the first float when there
+    // are at least two (a lone float is the level). Fade-out: by name, else the first float.
+    if (ReadFloat(FindByName(fields, "Level"), base, r.level))
+        r.levelSeen = true;
+    else if (!floats.empty())
+    {
+        r.level     = floats.back();
+        r.levelSeen = true;
+    }
+    if (!ReadFloat(FindByName(fields, "FadeInTime"), base, r.fadeIn) && floats.size() >= 2)
+        r.fadeIn = floats.front();
+    if (!ReadFloat(FindByName(fields, "FadeOutTime"), base, r.fadeOut) && !floats.empty())
+        r.fadeOut = floats.front();
+    return r;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -305,32 +370,35 @@ constexpr const wchar_t* kComp =
 constexpr const wchar_t* kPc =
     L"/Game/Technical/BP_HKPlayerController.BP_HKPlayerController_C:";
 
+struct HookInfo
+{
+    RC::StringType path;              // owned: HookInfo outlives every lookup
+    const char*    shortName = nullptr;
+    RC::Unreal::UnrealScriptFunctionCallable callback;
+
+    bool                registered = false;
+    std::pair<int, int> ids{};
+    UFunction*          function = nullptr;
+    std::vector<Field>  params;
+};
+
 std::vector<HookInfo> g_hooks;
 
 void RegisterAll();
 void BuildHookTable();
 
 // ---------------------------------------------------------------------------------------
-// PadVibrationEnabled — HKGameUserSettings' only vibration control (§9).
-//
-// READ ON THE GAME THREAD, INSIDE A HOOK. It used to be polled from on_update, and that was
-// wrong: on_update runs on UE4SS's OWN event-loop jthread
-// (UE4SSProgram.cpp:431 `m_event_loop = std::jthread{&UE4SSProgram::update, this}`, looping
-// with a 5 ms sleep), so reading a UObject there is an unsynchronised cross-thread read of
-// state the engine mutates and the GC can move. A UFunction hook, by contrast, runs on
-// whatever thread called the function — the game thread for these Blueprints.
-//
-// It is read only from StartPS5Vibration, which is rare. FindFirstOf walks the object array,
-// so it must not go anywhere near the ~60 Hz SetPS5VibrationLevel path.
+// Reads of GAME STATE. Both run ON THE GAME THREAD, INSIDE A HOOK, and nowhere else: on_update
+// runs on UE4SS's own event-loop jthread (UE4SSProgram.cpp:431), so a UObject read there is
+// an unsynchronised cross-thread read of state the engine mutates and the GC can move.
+// Neither caches a UObject* or FProperty* across calls — nothing establishes that they survive
+// a level transition — and both run on rare events, so the FindFirstOf scan is affordable.
 // ---------------------------------------------------------------------------------------
 int  g_padVibeMisses = 0;
 bool g_padVibeBound  = false;
 
 void ReadPadVibrationEnabledOnGameThread()
 {
-    // Deliberately NOT cached across calls: a cached UObject*/FProperty* would have to survive
-    // level transitions and GC, and nothing here establishes that it does. This runs on a rare
-    // event, so the scan is affordable and correctness is worth more.
     UObject* settings = RC::Unreal::UObjectGlobals::FindFirstOf(STR("HKGameUserSettings"));
     if (settings == nullptr)
     {
@@ -339,11 +407,8 @@ void ReadPadVibrationEnabledOnGameThread()
                          "and haptics will play regardless of the setting.");
         return;
     }
-
     FProperty* prop = settings->GetPropertyByNameInChain(STR("PadVibrationEnabled"));
-    // A UE bool is usually a `uint8 b : 1` bitfield, so it MUST go through FBoolProperty. A raw
-    // bool* read would be right for a native bool and wrong for a bitfield — correct on someone
-    // else's machine, which is the worst kind of wrong.
+    // A UE bool is usually a `uint8 b : 1` bitfield, so it MUST go through FBoolProperty.
     if (prop == nullptr || !prop->IsA<FBoolProperty>())
     {
         if (++g_padVibeMisses == 1)
@@ -351,7 +416,6 @@ void ReadPadVibrationEnabledOnGameThread()
                          "haptics will play regardless of the setting.");
         return;
     }
-
     if (!g_padVibeBound)
     {
         g_padVibeBound = true;
@@ -359,6 +423,81 @@ void ReadPadVibrationEnabledOnGameThread()
     }
     sds::Rt().OnPadVibrationEnabled(
         static_cast<FBoolProperty*>(prop)->GetPropertyValueInContainer(settings));
+}
+
+// HKPlayerController::m_scratchablePS5TriggerEffect — PS5TriggerEffectData {Mode, Value1,
+// Value2, Value3}, MEASURED at +0x730 reading mode=3 v1=0 v2=2 v3=0 (§13). Read through the
+// struct's own reflection rather than the measured offset: the offset is logged and compared,
+// so a licensee edit shows up as a log line rather than as a wrong byte.
+constexpr int32_t kMeasuredEffectOffset = 0x730;
+int  g_effectMisses  = 0;
+bool g_effectLayoutLogged = false;
+
+void ReadAuthoredTriggerEffectOnGameThread()
+{
+    sds::TriggerEffect effect;
+    bool ok = false;
+
+    UObject* pc = RC::Unreal::UObjectGlobals::FindFirstOf(STR("HKPlayerController"));
+    if (pc == nullptr)
+    {
+        if (++g_effectMisses == 1)
+            SDS_LOG_WARN("trigger effect: no HKPlayerController instance found");
+        sds::Rt().OnTriggerEffectRead(effect, false);
+        return;
+    }
+
+    FProperty* prop = pc->GetPropertyByNameInChain(STR("m_scratchablePS5TriggerEffect"));
+    if (prop == nullptr || !prop->IsA<FStructProperty>())
+    {
+        if (++g_effectMisses == 1)
+            SDS_LOG_WARN("trigger effect: HKPlayerController has no struct property "
+                         "'m_scratchablePS5TriggerEffect' (found=%d)", prop != nullptr ? 1 : 0);
+        sds::Rt().OnTriggerEffectRead(effect, false);
+        return;
+    }
+
+    const int32_t offset = prop->GetOffset_ForInternal();
+    UScriptStruct* type = static_cast<FStructProperty*>(prop)->GetStruct();
+    if (!g_effectLayoutLogged)
+    {
+        g_effectLayoutLogged = true;
+        SDS_LOG_INFO("trigger effect: m_scratchablePS5TriggerEffect at +0x%X (measured +0x%X%s), "
+                     "struct %s", static_cast<unsigned>(offset),
+                     static_cast<unsigned>(kMeasuredEffectOffset),
+                     offset == kMeasuredEffectOffset ? ", matches" : ", DIFFERS",
+                     type != nullptr ? Narrow(type->GetName()).c_str() : "null");
+    }
+    if (type == nullptr)
+    {
+        sds::Rt().OnTriggerEffectRead(effect, false);
+        return;
+    }
+
+    // Fields are re-described only until the layout is logged once; cheap either way.
+    static std::vector<Field> fields;
+    if (fields.empty())
+        fields = DescribeFields(type, false, "PS5TriggerEffectData");
+
+    uint8_t* base = reinterpret_cast<uint8_t*>(pc) + offset;
+    int64_t mode = 0, v1 = 0, v2 = 0, v3 = 0;
+    ok = ReadInt(FindByName(fields, "Mode"),   base, mode) &&
+         ReadInt(FindByName(fields, "Value1"), base, v1)   &&
+         ReadInt(FindByName(fields, "Value2"), base, v2)   &&
+         ReadInt(FindByName(fields, "Value3"), base, v3);
+    if (!ok)
+    {
+        if (++g_effectMisses == 1)
+            SDS_LOG_WARN("trigger effect: PS5TriggerEffectData lacks readable Mode/Value1..3 "
+                         "(see the 'fields of' line above)");
+        sds::Rt().OnTriggerEffectRead(effect, false);
+        return;
+    }
+    effect.mode   = static_cast<int>(mode);
+    effect.value1 = static_cast<uint8_t>(v1 < 0 ? 0 : (v1 > 255 ? 255 : v1));
+    effect.value2 = static_cast<uint8_t>(v2 < 0 ? 0 : (v2 > 255 ? 255 : v2));
+    effect.value3 = static_cast<uint8_t>(v3 < 0 ? 0 : (v3 > 255 ? 255 : v3));
+    sds::Rt().OnTriggerEffectRead(effect, true);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -371,15 +510,15 @@ class StrayDualSenseMod : public RC::CppUserModBase
     {
         ModName        = STR("StrayDualSense");
         ModVersion     = Widen(SDS_VERSION_STRING);
-        ModDescription = STR("DualSense adaptive triggers, haptics and controller speaker for Stray");
+        ModDescription = STR("DualSense adaptive triggers, coil haptics and controller speaker for Stray");
         ModAuthors     = STR("stray-dlss");
+        // ModIntendedSDKVersion deliberately left empty: UE4SS fills in the version this DLL
+        // was BUILT against, which is the honest value.
 
-        // Deliberately NOT set: ModIntendedSDKVersion. Leaving it empty makes UE4SS fill in
-        // the version this DLL was BUILT against, which is the honest value.
-
-        // The runtime brings up the pad, the workers and our own log file. It touches nothing
-        // Unreal, so it is safe this early — and safe on whatever thread UE4SS constructs us on.
-        sds::Rt().Startup(reinterpret_cast<void*>(&ReadPadVibrationEnabledOnGameThread));
+        // The runtime brings up the pad, the HID mode writer, the workers and our own log. It
+        // touches nothing Unreal, so it is safe this early and on whatever thread UE4SS
+        // constructs us on.
+        sds::Rt().Startup(reinterpret_cast<const void*>(&ReadPadVibrationEnabledOnGameThread));
         BuildHookTable();
         Say(STR("[StrayDualSense] ") + Widen(SDS_VERSION_STRING) +
             STR(" loaded; log is <game>/stray-dualsense.log"));
@@ -392,7 +531,7 @@ class StrayDualSenseMod : public RC::CppUserModBase
 
     // Fired from UE4SSProgram::init (UE4SSProgram.cpp:421), before the event-loop thread even
     // exists — so this is NOT the game thread either. Registering hooks off the game thread is
-    // what UE4SS itself does (LiveView.cpp does the same), so it is the supported pattern.
+    // what UE4SS itself does (LiveView.cpp), so it is the supported pattern.
     auto on_unreal_init() -> void override
     {
         SDS_LOG_INFO("on_unreal_init: the Unreal module is up; hook registration begins");
@@ -400,9 +539,8 @@ class StrayDualSenseMod : public RC::CppUserModBase
     }
 
     // THIS IS NOT THE GAME THREAD. UE4SS fires it from its own event-loop jthread
-    // (UE4SSProgram.cpp:431), which loops with a 5 ms sleep — so roughly 200 Hz, unsynchronised
-    // with game frames. Nothing here may read a UObject; everything here is our own state,
-    // guarded by its own mutexes and atomics.
+    // (UE4SSProgram.cpp:431), ~200 Hz, unsynchronised with game frames. Nothing here may read
+    // a UObject; everything here is our own state, guarded by its own mutexes and atomics.
     auto on_update() -> void override
     {
         sds::Rt().Tick();
@@ -411,10 +549,8 @@ class StrayDualSenseMod : public RC::CppUserModBase
     }
 
   private:
-    // Our logger runs on five threads (the game thread via hooks, this one, and the trigger,
-    // haptic and speaker workers) and deliberately never calls UE4SS's Output itself. Lines are
-    // mirrored here instead, so UE4SS's logging is only ever reached from the thread UE4SS
-    // itself calls us on.
+    // Our logger runs on six threads and never calls UE4SS's Output itself. Lines are mirrored
+    // here, on the thread UE4SS itself calls us on.
     static void DrainLogMirror()
     {
         for (const std::string& line : sds::Log::TakeMirrorLines())
@@ -428,42 +564,6 @@ class StrayDualSenseMod : public RC::CppUserModBase
 std::chrono::steady_clock::time_point g_lastAttempt{};
 int  g_attempts = 0;
 bool g_gaveUp   = false;
-
-void DescribeParams(HookInfo& hook)
-{
-    hook.params.clear();
-    if (hook.function == nullptr)
-        return;
-
-    std::string summary;
-    for (FProperty* prop : hook.function->ForEachProperty())
-    {
-        // CPF_Parm excludes a Blueprint function's LOCAL variables, which also live in this
-        // list; without it the ordinals would silently drift.
-        if (!prop->HasAnyPropertyFlags(RC::Unreal::CPF_Parm))
-            continue;
-
-        Param p;
-        p.name     = Narrow(prop->GetName());
-        p.offset   = prop->GetOffset_ForInternal();
-        p.size     = prop->GetSize();
-        p.kind     = ClassifyProperty(prop);
-        p.isReturn = prop->HasAnyPropertyFlags(RC::Unreal::CPF_ReturnParm);
-        if (p.kind == ParamKind::Bool)
-            p.boolProp = static_cast<FBoolProperty*>(prop);
-
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "%s%s:%s[%d]@%d%s", summary.empty() ? "" : ", ",
-                      p.name.c_str(), KindName(p.kind), p.size, p.offset,
-                      p.isReturn ? "(ret)" : "");
-        summary += buf;
-        hook.params.push_back(std::move(p));
-    }
-    // This line is the whole point of reading params reflectively: it says exactly which
-    // bytes we will read, so a layout surprise is visible in one pasted log.
-    SDS_LOG_INFO("  params of %s: %s", hook.shortName,
-                 summary.empty() ? "(none)" : summary.c_str());
-}
 
 void RegisterAll()
 {
@@ -498,7 +598,7 @@ void RegisterAll()
         if (hook.function == nullptr)
             continue;
 
-        DescribeParams(hook);
+        hook.params = DescribeFields(hook.function, true, hook.shortName);
 
         try
         {
@@ -508,8 +608,7 @@ void RegisterAll()
             // The POST callback must be a real callable, never a default-constructed
             // std::function: UObjectGlobals.cpp's GlobalScriptHookPost invokes
             // `Callable.CallablePost(...)` UNCONDITIONALLY, so an empty one would throw
-            // std::bad_function_call inside the game's script VM. We want no post behaviour,
-            // so it is an explicit no-op.
+            // std::bad_function_call inside the game's script VM.
             hook.ids = RC::Unreal::UObjectGlobals::RegisterHook(
                 hook.function, hook.callback,
                 [](UnrealScriptFunctionCallableContext&, void*) {}, &hook);
@@ -545,8 +644,8 @@ void CbTriggerActivated(UnrealScriptFunctionCallableContext& context, void* cust
     SDS_HOOK_PROLOGUE(hook);
     bool    state = false;
     int64_t side  = -1;
-    const bool gotState = ReadBool(FindParam(*hook, "State", 0), base, state);
-    const bool gotSide  = ReadInt(FindParam(*hook, "Side", 1), base, side);
+    const bool gotState = ReadBool(FindByNameOrOrdinal(hook->params, "State", 0), base, state);
+    const bool gotSide  = ReadInt(FindByNameOrOrdinal(hook->params, "Side", 1), base, side);
     if (!gotState || !gotSide)
     {
         // Loud: guessing here is how one trigger ends up hardened for the rest of the session.
@@ -555,6 +654,10 @@ void CbTriggerActivated(UnrealScriptFunctionCallableContext& context, void* cust
                       gotState ? 1 : 0, gotSide ? 1 : 0);
         return;
     }
+    // The authored effect is read on each ENGAGE (twice per scratch, rare) so it follows the
+    // game if a surface ever specifies something else, and before the first transmit.
+    if (state)
+        ReadAuthoredTriggerEffectOnGameThread();
     sds::Rt().OnTriggerActivated(state, static_cast<int>(side));
 }
 
@@ -568,64 +671,77 @@ void CbAfterUseDone(UnrealScriptFunctionCallableContext&, void*)
     sds::Rt().OnAfterUseDone();
 }
 
+// Both StartPS5Vibration shapes share this: the arguments are resolved by TYPE.
 void CbStartVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    // We are on the game thread here, which is the only place a UObject read is sound.
-    ReadPadVibrationEnabledOnGameThread();
-    float      level = 1.0f;
-    const bool seen  = LevelArg(*hook, base, level);
-    sds::Rt().OnStartVibration(ObjectArgFullName(*hook, base), level, seen);
+    ReadPadVibrationEnabledOnGameThread();   // game thread: the only sound place for it
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
+    if (a.soundFullName.empty())
+    {
+        SDS_LOG_ERROR("%s: no argument resolved to a SoundWave; nothing to play", hook->shortName);
+        return;
+    }
+    sds::VibrationStart s;
+    s.soundFullName     = a.soundFullName;
+    s.componentFullName = a.componentFullName;
+    s.level             = a.level;
+    s.levelSeen         = a.levelSeen;
+    s.fadeIn            = a.fadeIn;
+    sds::Rt().OnStartVibration(s);
 }
 
-// StartPS5VibrationOnAudioComponent is OBSERVED, NOT ACTED ON — the working Lua mod logged it
-// and nothing more. Its object argument is an AudioComponent, not the SoundWave, so deriving an
-// envelope name from it would look up an asset that cannot exist and produce a "MISSING"
-// error every time it fires. Log what it actually carries so a future session can decide.
-void CbStartVibrationOnAudioComponent(UnrealScriptFunctionCallableContext& context,
-                                      void* customData)
+void CbStopVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    float      level = 1.0f;
-    const bool seen  = LevelArg(*hook, base, level);
-    SDS_LOG_INFO("StartPS5VibrationOnAudioComponent object='%s' level=%.3f (seen=%d) "
-                 "- OBSERVED ONLY, nothing is played",
-                 ObjectArgFullName(*hook, base).c_str(), static_cast<double>(level),
-                 seen ? 1 : 0);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    sds::Rt().OnStopVibration(a.fadeOut);
 }
 
-void CbStopVibration(UnrealScriptFunctionCallableContext&, void*)
+void CbStopVibrationOnComponent(UnrealScriptFunctionCallableContext& context, void* customData)
 {
-    sds::Rt().OnStopVibration();
+    SDS_HOOK_PROLOGUE(hook);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    // ~700 calls a session: only the description of a HONOURED stop is worth a line, and the
+    // runtime logs that. An unresolvable component can never match, so it is ignored there.
+    sds::Rt().OnStopVibrationOnComponent(a.componentFullName, a.fadeOut);
 }
 
 void CbSetVibrationLevel(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    float level = 1.0f;
-    if (LevelArg(*hook, base, level))
-        sds::Rt().OnSetVibrationLevel(level);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    if (a.levelSeen)
+        sds::Rt().OnSetVibrationLevel(a.level);
 }
 
 void CbStartControllerSound(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    float      level = 1.0f;
-    const bool seen  = LevelArg(*hook, base, level);
-    sds::Rt().OnStartControllerSound(ObjectArgFullName(*hook, base), level, seen);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
+    if (a.soundFullName.empty())
+    {
+        SDS_LOG_ERROR("%s: no argument resolved to a SoundWave; nothing to play", hook->shortName);
+        return;
+    }
+    sds::Rt().OnStartControllerSound(a.soundFullName, a.level, a.levelSeen, a.fadeIn);
 }
 
-void CbStopControllerSound(UnrealScriptFunctionCallableContext&, void*)
+void CbStopControllerSound(UnrealScriptFunctionCallableContext& context, void* customData)
 {
-    sds::Rt().OnStopControllerSound();
+    SDS_HOOK_PROLOGUE(hook);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    sds::Rt().OnStopControllerSound(a.fadeOut);
 }
 
 void CbSetControllerSoundLevel(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    float level = 1.0f;
-    if (LevelArg(*hook, base, level))
-        sds::Rt().OnSetControllerSoundLevel(level);
+    const ResolvedArgs a = ResolveArgs(hook->params, base);
+    if (a.levelSeen)
+        sds::Rt().OnSetControllerSoundLevel(a.level);
 }
 
 #undef SDS_HOOK_PROLOGUE
@@ -640,20 +756,23 @@ void BuildHookTable()
     struct Row { const wchar_t* prefix; const wchar_t* name; const char* shortName;
                  RC::Unreal::UnrealScriptFunctionCallable cb; };
     const Row rows[] = {
-        // Adaptive triggers — the game drives each side separately (§8).
+        // Adaptive triggers (§13). Only the component's SetPS5TriggerActivated matters;
+        // SetPS5TriggersState is never called (0 times) and is not hooked.
         { kComp, L"SetPS5TriggerActivated", "SetPS5TriggerActivated", &CbTriggerActivated },
         { kComp, L"_OnUseStarted",          "_OnUseStarted",          &CbUseStarted },
         { kComp, L"_OnAfterUseDone",        "_OnAfterUseDone",        &CbAfterUseDone },
-        // Haptics.
-        { kPc,   L"StartPS5Vibration",                 "StartPS5Vibration",                 &CbStartVibration },
-        { kPc,   L"StartPS5VibrationOnAudioComponent", "StartPS5VibrationOnAudioComponent", &CbStartVibrationOnAudioComponent },
-        { kPc,   L"StopPS5Vibration",                  "StopPS5Vibration",                  &CbStopVibration },
-        { kPc,   L"SetPS5VibrationLevel",              "SetPS5VibrationLevel",              &CbSetVibrationLevel },
+        // Haptics: both start shapes, the global stop, the per-component stop, both levels.
+        { kPc, L"StartPS5Vibration",                    "StartPS5Vibration",                    &CbStartVibration },
+        { kPc, L"StartPS5VibrationOnAudioComponent",    "StartPS5VibrationOnAudioComponent",    &CbStartVibration },
+        { kPc, L"StopPS5Vibration",                     "StopPS5Vibration",                     &CbStopVibration },
+        { kPc, L"StopPS5VibrationOnAudioComponent",     "StopPS5VibrationOnAudioComponent",     &CbStopVibrationOnComponent },
+        { kPc, L"SetPS5VibrationLevel",                 "SetPS5VibrationLevel",                 &CbSetVibrationLevel },
+        { kPc, L"SetPS5VibrationLevelOnAudioComponent", "SetPS5VibrationLevelOnAudioComponent", &CbSetVibrationLevel },
         // Controller speaker.
-        { kPc,   L"StartPS5ControllerSound",                 "StartPS5ControllerSound",                 &CbStartControllerSound },
-        { kPc,   L"StartPS5ControllerSoundOnAudioComponent", "StartPS5ControllerSoundOnAudioComponent", &CbStartControllerSound },
-        { kPc,   L"StopPS5ControllerSound",                  "StopPS5ControllerSound",                  &CbStopControllerSound },
-        { kPc,   L"SetPS5ControllerSoundLevel",              "SetPS5ControllerSoundLevel",              &CbSetControllerSoundLevel },
+        { kPc, L"StartPS5ControllerSound",                 "StartPS5ControllerSound",                 &CbStartControllerSound },
+        { kPc, L"StartPS5ControllerSoundOnAudioComponent", "StartPS5ControllerSoundOnAudioComponent", &CbStartControllerSound },
+        { kPc, L"StopPS5ControllerSound",                  "StopPS5ControllerSound",                  &CbStopControllerSound },
+        { kPc, L"SetPS5ControllerSoundLevel",              "SetPS5ControllerSoundLevel",              &CbSetControllerSoundLevel },
     };
 
     g_hooks.reserve(std::size(rows));
