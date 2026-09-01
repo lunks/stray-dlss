@@ -79,6 +79,14 @@ void on_present(std::uint64_t frame);
 
 // addon_event::reshade_begin_effects. Runs on ReShade's OWN immediate command list, with the
 // resource behind `rtv` in D3D12_RESOURCE_STATE_RENDER_TARGET (v6.8.0 runtime.cpp:745/4020).
+//
+// THE UI IS ALREADY COMPOSITED INTO THIS IMAGE, and that is EXPECTED at this site, not a defect.
+// The DLSSNR runtime carries `DLSSNR.UI`, `DLSSNR.UIAlpha` and `DLSSNR.UICorrection` for exactly
+// this case, and RenoDX — the known-working deployment — ships `NRUICorrection=1`, which is our
+// default and is sent on this path. Supplying an actual DLSSNR.UI / DLSSNR.UIAlpha mask is a
+// POSSIBLE FUTURE REFINEMENT and is deliberately not built: it would need the HUD rendered to a
+// separate target we do not currently capture, and `preui` sidesteps the whole question by
+// running before Slate draws anything.
 void on_begin_effects(reshade::api::effect_runtime *runtime, reshade::api::command_list *cmd_list,
                       reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb);
 
