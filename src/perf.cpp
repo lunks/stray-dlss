@@ -142,9 +142,10 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	const double gbuf_ms = static_cast<double>(bucket_ns[kGBufferResolve]) * per_frame_ms;
 	const double sr_ms = static_cast<double>(bucket_ns[kNgxSr]) * per_frame_ms;
 	const double rr_ms = static_cast<double>(bucket_ns[kNgxRr]) * per_frame_ms;
+	const double nr_ms = static_cast<double>(bucket_ns[kNgxNr]) * per_frame_ms;
 	const double restore_ms = static_cast<double>(bucket_ns[kRestore]) * per_frame_ms;
 	const double total_ms = static_cast<double>(bucket_ns[kDispatchPath]) * per_frame_ms;
-	double intercept_ms = total_ms - (mv_ms + gbuf_ms + sr_ms + rr_ms + restore_ms);
+	double intercept_ms = total_ms - (mv_ms + gbuf_ms + sr_ms + rr_ms + nr_ms + restore_ms);
 	if (intercept_ms < 0.0)
 		intercept_ms = 0.0;
 
@@ -153,10 +154,10 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	};
 
 	STRAY_LOG_INFO("[perf] our CPU/frame: intercept %.2fms (%.0f%%), mv_resolve %.2fms, "
-		"gbuf_resolve %.2fms, ngx_sr %.2fms (%.0f%%), ngx_rr %.2fms (%.0f%%), restore %.2fms "
-		"- total %.2fms (%.0f%% of %.1fms)",
+		"gbuf_resolve %.2fms, ngx_sr %.2fms (%.0f%%), ngx_rr %.2fms (%.0f%%), ngx_nr %.2fms "
+		"(%.0f%%), restore %.2fms - total %.2fms (%.0f%% of %.1fms)",
 		intercept_ms, pct(intercept_ms), mv_ms, gbuf_ms,
-		sr_ms, pct(sr_ms), rr_ms, pct(rr_ms), restore_ms,
+		sr_ms, pct(sr_ms), rr_ms, pct(rr_ms), nr_ms, pct(nr_ms), restore_ms,
 		total_ms, pct(total_ms), avg_frame_ms);
 
 	STRAY_LOG_INFO("[perf] counts/frame: %.0f dispatches, %.1f size-gated (only these are "

@@ -2,6 +2,7 @@
 
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
+#include "ngx_nr.hpp"
 #include "perf.hpp"
 
 #include "frame_state.hpp"
@@ -1880,6 +1881,27 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										perf::Scope perf_sr(perf::kNgxSr);
 										ok = ngx::evaluate(native, ei);
 									}
+
+								// DLSS Neural Rendering (NGX feature 18), strictly AFTER
+								// SR/RR: it consumes the image they just wrote into u0 and,
+								// once validated non-degenerate, replaces it. Any failure
+								// leaves the SR/RR image exactly as it is. (src/ngx_nr.hpp)
+								if (ok && nr::enabled())
+								{
+									perf::Scope perf_nr(perf::kNgxNr);
+									nr::ApplyInputs ni;
+									ni.image = ei.output;
+									ni.render_color = ei.color;
+									ni.depth = ei.depth;
+									ni.motion_vectors = ei.motion_vectors;
+									ni.render_width = ei.render_width;
+									ni.render_height = ei.render_height;
+									ni.output_width = fd.output_width;
+									ni.output_height = fd.output_height;
+									ni.reset = ei.reset;
+									nr::apply(reinterpret_cast<ID3D12Device *>(
+										device->get_native()), native, ni);
+								}
 							}
 							if (ok)
 							{

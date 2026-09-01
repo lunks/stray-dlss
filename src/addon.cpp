@@ -9,6 +9,7 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "ngx_nr.hpp"
 #include "core/taa_hashes.hpp"
 #include "ext_unhook.hpp"
 #include "frame_state.hpp"
@@ -326,6 +327,53 @@ void on_init_device(reshade::api::device *device)
 			"indicator's 'Exposure level' should read this; a 0.25/1.0/4.0 sweep that moves "
 			"the image proves DLSS consumes our exposure texture.", exposure_scale);
 
+	// [STRAYDLSS] NgxNR: DLSS Neural Rendering (NGX feature 18 / DLSSNR). 0 = off (default,
+	// byte-identical to today), 1 = on. Runs AFTER the SR/RR evaluate as a post-pass on the
+	// image they produced. Needs the leaked nvngx_dlssnr.dll staged beside the game exe (or
+	// NgxNRDll); on a 4090 it must be an Ada-patched build.
+	// (docs/RESEARCH-RENODX-DLSS5.md §2.1-§3.2)
+	bool ngx_nr = false;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNR", ngx_nr);
+	nr::set_enabled(ngx_nr);
+
+	char nr_dll[480] = "";
+	size_t nr_dll_size = sizeof(nr_dll);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRDll", nr_dll, &nr_dll_size);
+	nr::set_dll_path(nr_dll);
+
+	// [STRAYDLSS] NgxNRTopology: "post" (default) = feature 18 post-processes our already
+	// upscaled output; "sr" = feature 18 takes the render-res SR contract and upscales
+	// itself. Both readings of the study are plausible (§0.1 vs §2.3), so both are reachable
+	// and the active one is logged.
+	char nr_topology[16] = "post";
+	size_t nr_topology_size = sizeof(nr_topology);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTopology", nr_topology,
+		&nr_topology_size);
+	const bool nr_sr_shaped = std::strcmp(nr_topology, "sr") == 0;
+	nr::set_topology(nr_sr_shaped ? nr::Topology::sr_shaped : nr::Topology::post_process);
+
+	// Live quality knobs (the study's DLSSNR.* tuning parameters, §2.2).
+	float nr_intensity = 1.0f, nr_local_tone = 1.0f, nr_local_structure = 1.0f;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", nr_intensity);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", nr_local_tone);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", nr_local_structure);
+	nr::set_tuning(nr_intensity, nr_local_tone, nr_local_structure);
+
+	float nr_mvec_scale = 0.0f;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", nr_mvec_scale);
+	nr::set_mvec_scale_override(nr_mvec_scale);
+
+	if (ngx_nr)
+	{
+		STRAY_LOG_WARN("NgxNR=1: DLSS Neural Rendering (feature 18) topology=%s "
+			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f. "
+			"Grep 'NR' lines.", nr_sr_shaped ? "sr-shaped" : "post-process",
+			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale);
+		// MUST precede NVSDK_NGX_D3D12_Init_* — the runtime is pre-loaded at device init.
+		// (docs/RESEARCH-RENODX-DLSS5.md §3.2)
+		nr::load_runtime();
+	}
+
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
 	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
 	bool resolve_only = false;
@@ -486,6 +534,7 @@ void on_destroy_device(reshade::api::device *device)
 		return;
 
 	std::lock_guard<std::mutex> lock(g_state.mutex);
+	nr::shutdown();
 	if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 		ngx::shutdown(g_state.native_device);
 	g_state.native_device = nullptr;
@@ -718,6 +767,9 @@ void on_present(
 
 	// Frame-time sampling and the periodic CPU-share report. Fed the cumulative counters we
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
+	// Drains the NR validation readback (it gates NR ever touching the screen).
+	nr::on_present();
+
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
 
@@ -916,6 +968,23 @@ void on_present(
 			STRAY_LOG_INFO("[%s] RR-1 SSD suppression: armed=%d last-frame=%u total=%llu",
 				when, rr1_armed ? 1 : 0, rr1_last,
 				static_cast<unsigned long long>(rr1_total));
+		}
+
+		if (nr::enabled())
+		{
+			std::uint64_t nr_applied = 0, nr_refused = 0;
+			std::uint32_t nr_reasons[nr::kNrRefusalCount] = {};
+			nr::counters(nr_applied, nr_refused, nr_reasons);
+			char nr_line[256];
+			int off = std::snprintf(nr_line, sizeof(nr_line),
+				"[%s] NR applied=%llu refused=%llu validated=%d reasons:", when,
+				static_cast<unsigned long long>(nr_applied),
+				static_cast<unsigned long long>(nr_refused), nr::validated() ? 1 : 0);
+			for (int i = 0; i < nr::kNrRefusalCount; ++i)
+				if (off > 0 && off < static_cast<int>(sizeof(nr_line)))
+					off += std::snprintf(nr_line + off, sizeof(nr_line) - off, " %s=%u",
+						nr::kNrRefusalNames[i], nr_reasons[i]);
+			STRAY_LOG_INFO("%s", nr_line);
 		}
 	}
 

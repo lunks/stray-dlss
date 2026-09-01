@@ -49,6 +49,7 @@ enum Bucket
 	kGBufferResolve,   // gbr::record (the RR guide resolve)
 	kNgxSr,            // ngx::evaluate      (DLSS SR)
 	kNgxRr,            // ngx::evaluate_rr   (DLSS Ray Reconstruction)
+	kNgxNr,            // nr::apply          (DLSS Neural Rendering, feature 18)
 	kRestore,          // restore_game_compute_state
 	kBucketCount,
 };
