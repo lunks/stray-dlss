@@ -57,6 +57,8 @@ add_library(stray_dlss_core STATIC
     src/core/envbrdf.hpp
     src/core/nr_codec.cpp
     src/core/nr_codec.hpp
+    src/core/nr_hook_plan.cpp
+    src/core/nr_hook_plan.hpp
     src/core/ring.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -162,6 +164,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/gbuffer_resolve.hpp
         src/nr_codec_pass.cpp
         src/nr_codec_pass.hpp
+        src/nr_hook.cpp
+        src/nr_hook.hpp
         src/ext_unhook.cpp
         src/input_dump.cpp
         src/mv_resolve.cpp
@@ -294,6 +298,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_gbuffer_classify.cpp
         tests/test_envbrdf.cpp
         tests/test_nr_codec.cpp
+        tests/test_nr_hook_plan.cpp
         tests/test_ring.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 

@@ -203,16 +203,14 @@ bool create_pipeline(const void *dxbc, std::size_t size, const char *what,
 // A format the device cannot load AND store through a typed UAV would make both dispatches
 // silently no-op — the exact "black output with no further indication" failure class
 // (CLAUDE.md §0.2). Ask the device instead of assuming.
+//
+// Implemented on top of the public probe so there is exactly ONE CheckFeatureSupport call site
+// for typed UAVs in this codebase; the post-tonemap NR hook reuses the same probe on the back
+// buffer and needs the individual bits, which this predicate collapses.
 bool format_supports_typed_uav(DXGI_FORMAT format)
 {
-	D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
-	support.Format = format;
-	if (FAILED(g_state.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
-			sizeof(support))))
-		return false;
-	const UINT need = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
-	return (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0 &&
-		(static_cast<UINT>(support.Support2) & need) == need;
+	const TypedUavSupport s = probe_typed_uav(g_state.device, static_cast<int>(format));
+	return s.queried && s.view && s.load && s.store;
 }
 
 bool create_resources(std::uint32_t width, std::uint32_t height)
@@ -402,6 +400,25 @@ void bind_common(ID3D12GraphicsCommandList *cmd, UINT slot, UINT base, ID3D12Pip
 }
 
 } // namespace
+
+TypedUavSupport probe_typed_uav(ID3D12Device *device, int format)
+{
+	TypedUavSupport out;
+	if (device == nullptr)
+		return out;
+
+	D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+	support.Format = static_cast<DXGI_FORMAT>(format);
+	if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+			sizeof(support))))
+		return out; // queried stays false: "the device would not answer", not "unsupported"
+
+	out.queried = true;
+	out.view = (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+	out.load = (static_cast<UINT>(support.Support2) & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+	out.store = (static_cast<UINT>(support.Support2) & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+	return out;
+}
 
 const char *last_error() { return g_state.error; }
 

@@ -30,6 +30,23 @@ struct ID3D12Resource;
 
 namespace stray_dlss::nrp {
 
+// The three bits CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) reports about a format's
+// typed-UAV behaviour, kept separate rather than collapsed to one bool so a caller's log can name
+// WHICH half is missing.
+struct TypedUavSupport
+{
+	bool queried = false; // false = CheckFeatureSupport itself failed
+	bool view = false;    // D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW
+	bool load = false;    // D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+	bool store = false;   // D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+};
+
+// THE single typed-UAV probe in this codebase. The codec uses it on the engine's colour image;
+// the post-tonemap NR hook uses it on the back buffer, whose DXGI_FORMAT_R10G10B10A2_UNORM
+// (CLAUDE.md §2.1) is exactly the kind of format that can fail it. `format` is a DXGI_FORMAT,
+// taken as an int so this header stays free of <dxgi.h>.
+TypedUavSupport probe_typed_uav(ID3D12Device *device, int format);
+
 // Idempotent; safe to call every frame. `image` is the engine's colour target — the proxy is
 // allocated to cover it and its format is validated for typed UAV load/store, because a format
 // the device cannot write through a UAV is exactly the "black output with no error" class of

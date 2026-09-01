@@ -18,6 +18,7 @@
 #include "gbuffer_resolve.hpp"
 #include "input_dump.hpp"
 #include "mv_resolve.hpp"
+#include "nr_hook.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
@@ -681,6 +682,7 @@ void on_destroy_device(reshade::api::device *device)
 		return;
 
 	std::lock_guard<std::mutex> lock(g_state.mutex);
+	nrhook::shutdown();
 	nr::shutdown();
 	if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 		ngx::shutdown(g_state.native_device);
@@ -916,6 +918,9 @@ void on_present(
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
 	// Drains the NR validation readback (it gates NR ever touching the screen).
 	nr::on_present();
+	// Per-present boundary for the post-tonemap hook sites: resets the back-buffer bind ordinal
+	// and the once-per-frame latch, retires staging allocations, and emits the periodic report.
+	nrhook::on_present(frame);
 
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
@@ -1246,6 +1251,33 @@ void draw_nr_controls()
 	if (!ImGui::CollapsingHeader("DLSS Neural Rendering (feature 18)"))
 		return;
 
+	// WHERE NR runs. Display only, never a control: NgxNRHook decides which ReShade events get
+	// registered, and registration happens once from DllMain — so a live toggle would silently
+	// do nothing. Changing it means editing ReShade.ini and relaunching.
+	const nrplan::HookMode hook = nrhook::hook_mode();
+	const nrhook::Counters hc = nrhook::counters();
+	ImGui::Text("Hook site:  %s  (NgxNRHook, restart to change)", nrplan::hook_mode_name(hook));
+	if (hook != nrplan::HookMode::taa)
+	{
+		ImGui::Text("  post-tonemap: triggered %llu  applied %llu",
+			static_cast<unsigned long long>(hc.triggered),
+			static_cast<unsigned long long>(hc.applied));
+		if (hook == nrplan::HookMode::preui)
+			ImGui::Text("  back-buffer RTV binds: last %u  max %u  (NgxNRPreUiBind), "
+				"frames with no boundary %u",
+				hc.last_backbuffer_binds, hc.max_backbuffer_binds, hc.frames_without_boundary);
+		else
+			ImGui::Text("  reshade_begin_effects fired %llu times%s",
+				static_cast<unsigned long long>(hc.begin_effects_seen),
+				hc.begin_effects_seen == 0 ? "  <-- NO EFFECTS LOADED: this site does not exist"
+					: "");
+		for (int i = 0; i < nrplan::kPlanResultCount; ++i)
+			if (hc.reasons[i] != 0)
+				ImGui::Text("    %-20s %u",
+					nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)), hc.reasons[i]);
+	}
+	ImGui::Separator();
+
 	std::uint64_t applied = 0, refused = 0;
 	std::uint32_t reasons[nr::kNrRefusalCount] = {};
 	nr::counters(applied, refused, reasons);
@@ -1382,10 +1414,13 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 {
 	(void)runtime;
 	const auto &ngx_status = ngx::status();
-	ImGui::Text("stray-dlss: %s | NGX %s | TAA x%u",
+	// The site is on the OSD because a screenshot is often the only evidence available, and
+	// "which path produced this image" is the first question to ask of one.
+	ImGui::Text("stray-dlss: %s | NGX %s | TAA x%u | NR@%s",
 		g_state.is_vkd3d ? "vkd3d" : "d3d12",
 		ngx_status.super_sampling_available ? "ok" : "n/a",
-		g_state.taa_pipelines_seen.load());
+		g_state.taa_pipelines_seen.load(),
+		nrplan::hook_mode_name(nrhook::hook_mode()));
 }
 
 // ---- finder event handlers (pass finder + G-buffer finder) ----
@@ -1402,6 +1437,37 @@ void on_pf_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t co
 {
 	pass_finder::note_render_targets(cmd_list, count, rtvs, dsv);
 	gbuffer_finder::note_render_targets(cmd_list, count, rtvs, dsv);
+}
+
+// ---- DLSS Neural Rendering hook sites (src/nr_hook.hpp) ----
+//
+// Registered only for the mode that needs them, because every extra event ReShade dispatches
+// costs the game a callback per command — and bind_render_targets_and_depth_stencil is a
+// per-render-pass event, not a per-frame one.
+
+void on_nr_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
+	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
+{
+	nrhook::on_bind_render_targets(cmd_list, count, rtvs, dsv);
+}
+
+void on_nr_begin_effects(reshade::api::effect_runtime *runtime,
+	reshade::api::command_list *cmd_list, reshade::api::resource_view rtv,
+	reshade::api::resource_view rtv_srgb)
+{
+	nrhook::on_begin_effects(runtime, cmd_list, rtv, rtv_srgb);
+}
+
+void on_nr_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+	(void)resize;
+	nrhook::note_swapchain(swapchain);
+}
+
+void on_nr_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+	(void)resize;
+	nrhook::forget_swapchain(swapchain);
 }
 
 bool on_pf_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t count,
@@ -1501,6 +1567,11 @@ bool g_pipeline_events_registered = false;
 // finder. Tracked separately so unregistration mirrors registration exactly.
 bool g_finder_rt_events_registered = false;
 bool g_pass_finder_events_registered = false;
+// [STRAYDLSS] NgxNRHook. Read HERE rather than in on_init_device because the choice decides
+// which events get registered, and registration happens from DllMain, before any device exists.
+// Same reason HashShaders / PassFinder / NgxRR are re-read in register_events().
+bool g_nr_preui_events_registered = false;
+bool g_nr_present_events_registered = false;
 
 void register_events()
 {
@@ -1591,6 +1662,59 @@ void register_events()
 		reshade::register_event<reshade::addon_event::draw>(on_pf_draw);
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
 	}
+	// [STRAYDLSS] NgxNRHook: taa (default) | present | preui. Where DLSS Neural Rendering runs.
+	// The whole argument for moving it — and what each site costs — is in src/nr_hook.hpp.
+	{
+		char nr_hook[16] = "taa";
+		size_t nr_hook_size = sizeof(nr_hook);
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRHook", nr_hook, &nr_hook_size);
+		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
+		nrhook::set_hook_mode(mode);
+
+		int preui_bind = 2;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreUiBind", preui_bind);
+		nrhook::set_preui_bind_ordinal(preui_bind < 0 ? 0u : static_cast<unsigned int>(preui_bind));
+
+		// Shared with the TAA path; only consulted on `preui`, which records onto the GAME's
+		// command list. Re-read here for the same reason the mode is.
+		bool restore_state = true;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "RestoreState", restore_state);
+		nrhook::set_restore_state(restore_state);
+
+		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
+			mode == nrplan::HookMode::taa
+				? "DLSS Neural Rendering runs inside the intercepted TAA dispatch, writing the "
+				  "engine's u0 — which UE 4.27 also extracts as the next frame's temporal "
+				  "history, so NR's answer compounds. This is the shipped default and the "
+				  "fallback."
+			: mode == nrplan::HookMode::present
+				? "DLSS Neural Rendering runs at reshade_begin_effects, on the composited back "
+				  "buffer. No feedback path by construction, and no pass identification — but "
+				  "the UI is already drawn, and ReShade only fires this event when at least one "
+				  "effect file is LOADED."
+				: "DLSS Neural Rendering runs at the pre-UI render-target boundary: after the "
+				  "scene composite, before Slate draws the HUD. No feedback path AND no HUD "
+				  "pixels in the network. Watch the NR hook census lines to confirm "
+				  "NgxNRPreUiBind.");
+
+		if (mode == nrplan::HookMode::preui)
+		{
+			g_nr_preui_events_registered = true;
+			reshade::register_event<reshade::addon_event::init_swapchain>(on_nr_init_swapchain);
+			reshade::register_event<reshade::addon_event::destroy_swapchain>(
+				on_nr_destroy_swapchain);
+			reshade::register_event<
+				reshade::addon_event::bind_render_targets_and_depth_stencil>(
+				on_nr_bind_render_targets);
+		}
+		else if (mode == nrplan::HookMode::present)
+		{
+			g_nr_present_events_registered = true;
+			reshade::register_event<reshade::addon_event::reshade_begin_effects>(
+				on_nr_begin_effects);
+		}
+	}
+
 	if (pass_finder_enabled)
 	{
 		g_pass_finder_events_registered = true;
@@ -1619,6 +1743,22 @@ void unregister_events()
 			on_pf_resolve_texture_region);
 		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
 		reshade::unregister_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
+	}
+	if (g_nr_present_events_registered)
+	{
+		g_nr_present_events_registered = false;
+		reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(
+			on_nr_begin_effects);
+	}
+	if (g_nr_preui_events_registered)
+	{
+		g_nr_preui_events_registered = false;
+		reshade::unregister_event<
+			reshade::addon_event::bind_render_targets_and_depth_stencil>(
+			on_nr_bind_render_targets);
+		reshade::unregister_event<reshade::addon_event::destroy_swapchain>(
+			on_nr_destroy_swapchain);
+		reshade::unregister_event<reshade::addon_event::init_swapchain>(on_nr_init_swapchain);
 	}
 	if (g_finder_rt_events_registered)
 	{

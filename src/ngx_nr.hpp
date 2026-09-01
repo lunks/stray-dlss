@@ -111,11 +111,35 @@ void set_warmup_frames(unsigned int frames);
 //                    the untouched original; 0 is an EXACT bypass, bit for bit.
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
 
+// WHERE the call comes from. One NR path, two call sites, and the difference between them is
+// entirely the colour pipeline — so it is a parameter rather than a second copy of this module.
+enum class Site
+{
+	// src/taa_hook.cpp, inside the intercepted TAA compute dispatch. `image` is the engine's
+	// `u0`: raw, unbounded, PRE-EXPOSED LINEAR HDR, in D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+	// because the SR/RR evaluate has just written it. The HDR colour codec is MANDATORY here —
+	// feature 18 is a display-referred network and this signal is out of its domain (measured:
+	// neural output max luminance 0.0026, red noise on screen).
+	taa_dispatch,
+	// src/nr_hook.cpp, at reshade_begin_effects or at the pre-UI render-target boundary.
+	// `image` is a staging copy of the back buffer: ALREADY TONEMAPPED and display-referred, in
+	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, and left in that state on exit.
+	//
+	// The HDR colour codec is BYPASSED here, deliberately and explicitly. The image is already in
+	// the domain the network was trained on; encoding it a second time would apply the soft clip
+	// and the sRGB curve on top of the game's own tone curve. The residual transfer has nothing
+	// to carry either — with no encode there is no proxy to subtract — so on success the neural
+	// answer is copied over `image` whole, which is correct precisely BECAUSE this site is
+	// terminal: nothing downstream reads it back into the engine's temporal state.
+	post_tonemap,
+};
+
 struct ApplyInputs
 {
-	// The image to improve: whatever our SR/RR evaluate just wrote (the engine's output
-	// resource, u0). Under post_process this is NR's Color; under sr_shaped it is only the
-	// copy-back destination and `render_color` is NR's Color.
+	// The image to improve. Under Site::taa_dispatch this is the engine's `u0` (and NR's Color
+	// under post_process, or the copy-back destination under sr_shaped). Under
+	// Site::post_tonemap it is our staging copy of the back buffer, and it is NR's Color
+	// directly, with no codec in between.
 	ID3D12Resource *image = nullptr;
 	// Render-resolution scene colour — used as NR's Color under sr_shaped only.
 	ID3D12Resource *render_color = nullptr;
@@ -126,7 +150,22 @@ struct ApplyInputs
 	std::uint32_t render_height = 0;
 	std::uint32_t output_width = 0;
 	std::uint32_t output_height = 0;
-	bool reset = false; // camera cut, same signal SR gets
+	// Camera cut, the same OR of three signals SR gets (CLAUDE.md §2.8: View.CameraCut row
+	// 145.x, TemporalAAJitter.zw == .xy, or a 1x1 history/velocity SRV). Feature 18 keeps its OWN
+	// temporal accumulation — it consumes motion vectors and depth, and DLSSNR.Reset is
+	// `settings.resetAccumulation` in the reference — so this must reach it at BOTH sites. A
+	// camera cut that does not reset NR's history is the "flicker between a frozen image and fog"
+	// class of bug this project has already been bitten by once.
+	bool reset = false;
+
+	Site site = Site::taa_dispatch;
+
+	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from output/render", which
+	// is what the TAA site does. The post-tonemap sites pass the ratio their own gate computed,
+	// because their colour rect is the BACK BUFFER's, which is not necessarily the TAA output
+	// rect the guides were sized against.
+	float mvec_scale_x = 0.0f;
+	float mvec_scale_y = 0.0f;
 };
 
 // Runs feature 18 and, once validated, copies the neural result back over `image`. Returns
