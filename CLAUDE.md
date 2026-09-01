@@ -1321,6 +1321,128 @@ effect that is stable frame-to-frame in a normal post-process chain can still di
 that porting a correct implementation is not sufficient when the target resource has a different
 role in the frame graph.
 
+### The hook site is now a choice: `[STRAYDLSS] NgxNRHook` = taa | present | preui
+
+The drift above is a PLACEMENT problem, so the fix is a placement. Three sites, one NR path
+(`nr::apply` parameterised by `nr::Site`; the gate and the boundary rule are pure and tested in
+`src/core/nr_hook_plan.{hpp,cpp}` / `tests/test_nr_hook_plan.cpp`):
+
+| `NgxNRHook` | Where | Feedback? | UI in the image? | Needs pass identification? |
+|---|---|---|---|---|
+| **`taa`** (default) | inside the intercepted TAA dispatch, writing `u0` | **yes — the bug** | no | yes |
+| `present` | `reshade_begin_effects` | no | **yes** | no |
+| `preui` | the frame's Nth back-buffer render-target bind | no | no | no |
+
+`preui` is the intended end state: it has `present`'s freedom from feedback AND keeps HUD pixels
+out of the network. `taa` stays the default and the fallback until a post-tonemap site is
+confirmed on the machine.
+
+**Why post-tonemap has no feedback path BY CONSTRUCTION**, rather than "we closed the known
+loops": on the desktop deferred path every `QueueTextureExtraction` into `PrevFrameViewInfo` sits
+at `PostProcessing.cpp` 576/599/643 while `AddTonemapPass` is at 777. Nothing after the
+tonemapper is carried into the next frame.
+
+**Two coupled loops, not one.** Feature 18 keeps its OWN temporal accumulator (it consumes motion
+vectors and depth, and `DLSSNR.Reset` is `settings.resetAccumulation` in the reference), so the
+engine's loop was feeding NR's history an input that already contained NR's previous output.
+Breaking the engine half lets NR's accumulator converge against a stable input, so the move should
+help more than a single-loop reading predicts.
+
+**Verified against the ReShade v6.8.0 source, all HARD:**
+
+* `reshade_begin_effects` fires at `runtime.cpp:4020` with the resource behind `rtv` in
+  **`RENDER_TARGET`** (`runtime.cpp:745` barriers `present -> render_target` immediately before;
+  the `_back_buffer_resolved` branch does the same at `:715`/`:721`). `render_effects` issues no
+  barrier and no GPU state setup before the invoke, and `api::capture_state` is a **no-op on
+  D3D12** (`state_block.cpp:53-92` has no d3d12 case).
+* Its `cmd_list` is **ReShade's own immediate command list**, a different
+  `ID3D12GraphicsCommandList` from the game's (`d3d12_impl_command_queue.cpp:22`,
+  `d3d12_impl_command_list_immediate.cpp:34`). So the game's state is untouched and there is
+  nothing of the game's to restore. ReShade's own heap/root-signature caches
+  (`d3d12_impl_command_list.cpp:538/549`) are **nulled at every flush**
+  (`d3d12_impl_command_list_immediate.cpp:127-130`, once per present via
+  `dxgi_swapchain.cpp:1009`), and nothing binds through the proxy between the flush and the event
+  — so a native clobber of ours cannot make the cache agree with reality by accident, and
+  ReShade's first per-pass bind re-issues the real calls. Calling `restore_game_compute_state`
+  there would be worse than doing nothing: that list's `state_tracking` holds ReShade's own
+  bindings. **`preui` is the opposite** — it is the GAME's list, UE4 filters its own redundant
+  binds, so it restores exactly as the TAA path does, plus viewports and scissors.
+* **`reshade_begin_effects` NEVER FIRES WITH AN EMPTY PRESET.** `render_effects` is only called
+  when `!is_loading() && !_techniques.empty()` (`runtime.cpp:737`, again at `:3810`), so
+  `NgxNRHook=present` is silently inert unless at least one effect file is LOADED (it may stay
+  disabled). The add-on logs an ERROR when `beginEffectsSeen` is still 0. `preui` has no such
+  dependency.
+
+**The `preui` boundary signal, and what is UNCONFIRMED about it.** It is a render-target IDENTITY
+test — resolve `rtvs[0]` to a resource and compare it against the swapchain's own back-buffer
+list — which is much cheaper and more robust than pass identification. What is *not* established
+is that UE 4.27 in this title produces exactly two back-buffer render-target binds per frame
+(composite, then Slate). `[STRAYDLSS] NgxNRPreUiBind` (default **2**) selects the ordinal, and the
+add-on logs a per-bind CENSUS for the first two frames so ONE run settles it. **It fails safe: a
+frame that never reaches the ordinal is skipped, counted under `boundary-not-reached`, never
+injected at a guessed point.** Reading a wrong ordinal off a screenshot: too LOW and the HUD looks
+processed (softened, denoised text); too HIGH and the image is unchanged.
+
+**Staging is a plain same-format copy**, not FP16. A copy cannot convert formats, so an FP16
+staging pair would need a conversion compute pass in EACH direction — and the write-back one
+would still need typed UAV store on the back buffer's format, so it would not even avoid the
+probe. The back buffer's own format for both textures makes both transfers plain copies with no
+shader of ours in the path. `nr_codec_pass`'s existing `CheckFeatureSupport` probe is exposed
+per-bit and logged; only VIEW and STORE gate (NGX writes `DLSSNR.Output` through a typed UAV and
+reads `DLSSNR.Color` through its own path).
+
+**The HDR codec is BYPASSED on both post-tonemap sites**, explicitly and logged. The image is
+already display-referred; encoding it again would apply the tone transfer twice.
+`NgxNRPaperWhiteScale`, `NgxNRColorStrength`, `NgxNRTransferStrength` and `NgxNRTrackExposure` all
+do nothing there, and the luminance diagnostic says so rather than printing codec terms that do
+not apply.
+
+**Guide freshness is a consumption SEQUENCE, not a present index.** The TAA capture publishes a
+counter; a trigger consumes it once. That keeps the gate independent of the order in which
+ReShade fires `addon_event::present` and `reshade_begin_effects`, and a frame with no TAA dispatch
+(a loading screen) simply never advances it.
+
+### Feature 18 has its OWN temporal history, and we were invalidating it silently
+
+Confirmed in the reference (`fc4de144:src/dxvk/rtx_render/rtx_neural_rendering.cpp:220-230`),
+verbatim: *"The NGX feature is keyed on the colour grid alone, so switching DLSS quality at a
+fixed output resolution moves the guide grid --- and DLSSNR.MVecScaleX/Y with it --- underneath a
+temporal history that was accumulated against the old one. Nothing else notices, so latch the
+guide extent here and force a single reset frame when it moves."*
+
+That is a **live bug for us**, not a hypothetical: this project runs both 50% and 70% screen
+percentage, where the colour/guide ratio is 2.0 versus 1.42857, while the output rect the feature
+is keyed on does not move. `nrplan::latch_guide_extent` now forces one `DLSSNR.Reset` when the
+extent changes, and — following the reference's `resetGuideHistory = (latched != 0)` — **none on
+the first observation**, so no session starts with a spurious reset. It is logged when it fires,
+with both extents.
+
+Corollary already in force but worth restating: the camera-cut OR (§2.8) must reach the evaluate
+at **every** site. It travels with the published guides for exactly that reason.
+
+### `NgxNRTrackExposure`: the codec's knee has to follow the scene, and the user found this by hand
+
+**USER MEASUREMENT:** on the `taa` path the best-looking `NgxNRPaperWhiteScale` is about **0.1**,
+an effective scale near 10x. That is not a quirk — it is the reciprocal of UE4's pre-exposure,
+measured live at **0.056** (§2.6 row 135.y), whose reciprocal is ~18. The soft-clip knee is at
+0.75, so a pre-exposed signal has to be lifted by roughly that factor to land near it.
+
+**What it revealed: we dropped `trackAutoExposure` in the port.** The reference
+(`rtx_neural_rendering.h:137-140`) defaults it TRUE and multiplies the proxy scale by the engine's
+live exposure so the knee follows scene brightness; we hardcoded a constant. **Pre-exposure moves
+with the scene**, so a paper white tuned in the dark starting apartment is wrong in a brighter
+area — there is no single right constant. `[STRAYDLSS] NgxNRTrackExposure` (default **ON**) makes
+the effective scale `proxy_scale(paperWhite) x OneOverPreExposure` (View row 135.z, already
+parsed), clamped to the same [1e-6, 1e6] and falling back to the static scale when the View CB did
+not decode. One `NR codec scale` line reports the decomposition, so "0.1 looks best" can be read
+off as "tracking has made 1.0 the new correct value".
+
+**The asymmetry, so it is not re-litigated:** the SR path's exposure goes through NGX
+(`InPreExposure`, the exposure texture, the AutoExposure flag) and is at the runtime's mercy — the
+texture mode measured INERT for us, and the NR codec reportedly ignores `DLSS.Pre.Exposure`
+outright. **The codec's scale is our own shader arithmetic and cannot be ignored by the runtime**,
+which is why this is expected to work where the SR exposure attempt did not.
+
 ### The NR luminance diagnostic must not run during a loading screen
 
 `NR CODEC LUMINANCE` reports input -> proxy -> output max Rec.709 over one crop, and is how

@@ -18,6 +18,7 @@
 #include "core/nr_codec.hpp"
 
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 
 using namespace stray_dlss::nrc;
