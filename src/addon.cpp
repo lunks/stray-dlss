@@ -17,6 +17,7 @@
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
 #include "input_dump.hpp"
+#include "mv_resolve.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
