@@ -1049,14 +1049,33 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 
 * **Default `r.RayTracing=False` for this title.** `-dx12` is still required (D3D12 is what NGX
   needs), and **DLSS SR does not need RT** — SR is the configuration to ship.
-* **DLSS RR is NOT independently usable here, because RR REQUIRES `r.RayTracing=True`.** Ray
-  Reconstruction is a denoiser for ray-traced input; with RT off there is nothing for it to
-  denoise and it does not run. So the two findings in this section are **coupled**, and the
-  coupling is what decides the matter: turning RT on to get RR costs 2.9x the frame time and
-  brings back the neon noise, which is most of what RR would then be denoising. **RR therefore
-  stays off (`NgxRR=0`) — it works, but only in a configuration this title should not run in.**
-  Do not read the 3.4x denoiser-stability result above as "enable RR": that measurement was
-  taken with RT on and only establishes that SR cannot replace the screen-space denoiser.
+* **RR WITHOUT RT IS THE UNTESTED COMBINATION, AND IT IS THE INTERESTING ONE.**
+
+> **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
+> so RR is not independently usable here" and treated it as concluded. **That was never
+> verified.** It came from a single passing remark, not a measurement or a source, and it was
+> then repeated as settled — the exact failure mode the HARD/SOFT discipline exists to prevent.
+>
+> **Nothing requires it.** `NVSDK_NGX_DLSSD_Create_Params` carries a denoise mode, a roughness
+> mode and a depth type, and no ray-tracing anything. Our own RR path takes its guides from the
+> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E, `src/gbuffer_finder.cpp`), which is
+> UE4's ordinary deferred output and is present with RT fully off. `grep -rn RayTracing src/`
+> finds nothing that gates it.
+
+**So the combination worth testing is `NgxRR=1` with `r.RayTracing=False`**, and the case for it
+is strong: RR is the only candidate for replacing UE's screen-space denoiser (SR provably cannot
+— the 3.4x shimmer gap below), the SSD runs with RT off anyway because it denoises SSR/SSGI/SSAO
+rather than ray tracing specifically, and keeping RT off preserves the 2.9x frame-time win. RR
+also does the upscaling, so it replaces SR rather than adding to it.
+
+The two-phase experiment, with a pre-registered metric:
+
+1. **RR on, RT off, SSD untouched.** Does it create, evaluate and look right? This is a config
+   flip — the guides and the DLSSD path are already built and were measured running at ~100% of
+   gameplay frames.
+2. **RR on, RT off, SSD suppressed.** Does RR cover the denoiser's job? The target is the
+   measured 3.4x: suppressed-SSD shimmer must come back down toward the ~1051 median rather than
+   the ~3599 it reached under SR.
 * When triaging *any* performance or noise report here, check the RT subsystem FIRST. It is
   scene-dependent, so a menu benchmark will hide it completely.
 * **A visual artifact and a performance problem sharing one root cause is not a coincidence to
