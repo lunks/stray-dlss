@@ -155,10 +155,19 @@ if(STRAY_DLSS_BUILD_ADDON)
     endif()
 
     add_library(stray-dlss SHARED
-        src/addon.cpp
+        # The ReShade host: the ONLY directory that includes ReShade's headers (CI enforces).
+        src/backend_reshade/addon_entry.cpp
+        src/backend_reshade/reshade_all.hpp
+        src/backend_reshade/reshade_backend.cpp
+        src/backend_reshade/reshade_backend.hpp
+        src/backend_reshade/reshade_bindings.cpp
+        src/backend_reshade/reshade_bindings.hpp
         src/backend_reshade/reshade_config.cpp
         src/backend_reshade/reshade_log.cpp
         src/backend_reshade/reshade_host.hpp
+        # The framework-free application, behind the seam.
+        src/app/dlss_app.cpp
+        src/app/dlss_app.hpp
         src/ngx_backend.cpp
         src/ngx_backend.hpp
         src/ngx_nr.cpp
@@ -167,8 +176,6 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/ngx_snippet.hpp
         src/shader_dump.cpp
         src/shader_dump.hpp
-        src/frame_state.cpp
-        src/frame_state.hpp
         src/taa_hook.cpp
         src/taa_hook.hpp
         src/pass_finder.cpp
@@ -198,6 +205,9 @@ if(STRAY_DLSS_BUILD_ADDON)
         OUTPUT_NAME "stray-dlss"
         PREFIX ""
         SUFFIX ".addon64")
+
+    # reshade_all.hpp and the backend's own headers are found relative to their directory.
+    target_include_directories(stray-dlss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend_reshade)
 
     target_link_libraries(stray-dlss PRIVATE
         stray_dlss_core
@@ -271,9 +281,9 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         tests/warp/log_stub.cpp
         src/mv_resolve.cpp
         src/d3d12_restore.cpp
-        # The real frame_state, so the ReShade-facing half of the restore is the code under
-        # test rather than a reimplementation of it.
-        src/frame_state.cpp)
+        # The real ReShade bindings, so the ReShade-facing half of the restore is the code
+        # under test rather than a reimplementation of it.
+        src/backend_reshade/reshade_bindings.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
@@ -282,6 +292,7 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
 
     target_include_directories(stray_dlss_warp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend_reshade
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/warp)
     target_link_libraries(stray_dlss_warp PRIVATE
         stray_dlss_core

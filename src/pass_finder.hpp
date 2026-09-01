@@ -1,4 +1,4 @@
-// The recorder half of the dataflow pass finder: turns ReShade events into the FrameEvents
+// The recorder half of the dataflow pass finder: turns interception events into the FrameEvents
 // that core/pass_walk.hpp walks, and logs the verdict.
 //
 // Diagnostic ONLY, behind [STRAYDLSS] PassFinder=1 (default off). It never suppresses,
@@ -17,7 +17,7 @@
 
 #include "core/pass_walk.hpp"
 
-#include "reshade_all.hpp"
+#include "intercept/types.hpp"
 
 #include <cstdint>
 
@@ -32,27 +32,26 @@ bool enabled();
 // bound-pipeline bookkeeping needs the pipeline's own kind to know which slot it fills.
 void note_pipeline(std::uint64_t pipeline_handle, std::uint64_t shader_hash, bool is_compute);
 void forget_pipeline(std::uint64_t pipeline_handle);
-void note_bind_pipeline(reshade::api::command_list *cmd_list, std::uint64_t pipeline_handle);
+void note_bind_pipeline(const icept::CommandContext &ctx, std::uint64_t pipeline_handle);
 
 // Recording taps, called from the add-on's event handlers. Cheap no-ops outside a
 // recording frame.
-void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-                         const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv);
-void note_draw(reshade::api::command_list *cmd_list, uint32_t vertex_or_index_count);
+void note_render_targets(const icept::CommandContext &ctx, uint32_t count,
+                         const icept::DescriptorId *rtvs, icept::DescriptorId dsv);
+void note_draw(const icept::CommandContext &ctx, uint32_t vertex_or_index_count);
 // Call ONLY for dispatches that will actually execute — a suppressed dispatch writes
 // nothing, so recording it would enter a phantom writer into the last-writer table.
-void note_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z);
-void note_copy(reshade::api::command_list *cmd_list, reshade::api::resource source,
-               reshade::api::resource dest);
+void note_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y, uint32_t z);
+void note_copy(const icept::CommandContext &ctx, icept::ResourceId source, icept::ResourceId dest);
 
 // Assigns execute-order sequence numbers and moves the list's recorded events into the
 // frame. Fires per list at ExecuteCommandLists, which is what makes the order total per
 // queue.
-void note_execute(reshade::api::command_list *cmd_list);
-void forget_command_list(reshade::api::command_list *cmd_list);
+void note_execute(const icept::CommandContext &ctx);
+void forget_command_list(const icept::CommandContext &ctx);
 
 // Frame boundary: walks the recorded events, logs the verdict when it changes, and decides
 // whether the next frame records. `back_buffer` is the walk's fallback anchor.
-void on_present(std::uint64_t frame, reshade::api::resource back_buffer);
+void on_present(std::uint64_t frame, icept::ResourceId back_buffer);
 
 } // namespace stray_dlss::pass_finder

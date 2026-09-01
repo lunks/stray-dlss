@@ -1,6 +1,6 @@
 #include "nr_hook.hpp"
 
-#include "frame_state.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_nr.hpp"
@@ -8,8 +8,6 @@
 #include "perf.hpp"
 
 #include <d3d12.h>
-
-#include <state_tracking.hpp>
 
 #include <atomic>
 #include <cstdio>
@@ -246,7 +244,7 @@ void transition(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res, D3D12_RESOU
 
 // Restores what our pass replaced on the GAME's command list. Only reached from `preui`; see
 // run_on_colour for why `present` deliberately restores nothing.
-void restore_after_preui(reshade::api::command_list *cmd_list)
+void restore_after_preui(const icept::CommandContext &ctx)
 {
 	perf::Scope scope(perf::kRestore);
 
@@ -254,7 +252,7 @@ void restore_after_preui(reshade::api::command_list *cmd_list)
 	// TAA path uses, which is exercised against WARP in CI and is the only thing that correctly
 	// replays UE4's ROOT descriptors (ReShade's own state_block cannot: it registers no
 	// push_descriptors handler). See src/frame_state.hpp for the full argument.
-	restore_game_compute_state(cmd_list);
+	icept::backend()->restore_game_compute_state(ctx);
 
 	// Viewports and scissors on top. NGX clobbers them and `restore_game_compute_state`
 	// deliberately does not touch graphics dynamic state. UE 4.27's RHI does set a viewport in
@@ -264,25 +262,17 @@ void restore_after_preui(reshade::api::command_list *cmd_list)
 	// Render targets are NOT restored here on purpose: the next command IS the
 	// OMSetRenderTargets we intercepted, so re-binding them would be redundant work whose only
 	// effect would be to make the game's own bind look redundant to ReShade's cache.
-	if (const auto *state = cmd_list->get_private_data<state_tracking>())
-	{
-		if (!state->viewports.empty())
-			cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()),
-				state->viewports.data());
-		if (!state->scissor_rects.empty())
-			cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()),
-				state->scissor_rects.data());
-	}
+	icept::backend()->restore_viewports_and_scissors(ctx);
 }
 
 // THE ONE ENTRY POINT BOTH TRIGGERS SHARE. Acquiring a colour resource and its rect is the
 // trigger's job; everything from here down is identical whichever one supplied it, which is what
 // keeps a third trigger from needing a third copy of this.
-bool run_on_colour(reshade::api::command_list *cmd_list, ID3D12Resource *colour,
+bool run_on_colour(const icept::CommandContext &ctx, ID3D12Resource *colour,
                    nrplan::HookMode mode)
 {
-	auto *device = reinterpret_cast<ID3D12Device *>(cmd_list->get_device()->get_native());
-	auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+	ID3D12Device *device = ctx.device;
+	ID3D12GraphicsCommandList *native = ctx.native;
 	if (device == nullptr || native == nullptr)
 		return refuse(nrplan::PlanResult::no_colour,
 			"the command list gave us no native device or list");
@@ -433,7 +423,7 @@ bool run_on_colour(reshade::api::command_list *cmd_list, ID3D12Resource *colour,
 		// never undone survives into the next draw — which is why the TAA path restores, and why
 		// this does too.
 		if (g_restore_state.load(std::memory_order_relaxed))
-			restore_after_preui(cmd_list);
+			restore_after_preui(ctx);
 	}
 	else
 	{
@@ -497,15 +487,11 @@ void note_guides(std::uint64_t frame, ID3D12Resource *depth, ID3D12Resource *mot
 	g_guides.reset = reset;
 }
 
-void note_swapchain(reshade::api::swapchain *swapchain)
+void note_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count)
 {
-	if (swapchain == nullptr)
+	if (back_buffers == nullptr)
 		return;
-	std::vector<std::uint64_t> buffers;
-	const uint32_t count = swapchain->get_back_buffer_count();
-	buffers.reserve(count);
-	for (uint32_t i = 0; i < count; ++i)
-		buffers.push_back(swapchain->get_back_buffer(i).handle);
+	std::vector<std::uint64_t> buffers(back_buffers, back_buffers + count);
 
 	{
 		std::lock_guard<std::mutex> lock(g_swapchain_mutex);
@@ -515,9 +501,8 @@ void note_swapchain(reshade::api::swapchain *swapchain)
 		"a render-target IDENTITY test against this list, not a shader-bytecode match.", count);
 }
 
-void forget_swapchain(reshade::api::swapchain *swapchain)
+void forget_swapchain()
 {
-	(void)swapchain;
 	std::lock_guard<std::mutex> lock(g_swapchain_mutex);
 	g_back_buffers.clear();
 }
@@ -609,14 +594,11 @@ void on_present(std::uint64_t frame)
 			"NgxNRHook=preui, which does not depend on ReShade's effect runtime at all.");
 }
 
-void on_begin_effects(reshade::api::effect_runtime *runtime, reshade::api::command_list *cmd_list,
-                      reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb)
+void on_begin_effects(const icept::CommandContext &ctx, icept::DescriptorId rtv)
 {
-	(void)runtime;
-	(void)rtv_srgb;
 	g_begin_effects.fetch_add(1, std::memory_order_relaxed);
 
-	if (hook_mode() != nrplan::HookMode::present || cmd_list == nullptr || rtv.handle == 0)
+	if (hook_mode() != nrplan::HookMode::present || ctx.native == nullptr || rtv == 0)
 		return;
 	if (g_ran_this_frame.exchange(true, std::memory_order_relaxed))
 	{
@@ -629,37 +611,29 @@ void on_begin_effects(reshade::api::effect_runtime *runtime, reshade::api::comma
 	// ReShade's `_back_buffer_resolved` on the MSAA / sRGB-variant path (v6.8.0
 	// runtime.cpp:739-747); either is the right target, because ReShade composites the resolved
 	// one back into the swapchain afterwards.
-	auto *device = cmd_list->get_device();
-	if (device == nullptr)
-		return;
-	const reshade::api::resource res = device->get_resource_from_view(rtv);
-	if (res.handle == 0)
+	icept::ResourceId res = 0;
+	if (!icept::backend()->resource_from_view(rtv, res) || res == 0)
 	{
 		refuse(nrplan::PlanResult::no_colour, "the effect-time RTV resolved to no resource");
 		return;
 	}
 
 	g_triggered.fetch_add(1, std::memory_order_relaxed);
-	run_on_colour(cmd_list, reinterpret_cast<ID3D12Resource *>(res.handle),
-		nrplan::HookMode::present);
+	run_on_colour(ctx, reinterpret_cast<ID3D12Resource *>(res), nrplan::HookMode::present);
 }
 
-void on_bind_render_targets(reshade::api::command_list *cmd_list, std::uint32_t count,
-                            const reshade::api::resource_view *rtvs,
-                            reshade::api::resource_view dsv)
+void on_bind_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
+                            const icept::DescriptorId *rtvs, icept::DescriptorId dsv)
 {
 	(void)dsv;
 	// The hot path: this fires on every OMSetRenderTargets in the frame, so the mode check is
 	// first and is a relaxed load of one int.
-	if (hook_mode() != nrplan::HookMode::preui || cmd_list == nullptr || count == 0 ||
-		rtvs == nullptr || rtvs[0].handle == 0)
+	if (hook_mode() != nrplan::HookMode::preui || ctx.native == nullptr || count == 0 ||
+		rtvs == nullptr || rtvs[0] == 0)
 		return;
 
-	auto *device = cmd_list->get_device();
-	if (device == nullptr)
-		return;
-	const reshade::api::resource res = device->get_resource_from_view(rtvs[0]);
-	if (res.handle == 0)
+	icept::ResourceId res = 0;
+	if (!icept::backend()->resource_from_view(rtvs[0], res) || res == 0)
 		return;
 
 	{
@@ -667,7 +641,7 @@ void on_bind_render_targets(reshade::api::command_list *cmd_list, std::uint32_t 
 		bool is_back_buffer = false;
 		for (const std::uint64_t h : g_back_buffers)
 		{
-			if (h == res.handle)
+			if (h == res)
 			{
 				is_back_buffer = true;
 				break;
@@ -687,7 +661,7 @@ void on_bind_render_targets(reshade::api::command_list *cmd_list, std::uint32_t 
 	// per guess.
 	if (frame < kBindCensusPresents)
 	{
-		auto *r = reinterpret_cast<ID3D12Resource *>(res.handle);
+		auto *r = reinterpret_cast<ID3D12Resource *>(res);
 		const D3D12_RESOURCE_DESC d = r->GetDesc();
 		STRAY_LOG_INFO("NR hook census: frame %llu, back-buffer render-target bind #%u — target "
 			"%p %llux%u fmt=%d, %u RTV(s) bound. Bind #%u is where NgxNRPreUiBind would inject; "
@@ -715,8 +689,7 @@ void on_bind_render_targets(reshade::api::command_list *cmd_list, std::uint32_t 
 			ordinal, static_cast<unsigned long long>(frame));
 	}
 
-	run_on_colour(cmd_list, reinterpret_cast<ID3D12Resource *>(res.handle),
-		nrplan::HookMode::preui);
+	run_on_colour(ctx, reinterpret_cast<ID3D12Resource *>(res), nrplan::HookMode::preui);
 }
 
 void shutdown()

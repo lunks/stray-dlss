@@ -1,36 +1,28 @@
-// stray-dlss — ReShade D3D12 add-on entry point.
-//
-// Skeleton stage. This build deliberately does not touch the TAA pass: it proves the whole
-// toolchain end to end — the add-on loads under ReShade 6.8, the imgui handshake matches,
-// the D3D12 device is reachable, vkd3d-proton is detected, NGX links and initialises, and
-// the compute-shader hashing sees Stray's shaders. Everything it learns goes into the log
-// and the overlay, because that is the only feedback channel this project has.
+// stray-dlss — the framework-free application: everything the add-on did, minus the ReShade
+// registrations and the overlay, behind icept::Sink. The bodies here moved from addon.cpp
+// verbatim; only the types at the seam changed. (Plan Task 7.)
+
+#include "app/dlss_app.hpp"
 
 #include "core/fnv1a.hpp"
+#include "core/taa_hashes.hpp"
+#include "ext_unhook.hpp"
+#include "gbuffer_finder.hpp"
+#include "gbuffer_resolve.hpp"
+#include "host/config.hpp"
+#include "input_dump.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
+#include "mv_resolve.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
-#include "core/taa_hashes.hpp"
-#include "ext_unhook.hpp"
-#include "frame_state.hpp"
-#include "gbuffer_finder.hpp"
-#include "gbuffer_resolve.hpp"
-#include "input_dump.hpp"
-#include "mv_resolve.hpp"
 #include "nr_history.hpp"
 #include "nr_hook.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
-
-#include "reshade_all.hpp"
-#include "backend_reshade/reshade_host.hpp"
-#include "host/config.hpp"
-
-#include <descriptor_tracking.hpp>
-#include <state_tracking.hpp>
 
 #include <d3d12.h>
 
@@ -43,15 +35,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
-extern "C" __declspec(dllexport) const char *NAME = "Stray DLSS";
-extern "C" __declspec(dllexport) const char *DESCRIPTION =
-	"Injects NVIDIA DLSS Super Resolution into Stray (UE 4.27.2, D3D12) by replacing the "
-	"engine's FTAAStandaloneCS temporal AA pass.";
-extern "C" __declspec(dllexport) const char *WEBSITE = "https://github.com/lunks/stray-dlss";
-
+namespace stray_dlss::app {
 namespace {
 
-using namespace stray_dlss;
 
 // vkd3d-proton exposes ID3D12GraphicsCommandListExt. ReShade uses exactly this interface as
 // its own vkd3d detector, so it costs nothing and is completely reliable.
@@ -72,6 +58,7 @@ constexpr int kNgxInitFrame = 120;
 // frame 300, so this only fires on a title (or a ReShade build) that never installs it.
 constexpr int kNgxDecisionDeadline = 900;
 
+
 struct State
 {
 	std::mutex mutex;
@@ -87,20 +74,12 @@ struct State
 	// (CLAUDE.md §2.3)
 	std::unordered_set<std::uint64_t> distinct_shader_hashes;
 	// command list -> the compute pipeline handle most recently bound on it.
-	std::unordered_map<reshade::api::command_list *, uint64_t> bound_compute_pipeline;
+	std::unordered_map<ID3D12GraphicsCommandList *, uint64_t> bound_compute_pipeline;
 
 	std::atomic<uint64_t> frame_index{ 0 };
 	std::atomic<uint32_t> compute_pipelines_seen{ 0 };
 	std::atomic<uint32_t> taa_pipelines_seen{ 0 };
 	std::atomic<uint32_t> dispatches_seen{ 0 };
-
-	// The add-on-level events only exist when ReShade was built with RESHADE_ADDON >= 2,
-	// i.e. the full add-on build. Without them we can observe nothing useful, and the log
-	// must say so plainly rather than leaving "wrong ReShade build" and "UE4 binds
-	// differently" indistinguishable. (docs/RESEARCH.md §2.2)
-	std::atomic<bool> saw_bind_pipeline{ false };
-	std::atomic<bool> saw_push_descriptors{ false };
-	std::atomic<bool> reported_capability_verdict{ false };
 
 	// NGX initialisation is deferred and opt-in. Doing it inside init_device deadlocks the
 	// game: NGX re-enters DXGI while ReShade and DXVK-NVAPI still hold their device-creation
@@ -112,7 +91,6 @@ struct State
 
 State g_state;
 
-void load_hash_override_file(); // defined beside the overlay below
 
 // Reports whether ReShade's vkd3d extension hook is installed on the ID3D12DeviceExt vtable.
 //
@@ -207,51 +185,32 @@ ID3D12Device *reshade_proxy_device(ID3D12Device *native)
 // parameter block on EVERY evaluate, and the codec's three ride in push constants on every
 // dispatch, so a change takes effect on the next frame with no feature recreation and no
 // restart. Only the geometry (Width/Height/ScalingRatio) is create-time, and none of that is
-// a user knob.
-struct NrUiState
-{
-	bool  enabled = false;
-	float intensity = 1.0f;
-	float local_tone = 1.74f;
-	float local_structure = 1.0f;
-	float skin_structure = 1.33f;
-	int   preset = 1;
-	bool  auto_mask = true;
-	bool  ui_correction = true;
-	float paper_white = 1.0f;
-	// The reference's `trackAutoExposure`, default TRUE there and here. See ngx_nr.hpp.
-	bool  track_exposure = true;
-	float color_strength = 1.0f;
-	float transfer_strength = 1.0f;
-	bool  smooth_exposure = true;     // the toggle; when off the rate is forced to 1.0
-	float scale_reset_tol = 0.15f;    // ratio drift before NR's history is discarded; 0 = never
-	float exposure_smoothing = 0.05f; // per-frame weight of the new exposure sample; 1.0 = off
-	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
-	int   mv_convention = 0;  // index into kMvConventions
-	bool  mv_invert_x = false;
-	bool  mv_invert_y = false;
-	bool  mv_legacy_clip = false; // reproduce the pre-row_major transposed camera branch
-	// [STRAYDLSS] NgxNRRestoreHistory, default OFF (histplan::Config carries the reasoning).
-	// Live, and deliberately so: it is the A/B for the SSR drift, and every other hypothesis in
-	// this project was settled by flipping something inside ONE session rather than across two
-	// launches. Overwritten at startup with what the ini said. (src/nr_history.hpp)
-	bool  restore_history = false;
-};
+
+// [STRAYDLSS] hash override file state; -1: no file.
+int g_extra_hashes_loaded = -1;
+
+} // namespace
+
 
 // Which branch of the resolve gets its sign flipped. UE4's velocity buffer is sparse, so the
 // shader has two paths and they were derived separately; an inverted one is branch-selective and
 // shows only on moving objects. Exposed rather than guessed — see mv_resolve.hpp.
-const char *const kMvConventions[] = {
+const char *const kMvConventions[4] = {
 	"Default (no flip)",
 	"Invert moving objects",
 	"Invert camera",
 	"Invert both",
 };
-NrUiState g_nr_ui;
+
+namespace {
+
+// The live NR state (NrLive) and its push-down, file-static so the moved bodies keep their
+// names; the host reaches them through DlssApp::nr_live() / apply_nr_live().
+NrLive g_nr_ui;
 
 // Push the whole live set down at once. Cheap (three stores plus a few globals) and called only
 // when a control actually changed, so there is no per-frame cost to having the overlay open.
-void apply_nr_ui()
+void apply_nr_live_impl()
 {
 	nr::set_tuning(g_nr_ui.intensity, g_nr_ui.local_tone, g_nr_ui.local_structure);
 	nr::set_renodx_tuning(g_nr_ui.skin_structure,
@@ -277,18 +236,47 @@ void apply_nr_ui()
 	mv::set_legacy_transposed_clip(g_nr_ui.mv_legacy_clip);
 }
 
-void on_init_device(reshade::api::device *device)
+} // namespace
+
+DlssApp &instance()
 {
-	if (device->get_api() != reshade::api::device_api::d3d12)
+	static DlssApp app;
+	return app;
+}
+
+NrLive &DlssApp::nr_live() { return g_nr_ui; }
+void DlssApp::apply_nr_live() { apply_nr_live_impl(); }
+
+Status DlssApp::status() const
+{
+	Status s;
+	s.have_device = g_state.native_device != nullptr;
+	s.is_vkd3d = g_state.is_vkd3d;
+	s.frame = g_state.frame_index.load(std::memory_order_relaxed);
+	s.compute_pipelines = g_state.compute_pipelines_seen.load(std::memory_order_relaxed);
+	s.taa_pipelines = g_state.taa_pipelines_seen.load(std::memory_order_relaxed);
+	s.dispatches = g_state.dispatches_seen.load(std::memory_order_relaxed);
+	s.ngx_attempted = g_state.ngx_attempted.load(std::memory_order_relaxed);
+	s.shader_census = g_state.shader_census.load(std::memory_order_relaxed);
+	s.extra_hashes_loaded = g_extra_hashes_loaded;
+	return s;
+}
+
+void DlssApp::on_device(ID3D12Device *native, bool created)
+{
+	if (!created)
 	{
-		STRAY_LOG_ERROR("Device is not D3D12 (api=%d). This add-on does nothing on other APIs.",
-			static_cast<int>(device->get_api()));
+
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		nrhist::shutdown();
+		nrhook::shutdown();
+		nr::shutdown();
+		if (g_state.ngx_attempted.load(std::memory_order_relaxed))
+			ngx::shutdown(g_state.native_device);
+		g_state.native_device = nullptr;
+		g_state.compute_pipeline_hashes.clear();
 		return;
 	}
-
-	// get_native() returns uint64_t and hands back the ORIGINAL vkd3d device, not a ReShade
-	// proxy. That is exactly what NGX must be initialised with. (docs/RESEARCH.md §1.2)
-	auto *native = reinterpret_cast<ID3D12Device *>(device->get_native());
 
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	g_state.native_device = native;
@@ -504,7 +492,7 @@ void on_init_device(reshade::api::device *device)
 	nr_smooth = host::cfg::get_int("NgxNRSmoothExposure", nr_smooth);
 	g_nr_ui.smooth_exposure = nr_smooth != 0;
 	g_nr_ui.enabled = ngx_nr;
-	apply_nr_ui();
+	apply_nr_live_impl();
 	const float nr_paper_white = g_nr_ui.paper_white;
 	const float nr_color_strength = g_nr_ui.color_strength;
 	const float nr_transfer_strength = g_nr_ui.transfer_strength;
@@ -694,29 +682,17 @@ void on_init_device(reshade::api::device *device)
 	load_hash_override_file();
 }
 
-void on_destroy_device(reshade::api::device *device)
+void DlssApp::on_command_list(const icept::CommandContext &ctx, bool created)
 {
-	if (device->get_api() != reshade::api::device_api::d3d12)
+	if (!created)
 		return;
 
-	std::lock_guard<std::mutex> lock(g_state.mutex);
-	nrhist::shutdown();
-	nrhook::shutdown();
-	nr::shutdown();
-	if (g_state.ngx_attempted.load(std::memory_order_relaxed))
-		ngx::shutdown(g_state.native_device);
-	g_state.native_device = nullptr;
-	g_state.compute_pipeline_hashes.clear();
-}
-
-void on_init_command_list(reshade::api::command_list *cmd_list)
-{
 	// One-shot vkd3d probe. Doing it here rather than at device init because the detector
 	// interface lives on the command list.
 	if (g_state.is_vkd3d)
 		return;
 
-	auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+	ID3D12GraphicsCommandList *native = ctx.native;
 	if (native == nullptr)
 		return;
 
@@ -733,169 +709,111 @@ void on_init_command_list(reshade::api::command_list *cmd_list)
 	}
 }
 
-void on_reset_command_list(reshade::api::command_list *cmd_list)
+void DlssApp::on_command_list_reset(const icept::CommandContext &ctx)
 {
-	reset_command_list_state(cmd_list);
-	taa_hook::forget_command_list(cmd_list);
-	pass_finder::forget_command_list(cmd_list);
-	gbuffer_finder::forget_command_list(cmd_list);
+
+	taa_hook::forget_command_list(ctx);
+	pass_finder::forget_command_list(ctx);
+	gbuffer_finder::forget_command_list(ctx);
 }
 
-void on_push_constants(
-	reshade::api::command_list *cmd_list,
-	reshade::api::shader_stage stages,
-	reshade::api::pipeline_layout layout,
-	uint32_t layout_param,
-	uint32_t first,
-	uint32_t count,
-	const void *values) // const void*, not const uint32_t* — see reshade_events.hpp:1896
-{
-	note_push_constants(cmd_list, stages, layout, layout_param, first, count, values);
-}
 
-void on_init_pipeline_layout(
-	reshade::api::device *device,
-	uint32_t count,
-	const reshade::api::pipeline_layout_param *params,
-	reshade::api::pipeline_layout layout)
+void DlssApp::on_pipeline(std::uint64_t pipeline, const void *code, std::size_t code_size,
+                          icept::ShaderKind kind, bool created)
 {
-	note_pipeline_layout(device, count, params, layout);
-}
-
-void on_destroy_pipeline_layout(reshade::api::device *device, reshade::api::pipeline_layout layout)
-{
-	(void)device;
-	forget_pipeline_layout(layout);
-}
-
-void on_init_pipeline(
-	reshade::api::device *device,
-	reshade::api::pipeline_layout layout,
-	uint32_t subobject_count,
-	const reshade::api::pipeline_subobject *subobjects,
-	reshade::api::pipeline pipeline)
-{
-	(void)device;
-	(void)layout;
-
-	for (uint32_t i = 0; i < subobject_count; ++i)
+	if (!created)
 	{
-		const bool is_compute =
-			subobjects[i].type == reshade::api::pipeline_subobject_type::compute_shader;
-		const bool is_pixel =
-			subobjects[i].type == reshade::api::pipeline_subobject_type::pixel_shader;
-		if (!is_compute && !is_pixel)
-			continue;
+		// ID3D12PipelineState pointers get recycled, so eviction is not optional.
+		taa_hook::forget_pipeline(pipeline);
+		pass_finder::forget_pipeline(pipeline);
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.compute_pipeline_hashes.erase(pipeline);
+		return;
+	}
 
-		const auto *shader = static_cast<const reshade::api::shader_desc *>(subobjects[i].data);
-		if (shader == nullptr || shader->code == nullptr || shader->code_size == 0)
-			continue;
+	const bool is_compute = kind == icept::ShaderKind::compute;
+	if (code == nullptr || code_size == 0)
+		return;
 
-		const std::uint64_t hash = fnv1a64(shader->code, shader->code_size);
+	const std::uint64_t hash = fnv1a64(code, code_size);
 
-		{
-			std::lock_guard<std::mutex> lock(g_state.mutex);
-			g_state.distinct_shader_hashes.insert(hash);
-		}
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.distinct_shader_hashes.insert(hash);
+	}
 
-		if (!is_compute)
-		{
-			// The census counts PS too, but only CS is hashed for identification. The pass
-			// finder additionally attributes draws by pixel-shader hash.
-			pass_finder::note_pipeline(pipeline.handle, hash, /*is_compute=*/false);
-			continue;
-		}
+	if (!is_compute)
+	{
+		// The census counts PS too, but only CS is hashed for identification. The pass
+		// finder additionally attributes draws by pixel-shader hash.
+		pass_finder::note_pipeline(pipeline, hash, /*is_compute=*/false);
+		return;
+	}
 
-		{
-			std::lock_guard<std::mutex> lock(g_state.mutex);
-			g_state.compute_pipeline_hashes[pipeline.handle] = hash;
-		}
-		g_state.compute_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
-		pass_finder::note_pipeline(pipeline.handle, hash, /*is_compute=*/true);
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.compute_pipeline_hashes[pipeline] = hash;
+	}
+	g_state.compute_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
+	pass_finder::note_pipeline(pipeline, hash, /*is_compute=*/true);
 
-		// Getting the real bytecode off the user's machine settles the binding layout
-		// offline, which is worth far more than any inference we could make here.
-		shader_dump::dump_compute_shader(hash, shader->code, shader->code_size);
-		taa_hook::set_pipeline_hash(pipeline.handle, hash);
+	// Getting the real bytecode off the user's machine settles the binding layout
+	// offline, which is worth far more than any inference we could make here.
+	shader_dump::dump_compute_shader(hash, code, code_size);
+	taa_hook::set_pipeline_hash(pipeline, hash);
 
-		if (is_known_taa_hash(hash))
-		{
-			g_state.taa_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
-			STRAY_LOG_INFO("FOUND FTAAStandaloneCS permutation: hash=0x%016llx "
-				"pipeline=0x%016llx bytes=%zu",
-				static_cast<unsigned long long>(hash),
-				static_cast<unsigned long long>(pipeline.handle),
-				shader->code_size);
-		}
-		else if (hash == kDenoiserLookalikeHash)
-		{
-			STRAY_LOG_INFO("Saw the denoiser look-alike 0x%016llx (cb1[126], not TAA) - not hooking",
-				static_cast<unsigned long long>(hash));
-		}
-		else if (hash == kSecondCandidateHash)
-		{
-			STRAY_LOG_INFO("Saw 0x%016llx (11 SRVs, cb1[131], not TAA) - not hooking",
-				static_cast<unsigned long long>(hash));
-		}
+	if (is_known_taa_hash(hash))
+	{
+		g_state.taa_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
+		STRAY_LOG_INFO("FOUND FTAAStandaloneCS permutation: hash=0x%016llx "
+			"pipeline=0x%016llx bytes=%zu",
+			static_cast<unsigned long long>(hash),
+			static_cast<unsigned long long>(pipeline),
+			code_size);
+	}
+	else if (hash == kDenoiserLookalikeHash)
+	{
+		STRAY_LOG_INFO("Saw the denoiser look-alike 0x%016llx (cb1[126], not TAA) - not hooking",
+			static_cast<unsigned long long>(hash));
+	}
+	else if (hash == kSecondCandidateHash)
+	{
+		STRAY_LOG_INFO("Saw 0x%016llx (11 SRVs, cb1[131], not TAA) - not hooking",
+			static_cast<unsigned long long>(hash));
 	}
 }
 
-void on_destroy_pipeline(reshade::api::device *device, reshade::api::pipeline pipeline)
-{
-	(void)device;
-	// ID3D12PipelineState pointers get recycled, so eviction is not optional.
-	taa_hook::forget_pipeline(pipeline.handle);
-	pass_finder::forget_pipeline(pipeline.handle);
-	std::lock_guard<std::mutex> lock(g_state.mutex);
-	g_state.compute_pipeline_hashes.erase(pipeline.handle);
-}
-
-void on_bind_pipeline(
-	reshade::api::command_list *cmd_list,
-	reshade::api::pipeline_stage stages,
-	reshade::api::pipeline pipeline)
+void DlssApp::on_bind_pipeline(const icept::CommandContext &ctx, std::uint64_t pipeline)
 {
 	// NOTE: in D3D12 this fires with pipeline_stage::all, NOT compute_shader. Filtering on
-	// the compute stage here would silently miss every event. (docs/RESEARCH.md §2.3)
-	(void)stages;
-	g_state.saw_bind_pipeline.store(true, std::memory_order_relaxed);
+	// the compute stage would silently miss every event. (docs/RESEARCH.md §2.3)
 
 	// Remember the pipeline per command list so a dispatch can be attributed to a hash.
-	taa_hook::set_bound_pipeline(cmd_list, pipeline.handle);
-	pass_finder::note_bind_pipeline(cmd_list, pipeline.handle);
+	taa_hook::set_bound_pipeline(ctx, pipeline);
+	pass_finder::note_bind_pipeline(ctx, pipeline);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
-	if (g_state.compute_pipeline_hashes.count(pipeline.handle) != 0)
-		g_state.bound_compute_pipeline[cmd_list] = pipeline.handle;
+	if (g_state.compute_pipeline_hashes.count(pipeline) != 0)
+		g_state.bound_compute_pipeline[ctx.native] = pipeline;
 }
 
-void on_push_descriptors(
-	reshade::api::command_list *cmd_list,
-	reshade::api::shader_stage stages,
-	reshade::api::pipeline_layout layout,
-	uint32_t layout_param,
-	const reshade::api::descriptor_table_update &update)
+bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std::uint32_t y, std::uint32_t z)
 {
-	g_state.saw_push_descriptors.store(true, std::memory_order_relaxed);
-	note_push_descriptors(cmd_list, stages, layout, layout_param, update);
-}
 
-bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
-{
 	g_state.dispatches_seen.fetch_add(1, std::memory_order_relaxed);
 
-	if (taa_hook::intercept_dispatch(cmd_list, x, y, z))
+	if (taa_hook::intercept_dispatch(ctx, x, y, z))
 		return true;
 
 	// Strictly AFTER the intercept decision: a suppressed dispatch never executes, and
 	// recording one would enter a phantom writer into the pass finder's last-writer table.
-	pass_finder::note_dispatch(cmd_list, x, y, z);
+	pass_finder::note_dispatch(ctx, x, y, z);
 
 	if (shader_dump::enabled() || gbuffer_finder::enabled())
 	{
 		std::uint64_t hash = 0;
 		{
 			std::lock_guard<std::mutex> lock(g_state.mutex);
-			const auto bound = g_state.bound_compute_pipeline.find(cmd_list);
+			const auto bound = g_state.bound_compute_pipeline.find(ctx.native);
 			if (bound != g_state.bound_compute_pipeline.end())
 			{
 				const auto it = g_state.compute_pipeline_hashes.find(bound->second);
@@ -909,7 +827,7 @@ bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, u
 				shader_dump::note_dispatch(hash, x, y, z);
 			// The G-buffer finder's SSR-denoiser cross-check. It resolves bindings only
 			// for the one known denoiser hash, so this is a no-op for everything else.
-			gbuffer_finder::note_dispatch(cmd_list, hash);
+			gbuffer_finder::note_dispatch(ctx, hash);
 		}
 	}
 	// Skeleton stage: observe only. Returning true here is what will eventually suppress the
@@ -917,20 +835,52 @@ bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, u
 	return false;
 }
 
-void on_present(
-	reshade::api::command_queue *queue,
-	reshade::api::swapchain *swapchain,
-	const reshade::api::rect *source_rect,
-	const reshade::api::rect *dest_rect,
-	uint32_t dirty_rect_count,
-	const reshade::api::rect *dirty_rects)
+void DlssApp::on_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
+                                const icept::DescriptorId *rtvs, icept::DescriptorId dsv,
+                                bool via_render_pass)
 {
-	(void)source_rect;
-	(void)dest_rect;
-	(void)dirty_rect_count;
-	(void)dirty_rects;
+	// The render-target event feeds both finders (when either is on) and, at
+	// NgxNRHook=preui, the NR trigger — which never listened to begin_render_pass, so the
+	// flag keeps that exact split. Each callee is a cheap no-op when its feature is off.
+	pass_finder::note_render_targets(ctx, count, rtvs, dsv);
+	gbuffer_finder::note_render_targets(ctx, count, rtvs, dsv);
+	if (!via_render_pass)
+		nrhook::on_bind_render_targets(ctx, count, rtvs, dsv);
+}
 
-	const uint64_t frame = g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
+void DlssApp::on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count)
+{
+	pass_finder::note_draw(ctx, vertex_or_index_count);
+	gbuffer_finder::note_draw(ctx);
+}
+
+void DlssApp::on_copy(const icept::CommandContext &ctx, icept::ResourceId src, icept::ResourceId dst)
+{
+	pass_finder::note_copy(ctx, src, dst);
+}
+
+void DlssApp::on_execute(const icept::CommandContext &ctx)
+{
+	pass_finder::note_execute(ctx);
+}
+
+void DlssApp::on_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count, bool created)
+{
+	if (created)
+		nrhook::note_swapchain(back_buffers, count);
+	else
+		nrhook::forget_swapchain();
+}
+
+std::uint64_t DlssApp::next_frame()
+{
+	return g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DlssApp::on_present(const icept::PresentContext &pc)
+{
+
+	const uint64_t frame = pc.frame;
 
 	// Frame-time sampling and the periodic CPU-share report. Fed the cumulative counters we
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
@@ -945,7 +895,7 @@ void on_present(
 	// command list, which the D3D12 present path flushes at dxgi_swapchain.cpp:1009 — after this
 	// event and after the game has submitted every command list of the frame to the same queue,
 	// so the copy executes after every same-frame consumer of `u0`. (src/nr_history.hpp)
-	nrhist::on_present(frame, queue);
+	nrhist::on_present(pc);
 
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
@@ -958,8 +908,7 @@ void on_present(
 	// The pass finder's frame boundary. The presented back buffer is its fallback anchor
 	// when no tonemapper (3D LUT SRV) was seen this frame.
 	if (pass_finder::enabled())
-		pass_finder::on_present(frame, swapchain != nullptr
-			? swapchain->get_current_back_buffer() : reshade::api::resource{ 0 });
+		pass_finder::on_present(frame, reinterpret_cast<icept::ResourceId>(pc.back_buffer));
 
 	// The G-buffer finder's frame boundary: stability accounting and the (log-only)
 	// identification report. (gbuffer_finder.hpp, DLSS-RR phase 1)
@@ -1039,7 +988,6 @@ void on_present(
 			// looks like. That makes the device choice worth testing rather than assuming, so
 			// it can be forced either way from the ini.
 			char device_pref[16] = "auto";
-			size_t device_pref_size = sizeof(device_pref);
 			host::cfg::get_string("NgxDevice", device_pref, sizeof(device_pref));
 			const bool force_native = std::strcmp(device_pref, "native") == 0;
 			const bool force_proxy = std::strcmp(device_pref, "proxy") == 0;
@@ -1170,39 +1118,192 @@ void on_present(
 	if (frame == 2400)
 		taa_hook::dump_summary();
 
-	if (frame == 300 && !g_state.reported_capability_verdict.exchange(true))
+}
+
+EventNeeds DlssApp::configure_events()
+{
+	EventNeeds needs;
+
+	bool hash_shaders = true;
+	hash_shaders = host::cfg::get_bool("HashShaders", hash_shaders);
+
+	// [STRAYDLSS] PassFinder, default OFF: dataflow identification of the TAA pass — the
+	// bounded walk backwards from the tonemapper (core/pass_walk.hpp), proven in CI and here
+	// only LOGGING its verdict against the live game. It attributes events by shader hash,
+	// so enabling it forces the pipeline events (and their PSO-cache cost) on.
+	bool pass_finder_enabled = false;
+	pass_finder_enabled = host::cfg::get_bool("PassFinder", pass_finder_enabled);
+	pass_finder::set_enabled(pass_finder_enabled);
+
+	// [STRAYDLSS] GBufferFinder, default OFF: log-only identification of the base pass's
+	// G-buffer targets for DLSS Ray Reconstruction (gbuffer_finder.hpp). It needs the
+	// render-target/draw events below, and the pipeline events for the SSR-denoiser
+	// cross-check's shader hash.
+	bool gbuffer_finder_enabled = false;
+	gbuffer_finder_enabled = host::cfg::get_bool("GBufferFinder", gbuffer_finder_enabled);
 	{
-		const bool full_addon_build =
-			g_state.saw_bind_pipeline.load(std::memory_order_relaxed) &&
-			g_state.saw_push_descriptors.load(std::memory_order_relaxed);
-
-		if (full_addon_build)
+		// NgxRR=2 consumes the finder's identification (taa_hook::try_evaluate_rr), so the
+		// finder must observe even when GBufferFinder was not set explicitly. Read here as
+		// well as in on_init_device because event registration happens first.
+		int ngx_rr_for_finder = 0;
+		ngx_rr_for_finder = host::cfg::get_int("NgxRR", ngx_rr_for_finder);
+		if ((ngx_rr_for_finder == 2 || ngx_rr_for_finder == 3) && !gbuffer_finder_enabled)
 		{
-			STRAY_LOG_INFO("Add-on event check OK: bind_pipeline and push_descriptors both observed");
+			gbuffer_finder_enabled = true;
+			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2/3 needs the G-buffer "
+				"identification it produces.");
 		}
-		else
-		{
-			STRAY_LOG_ERROR("Add-on event check FAILED after 300 frames "
-				"(bind_pipeline=%d push_descriptors=%d).",
-				g_state.saw_bind_pipeline.load(std::memory_order_relaxed) ? 1 : 0,
-				g_state.saw_push_descriptors.load(std::memory_order_relaxed) ? 1 : 0);
-			STRAY_LOG_ERROR("  These events require a ReShade build with full add-on support "
-				"(RESHADE_ADDON >= 2). Reinstall ReShade 6.8+ with add-on support enabled.");
-		}
-
-		STRAY_LOG_INFO("Census at frame 300: compute pipelines=%u, TAA matches=%u, dispatches=%u",
-			g_state.compute_pipelines_seen.load(std::memory_order_relaxed),
-			g_state.taa_pipelines_seen.load(std::memory_order_relaxed),
-			g_state.dispatches_seen.load(std::memory_order_relaxed));
 	}
+	gbuffer_finder::set_enabled(gbuffer_finder_enabled);
+
+	needs.pipeline_events = hash_shaders || shader_dump::enabled() ||
+		pass_finder_enabled || gbuffer_finder_enabled;
+
+	if (needs.pipeline_events)
+	{
+		STRAY_LOG_WARN("Pipeline events registered: ReShade will drop the D3D12 PSO cache, so "
+			"EXPECT A VERY SLOW FIRST LOAD while every shader recompiles.");
+		STRAY_LOG_WARN("  Set [STRAYDLSS] HashShaders=0 (and DumpShaders=0) to get normal load "
+			"times once the bytecode has been captured.");
+	}
+	else
+	{
+		STRAY_LOG_INFO("Pipeline hashing disabled; the TAA pass will be identified structurally.");
+	}
+	// ReShade's own state_tracking does not register this, which is why its state_block can
+	// never replay root constants.
+
+	if (pass_finder_enabled || gbuffer_finder_enabled)
+	{
+		needs.finder_rt_events = true;
+		// Logged so a pasted log PROVES the events were registered for this combination of
+		// flags — the 2026-08-31 GBufferFinder run could not distinguish "tap registered
+		// but never fired" from "tap never registered" after the fact.
+		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
+			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
+	}
+	// [STRAYDLSS] NgxNRHook: taa (default) | present | preui. Where DLSS Neural Rendering runs.
+	// The whole argument for moving it — and what each site costs — is in src/nr_hook.hpp.
+	{
+		char nr_hook[16] = "taa";
+		host::cfg::get_string("NgxNRHook", nr_hook, sizeof(nr_hook));
+		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
+		nrhook::set_hook_mode(mode);
+
+		int preui_bind = 2;
+		preui_bind = host::cfg::get_int("NgxNRPreUiBind", preui_bind);
+		nrhook::set_preui_bind_ordinal(preui_bind < 0 ? 0u : static_cast<unsigned int>(preui_bind));
+
+		// Shared with the TAA path; only consulted on `preui`, which records onto the GAME's
+		// command list. Re-read here for the same reason the mode is.
+		bool restore_state = true;
+		restore_state = host::cfg::get_bool("RestoreState", restore_state);
+		nrhook::set_restore_state(restore_state);
+
+		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
+			mode == nrplan::HookMode::taa
+				? "DLSS Neural Rendering runs inside the intercepted TAA dispatch, writing the "
+				  "engine's u0 — which UE 4.27 also extracts as the next frame's temporal "
+				  "history, so NR's answer compounds. This is the shipped default and the "
+				  "fallback."
+			: mode == nrplan::HookMode::present
+				? "DLSS Neural Rendering runs at reshade_begin_effects, on the composited back "
+				  "buffer. No feedback path by construction, and no pass identification — but "
+				  "the UI is already drawn, and ReShade only fires this event when at least one "
+				  "effect file is LOADED."
+				: "DLSS Neural Rendering runs at the pre-UI render-target boundary: after the "
+				  "scene composite, before Slate draws the HUD. No feedback path AND no HUD "
+				  "pixels in the network. Watch the NR hook census lines to confirm "
+				  "NgxNRPreUiBind.");
+
+		if (mode == nrplan::HookMode::preui)
+		{
+			needs.nr_preui_events = true;
+		}
+		else if (mode == nrplan::HookMode::present)
+		{
+			needs.nr_present_events = true;
+		}
+
+		// [STRAYDLSS] NgxNRRestoreHistory, default ON. Keeps NR's residual out of the engine's
+		// temporal history at the `taa` site by snapshotting u0 before the decode and putting it
+		// back at present. Read alongside the hook mode because it is only meaningful for one of
+		// them, and inert (loudly) for the other two. Full argument: src/nr_history.hpp.
+		bool restore_history = false;
+		restore_history = host::cfg::get_bool("NgxNRRestoreHistory", restore_history);
+		nrhist::set_enabled(restore_history);
+		nrhist::set_site(mode);
+		g_nr_ui.restore_history = restore_history;
+
+		// The one hypothesis in that path: which D3D12_RESOURCE_STATES u0 is in at present time,
+		// where the restore copy is recorded on a different command list from the snapshot. 0
+		// keeps the derived default (0xC0 = NON_PIXEL|PIXEL_SHADER_RESOURCE); the derivation is
+		// in src/nr_history.cpp and is echoed in full on the first restore.
+		int restore_state_bits = 0;
+		restore_state_bits = host::cfg::get_int("NgxNRRestoreState", restore_state_bits);
+		nrhist::set_image_state_at_present(restore_state_bits <= 0
+			? 0u : static_cast<unsigned int>(restore_state_bits));
+
+		if (mode == nrplan::HookMode::taa)
+			STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
+				"the pre-NR image of u0 aside inside the TAA dispatch and copies it back at "
+				"present, so UE 4.27's TemporalAAHistory.RT[0] — which "
+				"ScreenSpaceRayTracing.cpp:596-620 reads on the NEXT frame — never holds the "
+				"neural residual; the DISPLAYED frame is unchanged either way, because every "
+				"same-frame consumer of u0 has already run by Present. It is OFF by default "
+				"because the SSR fade stopped reproducing on 2026-09-01 and the restore rests on "
+				"an INFERRED state for u0 at present (assumed 0x%X; [STRAYDLSS] NgxNRRestoreState "
+				"overrides) — four UE 4.27 source anchors, no measurement. Flip it live in the "
+				"DLSS Neural Rendering overlay the moment the fade returns; the whole diagnosis "
+				"is in src/nr_history.hpp.",
+				restore_history ? 1 : 0,
+				restore_history
+					? "ENABLED, so the engine's temporal history is being kept pristine."
+					: "Off, so NR's residual re-enters the engine's temporal state every frame "
+					  "exactly as it did before this feature existed — which is the SHIPPED "
+					  "behaviour, not a fault.",
+				nrhist::image_state_at_present());
+		else
+			STRAY_LOG_INFO("NgxNRRestoreHistory is INERT at NgxNRHook=%s: a post-tonemap site has "
+				"no feedback path to close by construction (every QueueTextureExtraction into "
+				"PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is "
+				"at 777), so nothing is snapshotted and nothing is restored.",
+				nrplan::hook_mode_name(mode));
+	}
+
+	if (pass_finder_enabled)
+		needs.pass_finder_events = true;
+
+
+	return needs;
+}
+
+void DlssApp::log_final_census(bool saw_bind_pipeline, bool saw_push_descriptors)
+{
+	// A final census, unconditionally. The frame-300 census is driven by present events,
+	// so it never runs in a headless host — and a headless host is exactly how CI loads
+	// this add-on into the real ReShade with no game. Logging it on detach also gives
+	// field reports a definitive "what did the add-on actually see" line even when the
+	// user closes the game before frame 300.
+	{
+		std::uint32_t attempts = 0, skipped = 0;
+		taa_hook::resolve_counters(attempts, skipped);
+		STRAY_LOG_INFO("Resolve attempts=%u skipped_stale=%u (%.1f%%) — a skipped frame "
+			"contributes no motion vectors.", attempts, skipped,
+			attempts ? (100.0 * skipped / attempts) : 0.0);
+	}
+	STRAY_LOG_INFO("Final census: compute pipelines=%u, TAA matches=%u, dispatches=%u, "
+		"bind_pipeline=%d, push_descriptors=%d",
+		g_state.compute_pipelines_seen.load(std::memory_order_relaxed),
+		g_state.taa_pipelines_seen.load(std::memory_order_relaxed),
+		g_state.dispatches_seen.load(std::memory_order_relaxed),
+		saw_bind_pipeline ? 1 : 0, saw_push_descriptors ? 1 : 0);
 }
 
 // [STRAYDLSS] hash override file: one fnv1a64 per line (0x-prefixed or bare hex, # comments),
 // generated offline by tools/stray_taa_hashes.py after a game update. Read from the game's
 // working directory, the same place ReShade.log lands.
-int g_extra_hashes_loaded = -1; // -1: no file
-
-void load_hash_override_file()
+void DlssApp::load_hash_override_file()
 {
 	std::FILE *f = nullptr;
 	fopen_s(&f, "stray-dlss-hashes.txt", "r");
@@ -1269,756 +1370,5 @@ void load_hash_override_file()
 // every dispatch, so an edit lands on the next frame with no feature recreation. The values are
 // NOT written back to ReShade.ini automatically — "Save to ReShade.ini" does that on demand,
 // because ReShade rewrites its config on exit and a silent autosave would make an experiment
-// permanent without the user deciding it should be.
-void draw_nr_controls()
-{
-	if (!ImGui::CollapsingHeader("DLSS Neural Rendering (feature 18)"))
-		return;
 
-	// WHERE NR runs. Display only, never a control: NgxNRHook decides which ReShade events get
-	// registered, and registration happens once from DllMain — so a live toggle would silently
-	// do nothing. Changing it means editing ReShade.ini and relaunching.
-	const nrplan::HookMode hook = nrhook::hook_mode();
-	const nrhook::Counters hc = nrhook::counters();
-	ImGui::Text("Hook site:  %s  (NgxNRHook, restart to change)", nrplan::hook_mode_name(hook));
-	if (hook != nrplan::HookMode::taa)
-	{
-		ImGui::Text("  post-tonemap: triggered %llu  applied %llu",
-			static_cast<unsigned long long>(hc.triggered),
-			static_cast<unsigned long long>(hc.applied));
-		if (hook == nrplan::HookMode::preui)
-			ImGui::Text("  back buffers known %u | RTV binds: last %u  max %u "
-				"(NgxNRPreUiBind), frames with no boundary %u",
-				hc.back_buffers_known, hc.last_backbuffer_binds, hc.max_backbuffer_binds,
-				hc.frames_without_boundary);
-		else
-			ImGui::Text("  reshade_begin_effects fired %llu times%s",
-				static_cast<unsigned long long>(hc.begin_effects_seen),
-				hc.begin_effects_seen == 0 ? "  <-- NO EFFECTS LOADED: this site does not exist"
-					: "");
-		for (int i = 0; i < nrplan::kPlanResultCount; ++i)
-			if (hc.reasons[i] != 0)
-				ImGui::Text("    %-20s %u",
-					nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)), hc.reasons[i]);
-	}
-	ImGui::Separator();
-
-	std::uint64_t applied = 0, refused = 0;
-	std::uint32_t reasons[nr::kNrRefusalCount] = {};
-	nr::counters(applied, refused, reasons);
-	ImGui::Text("applied %llu  refused %llu  validated %s",
-		static_cast<unsigned long long>(applied), static_cast<unsigned long long>(refused),
-		nr::validated() ? "yes" : "no");
-	ImGui::Separator();
-
-	bool changed = false;
-
-	// The master switch only gates whether apply() runs; the runtime stays loaded either way,
-	// so this toggles cleanly in both directions without touching the GPU.
-	if (ImGui::Checkbox("Enabled", &g_nr_ui.enabled))
-	{
-		nr::set_enabled(g_nr_ui.enabled);
-	}
-
-	// THE SSR-DRIFT A/B. `u0` is both this frame's scene colour and the next frame's
-	// HistoryBuffer[0] (TemporalAA.cpp:696/:969), so NR's residual re-enters the engine's
-	// temporal state and compounds. With this on, the pristine pre-NR image is copied aside
-	// inside the TAA dispatch and copied back at present — after every same-frame consumer has
-	// run, so the DISPLAYED frame is identical either way and only the drift changes. Live on
-	// purpose: turning it off mid-session and watching a wet floor or the menu's light shafts is
-	// the measurement. (src/nr_history.hpp)
-	const nrhist::Counters histc = nrhist::counters();
-	if (hook == nrplan::HookMode::taa)
-	{
-		changed |= ImGui::Checkbox("Restore engine history (keeps NR out of TAA history)",
-			&g_nr_ui.restore_history);
-		ImGui::Text("  snapshots %llu  restores %llu  harmful misses %llu%s",
-			static_cast<unsigned long long>(histc.snapshots),
-			static_cast<unsigned long long>(histc.restores),
-			static_cast<unsigned long long>(histc.harmful_misses),
-			histc.harmful_misses != 0 ? "  <-- frames whose residual DID reach the history" : "");
-		for (int i = 0; i < histplan::kStepCount; ++i)
-		{
-			const std::uint32_t total = histc.snapshot_reasons[i] + histc.restore_reasons[i];
-			if (total != 0 && i != static_cast<int>(histplan::Step::ok))
-				ImGui::Text("    %-20s %u",
-					histplan::step_name(static_cast<histplan::Step>(i)), total);
-		}
-	}
-	else
-	{
-		// Not a control here, and saying so beats a greyed-out box nobody can explain: a
-		// post-tonemap site has no feedback path to close by construction.
-		ImGui::TextUnformatted("Restore engine history: INERT at this hook site (no feedback "
-			"path post-tonemap)");
-	}
-
-	ImGui::TextUnformatted("HDR colour codec");
-	// Below 1.0 is legal and is the useful direction here: the shader's multiplier is
-	// 1/paperWhite, so raising this multiplies the colour DOWN, and Stray's scene colour already
-	// carries UE4's pre-exposure. The soft clip saturates at an input near 3.474, so there is no
-	// point going far above that.
-	changed |= ImGui::SliderFloat("Paper white", &g_nr_ui.paper_white, 0.01f, 8.0f, "%.3f");
-	// With tracking ON the engine's OneOverPreExposure supplies the ~18x this scene needs, so
-	// paper white should sit near 1.0; with it OFF the user has to supply that factor by hand,
-	// which is how ~0.1 came to look best. Read the "NR codec scale" line to see the split.
-	changed |= ImGui::Checkbox("Track engine exposure (TAA site only)",
-		&g_nr_ui.track_exposure);
-	// 0 keeps the ORIGINAL's chromaticity and carries only the network's luminance change — the
-	// escape hatch for a colour cast.
-	changed |= ImGui::SliderFloat("Colour strength", &g_nr_ui.color_strength, 0.0f, 1.0f, "%.2f");
-	// 0 is an EXACT bit-for-bit bypass, which makes it the honest A/B against "NR off".
-	changed |= ImGui::SliderFloat("Transfer strength", &g_nr_ui.transfer_strength, 0.0f, 1.0f,
-		"%.2f");
-	// 1.0 reproduces the unsmoothed behaviour. Lower is steadier; NR's own history is
-	// accumulated at this scale, so jitter here shows up as flicker that intensity amplifies.
-	changed |= ImGui::Checkbox("Smooth exposure", &g_nr_ui.smooth_exposure);
-	if (g_nr_ui.smooth_exposure)
-	{
-		ImGui::SameLine();
-		changed |= ImGui::SliderFloat("rate", &g_nr_ui.exposure_smoothing, 0.002f, 1.0f, "%.4f");
-	}
-	// How far the scale may drift before NR's history is thrown away. Measured live: the
-	// exposure factor swings ~20% during normal play, so a tight tolerance resets the history
-	// many times a minute — which is its own flicker source. 0 disables the latch entirely and
-	// lets the history ride through the drift instead.
-	changed |= ImGui::SliderFloat("Scale reset tol (0=never)", &g_nr_ui.scale_reset_tol, 0.0f,
-		2.0f, "%.2f");
-
-	// THE MOTION KNOB. Our motion vectors are render-resolution (1920x1080) while the colour is
-	// the output rect (3840x2160). Whether the runtime wants them in the guide's own pixels
-	// (1.0, since MVecSubrectWidth/Height already declare that rect) or in colour pixels (2.0)
-	// is NOT documented for this leaked runtime, and it is exactly the kind of error that looks
-	// perfect on a still frame and noisy in motion — a still frame needs no reprojection at all.
-	// 0 means "use the built-in default"; try 1.0 against 2.0 while panning the camera.
-	ImGui::Separator();
-	ImGui::TextUnformatted("Motion");
-	changed |= ImGui::SliderFloat("MVec scale (0=auto)", &g_nr_ui.mvec_scale, 0.0f, 4.0f, "%.2f");
-	// NOTE: this also affects DLSS SR, which consumes the same resolve — so a change here is not
-	// isolated to NR, and an improvement may show up in both.
-	changed |= ImGui::Combo("MV convention", &g_nr_ui.mv_convention, kMvConventions,
-		static_cast<int>(std::size(kMvConventions)));
-	// The row_major fix: ON reproduces the OLD transposed camera branch, so the two can be
-	// compared live. Static frames look identical either way (ClipToPrevClip is ~identity with
-	// a still camera, and a transposed identity is still the identity) — judge this while MOVING.
-	changed |= ImGui::Checkbox("Legacy transposed ClipToPrevClip", &g_nr_ui.mv_legacy_clip);
-	changed |= ImGui::Checkbox("Invert MV X", &g_nr_ui.mv_invert_x);
-	ImGui::SameLine();
-	changed |= ImGui::Checkbox("Invert MV Y", &g_nr_ui.mv_invert_y);
-
-	ImGui::Separator();
-	ImGui::TextUnformatted("Network");
-	// 0-1: values above 1 change nothing, so the extra range was only a way to waste a test.
-	changed |= ImGui::SliderFloat("Intensity", &g_nr_ui.intensity, 0.0f, 1.0f, "%.2f");
-	// Named LocalToneStrength, but it is the style blend weight rather than a tone control.
-	// RenoDX ships NRLocalTone=1.74, so the range has to reach it comfortably. Despite the name
-	// this is the STYLE BLEND WEIGHT, not a tone control.
-	changed |= ImGui::SliderFloat("Local tone", &g_nr_ui.local_tone, 0.0f, 2.0f, "%.2f");
-	// 1.0 is the snippet's own fallback. Same auto-mask gate as skin structure: with UseAutoMask
-	// off, the snippet forces this to -1 internally and the slider does nothing at all — which is
-	// why the gate is surfaced right below rather than buried in the ini.
-	changed |= ImGui::SliderFloat("Local structure", &g_nr_ui.local_structure, 0.0f, 2.0f, "%.2f");
-	// -1 is a sentinel meaning "use local structure", so the range deliberately reaches it.
-	// SkinStructureStrength has three regimes and a bare slider hides two of them, so surface the
-	// sentinel as a checkbox the way RenoDX does:
-	//   negative  -> "inherit localStructureStrength" (the reference's DEFAULT)
-	//   0.0       -> NOT neutral: it flattens skin structure
-	//   > 0       -> independent strength
-	// Both gated on UseAutoMask with no ControlMask bound; with the auto mask off the snippet
-	// forces BOTH structure strengths to -1 internally and neither does anything.
-	bool skin_matches_local = g_nr_ui.skin_structure < 0.0f;
-	if (ImGui::Checkbox("Skin structure: match local", &skin_matches_local))
-	{
-		// Leaving "match" restores a usable independent value rather than dropping to 0.0, which
-		// would silently flatten skin structure and read as "the control does nothing".
-		g_nr_ui.skin_structure = skin_matches_local ? -1.0f : 1.33f;
-		changed = true;
-	}
-	if (!skin_matches_local)
-	{
-		changed |= ImGui::SliderFloat("Skin structure (0 = off)", &g_nr_ui.skin_structure, 0.0f,
-			2.0f, "%.2f");
-	}
-	// 310.8 ships one weight set registered as preset 1 and falls back to it for every other
-	// value, so this is expected to change nothing — exposed to confirm that rather than assume.
-	changed |= ImGui::SliderInt("Preset", &g_nr_ui.preset, 0, 4);
-	// GATES BOTH STRUCTURE STRENGTHS. Reference: "with it disabled the snippet forces
-	// localStructureStrength and skinStructureStrength to -1 and neither does anything."
-	changed |= ImGui::Checkbox("Auto mask (gates both structure sliders)", &g_nr_ui.auto_mask);
-	if (!g_nr_ui.auto_mask)
-		ImGui::TextUnformatted("  ^ off: the structure sliders above do nothing");
-	ImGui::SameLine();
-	changed |= ImGui::Checkbox("UI correction", &g_nr_ui.ui_correction);
-
-	if (changed)
-		apply_nr_ui();
-
-	ImGui::Separator();
-	if (ImGui::Button("Save to ReShade.ini"))
-	{
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTrackExposure",
-			g_nr_ui.track_exposure ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
-			g_nr_ui.transfer_strength);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
-			g_nr_ui.exposure_smoothing);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRScaleResetTolerance",
-			g_nr_ui.scale_reset_tol);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSmoothExposure",
-			g_nr_ui.smooth_exposure ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure",
-			g_nr_ui.local_structure);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure",
-			g_nr_ui.skin_structure);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", g_nr_ui.mvec_scale);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "MVConvention", g_nr_ui.mv_convention);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "MVInvertX", g_nr_ui.mv_invert_x ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "MVInvertY", g_nr_ui.mv_invert_y ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask",
-			g_nr_ui.auto_mask ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection",
-			g_nr_ui.ui_correction ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreHistory",
-			g_nr_ui.restore_history ? 1 : 0);
-		STRAY_LOG_WARN("NR: live settings saved to ReShade.ini.");
-	}
-	ImGui::SameLine();
-	if (ImGui::Button("Reset to defaults"))
-	{
-		const bool was_enabled = g_nr_ui.enabled;
-		g_nr_ui = NrUiState{};
-		g_nr_ui.enabled = was_enabled;
-		apply_nr_ui();
-	}
-}
-
-void draw_status(reshade::api::effect_runtime *runtime)
-{
-	(void)runtime;
-
-	const auto &ngx_status = ngx::status();
-
-	ImGui::Text("stray-dlss %s", "0.1.0-skeleton");
-	ImGui::Separator();
-	ImGui::Text("D3D12 device:   %s", g_state.native_device != nullptr ? "yes" : "no");
-	ImGui::Text("vkd3d-proton:   %s", g_state.is_vkd3d ? "yes" : "no");
-	ImGui::Text("NGX init:       %s", ngx_status.initialised ? "ok" : "FAILED");
-	ImGui::Text("DLSS SR:        %s", ngx_status.super_sampling_available ? "available" : "unavailable");
-	ImGui::Text("TAA hash table: %zu baked%s", std::size(kKnownTaaHashes),
-		g_extra_hashes_loaded < 0 ? " (no override file)" : "");
-	if (g_extra_hashes_loaded >= 0)
-		ImGui::Text("                +%d from stray-dlss-hashes.txt", g_extra_hashes_loaded);
-	if (ImGui::Button("Reload hash file"))
-		load_hash_override_file();
-	if (ngx_status.needs_updated_driver)
-		ImGui::Text("Driver:         needs >= %u.%u", ngx_status.min_driver_major, ngx_status.min_driver_minor);
-	ImGui::Separator();
-	ImGui::Text("Frame:          %llu", static_cast<unsigned long long>(g_state.frame_index.load()));
-	ImGui::Text("Compute PSOs:   %u", g_state.compute_pipelines_seen.load());
-	ImGui::Text("TAA matches:    %u", g_state.taa_pipelines_seen.load());
-	ImGui::Text("Dispatches:     %u", g_state.dispatches_seen.load());
-	ImGui::Text("Addon events:   bind_pipeline=%s push_descriptors=%s",
-		g_state.saw_bind_pipeline.load() ? "yes" : "no",
-		g_state.saw_push_descriptors.load() ? "yes" : "no");
-
-	ImGui::Separator();
-	draw_nr_controls();
-}
-
-void draw_osd(reshade::api::effect_runtime *runtime)
-{
-	(void)runtime;
-	const auto &ngx_status = ngx::status();
-	// The site is on the OSD because a screenshot is often the only evidence available, and
-	// "which path produced this image" is the first question to ask of one.
-	ImGui::Text("stray-dlss: %s | NGX %s | TAA x%u | NR@%s",
-		g_state.is_vkd3d ? "vkd3d" : "d3d12",
-		ngx_status.super_sampling_available ? "ok" : "n/a",
-		g_state.taa_pipelines_seen.load(),
-		nrplan::hook_mode_name(nrhook::hook_mode()));
-}
-
-// ---- finder event handlers (pass finder + G-buffer finder) ----
-//
-// The render-target and draw events feed BOTH diagnostics and are registered when either
-// [STRAYDLSS] PassFinder=1 or [STRAYDLSS] GBufferFinder=1; the copy and execute events are
-// pass-finder-only. Conditional registration matters: every extra event ReShade dispatches
-// costs a call per operation even when the handler early-outs, and both finders are
-// diagnostics. All of the skip-capable ones return false — the finders observe, never
-// suppress.
-
-void on_pf_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
-{
-	pass_finder::note_render_targets(cmd_list, count, rtvs, dsv);
-	gbuffer_finder::note_render_targets(cmd_list, count, rtvs, dsv);
-}
-
-// ---- DLSS Neural Rendering hook sites (src/nr_hook.hpp) ----
-//
-// Registered only for the mode that needs them, because every extra event ReShade dispatches
-// costs the game a callback per command — and bind_render_targets_and_depth_stencil is a
-// per-render-pass event, not a per-frame one.
-
-void on_nr_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
-{
-	nrhook::on_bind_render_targets(cmd_list, count, rtvs, dsv);
-}
-
-void on_nr_begin_effects(reshade::api::effect_runtime *runtime,
-	reshade::api::command_list *cmd_list, reshade::api::resource_view rtv,
-	reshade::api::resource_view rtv_srgb)
-{
-	nrhook::on_begin_effects(runtime, cmd_list, rtv, rtv_srgb);
-}
-
-void on_nr_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
-{
-	(void)resize;
-	nrhook::note_swapchain(swapchain);
-}
-
-void on_nr_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
-{
-	(void)resize;
-	nrhook::forget_swapchain(swapchain);
-}
-
-bool on_pf_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t count,
-	const reshade::api::render_pass_render_target_desc *rts,
-	const reshade::api::render_pass_depth_stencil_desc *ds,
-	reshade::api::render_pass_flags flags)
-{
-	(void)flags;
-	// D3D12 allows at most 8 simultaneous render targets, so the fixed array cannot clip.
-	reshade::api::resource_view views[8] = {};
-	const uint32_t n = count < 8 ? count : 8;
-	for (uint32_t i = 0; i < n; ++i)
-		views[i] = rts[i].view;
-	pass_finder::note_render_targets(cmd_list, n, views,
-		ds != nullptr ? ds->view : reshade::api::resource_view{ 0 });
-	gbuffer_finder::note_render_targets(cmd_list, n, views,
-		ds != nullptr ? ds->view : reshade::api::resource_view{ 0 });
-	return false;
-}
-
-bool on_pf_draw(reshade::api::command_list *cmd_list, uint32_t vertex_count,
-	uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
-{
-	(void)instance_count;
-	(void)first_vertex;
-	(void)first_instance;
-	pass_finder::note_draw(cmd_list, vertex_count);
-	gbuffer_finder::note_draw(cmd_list);
-	return false;
-}
-
-bool on_pf_draw_indexed(reshade::api::command_list *cmd_list, uint32_t index_count,
-	uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
-{
-	(void)instance_count;
-	(void)first_index;
-	(void)vertex_offset;
-	(void)first_instance;
-	pass_finder::note_draw(cmd_list, index_count);
-	gbuffer_finder::note_draw(cmd_list);
-	return false;
-}
-
-bool on_pf_copy_resource(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, reshade::api::resource dest)
-{
-	pass_finder::note_copy(cmd_list, source, dest);
-	return false;
-}
-
-bool on_pf_copy_texture_region(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, uint32_t source_subresource,
-	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
-	uint32_t dest_subresource, const reshade::api::subresource_box *dest_box,
-	reshade::api::filter_mode filter)
-{
-	(void)source_subresource;
-	(void)source_box;
-	(void)dest_subresource;
-	(void)dest_box;
-	(void)filter;
-	pass_finder::note_copy(cmd_list, source, dest);
-	return false;
-}
-
-bool on_pf_resolve_texture_region(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, uint32_t source_subresource,
-	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
-	uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z,
-	reshade::api::format format)
-{
-	(void)source_subresource;
-	(void)source_box;
-	(void)dest_subresource;
-	(void)dest_x;
-	(void)dest_y;
-	(void)dest_z;
-	(void)format;
-	pass_finder::note_copy(cmd_list, source, dest);
-	return false;
-}
-
-void on_pf_execute_command_list(reshade::api::command_queue *queue,
-	reshade::api::command_list *cmd_list)
-{
-	(void)queue;
-	pass_finder::note_execute(cmd_list);
-}
-
-// Registering the pipeline events is not free: ReShade responds by routing every PSO creation
-// through ID3D12Device2::CreatePipelineState and dropping the cached-PSO blob. Under
-// vkd3d-proton that means every shader recompiles on each launch, which for a UE4 title is a
-// very long first load. Worth it while we need bytecode; wasteful otherwise, so it is a
-// switch. (docs/RESEARCH.md §2.5)
-bool g_pipeline_events_registered = false;
-// The render-target/draw events feed both finders; the copy/execute events only the pass
-// finder. Tracked separately so unregistration mirrors registration exactly.
-bool g_finder_rt_events_registered = false;
-bool g_pass_finder_events_registered = false;
-// [STRAYDLSS] NgxNRHook. Read HERE rather than in on_init_device because the choice decides
-// which events get registered, and registration happens from DllMain, before any device exists.
-// Same reason HashShaders / PassFinder / NgxRR are re-read in register_events().
-bool g_nr_preui_events_registered = false;
-bool g_nr_present_events_registered = false;
-
-void register_events()
-{
-	reshade::register_event<reshade::addon_event::init_device>(on_init_device);
-	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
-	// Resource lifetime. ReShade never calls destroy_resource_view on D3D12, so its
-	// view->resource map hands back destroyed resources for recycled descriptor slots; viewing
-	// one faults inside vkd3d. Track liveness ourselves. (frame_state.hpp)
-	reshade::register_event<reshade::addon_event::init_resource>(
-		[](reshade::api::device *, const reshade::api::resource_desc &,
-		   const reshade::api::subresource_data *, reshade::api::resource_usage,
-		   reshade::api::resource res) { note_resource_created(res); });
-	reshade::register_event<reshade::addon_event::destroy_resource>(
-		[](reshade::api::device *, reshade::api::resource res) { note_resource_destroyed(res); });
-
-	reshade::register_event<reshade::addon_event::init_command_list>(on_init_command_list);
-	reshade::register_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
-	reshade::register_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
-	reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
-
-	bool hash_shaders = true;
-	hash_shaders = host::cfg::get_bool("HashShaders", hash_shaders);
-
-	// [STRAYDLSS] PassFinder, default OFF: dataflow identification of the TAA pass — the
-	// bounded walk backwards from the tonemapper (core/pass_walk.hpp), proven in CI and here
-	// only LOGGING its verdict against the live game. It attributes events by shader hash,
-	// so enabling it forces the pipeline events (and their PSO-cache cost) on.
-	bool pass_finder_enabled = false;
-	pass_finder_enabled = host::cfg::get_bool("PassFinder", pass_finder_enabled);
-	pass_finder::set_enabled(pass_finder_enabled);
-
-	// [STRAYDLSS] GBufferFinder, default OFF: log-only identification of the base pass's
-	// G-buffer targets for DLSS Ray Reconstruction (gbuffer_finder.hpp). It needs the
-	// render-target/draw events below, and the pipeline events for the SSR-denoiser
-	// cross-check's shader hash.
-	bool gbuffer_finder_enabled = false;
-	gbuffer_finder_enabled = host::cfg::get_bool("GBufferFinder", gbuffer_finder_enabled);
-	{
-		// NgxRR=2 consumes the finder's identification (taa_hook::try_evaluate_rr), so the
-		// finder must observe even when GBufferFinder was not set explicitly. Read here as
-		// well as in on_init_device because event registration happens first.
-		int ngx_rr_for_finder = 0;
-		ngx_rr_for_finder = host::cfg::get_int("NgxRR", ngx_rr_for_finder);
-		if ((ngx_rr_for_finder == 2 || ngx_rr_for_finder == 3) && !gbuffer_finder_enabled)
-		{
-			gbuffer_finder_enabled = true;
-			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2/3 needs the G-buffer "
-				"identification it produces.");
-		}
-	}
-	gbuffer_finder::set_enabled(gbuffer_finder_enabled);
-
-	g_pipeline_events_registered = hash_shaders || shader_dump::enabled() ||
-		pass_finder_enabled || gbuffer_finder_enabled;
-
-	if (g_pipeline_events_registered)
-	{
-		STRAY_LOG_WARN("Pipeline events registered: ReShade will drop the D3D12 PSO cache, so "
-			"EXPECT A VERY SLOW FIRST LOAD while every shader recompiles.");
-		STRAY_LOG_WARN("  Set [STRAYDLSS] HashShaders=0 (and DumpShaders=0) to get normal load "
-			"times once the bytecode has been captured.");
-		reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
-		reshade::register_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
-	}
-	else
-	{
-		STRAY_LOG_INFO("Pipeline hashing disabled; the TAA pass will be identified structurally.");
-	}
-	reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
-	reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
-	// ReShade's own state_tracking does not register this, which is why its state_block can
-	// never replay root constants.
-	reshade::register_event<reshade::addon_event::push_constants>(on_push_constants);
-	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
-	reshade::register_event<reshade::addon_event::present>(on_present);
-
-	if (pass_finder_enabled || gbuffer_finder_enabled)
-	{
-		g_finder_rt_events_registered = true;
-		// Logged so a pasted log PROVES the events were registered for this combination of
-		// flags — the 2026-08-31 GBufferFinder run could not distinguish "tap registered
-		// but never fired" from "tap never registered" after the fact.
-		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
-			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
-		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-			on_pf_bind_render_targets);
-		reshade::register_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);
-		reshade::register_event<reshade::addon_event::draw>(on_pf_draw);
-		reshade::register_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
-	}
-	// [STRAYDLSS] NgxNRHook: taa (default) | present | preui. Where DLSS Neural Rendering runs.
-	// The whole argument for moving it — and what each site costs — is in src/nr_hook.hpp.
-	{
-		char nr_hook[16] = "taa";
-		host::cfg::get_string("NgxNRHook", nr_hook, sizeof(nr_hook));
-		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
-		nrhook::set_hook_mode(mode);
-
-		int preui_bind = 2;
-		preui_bind = host::cfg::get_int("NgxNRPreUiBind", preui_bind);
-		nrhook::set_preui_bind_ordinal(preui_bind < 0 ? 0u : static_cast<unsigned int>(preui_bind));
-
-		// Shared with the TAA path; only consulted on `preui`, which records onto the GAME's
-		// command list. Re-read here for the same reason the mode is.
-		bool restore_state = true;
-		restore_state = host::cfg::get_bool("RestoreState", restore_state);
-		nrhook::set_restore_state(restore_state);
-
-		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
-			mode == nrplan::HookMode::taa
-				? "DLSS Neural Rendering runs inside the intercepted TAA dispatch, writing the "
-				  "engine's u0 — which UE 4.27 also extracts as the next frame's temporal "
-				  "history, so NR's answer compounds. This is the shipped default and the "
-				  "fallback."
-			: mode == nrplan::HookMode::present
-				? "DLSS Neural Rendering runs at reshade_begin_effects, on the composited back "
-				  "buffer. No feedback path by construction, and no pass identification — but "
-				  "the UI is already drawn, and ReShade only fires this event when at least one "
-				  "effect file is LOADED."
-				: "DLSS Neural Rendering runs at the pre-UI render-target boundary: after the "
-				  "scene composite, before Slate draws the HUD. No feedback path AND no HUD "
-				  "pixels in the network. Watch the NR hook census lines to confirm "
-				  "NgxNRPreUiBind.");
-
-		if (mode == nrplan::HookMode::preui)
-		{
-			g_nr_preui_events_registered = true;
-			reshade::register_event<reshade::addon_event::init_swapchain>(on_nr_init_swapchain);
-			reshade::register_event<reshade::addon_event::destroy_swapchain>(
-				on_nr_destroy_swapchain);
-			reshade::register_event<
-				reshade::addon_event::bind_render_targets_and_depth_stencil>(
-				on_nr_bind_render_targets);
-		}
-		else if (mode == nrplan::HookMode::present)
-		{
-			g_nr_present_events_registered = true;
-			reshade::register_event<reshade::addon_event::reshade_begin_effects>(
-				on_nr_begin_effects);
-		}
-
-		// [STRAYDLSS] NgxNRRestoreHistory, default ON. Keeps NR's residual out of the engine's
-		// temporal history at the `taa` site by snapshotting u0 before the decode and putting it
-		// back at present. Read alongside the hook mode because it is only meaningful for one of
-		// them, and inert (loudly) for the other two. Full argument: src/nr_history.hpp.
-		bool restore_history = false;
-		restore_history = host::cfg::get_bool("NgxNRRestoreHistory", restore_history);
-		nrhist::set_enabled(restore_history);
-		nrhist::set_site(mode);
-		g_nr_ui.restore_history = restore_history;
-
-		// The one hypothesis in that path: which D3D12_RESOURCE_STATES u0 is in at present time,
-		// where the restore copy is recorded on a different command list from the snapshot. 0
-		// keeps the derived default (0xC0 = NON_PIXEL|PIXEL_SHADER_RESOURCE); the derivation is
-		// in src/nr_history.cpp and is echoed in full on the first restore.
-		int restore_state_bits = 0;
-		restore_state_bits = host::cfg::get_int("NgxNRRestoreState", restore_state_bits);
-		nrhist::set_image_state_at_present(restore_state_bits <= 0
-			? 0u : static_cast<unsigned int>(restore_state_bits));
-
-		if (mode == nrplan::HookMode::taa)
-			STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
-				"the pre-NR image of u0 aside inside the TAA dispatch and copies it back at "
-				"present, so UE 4.27's TemporalAAHistory.RT[0] — which "
-				"ScreenSpaceRayTracing.cpp:596-620 reads on the NEXT frame — never holds the "
-				"neural residual; the DISPLAYED frame is unchanged either way, because every "
-				"same-frame consumer of u0 has already run by Present. It is OFF by default "
-				"because the SSR fade stopped reproducing on 2026-09-01 and the restore rests on "
-				"an INFERRED state for u0 at present (assumed 0x%X; [STRAYDLSS] NgxNRRestoreState "
-				"overrides) — four UE 4.27 source anchors, no measurement. Flip it live in the "
-				"DLSS Neural Rendering overlay the moment the fade returns; the whole diagnosis "
-				"is in src/nr_history.hpp.",
-				restore_history ? 1 : 0,
-				restore_history
-					? "ENABLED, so the engine's temporal history is being kept pristine."
-					: "Off, so NR's residual re-enters the engine's temporal state every frame "
-					  "exactly as it did before this feature existed — which is the SHIPPED "
-					  "behaviour, not a fault.",
-				nrhist::image_state_at_present());
-		else
-			STRAY_LOG_INFO("NgxNRRestoreHistory is INERT at NgxNRHook=%s: a post-tonemap site has "
-				"no feedback path to close by construction (every QueueTextureExtraction into "
-				"PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is "
-				"at 777), so nothing is snapshotted and nothing is restored.",
-				nrplan::hook_mode_name(mode));
-	}
-
-	if (pass_finder_enabled)
-	{
-		g_pass_finder_events_registered = true;
-		reshade::register_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
-		reshade::register_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
-		reshade::register_event<reshade::addon_event::resolve_texture_region>(
-			on_pf_resolve_texture_region);
-		reshade::register_event<reshade::addon_event::execute_command_list>(
-			on_pf_execute_command_list);
-	}
-
-	reshade::register_overlay(nullptr, draw_status); // settings page under our add-on entry
-	reshade::register_overlay("OSD", draw_osd);      // always-visible one-liner
-}
-
-void unregister_events()
-{
-	reshade::unregister_overlay("OSD", draw_osd);
-	reshade::unregister_overlay(nullptr, draw_status);
-
-	if (g_pass_finder_events_registered)
-	{
-		reshade::unregister_event<reshade::addon_event::execute_command_list>(
-			on_pf_execute_command_list);
-		reshade::unregister_event<reshade::addon_event::resolve_texture_region>(
-			on_pf_resolve_texture_region);
-		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_pf_copy_texture_region);
-		reshade::unregister_event<reshade::addon_event::copy_resource>(on_pf_copy_resource);
-	}
-	if (g_nr_present_events_registered)
-	{
-		g_nr_present_events_registered = false;
-		reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(
-			on_nr_begin_effects);
-	}
-	if (g_nr_preui_events_registered)
-	{
-		g_nr_preui_events_registered = false;
-		reshade::unregister_event<
-			reshade::addon_event::bind_render_targets_and_depth_stencil>(
-			on_nr_bind_render_targets);
-		reshade::unregister_event<reshade::addon_event::destroy_swapchain>(
-			on_nr_destroy_swapchain);
-		reshade::unregister_event<reshade::addon_event::init_swapchain>(on_nr_init_swapchain);
-	}
-	if (g_finder_rt_events_registered)
-	{
-		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_pf_draw_indexed);
-		reshade::unregister_event<reshade::addon_event::draw>(on_pf_draw);
-		reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_pf_begin_render_pass);
-		reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-			on_pf_bind_render_targets);
-	}
-
-	reshade::unregister_event<reshade::addon_event::present>(on_present);
-	reshade::unregister_event<reshade::addon_event::dispatch>(on_dispatch);
-	reshade::unregister_event<reshade::addon_event::push_constants>(on_push_constants);
-	reshade::unregister_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
-	reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
-	if (g_pipeline_events_registered)
-	{
-		reshade::unregister_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
-		reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
-	}
-	reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(on_destroy_pipeline_layout);
-	reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
-	reshade::unregister_event<reshade::addon_event::reset_command_list>(on_reset_command_list);
-	reshade::unregister_event<reshade::addon_event::init_command_list>(on_init_command_list);
-	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
-	reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
-}
-
-} // namespace
-
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
-{
-	switch (reason)
-	{
-	case DLL_PROCESS_ATTACH:
-		// The file sink comes up FIRST, before register_addon, so that a failed registration
-		// (an imgui version mismatch is the classic silent one) is distinguishable from the
-		// add-on never being loaded at all.
-		log::init_file_sink();
-		log::write(log::Level::info, "stray-dlss 0.1.0-skeleton attaching");
-		log::writef(log::Level::info, "  built against ReShade API version %u, imgui %d",
-			RESHADE_API_VERSION, IMGUI_VERSION_NUM);
-
-		if (!reshade::register_addon(module))
-		{
-			log::write(log::Level::error,
-				"reshade::register_addon FAILED. Either ReShade is older than the API version "
-				"above, or the imgui version handshake did not match.");
-			return FALSE;
-		}
-
-		log::enable_reshade_sink();
-		log::write(log::Level::info, "reshade::register_addon succeeded");
-		shader_dump::initialise();
-		// These must come first: they populate the descriptor and command-list state our own
-		// callbacks read, and there is no retroactive recovery of a heap we attached late to.
-		// (docs/RESEARCH.md §2.6)
-		descriptor_tracking::register_events();
-		state_tracking::register_events();
-		register_events();
-		break;
-
-	case DLL_PROCESS_DETACH:
-		shader_dump::finish();
-		// A final census, unconditionally. The frame-300 census is driven by present events,
-		// so it never runs in a headless host — and a headless host is exactly how CI loads
-		// this add-on into the real ReShade with no game. Logging it on detach also gives
-		// field reports a definitive "what did the add-on actually see" line even when the
-		// user closes the game before frame 300.
-		{
-			std::uint32_t attempts = 0, skipped = 0;
-			taa_hook::resolve_counters(attempts, skipped);
-			STRAY_LOG_INFO("Resolve attempts=%u skipped_stale=%u (%.1f%%) — a skipped frame "
-				"contributes no motion vectors.", attempts, skipped,
-				attempts ? (100.0 * skipped / attempts) : 0.0);
-		}
-		STRAY_LOG_INFO("Final census: compute pipelines=%u, TAA matches=%u, dispatches=%u, "
-			"bind_pipeline=%d, push_descriptors=%d",
-			g_state.compute_pipelines_seen.load(std::memory_order_relaxed),
-			g_state.taa_pipelines_seen.load(std::memory_order_relaxed),
-			g_state.dispatches_seen.load(std::memory_order_relaxed),
-			g_state.saw_bind_pipeline.load(std::memory_order_relaxed) ? 1 : 0,
-			g_state.saw_push_descriptors.load(std::memory_order_relaxed) ? 1 : 0);
-		unregister_events();
-		state_tracking::unregister_events();
-		descriptor_tracking::unregister_events();
-		forget_all_command_lists();
-		forget_all_resources();
-		reshade::unregister_addon(module);
-		log::write(log::Level::info, "stray-dlss detaching");
-		log::shutdown_file_sink();
-		break;
-
-	default:
-		break;
-	}
-
-	return TRUE;
-}
+} // namespace stray_dlss::app

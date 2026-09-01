@@ -7,13 +7,12 @@
 #include "nr_hook.hpp"
 #include "perf.hpp"
 
-#include "frame_state.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
 #include "input_dump.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_backend.hpp"
 
-#include <state_tracking.hpp>
 
 #include <d3d12.h>
 
@@ -25,11 +24,13 @@
 #include <unordered_map>
 
 namespace stray_dlss::taa_hook {
+
+using icept::DispatchBindings;
 namespace {
 
 std::mutex g_mutex;
 std::unordered_map<uint64_t, std::uint64_t> g_pipeline_hashes;                  // pipeline -> DXBC hash
-std::unordered_map<reshade::api::command_list *, uint64_t> g_bound;             // cmd list -> pipeline
+std::unordered_map<ID3D12GraphicsCommandList *, uint64_t> g_bound;             // cmd list -> pipeline
 std::unordered_map<std::uint64_t, std::uint64_t> g_prev_output;                 // hash -> its u0 last frame
 std::unordered_map<std::uint64_t, std::uint32_t> g_report_count;                // hash -> reports emitted
 std::unordered_map<std::uint64_t, bool> g_steady_reported;                      // hash -> saw a non-cut frame
@@ -388,14 +389,13 @@ bool rr_refuse(int reason)
 }
 
 // Defined below; the SSD trigger needs it before its definition point.
-bool read_view_cb(reshade::api::device *device, const reshade::api::buffer_range &cb,
-                  ue4::ViewParams &out);
+bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out);
 
 // Records the guide resolve onto `native` and leaves the four guides in
 // NON_PIXEL_SHADER_RESOURCE, reporting the identification that fed them. Shared by both
 // trigger points. Every failure path names its reason through rr_refuse and returns false
 // — the caller falls back to SR, never guesses.
-bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *native,
+bool record_guides(ID3D12Device *native_device, ID3D12GraphicsCommandList *native,
                    std::uint32_t render_w, std::uint32_t render_h,
                    const ue4::ViewParams &view, gbuffer_finder::Identification &out_id)
 {
@@ -437,19 +437,19 @@ bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *nati
 	// Liveness BEFORE any dereference, per the §5 discipline — the pool can have destroyed
 	// a G-buffer between its bind and this dispatch (save-load transitions measured doing
 	// exactly this to depth/velocity).
-	if (!is_resource_live(id.gbuffer_a) || !is_resource_live(id.gbuffer_b) ||
-		!is_resource_live(id.gbuffer_c))
+	if (!icept::backend()->is_resource_live(id.gbuffer_a) || !icept::backend()->is_resource_live(id.gbuffer_b) ||
+		!icept::backend()->is_resource_live(id.gbuffer_c))
 	{
 		if (rr_refuse(kRrLiveness))
 			STRAY_LOG_WARN("RR: a G-buffer resource died between bind and dispatch "
 				"(A=%p live=%d, B=%p live=%d, C=%p live=%d, bind age %u frames); SR "
 				"carries the frame. First occurrence only.",
 				reinterpret_cast<void *>(id.gbuffer_a),
-				is_resource_live(id.gbuffer_a) ? 1 : 0,
+				icept::backend()->is_resource_live(id.gbuffer_a) ? 1 : 0,
 				reinterpret_cast<void *>(id.gbuffer_b),
-				is_resource_live(id.gbuffer_b) ? 1 : 0,
+				icept::backend()->is_resource_live(id.gbuffer_b) ? 1 : 0,
 				reinterpret_cast<void *>(id.gbuffer_c),
-				is_resource_live(id.gbuffer_c) ? 1 : 0, id.age_frames);
+				icept::backend()->is_resource_live(id.gbuffer_c) ? 1 : 0, id.age_frames);
 		return false;
 	}
 
@@ -500,7 +500,6 @@ bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *nati
 		return false;
 	}
 
-	auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
 	if (!gbr::initialise(native_device, render_w, render_h))
 	{
 		if (rr_refuse(kRrResolveFailed))
@@ -635,7 +634,7 @@ bool should_suppress_ssd_for_rr1(std::uint64_t hash)
 	return g_guides_frame == frame && g_guides_ready;
 }
 
-void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint64_t hash)
+void maybe_record_guides_at_ssd(const icept::CommandContext &ctx, std::uint64_t hash)
 {
 	// Mode 2 captures at the SSD trigger only when GBufferResolveAt=ssd; mode 3 (RR-1)
 	// ALWAYS captures here — the TAA-hook alternative reads dead content (measured), which
@@ -665,7 +664,7 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 	}
 
 	DispatchBindings b;
-	if (!resolve_compute_bindings(cmd_list, b))
+	if (!icept::backend()->resolve_compute_bindings(ctx, b))
 	{
 		if (rr_refuse(kRrResolveFailed))
 			STRAY_LOG_ERROR("RR: could not resolve the SSD dispatch's bindings for the View "
@@ -675,13 +674,12 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 
 	// The View CB, exactly as the TAA path finds it: try every bound CB, keep the one
 	// that parses plausibly. The SSD pass carries the same View buffer.
-	reshade::api::device *device = cmd_list->get_device();
 	ue4::ViewParams view{};
 	bool view_ok = false;
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
-		if (read_view_cb(device, cb.second, candidate) && ue4::view_params_plausible(candidate))
+		if (read_view_cb(cb.second, candidate) && ue4::view_params_plausible(candidate))
 		{
 			view = candidate;
 			view_ok = true;
@@ -701,9 +699,9 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 	const auto render_w = static_cast<std::uint32_t>(vw);
 	const auto render_h = static_cast<std::uint32_t>(vh);
 
-	auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+	ID3D12GraphicsCommandList *native = ctx.native;
 	gbuffer_finder::Identification id;
-	if (!record_guides(device, native, render_w, render_h, view, id))
+	if (!record_guides(ctx.device, native, render_w, render_h, view, id))
 		return; // the reason was counted and logged inside; the frame stays claimed-not-ready
 
 	// THE WEDGE FIX (attempt 4, Xid 109 minutes into an RR menu session): record_guides
@@ -715,7 +713,7 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 	// state natively, exactly as the TAA site does after NGX clobbers it.
 	{
 		perf::Scope perf_restore(perf::kRestore);
-		restore_game_compute_state(cmd_list);
+		icept::backend()->restore_game_compute_state(ctx);
 	}
 
 	{
@@ -738,7 +736,7 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 // the content-death finding), then evaluates DLSSD. Every missing precondition returns
 // false so the caller falls back to the SR evaluate — SR is the safety net EVERY frame,
 // never just at startup.
-bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *native,
+bool try_evaluate_rr(ID3D12Device *native_device, ID3D12GraphicsCommandList *native,
                      const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
                      const ue4::ViewParams &view)
 {
@@ -785,7 +783,7 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 	}
 	else
 	{
-		if (!record_guides(device, native, ei.render_width, ei.render_height, view, id))
+		if (!record_guides(native_device, native, ei.render_width, ei.render_height, view, id))
 			return false; // the reason was counted and logged inside
 	}
 
@@ -868,10 +866,12 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 // command-recording time on the thread that just set the root arguments, because UE4's
 // FD3D12FastConstantAllocator sub-allocates from an upload ring that the CPU writer will
 // advance past later in the frame. (docs/RESEARCH.md §2.6)
-bool read_view_cb(reshade::api::device *device, const reshade::api::buffer_range &cb, ue4::ViewParams &out)
+bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out)
 {
-	const reshade::api::resource_desc rd = device->get_resource_desc(cb.buffer);
-	if (rd.heap != reshade::api::memory_heap::upload && rd.heap != reshade::api::memory_heap::unknown)
+	// Liveness and facts from the backend, never a dereference of ours: the ReShade backend
+	// checks liveness first, the native backend answers from its creation-time snapshot.
+	icept::ResourceInfo ri{};
+	if (!icept::backend()->describe_resource(cb.buffer, ri) || !ri.is_buffer || !ri.upload_heap)
 		return false;
 
 	// BOUNDS CHECK, and it is not a formality — its absence was the access violation.
@@ -881,21 +881,16 @@ bool read_view_cb(reshade::api::device *device, const reshade::api::buffer_range
 	// 2448 bytes out of one that sits near the end of its page reads unmapped memory and kills
 	// the process, with the fault landing inside memcpy where it is hard to attribute.
 	//
-	// buffer_range::size is UINT64_MAX for root CBVs, where ReShade does not know the extent,
-	// so the resource's own size is the authority.
-	if (cb.size != UINT64_MAX && cb.size < ue4::kViewPrefixBytes)
+	// BufferRange::size is kUnknownSize for root CBVs, where the backend does not know the
+	// extent, so the resource's own size is the authority.
+	if (cb.size != icept::kUnknownSize && cb.size < ue4::kViewPrefixBytes)
 		return false;
-	if (rd.buffer.size < cb.offset + ue4::kViewPrefixBytes)
-		return false;
-
-	void *mapped = nullptr;
-	if (!device->map_buffer_region(cb.buffer, cb.offset, ue4::kViewPrefixBytes,
-			reshade::api::map_access::read_only, &mapped) || mapped == nullptr)
+	if (ri.buffer_size < cb.offset + ue4::kViewPrefixBytes)
 		return false;
 
 	unsigned char copy[ue4::kViewPrefixBytes];
-	std::memcpy(copy, mapped, sizeof(copy));
-	device->unmap_buffer_region(cb.buffer);
+	if (!icept::backend()->read_buffer(cb, sizeof(copy), copy))
+		return false;
 
 	return ue4::parse_view_params(copy, sizeof(copy), out);
 }
@@ -1084,22 +1079,22 @@ void forget_pipeline(uint64_t pipeline_handle)
 	g_pipeline_hashes.erase(pipeline_handle);
 }
 
-void set_bound_pipeline(reshade::api::command_list *cmd_list, uint64_t pipeline_handle)
+void set_bound_pipeline(const icept::CommandContext &ctx, uint64_t pipeline_handle)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_pipeline_hashes.count(pipeline_handle) != 0)
-		g_bound[cmd_list] = pipeline_handle;
+		g_bound[ctx.native] = pipeline_handle;
 }
 
-void forget_command_list(reshade::api::command_list *cmd_list)
+void forget_command_list(const icept::CommandContext &ctx)
 {
 	// Without this a reset command list keeps its previous pipeline attribution, so a dispatch
 	// can be blamed on a shader that is no longer bound.
 	std::lock_guard<std::mutex> lock(g_mutex);
-	g_bound.erase(cmd_list);
+	g_bound.erase(ctx.native);
 }
 
-bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
+bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y, uint32_t z)
 {
 	// Cheap rejection first: this runs on every dispatch, thousands of times a frame.
 	// Anything smaller than a plausible full-screen tile grid cannot be the TAA pass.
@@ -1116,7 +1111,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		std::lock_guard<std::mutex> lock(g_mutex);
 		++g_diag.large_dispatches;
 
-		const auto b = g_bound.find(cmd_list);
+		const auto b = g_bound.find(ctx.native);
 		if (b == g_bound.end())
 		{
 			++g_diag.no_bound_pipeline;
@@ -1179,7 +1174,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	// content is alive HERE — record the guides on this list before the dispatch proceeds
 	// (RR-0 never suppresses it; the throttle above cannot eat this call because every RR
 	// session sets NgxEvaluate, which disables the throttle entirely).
-	maybe_record_guides_at_ssd(cmd_list, hash);
+	maybe_record_guides_at_ssd(ctx, hash);
 
 	// RR-1 ([STRAYDLSS] NgxRR=3): the guides were just captured at this content-alive point
 	// AND the game's compute state restored, so skipping the SSD dispatch here is clean.
@@ -1198,7 +1193,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	}
 
 	DispatchBindings b;
-	if (!resolve_compute_bindings(cmd_list, b))
+	if (!icept::backend()->resolve_compute_bindings(ctx, b))
 	{
 		// Say so once. A resolve that fails silently looks exactly like "the TAA pass never
 		// ran", and telling those apart is otherwise a whole extra round-trip on a machine
@@ -1225,7 +1220,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			char why[128];
 			std::snprintf(why, sizeof(why), "resolve FAILED for 0x%016llx at %ux%u",
 				static_cast<unsigned long long>(hash), x, y);
-			dump_tracker_state_for(cmd_list, why);
+			icept::backend()->dump_tracker_state(ctx, why);
 		}
 
 		static bool warned = false;
@@ -1240,8 +1235,6 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		return false;
 	}
 
-	reshade::api::device *device = cmd_list->get_device();
-
 	// Try every bound constant buffer and keep the first that decodes to a plausible View.
 	// Guessing a register would be fragile: b3, b4 and b5 have all been observed carrying it
 	// on different passes.
@@ -1250,7 +1243,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
-		if (read_view_cb(device, cb.second, candidate) && ue4::view_params_plausible(candidate))
+		if (read_view_cb(cb.second, candidate) && ue4::view_params_plausible(candidate))
 		{
 			view = candidate;
 			view_ok = true;
@@ -1421,8 +1414,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
 		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
 		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it.
-		const bool resources_live = is_resource_live(depth_resource) &&
-			is_resource_live(velocity_resource);
+		const bool resources_live = icept::backend()->is_resource_live(depth_resource) &&
+			icept::backend()->is_resource_live(velocity_resource);
 		if (depth_resource != 0 && velocity_resource != 0)
 		{
 			g_resolve_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -1436,9 +1429,9 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 			STRAY_LOG_WARN("Skipping the resolve: ReShade reported a resource that is no longer "
 				"live (depth=%p live=%d, velocity=%p live=%d). Its view->resource map outlives "
 				"the resource on D3D12.",
-				reinterpret_cast<void *>(depth_resource), is_resource_live(depth_resource) ? 1 : 0,
+				reinterpret_cast<void *>(depth_resource), icept::backend()->is_resource_live(depth_resource) ? 1 : 0,
 				reinterpret_cast<void *>(velocity_resource),
-				is_resource_live(velocity_resource) ? 1 : 0);
+				icept::backend()->is_resource_live(velocity_resource) ? 1 : 0);
 		}
 
 		if (tracing && !g_ngx_gate_logged)
@@ -1486,8 +1479,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		if (worth_resolving && view_ok && resources_live)
 		{
 			mark(2, "descriptors-found");
-			auto *native_device = reinterpret_cast<ID3D12Device *>(device->get_native());
-			auto *native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native());
+			ID3D12Device *native_device = ctx.device;
+			ID3D12GraphicsCommandList *native = ctx.native;
 
 			// The RENDER rect comes from the View constant buffer, not from a texture extent.
 			//
@@ -1659,7 +1652,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						const BoundTexture *out_tex = nullptr;
 						for (const auto &u : b.uavs)
 						{
-							if (u.slot == m.output_uav && is_resource_live(u.resource))
+							if (u.slot == m.output_uav && icept::backend()->is_resource_live(u.resource))
 								out_tex = &u;
 						}
 
@@ -1690,7 +1683,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						{
 							for (const auto &t : b.srvs)
 							{
-								if (t.slot == kSceneColourReg && is_resource_live(t.resource))
+								if (t.slot == kSceneColourReg && icept::backend()->is_resource_live(t.resource))
 									reg_colour = t.resource;
 							}
 							if (!g_ngx_registers_logged)
@@ -1717,7 +1710,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						// require the same format as the output since TAA's colour and result are
 						// the same buffer kind. Width/height of 0 means a buffer, not a texture.
 						const auto colour_candidate = [&](const BoundTexture &t) {
-							return out_tex != nullptr && is_resource_live(t.resource) &&
+							return out_tex != nullptr && icept::backend()->is_resource_live(t.resource) &&
 								t.width == render_w && t.height == render_h &&
 								t.format == out_tex->format && t.width > 0 && t.height > 0;
 						};
@@ -1774,7 +1767,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						ID3D12Resource *output = nullptr;
 						for (const auto &u : b.uavs)
 						{
-							if (u.slot == m.output_uav && is_resource_live(u.resource))
+							if (u.slot == m.output_uav && icept::backend()->is_resource_live(u.resource))
 								output = reinterpret_cast<ID3D12Resource *>(u.resource);
 						}
 
@@ -1876,7 +1869,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							if (ngx::exposure_from_texture())
 							{
 								const std::uint64_t eye = find_eye_adaptation_srv(b.srvs);
-								if (eye != 0 && is_resource_live(eye))
+								if (eye != 0 && icept::backend()->is_resource_live(eye))
 								{
 									ei.exposure = reinterpret_cast<ID3D12Resource *>(eye);
 								}
@@ -1892,7 +1885,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 											"1.0 for such frames. If this persists, set "
 											"NgxExposure=auto. First occurrence only.",
 											eye != 0 ? 1 : 0,
-											eye != 0 && is_resource_live(eye) ? 1 : 0);
+											eye != 0 && icept::backend()->is_resource_live(eye) ? 1 : 0);
 									}
 								}
 							}
@@ -1923,12 +1916,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							{
 								// Both inputs sit in NON_PIXEL_SHADER_RESOURCE here — the
 								// engine transitioned them for the dispatch we are replacing.
-								input_dump::capture(reinterpret_cast<ID3D12Device *>(
-										device->get_native()), native, ei.color,
+								input_dump::capture(native_device, native, ei.color,
 									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "colour",
 									eval_no);
-								input_dump::capture(reinterpret_cast<ID3D12Device *>(
-										device->get_native()), native, ei.depth,
+								input_dump::capture(native_device, native, ei.depth,
 									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "depth",
 									eval_no);
 							}
@@ -1971,8 +1962,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// Same state we hand NGX: the game bound t0 as a
 										// compute SRV, so NON_PIXEL_SHADER_RESOURCE.
 										input_dump::capture_texel(
-											reinterpret_cast<ID3D12Device *>(
-												device->get_native()), native, ei.exposure,
+											native_device, native, ei.exposure,
 											D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 											label, eval_no);
 									}
@@ -2004,7 +1994,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									g_ngx_rr_mode.load(std::memory_order_relaxed);
 								if (rrm == 2 || rrm == 3)
 								{
-									ok = try_evaluate_rr(device, native, ei, fd, view);
+									ok = try_evaluate_rr(native_device, native, ei, fd, view);
 									if (ok)
 										g_rr_evaluates.fetch_add(1,
 											std::memory_order_relaxed);
@@ -2069,8 +2059,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// `cw`/`ch`, i.e. the same fd.output_* handed to apply()
 										// below — never the texture's allocation.
 										// ([STRAYDLSS] NgxNRRestoreHistory; default ON.)
-										nrhist::snapshot(reinterpret_cast<ID3D12Device *>(
-											device->get_native()), native, ei.output,
+										nrhist::snapshot(native_device, native, ei.output,
 											fd.output_width, fd.output_height);
 
 										nr::ApplyInputs ni;
@@ -2129,8 +2118,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										ni.pre_exposure_ok =
 											view_ok && ue4::pre_exposure_plausible(view);
 										const bool nr_applied = nr::apply(
-											reinterpret_cast<ID3D12Device *>(
-												device->get_native()), native, ni);
+											native_device, native, ni);
 										// Half two of the history restore: only a frame NR really
 										// modified needs putting back. A refusal (warmup,
 										// validating, degenerate, codec failure) leaves `u0`
@@ -2164,8 +2152,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							if (ok && input_dump::wants(eval_no))
 							{
 								// The output is in UAV state; NGX has just written it.
-								input_dump::capture(reinterpret_cast<ID3D12Device *>(
-										device->get_native()), native, ei.output,
+								input_dump::capture(native_device, native, ei.output,
 									D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "output", eval_no);
 							}
 
@@ -2218,7 +2205,7 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						NGX_TRACE("%s", "restore begin");
 						{
 							perf::Scope perf_restore(perf::kRestore);
-							restore_game_compute_state(cmd_list);
+							icept::backend()->restore_game_compute_state(ctx);
 						}
 						NGX_TRACE("%s", "restore done");
 						mark(6, "state-restored");

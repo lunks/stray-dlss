@@ -1,6 +1,6 @@
 #include "pass_finder.hpp"
 
-#include "frame_state.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
 #include "taa_hook.hpp"
 
@@ -51,7 +51,7 @@ struct ListRecord
 	std::uint64_t bound_compute_hash = 0;
 	std::uint64_t bound_graphics_hash = 0;
 };
-std::unordered_map<reshade::api::command_list *, ListRecord> g_lists;
+std::unordered_map<ID3D12GraphicsCommandList *, ListRecord> g_lists;
 
 // The frame under assembly: everything executed since the last present.
 std::vector<FrameEvent> g_frame;
@@ -237,7 +237,7 @@ void forget_pipeline(std::uint64_t pipeline_handle)
 	g_pipelines.erase(pipeline_handle);
 }
 
-void note_bind_pipeline(reshade::api::command_list *cmd_list, std::uint64_t pipeline_handle)
+void note_bind_pipeline(const icept::CommandContext &ctx, std::uint64_t pipeline_handle)
 {
 	if (!g_enabled)
 		return;
@@ -245,36 +245,34 @@ void note_bind_pipeline(reshade::api::command_list *cmd_list, std::uint64_t pipe
 	const auto it = g_pipelines.find(pipeline_handle);
 	if (it == g_pipelines.end())
 		return;
-	ListRecord &lr = g_lists[cmd_list];
+	ListRecord &lr = g_lists[ctx.native];
 	if (it->second.is_compute)
 		lr.bound_compute_hash = it->second.hash;
 	else
 		lr.bound_graphics_hash = it->second.hash;
 }
 
-void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-                         const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
+void note_render_targets(const icept::CommandContext &ctx, uint32_t count,
+                         const icept::DescriptorId *rtvs, icept::DescriptorId dsv)
 {
 	if (!recording_now())
 		return;
 
-	reshade::api::device *device = cmd_list->get_device();
-
-	// describe_bound_view is liveness-checked first, like every view this project touches:
-	// ReShade's view->resource map outlives the resource on D3D12. (frame_state.hpp)
+	// describe_view is liveness-checked first, like every view this project touches:
+	// ReShade's view->resource map outlives the resource on D3D12. (intercept/backend.hpp)
 	std::vector<BoundTexture> rts;
 	for (uint32_t i = 0; i < count; ++i)
-		describe_bound_view(device, rtvs[i], i, rts);
-	if (dsv.handle != 0)
-		describe_bound_view(device, dsv, count, rts);
+		icept::backend()->describe_view(rtvs[i], i, rts);
+	if (dsv != 0)
+		icept::backend()->describe_view(dsv, count, rts);
 
 	std::lock_guard<std::mutex> lock(g_mutex);
-	ListRecord &lr = g_lists[cmd_list];
+	ListRecord &lr = g_lists[ctx.native];
 	lr.current_rts = std::move(rts);
 	lr.draw_recorded_for_rts = false;
 }
 
-void note_draw(reshade::api::command_list *cmd_list, uint32_t vertex_or_index_count)
+void note_draw(const icept::CommandContext &ctx, uint32_t vertex_or_index_count)
 {
 	if (!recording_now())
 		return;
@@ -282,7 +280,7 @@ void note_draw(reshade::api::command_list *cmd_list, uint32_t vertex_or_index_co
 	bool want_srvs = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		ListRecord &lr = g_lists[cmd_list];
+		ListRecord &lr = g_lists[ctx.native];
 		if (lr.current_rts.empty())
 			return;
 
@@ -308,17 +306,17 @@ void note_draw(reshade::api::command_list *cmd_list, uint32_t vertex_or_index_co
 	if (want_srvs)
 	{
 		std::vector<BoundTexture> srvs;
-		resolve_graphics_srvs(cmd_list, srvs);
+		icept::backend()->resolve_graphics_srvs(ctx, srvs);
 
 		std::lock_guard<std::mutex> lock(g_mutex);
-		ListRecord &lr = g_lists[cmd_list];
+		ListRecord &lr = g_lists[ctx.native];
 		if (!lr.events.empty() && lr.events.back().kind == FrameEvent::Kind::draw &&
 			lr.events.back().srvs.empty())
 			lr.events.back().srvs = std::move(srvs);
 	}
 }
 
-void note_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
+void note_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y, uint32_t z)
 {
 	if (!recording_now())
 		return;
@@ -326,12 +324,12 @@ void note_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y,
 		return;
 
 	// The same resolver the interception path trusts, outside our lock.
-	DispatchBindings b;
-	if (!resolve_compute_bindings(cmd_list, b))
+	icept::DispatchBindings b;
+	if (!icept::backend()->resolve_compute_bindings(ctx, b))
 		return;
 
 	std::lock_guard<std::mutex> lock(g_mutex);
-	ListRecord &lr = g_lists[cmd_list];
+	ListRecord &lr = g_lists[ctx.native];
 
 	FrameEvent e;
 	e.kind = FrameEvent::Kind::dispatch;
@@ -341,42 +339,36 @@ void note_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y,
 	lr.events.push_back(std::move(e));
 }
 
-void note_copy(reshade::api::command_list *cmd_list, reshade::api::resource source,
-               reshade::api::resource dest)
+void note_copy(const icept::CommandContext &ctx, icept::ResourceId source, icept::ResourceId dest)
 {
 	if (!recording_now())
 		return;
-	if (source.handle == 0 || dest.handle == 0)
+	if (source == 0 || dest == 0)
 		return;
-	// Liveness BEFORE get_resource_desc — the desc of a destroyed resource reads freed
-	// memory and returns plausible garbage. (CLAUDE.md §5, "Two descriptor hazards")
-	if (!is_resource_live(source.handle) || !is_resource_live(dest.handle))
+	// describe_resource answers only for a resource KNOWN LIVE — the desc of a destroyed
+	// resource reads freed memory and returns plausible garbage. (CLAUDE.md §5, "Two
+	// descriptor hazards")
+	icept::ResourceInfo sd{}, dd{};
+	if (!icept::backend()->describe_resource(source, sd) || !icept::backend()->describe_resource(dest, dd))
 		return;
-
-	reshade::api::device *device = cmd_list->get_device();
-	const reshade::api::resource_desc sd = device->get_resource_desc(source);
-	const reshade::api::resource_desc dd = device->get_resource_desc(dest);
-	if (sd.type == reshade::api::resource_type::buffer ||
-		dd.type == reshade::api::resource_type::buffer)
+	if (sd.is_buffer || dd.is_buffer)
 		return; // only texture-to-texture copies can be on the colour chain
 
 	FrameEvent e;
 	e.kind = FrameEvent::Kind::copy;
-	e.srvs.push_back(BoundTexture{ 0, source.handle, to_tex_format(sd.texture.format),
-		sd.texture.width, sd.texture.height });
-	e.outputs.push_back(BoundTexture{ 0, dest.handle, to_tex_format(dd.texture.format),
-		dd.texture.width, dd.texture.height });
+	e.srvs.push_back(BoundTexture{ 0, source, sd.format, sd.width, sd.height });
+	e.outputs.push_back(BoundTexture{ 0, dest, dd.format, dd.width, dd.height });
 
 	std::lock_guard<std::mutex> lock(g_mutex);
-	g_lists[cmd_list].events.push_back(std::move(e));
+	g_lists[ctx.native].events.push_back(std::move(e));
 }
 
-void note_execute(reshade::api::command_list *cmd_list)
+void note_execute(const icept::CommandContext &ctx)
 {
 	if (!g_enabled)
 		return;
 	std::lock_guard<std::mutex> lock(g_mutex);
-	const auto it = g_lists.find(cmd_list);
+	const auto it = g_lists.find(ctx.native);
 	if (it == g_lists.end() || it->second.events.empty())
 		return;
 
@@ -392,15 +384,15 @@ void note_execute(reshade::api::command_list *cmd_list)
 	it->second.events.clear();
 }
 
-void forget_command_list(reshade::api::command_list *cmd_list)
+void forget_command_list(const icept::CommandContext &ctx)
 {
 	if (!g_enabled)
 		return;
 	std::lock_guard<std::mutex> lock(g_mutex);
-	g_lists.erase(cmd_list);
+	g_lists.erase(ctx.native);
 }
 
-void on_present(std::uint64_t frame, reshade::api::resource back_buffer)
+void on_present(std::uint64_t frame, icept::ResourceId back_buffer)
 {
 	if (!g_enabled)
 		return;
@@ -412,7 +404,7 @@ void on_present(std::uint64_t frame, reshade::api::resource back_buffer)
 			std::lock_guard<std::mutex> lock(g_mutex);
 			events.swap(g_frame);
 		}
-		finalise_frame(frame, std::move(events), back_buffer.handle);
+		finalise_frame(frame, std::move(events), back_buffer);
 	}
 
 	const std::uint64_t next = frame + 1;

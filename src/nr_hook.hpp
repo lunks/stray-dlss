@@ -32,7 +32,7 @@
 #pragma once
 
 #include "core/nr_hook_plan.hpp"
-#include "reshade_all.hpp"
+#include "intercept/types.hpp"
 
 #include <cstdint>
 
@@ -68,8 +68,8 @@ void note_guides(std::uint64_t frame, ID3D12Resource *depth, ID3D12Resource *mot
 
 // The swapchain's back-buffer identities, cached so the `preui` trigger can answer "is this
 // render target the back buffer?" without touching the swapchain from a recording thread.
-void note_swapchain(reshade::api::swapchain *swapchain);
-void forget_swapchain(reshade::api::swapchain *swapchain);
+void note_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count);
+void forget_swapchain();
 
 // Per-present boundary: resets the bind ordinal and the once-per-frame latch, retires staging
 // allocations, and emits the periodic diagnostic.
@@ -77,8 +77,10 @@ void on_present(std::uint64_t frame);
 
 // --- triggers ---
 
-// addon_event::reshade_begin_effects. Runs on ReShade's OWN immediate command list, with the
-// resource behind `rtv` in D3D12_RESOURCE_STATE_RENDER_TARGET (v6.8.0 runtime.cpp:745/4020).
+// addon_event::reshade_begin_effects — a RESHADE-BACKEND-ONLY site, called straight from the
+// add-on entry point rather than through icept::Sink (the native backend has no equivalent
+// and refuses NgxNRHook=present loudly). `ctx` is ReShade's OWN immediate command list, with
+// the resource behind `rtv` in D3D12_RESOURCE_STATE_RENDER_TARGET (v6.8.0 runtime.cpp:745/4020).
 //
 // THE UI IS ALREADY COMPOSITED INTO THIS IMAGE, and that is EXPECTED at this site, not a defect.
 // The DLSSNR runtime carries `DLSSNR.UI`, `DLSSNR.UIAlpha` and `DLSSNR.UICorrection` for exactly
@@ -87,14 +89,12 @@ void on_present(std::uint64_t frame);
 // POSSIBLE FUTURE REFINEMENT and is deliberately not built: it would need the HUD rendered to a
 // separate target we do not currently capture, and `preui` sidesteps the whole question by
 // running before Slate draws anything.
-void on_begin_effects(reshade::api::effect_runtime *runtime, reshade::api::command_list *cmd_list,
-                      reshade::api::resource_view rtv, reshade::api::resource_view rtv_srgb);
+void on_begin_effects(const icept::CommandContext &ctx, icept::DescriptorId rtv);
 
 // addon_event::bind_render_targets_and_depth_stencil. Runs on the GAME's command list, before the
 // command. Fires NR on the configured back-buffer bind ordinal.
-void on_bind_render_targets(reshade::api::command_list *cmd_list, std::uint32_t count,
-                            const reshade::api::resource_view *rtvs,
-                            reshade::api::resource_view dsv);
+void on_bind_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
+                            const icept::DescriptorId *rtvs, icept::DescriptorId dsv);
 
 void shutdown();
 

@@ -1,6 +1,6 @@
 #include "gbuffer_finder.hpp"
 
-#include "frame_state.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -64,7 +64,7 @@ struct ListRecord
 	bool has_pending = false;
 	std::uint32_t pending_draws = 0;
 };
-std::unordered_map<reshade::api::command_list *, ListRecord> g_lists;
+std::unordered_map<ID3D12GraphicsCommandList *, ListRecord> g_lists;
 
 // One frame's base-pass candidates, coalesced across binds by target identity: the base
 // pass re-binds its MRT set several times per frame (per command list, and around the
@@ -264,8 +264,8 @@ bool enabled()
 	return g_enabled;
 }
 
-void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-                         const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
+void note_render_targets(const icept::CommandContext &ctx, uint32_t count,
+                         const icept::DescriptorId *rtvs, icept::DescriptorId dsv)
 {
 	if (!g_enabled)
 		return;
@@ -274,7 +274,7 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 	bool first_event = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		const auto it = g_lists.find(cmd_list);
+		const auto it = g_lists.find(ctx.native);
 		if (it != g_lists.end())
 		{
 			flush_pending_locked(it->second);
@@ -310,15 +310,14 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 	// SEPARATE velocity pass — one RTV plus depth, the shape Stray's
 	// r.SelectiveBasePassOutputs=True forces (RESEARCH-RR-GBUFFER.md §1.3) — whose narrow
 	// binds during gameplay are the expected home of the R16G16B16A16_UNORM target the
-	// MRT sets lack. describe_bound_view is liveness-checked
+	// MRT sets lack. describe_view is liveness-checked
 	// FIRST, like every view this project touches (frame_state.hpp, CLAUDE.md §5 "Two
 	// descriptor hazards"), and runs outside our lock — it takes frame_state's own.
-	reshade::api::device *device = cmd_list->get_device();
 	std::vector<BoundTexture> rts;
 	for (uint32_t i = 0; i < count; ++i)
-		describe_bound_view(device, rtvs[i], i, rts);
-	if (count >= kMinMrtCount && dsv.handle != 0)
-		describe_bound_view(device, dsv, count, rts);
+		icept::backend()->describe_view(rtvs[i], i, rts);
+	if (count >= kMinMrtCount && dsv != 0)
+		icept::backend()->describe_view(dsv, count, rts);
 
 	bool has_velocity = false;
 	std::uint32_t vel_w = 0, vel_h = 0;
@@ -396,7 +395,7 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 			g_latest = cls; // freshest pointers for current_identification()
 			g_have_latest = true;
 			g_latest_present = g_present_counter;
-			ListRecord &lr = g_lists[cmd_list];
+			ListRecord &lr = g_lists[ctx.native];
 			lr.pending = std::move(cls);
 			lr.has_pending = true;
 			lr.pending_draws = 0;
@@ -418,25 +417,25 @@ void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
 	}
 }
 
-void note_draw(reshade::api::command_list *cmd_list)
+void note_draw(const icept::CommandContext &ctx)
 {
 	if (!g_enabled)
 		return;
 	std::lock_guard<std::mutex> lock(g_mutex);
-	const auto it = g_lists.find(cmd_list);
+	const auto it = g_lists.find(ctx.native);
 	if (it != g_lists.end() && it->second.has_pending)
 		++it->second.pending_draws;
 }
 
-void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_hash)
+void note_dispatch(const icept::CommandContext &ctx, std::uint64_t shader_hash)
 {
 	// Only the known SSR-denoiser look-alike is worth a descriptor-table resolve — the one
 	// expensive operation in this module, and it runs at most a handful of times per frame.
 	if (!g_enabled || shader_hash != kDenoiserLookalikeHash)
 		return;
 
-	DispatchBindings b;
-	if (!resolve_compute_bindings(cmd_list, b)) // outside our lock; takes frame_state's
+	icept::DispatchBindings b;
+	if (!icept::backend()->resolve_compute_bindings(ctx, b)) // outside our lock; takes the backend's
 		return;
 
 	std::lock_guard<std::mutex> lock(g_mutex);
@@ -446,12 +445,12 @@ void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_ha
 			g_denoiser_srvs.insert(s.resource);
 }
 
-void forget_command_list(reshade::api::command_list *cmd_list)
+void forget_command_list(const icept::CommandContext &ctx)
 {
 	if (!g_enabled)
 		return;
 	std::lock_guard<std::mutex> lock(g_mutex);
-	const auto it = g_lists.find(cmd_list);
+	const auto it = g_lists.find(ctx.native);
 	if (it != g_lists.end())
 	{
 		// A reset list was almost always executed first, so harvest its draws rather than

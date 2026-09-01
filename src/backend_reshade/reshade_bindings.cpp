@@ -1,4 +1,4 @@
-#include "frame_state.hpp"
+#include "reshade_bindings.hpp"
 
 #include "d3d12_restore.hpp"
 #include "log.hpp"
@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace stray_dlss {
+namespace stray_dlss::rsb {
 namespace {
 
 // Root descriptors bypass the descriptor heap entirely, so they have to be remembered as they
@@ -27,7 +27,7 @@ struct RootDescriptors
 	std::vector<BoundTexture> uavs;
 	// Every root constant buffer, not just the last. UE4 binds several, and which one carries
 	// the View uniform buffer is not fixed — keeping only one loses it on most frames.
-	std::vector<std::pair<uint32_t, reshade::api::buffer_range>> constant_buffers;
+	std::vector<std::pair<uint32_t, icept::BufferRange>> constant_buffers;
 
 	// --- everything needed to REPLAY the game's compute root arguments ---
 	//
@@ -113,11 +113,11 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 // alive. Storing the ID3D12Resource* and dereferencing it at replay time would reintroduce the
 // stale-pointer hazard that ReShade's missing destroy_resource_view on D3D12 already caused
 // once. (docs/RESEARCH.md §2.7)
-std::uint64_t gpu_address(const reshade::api::buffer_range &range)
+std::uint64_t gpu_address(const icept::BufferRange &range)
 {
-	if (range.buffer.handle == 0)
+	if (range.buffer == 0)
 		return 0;
-	auto *res = reinterpret_cast<::ID3D12Resource *>(range.buffer.handle);
+	auto *res = reinterpret_cast<::ID3D12Resource *>(range.buffer);
 	return res->GetGPUVirtualAddress() + range.offset;
 }
 
@@ -182,66 +182,6 @@ void dump_tracker_state_for(reshade::api::command_list *cmd_list, const char *wh
 	dump_tracker_state(device, state, desc);
 }
 
-TexFormat to_tex_format(reshade::api::format f)
-{
-	using reshade::api::format;
-	switch (f)
-	{
-	case format::r32_float_x8_uint:
-	case format::r32_g8_typeless:        return TexFormat::r32_float_x8x24_typeless;
-	// Depth-stencil VIEW formats, seen when the pass finder describes a draw's DSV. Mapped
-	// onto the depth TexFormat so the write-set gate recognises a depth write for what it
-	// is: a pass writing one can never be replaced by DLSS. (pass_walk.hpp)
-	case format::d32_float_s8_uint:
-	case format::d24_unorm_s8_uint:
-	case format::d32_float:
-	case format::d16_unorm:              return TexFormat::r32_float_x8x24_typeless;
-	case format::s8_uint:                return TexFormat::x32_typeless_g8x24_uint;
-	case format::x32_float_g8_uint:      return TexFormat::x32_typeless_g8x24_uint;
-	case format::r16g16b16a16_unorm:     return TexFormat::r16g16b16a16_unorm;
-	case format::r16g16b16a16_float:     return TexFormat::r16g16b16a16_float;
-	case format::r16g16_float:           return TexFormat::r16g16_float;
-	case format::r32g32b32a32_float:     return TexFormat::r32g32b32a32_float;
-	case format::r11g11b10_float:        return TexFormat::r11g11b10_float;
-	case format::r10g10b10a2_unorm:      return TexFormat::r10g10b10a2_unorm;
-	case format::r32_float:              return TexFormat::r32_float;
-	case format::r16_float:              return TexFormat::r16_float;
-	case format::r8g8b8a8_unorm:
-	case format::r8g8b8a8_unorm_srgb:    return TexFormat::r8g8b8a8_unorm;
-	// UE4's PF_B8G8R8A8, the stock GBufferB/C format — created typeless, viewed unorm or
-	// srgb. The gbuffer classifier needs to see all three as one thing.
-	// (core/gbuffer_classify.hpp)
-	case format::b8g8r8a8_typeless:
-	case format::b8g8r8a8_unorm:
-	case format::b8g8r8a8_unorm_srgb:    return TexFormat::b8g8r8a8_unorm;
-	default:                             return TexFormat::unknown;
-	}
-}
-
-const char *format_name(reshade::api::format f)
-{
-	using reshade::api::format;
-	switch (f)
-	{
-	case format::r32_float_x8_uint:    return "R32_FLOAT_X8X24_TYPELESS";
-	case format::r32_g8_typeless:      return "R32G8X24_TYPELESS";
-	case format::x32_float_g8_uint:    return "X32_TYPELESS_G8X24_UINT";
-	case format::r16g16b16a16_unorm:   return "R16G16B16A16_UNORM";
-	case format::r16g16b16a16_float:   return "R16G16B16A16_FLOAT";
-	case format::r16g16_float:         return "R16G16_FLOAT";
-	case format::r32g32b32a32_float:   return "R32G32B32A32_FLOAT";
-	case format::r11g11b10_float:      return "R11G11B10_FLOAT";
-	case format::r8g8b8a8_unorm:       return "R8G8B8A8_UNORM";
-	case format::b8g8r8a8_unorm:       return "B8G8R8A8_UNORM";
-	case format::r10g10b10a2_unorm:    return "R10G10B10A2_UNORM";
-	case format::r32_float:            return "R32_FLOAT";
-	case format::r16_float:            return "R16_FLOAT";
-	case format::r8_unorm:             return "R8_UNORM";
-	case format::unknown:              return "unknown";
-	default:                           return "other";
-	}
-}
-
 void note_push_descriptors(
 	reshade::api::command_list *cmd_list,
 	reshade::api::shader_stage stages,
@@ -277,9 +217,10 @@ void note_push_descriptors(
 			// frames — which is why the CB read intermittently failed.
 			if (ranges[i].buffer.handle != 0)
 			{
-				rd.constant_buffers.emplace_back(layout_param, ranges[i]);
+				const icept::BufferRange br = to_range(ranges[i]);
+				rd.constant_buffers.emplace_back(layout_param, br);
 				// Last write wins per root parameter, which matches D3D12 semantics.
-				rd.root_cbv_va[layout_param] = gpu_address(ranges[i]);
+				rd.root_cbv_va[layout_param] = gpu_address(br);
 			}
 			break;
 		}
@@ -583,7 +524,7 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 						const reshade::api::buffer_range br = desc->get_buffer_range(heap, offset);
 						if (br.buffer.handle != 0 && !out.view_cb_valid)
 						{
-							out.view_cb = br;
+							out.view_cb = to_range(br);
 							out.view_cb_valid = true;
 							out.view_cb_register = reg;
 						}
@@ -762,6 +703,27 @@ void restore_game_compute_state(reshade::api::command_list *cmd_list)
 	//    are untouched by anything we do.
 }
 
+void restore_viewports_and_scissors(reshade::api::command_list *cmd_list)
+{
+	// NGX clobbers them and restore_game_compute_state deliberately does not touch graphics
+	// dynamic state. UE 4.27's RHI does set a viewport in RHISetRenderTargets — which is the
+	// very command the pre-UI site records in front of — so this is belt and braces rather
+	// than the load-bearing part, and it is six lines.
+	//
+	// Render targets are NOT restored here on purpose: at that site the next command IS the
+	// OMSetRenderTargets we intercepted, so re-binding them would be redundant work whose
+	// only effect would be to make the game's own bind look redundant to ReShade's cache.
+	if (const auto *state = cmd_list->get_private_data<state_tracking>())
+	{
+		if (!state->viewports.empty())
+			cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()),
+				state->viewports.data());
+		if (!state->scissor_rects.empty())
+			cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()),
+				state->scissor_rects.data());
+	}
+}
+
 void reset_command_list_state(reshade::api::command_list *cmd_list)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
@@ -812,4 +774,4 @@ void forget_all_command_lists()
 	g_root.clear();
 }
 
-} // namespace stray_dlss
+} // namespace stray_dlss::rsb

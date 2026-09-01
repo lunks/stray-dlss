@@ -31,7 +31,7 @@
 
 #include "core/gbuffer_classify.hpp"
 
-#include "reshade_all.hpp"
+#include "intercept/types.hpp"
 
 #include <cstdint>
 
@@ -43,9 +43,9 @@ bool enabled();
 
 // Recording taps, called from the add-on's shared finder event handlers. Cheap no-ops
 // when disabled.
-void note_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-                         const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv);
-void note_draw(reshade::api::command_list *cmd_list);
+void note_render_targets(const icept::CommandContext &ctx, uint32_t count,
+                         const icept::DescriptorId *rtvs, icept::DescriptorId dsv);
+void note_draw(const icept::CommandContext &ctx);
 
 // The SSR-denoiser cross-check tap: `shader_hash` is the DXBC hash of the compute pipeline
 // bound at this dispatch (0 when unknown). Bindings are resolved ONLY when it is the known
@@ -53,9 +53,9 @@ void note_draw(reshade::api::command_list *cmd_list);
 // base-pass MRT and as one of that dispatch's SRVs corroborates a G-buffer identity. The
 // hash is a permutation fingerprint measured at one configuration, so its absence proves
 // nothing and the report says so.
-void note_dispatch(reshade::api::command_list *cmd_list, std::uint64_t shader_hash);
+void note_dispatch(const icept::CommandContext &ctx, std::uint64_t shader_hash);
 
-void forget_command_list(reshade::api::command_list *cmd_list);
+void forget_command_list(const icept::CommandContext &ctx);
 
 // The live identification, for the RR path — ROLE-KEYED, deliberately not shape-keyed.
 //

@@ -13,7 +13,7 @@
 #include "core/ring.hpp"
 #include "core/view_params.hpp"
 #include "d3d12_restore.hpp"
-#include "frame_state.hpp"
+#include "reshade_bindings.hpp"
 
 #include "fake_reshade_command_list.hpp"
 
@@ -1284,7 +1284,7 @@ bool test_reshade_restore_call_pattern(Gpu &gpu)
 		reinterpret_cast<std::uint64_t>(p.pso.Get()) };
 	fake.put_private_data(&st);
 
-	stray_dlss::restore_game_compute_state(&fake);
+	stray_dlss::rsb::restore_game_compute_state(&fake);
 
 	const auto &b = fake.binds;
 	check(!b.empty(), "the restore called into ReShade at all");
@@ -1336,7 +1336,7 @@ bool test_reshade_restore_call_pattern(Gpu &gpu)
 	gpu.list->Close();
 	gpu.allocator->Reset();
 	gpu.list->Reset(gpu.allocator.Get(), nullptr);
-	stray_dlss::forget_all_command_lists();
+	stray_dlss::rsb::forget_all_command_lists();
 	drain_validation(gpu, "reshade-restore-teardown");
 	return true;
 }

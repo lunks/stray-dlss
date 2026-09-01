@@ -1,5 +1,6 @@
 #include "nr_history.hpp"
 
+#include "intercept/backend.hpp"
 #include "log.hpp"
 #include "ngx_nr.hpp"
 
@@ -65,8 +66,11 @@ constexpr D3D12_RESOURCE_STATES kImageStateAtSnapshot = D3D12_RESOURCE_STATE_UNO
 //
 //    Which is the whole point of the override: a wrong guess costs a config edit, not a round
 //    trip through CI and the user's machine.
-constexpr D3D12_RESOURCE_STATES kImageStateAtPresent =
-	D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+// As an integer OR rather than the enum's operator|, which is not constexpr in every SDK
+// (mingw's, used for the local syntax check, in particular). Same bits either way: 0xC0.
+constexpr std::uint32_t kImageStateAtPresent =
+	static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+	static_cast<std::uint32_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
 // The state our scratch texture lives in between the snapshot and the restore. COPY_SOURCE,
 // because that is what the restore needs — so the restore records NO barrier of its own on the
@@ -516,8 +520,9 @@ void note_nr_applied(bool applied)
 	}
 }
 
-void on_present(std::uint64_t frame, reshade::api::command_queue *queue)
+void on_present(const icept::PresentContext &pc)
 {
+	const std::uint64_t frame = pc.frame;
 	const histplan::Config cfg = config();
 
 	// The pending record has to be consumed on EVERY present, whatever the verdict — otherwise a
@@ -572,13 +577,10 @@ void on_present(std::uint64_t frame, reshade::api::command_queue *queue)
 		// `unique_direct3d_device_lock` on the D3D12CommandQueue's own _mutex before invoking any
 		// event, precisely so "the immediate command list may be accessed" (its comment). We are
 		// inside that lock for the whole of this callback.
-		reshade::api::command_list *cmd_list =
-			queue != nullptr ? queue->get_immediate_command_list() : nullptr;
-		auto *native = cmd_list != nullptr
-			? reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list->get_native()) : nullptr;
+		ID3D12GraphicsCommandList *native = pc.present_list;
 
 		std::lock_guard<std::mutex> lock(g_mutex);
-		if (cmd_list == nullptr || native == nullptr || g_scratch.texture == nullptr)
+		if (native == nullptr || g_scratch.texture == nullptr)
 		{
 			count_step(g_restore_reasons, histplan::Step::no_command_list, "restore",
 				"the present queue offered no immediate command list, or the scratch was gone");
@@ -593,21 +595,20 @@ void on_present(std::uint64_t frame, reshade::api::command_queue *queue)
 		else
 		{
 			const std::uint32_t assumed = image_state_at_present();
-			// api::resource_usage's values ARE the D3D12_RESOURCE_STATES bits — copy_dest 0x400,
-			// shader_resource 0xC0, and convert_usage_to_resource_states (d3d12_impl_type_convert
-			// .cpp:236) is a plain mask — so this is a reinterpretation, not a translation. Going
-			// through uint32_t makes that explicit rather than resting on enum conversion rules.
-			const auto assumed_usage = static_cast<reshade::api::resource_usage>(assumed);
-			const auto res = reshade::api::resource{ reinterpret_cast<std::uint64_t>(
-				pending.image) };
+			// The barriers go through the BACKEND, not straight onto `native`: ReShade's immediate
+			// list only flushes what its own API recorded (CLAUDE.md §5), and its barrier is the
+			// call that marks it. The backend's present_barrier is that call under ReShade and a
+			// plain ResourceBarrier under the native backend; the bits are D3D12_RESOURCE_STATES
+			// either way (api::resource_usage is a bit-for-bit passthrough).
+			const auto res = reinterpret_cast<icept::ResourceId>(pending.image);
 
-			cmd_list->barrier(res, assumed_usage, reshade::api::resource_usage::copy_dest);
+			icept::backend()->present_barrier(pc, res, assumed, D3D12_RESOURCE_STATE_COPY_DEST);
 			// The scratch needs no barrier: it RESTS in COPY_SOURCE, and the snapshot's own
 			// COPY_DEST -> COPY_SOURCE transition (recorded on the game's list, which executes
 			// earlier on this same queue) is both the layout change and the write-before-read
 			// dependency this copy needs.
 			copy_rect(native, pending.image, g_scratch.texture, pending.width, pending.height);
-			cmd_list->barrier(res, reshade::api::resource_usage::copy_dest, assumed_usage);
+			icept::backend()->present_barrier(pc, res, D3D12_RESOURCE_STATE_COPY_DEST, assumed);
 
 			const std::uint64_t n = g_restores.fetch_add(1, std::memory_order_relaxed);
 			count_step(g_restore_reasons, histplan::Step::ok, "restore", "");

@@ -7,7 +7,7 @@
 #include "core/taa_signature.hpp"
 #include "core/view_params.hpp"
 
-#include "reshade_all.hpp"
+#include "intercept/types.hpp"
 
 #include <cstdint>
 
@@ -15,11 +15,11 @@ namespace stray_dlss::taa_hook {
 
 void set_pipeline_hash(uint64_t pipeline_handle, std::uint64_t hash);
 void forget_pipeline(uint64_t pipeline_handle);
-void set_bound_pipeline(reshade::api::command_list *cmd_list, uint64_t pipeline_handle);
-void forget_command_list(reshade::api::command_list *cmd_list);
+void set_bound_pipeline(const icept::CommandContext &ctx, uint64_t pipeline_handle);
+void forget_command_list(const icept::CommandContext &ctx);
 
 // Returns true to suppress the game's dispatch. Phase A always returns false.
-bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z);
+bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y, uint32_t z);
 
 // True once this hash has demonstrated the history round-trip: UE4 bound its previous u0
 // back as one of its SRVs on a later frame (CLAUDE.md §2.9). Accumulates over the session.

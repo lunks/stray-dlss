@@ -24,10 +24,8 @@ jobs:
 
       # The interception seam (plan Stage 1): ReShade's headers are allowed in exactly one
       # directory. Anything else that includes them is coupled to the framework and cannot be
-      # shared with the native backend. Red until the seam lands; then it stays red on purpose
-      # for any regression.
+      # shared with the native backend.
       - name: No ReShade include outside the ReShade backend
-        continue-on-error: true
         run: |
           set -e
           bad=$(grep -rln --include='*.cpp' --include='*.hpp' -E '#include *[<"](reshade|imgui|reshade_all|descriptor_tracking|state_tracking)' src | grep -v '^src/backend_reshade/' || true)

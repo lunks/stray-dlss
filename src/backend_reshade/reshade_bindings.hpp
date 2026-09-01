@@ -1,4 +1,8 @@
-// Recovering, at dispatch time, exactly which resource the game bound to which register.
+// The ReShade backend's binding trackers: recovering, at dispatch time, exactly which
+// resource the game bound to which register, out of ReShade's descriptor_tracking and
+// state_tracking utilities plus our own root-descriptor capture. Every function here takes
+// ReShade's own types; src/backend_reshade/reshade_backend.cpp wraps them behind
+// icept::Backend for the framework-free application. (Formerly src/frame_state.{hpp,cpp}.)
 //
 // Resources are tracked BY DESCRIPTOR REGISTER, never by pointer identity alone: the same
 // texture turns up at different registers meaning different things, and telling those cases
@@ -11,41 +15,35 @@
 //                         through ReShade's own descriptor_tracking utility
 #pragma once
 
-#include "core/taa_signature.hpp"
+#include "core/dxgi_format.hpp"
+#include "intercept/types.hpp"
 
 #include "reshade_all.hpp"
 
 #include <utility>
 #include <vector>
 
-// Global scope on purpose: writing `struct ID3D12DescriptorHeap *` inside the namespace below
-// declares a NEW type stray_dlss::ID3D12DescriptorHeap rather than referring to the real one.
-struct ID3D12DescriptorHeap;
+namespace stray_dlss::rsb {
 
-namespace stray_dlss {
+using icept::DispatchBindings;
 
-TexFormat to_tex_format(reshade::api::format f);
-const char *format_name(reshade::api::format f);
-
-// What a single compute dispatch had bound.
-struct DispatchBindings
+// ReShade's api::format shares DXGI_FORMAT's numeric values (reshade_api_format.hpp), so the
+// CI-tested table in core/dxgi_format.cpp is the single mapping for both backends.
+inline TexFormat to_tex_format(reshade::api::format f)
 {
-	std::vector<BoundTexture> srvs;
-	std::vector<BoundTexture> uavs;
-	// EVERY constant buffer bound, not just the first. Which register carries UE4's View
-	// uniform buffer varies between passes (b3, b4 and b5 all seen), so the only reliable
-	// way to find it is to try each and keep the one that parses plausibly.
-	std::vector<std::pair<uint32_t, reshade::api::buffer_range>> constant_buffers;
-	reshade::api::buffer_range view_cb{};
-	bool view_cb_valid = false;
-	uint32_t view_cb_register = 0;
+	return tex_format_from_dxgi(static_cast<std::uint32_t>(f));
+}
+inline const char *format_name(reshade::api::format f)
+{
+	return dxgi_format_name(static_cast<std::uint32_t>(f));
+}
 
-	// The descriptor heaps that owned THIS dispatch's descriptors — i.e. exactly what the game
-	// had bound at this moment. Restoring these is precise, where picking the first heap found
-	// across every tracked table is a guess that can restore the wrong one.
-	::ID3D12DescriptorHeap *heaps[2] = {};
-	unsigned int heap_count = 0;
-};
+// ReShade's buffer_range and the seam's BufferRange are the same three numbers; UINT64_MAX
+// and kUnknownSize are both "to the end".
+inline icept::BufferRange to_range(const reshade::api::buffer_range &r)
+{
+	return icept::BufferRange{ r.buffer.handle, r.offset, r.size };
+}
 
 // Resolves the bindings for the compute pipeline currently bound on `cmd_list`, using
 // ReShade's state_tracking (which tables are bound) plus descriptor_tracking (what is in
@@ -101,6 +99,10 @@ void note_push_constants(
 	uint32_t count,
 	const void *values);
 
+// Viewports and scissors from ReShade's state_tracking, replayed through its API. Only the
+// pre-UI NR site needs these; the TAA path never touches graphics dynamic state.
+void restore_viewports_and_scissors(reshade::api::command_list *cmd_list);
+
 // Re-establishes the compute state the game had before our pass ran.
 //
 // This exists because ReShade's state_block CANNOT do it. state_tracking.cpp registers only
@@ -138,4 +140,4 @@ void note_resource_destroyed(reshade::api::resource res);
 bool is_resource_live(std::uint64_t handle);
 void forget_all_resources();
 
-} // namespace stray_dlss
+} // namespace stray_dlss::rsb

@@ -60,7 +60,7 @@
 #pragma once
 
 #include "core/nr_history_plan.hpp"
-#include "reshade_all.hpp"
+#include "intercept/types.hpp"
 
 #include <cstdint>
 
@@ -114,9 +114,10 @@ void snapshot(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resour
 // the restore is skipped as a pointless copy of identical pixels.
 void note_nr_applied(bool applied);
 
-// Records the restore, once per present, on ReShade's own immediate command list. Call from
-// addon.cpp's addon_event::present handler with the queue that event hands over.
-void on_present(std::uint64_t frame, reshade::api::command_queue *queue);
+// Records the restore, once per present, on the backend's present-time list
+// (PresentContext::present_list — ReShade's own immediate command list today). Call from the
+// application's present handler.
+void on_present(const icept::PresentContext &pc);
 
 void shutdown();
 
