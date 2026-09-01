@@ -1296,6 +1296,42 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### Exposure tracking: needed, but only with a LONG time constant (measured 2026-09-01)
+
+Three findings that only make sense together, and the third is the one that settles it:
+
+1. **Tracking creates a feedback loop and it rings.** With `NgxNRTrackExposure` on, the measured
+   codec scale ramped `13.56 -> 4.82 -> 8.49` — a 2.8x swing on a **~5 second period**, which is
+   what the user saw as "flickering every 3-5s" on a *static* image. The loop is
+   `scale -> proxy brightness -> NR output -> u0 -> histogram -> eye adaptation -> PreExposure ->
+   scale`. Adding a reset-on-scale-change latch made it worse: 52 fires, each discarding feature
+   18's accumulation. **A reset latch is right for a rare discrete change (a resolution switch)
+   and wrong for a quantity that varies continuously — there it is a metronome.**
+
+2. **The argument for dropping tracking entirely looked strong.** UE's base pass already
+   multiplies scene colour by `PreExposure` (`BasePassPixelShader.usf:1512`), and `PreExposure`
+   IS the eye-adaptation scale rather than its inverse (`PostProcessEyeAdaptation.usf:127-130`),
+   so the image reaching us is already exposure-normalised and a constant *should* suffice.
+   RenoDX — the only known-working DLSSNR deployment — uses a hardcoded constant and writes a
+   literal `1.0` into every exposure parameter.
+
+3. **But it does not suffice, measured: the MENU FOG needs tracking.** With a fixed scale tuned
+   for gameplay the menu's fog is wrong. So UE's pre-exposure does NOT normalise enough to span a
+   menu-to-gameplay swing — plausibly because the menu runs a different TAA permutation and a
+   different scene-colour format (`R11G11B10` vs `R16G16B16A16`, §5), putting its operating point
+   far from gameplay's.
+
+**So the choice was never "fixed (wrong per scene)" versus "tracked (rings)". It is the TIME
+CONSTANT.** Keep tracking on and make it far slower than the loop it sits in: `rate` 0.002 follows
+a change over ~500 frames (~8 s), fast enough for a menu-to-gameplay transition and far too slow
+to participate in a ~5 s resonance. Putting our pole well below the loop's is the ordinary way to
+keep an adaptive term without letting it oscillate.
+
+**The general lesson, and it cost most of a session: when an adaptive quantity you consume is
+also, indirectly, downstream of what you produce, you have closed a loop — and the question is
+never "track or not" but "at what frequency".** Ask what reads your output before deciding to
+follow anything the engine computes.
+
 ### The drift was mostly EXPOSURE COUPLING, and we caused it by dropping a feature in the port
 
 > **CORRECTED 2026-09-01, on the user's report that `NgxNRTrackExposure` "seem[s] to fix a lot of
