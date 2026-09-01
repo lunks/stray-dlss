@@ -169,6 +169,13 @@ bool g_ngx_gate3_logged = false;
 // several of the engine's dispatches, not just its TAA. Pin to the first pass we successfully
 // evaluate and refuse every other from then on.
 std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
+// ...but a pin must not outlive its pass. UE 4.27 picks FTAAScreenPercentageDim from the
+// input:output ratio EVERY frame (TemporalAA.cpp:726-750), so the TAA pass's DXBC — and
+// therefore our hash — CHANGES with the screen percentage: range 1 below 71%, range 0 at 1:1.
+// A pin taken at one ratio then refuses the real pass at every other ratio FOREVER, and used
+// to do so in complete silence. Release a pin whose pass has stopped dispatching.
+std::atomic<std::uint64_t> g_ngx_pass_last_frame{ 0 };
+constexpr std::uint64_t kPinStaleFrames = 300;
 // Hashes that have demonstrated the history round-trip, i.e. UE4 bound their previous u0 back
 // as an SRV the following frame. CLAUDE.md §2.9 calls this the decisive test for which pass
 // owns the temporal history — and it is a far better gate than "the first pass that happens to
@@ -176,6 +183,33 @@ std::atomic<std::uint64_t> g_ngx_pass_hash{ 0 };
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
+
+// Why a structurally matched TAA pass never reached DLSS.
+//
+// Every one of these paths used to refuse in SILENCE: the dispatch report says the pass
+// matched, and then nothing at all says why it went no further. That is exactly how "no DLSS
+// feature is ever created at 100% screen percentage" cost a whole round trip to localise, and
+// a round trip is the most expensive thing this project spends. One line per pass per reason.
+// (CLAUDE.md §0.1)
+enum GateReason
+{
+	kGateUnknownHash = 0,  // not a cooked FTAAStandaloneCS permutation
+	kGateNoViewCb,         // no bound constant buffer decoded as a plausible View
+	kGateDeadInputs,       // depth or velocity missing, or not known live
+	kGatePinnedElsewhere,  // DLSS is pinned to a different pass
+	kGateNoRoundTrip,      // this pass has not proved it owns the temporal history
+	kGateReasonCount,
+};
+const char *const kGateReasonText[kGateReasonCount] = {
+	"its hash is not a cooked FTAAStandaloneCS permutation (regenerate taa_hashes.hpp, or "
+	"drop a stray-dlss-hashes.txt beside the add-on)",
+	"no bound constant buffer decoded as a plausible View",
+	"its depth or velocity SRV is missing or not known live",
+	"DLSS is pinned to a different pass",
+	"it has not proved it owns the temporal history yet (no u0 round-trip seen)",
+};
+std::unordered_map<std::uint64_t, std::uint32_t> g_gate_logged; // hash -> reason bitmask
+
 bool g_dry_run_all_logged = false;
 bool g_dry_run_mode2_logged = false;
 bool g_ngx_waiting_logged = false;
@@ -254,6 +288,23 @@ const char *verdict_name(MatchVerdict v)
 	case MatchVerdict::excluded:            return "excluded";
 	}
 	return "?";
+}
+
+// One line, the first time each pass hits each gate. Deliberately WARN: an intercepted TAA
+// pass that never reaches DLSS is the failure this add-on exists to avoid, and it must never
+// again be indistinguishable from "the pass was not there".
+void log_gate_refusal(std::uint64_t hash, GateReason reason)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		std::uint32_t &mask = g_gate_logged[hash];
+		const std::uint32_t bit = 1u << static_cast<unsigned>(reason);
+		if ((mask & bit) != 0)
+			return;
+		mask |= bit;
+	}
+	STRAY_LOG_WARN("DLSS did not run for pass 0x%016llx: %s. First occurrence for this pass "
+		"and reason only.", static_cast<unsigned long long>(hash), kGateReasonText[reason]);
 }
 
 const char *hook_format_name(TexFormat f)
@@ -1408,6 +1459,18 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 		const bool worth_resolving = is_known_taa_hash(hash) ||
 			(g_ngx_pass_override != 0 && hash == g_ngx_pass_override);
 
+		// Say which gate stopped it, once. Only while an evaluate is actually wanted — in
+		// observation-only sessions these paths are expected and silence is correct.
+		if (g_ngx_evaluate)
+		{
+			if (!worth_resolving)
+				log_gate_refusal(hash, kGateUnknownHash);
+			else if (!view_ok)
+				log_gate_refusal(hash, kGateNoViewCb);
+			else if (!resources_live)
+				log_gate_refusal(hash, kGateDeadInputs);
+		}
+
 		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set
 		// via is_camera_cut — so the engine's TAA never runs once DLSS engages. Skipping them
 		// let the engine's TAA blend against DLSS-written history, which flickered. The dummy
@@ -1490,18 +1553,48 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					// Only ever replace a pass that has proved it owns the temporal history.
 					// Waiting a few frames for that proof costs nothing; picking the wrong pass
 					// means DLSS's output goes somewhere the frame never reads.
-					const std::uint64_t pinned =
-						g_ngx_pass_hash.load(std::memory_order_relaxed);
+					std::uint64_t pinned = g_ngx_pass_hash.load(std::memory_order_relaxed);
+					// A pin must not outlive its pass. The TAA permutation — and therefore the
+					// hash — changes with the screen percentage (see g_ngx_pass_last_frame), so
+					// a pin taken at one ratio silently refuses the real pass at every other
+					// ratio for the rest of the session. Release it once its pass has gone
+					// quiet for kPinStaleFrames presents and let the round-trip test re-choose.
+					const std::uint64_t now = g_present_frame.load(std::memory_order_relaxed);
+					if (pinned == hash)
+					{
+						g_ngx_pass_last_frame.store(now, std::memory_order_relaxed);
+					}
+					else if (pinned != 0 &&
+						now > g_ngx_pass_last_frame.load(std::memory_order_relaxed) +
+							kPinStaleFrames)
+					{
+						std::uint64_t expected = pinned;
+						if (g_ngx_pass_hash.compare_exchange_strong(expected, 0))
+							STRAY_LOG_WARN("DLSS pin RELEASED: 0x%016llx has not dispatched for "
+								"%llu presents. UE4 recompiles the TAA permutation when the "
+								"screen percentage changes (CLAUDE.md §2.3), so the pinned hash "
+								"can stop existing mid-session. Re-choosing a pass.",
+								static_cast<unsigned long long>(pinned),
+								static_cast<unsigned long long>(kPinStaleFrames));
+						pinned = 0;
+					}
 					// An explicitly named pass wins outright over the round-trip heuristic.
 					const bool eligible = g_ngx_pass_override != 0
 						? (hash == g_ngx_pass_override)
 						: (pinned != 0 ? (pinned == hash) : owns_temporal_history(hash));
-					if (g_ngx_evaluate && ngx::status().super_sampling_available && !eligible &&
-						pinned == 0 && !g_ngx_waiting_logged)
+					if (g_ngx_evaluate && ngx::status().super_sampling_available && !eligible)
 					{
-						g_ngx_waiting_logged = true;
-						STRAY_LOG_INFO("DLSS is waiting for a pass to prove it owns the temporal "
-							"history before replacing anything.");
+						if (pinned != 0)
+						{
+							log_gate_refusal(hash, kGatePinnedElsewhere);
+						}
+						else if (!g_ngx_waiting_logged)
+						{
+							g_ngx_waiting_logged = true;
+							STRAY_LOG_INFO("DLSS is waiting for a pass to prove it owns the "
+								"temporal history before replacing anything.");
+							log_gate_refusal(hash, kGateNoRoundTrip);
+						}
 					}
 					// Dry run. Mode 2 suppresses everything we match; mode 1 only the pinned
 					// pass. Either way nothing is written in its place.
@@ -1519,6 +1612,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					else if (g_ngx_dry_run == 1 && eligible && dry_run_phase_active())
 					{
 						std::uint64_t expected = 0;
+						// Stamp the pin's liveness BEFORE publishing it: a pin whose
+						// last-seen frame is still 0 would be released by the staleness
+						// check the very next time another candidate dispatches.
+						g_ngx_pass_last_frame.store(now, std::memory_order_relaxed);
 						if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
 							STRAY_LOG_WARN("DRY RUN: suppressing pass 0x%016llx and writing "
 								"NOTHING. If the image is unchanged, this pass does not drive "
@@ -1907,6 +2004,8 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
 								std::uint64_t expected = 0;
+								// See the dry-run pin: stamp liveness before publishing.
+								g_ngx_pass_last_frame.store(now, std::memory_order_relaxed);
 								if (g_ngx_pass_hash.compare_exchange_strong(expected, hash))
 									STRAY_LOG_INFO("DLSS pinned to pass 0x%016llx; no other pass "
 										"will be replaced.",

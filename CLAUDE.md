@@ -243,10 +243,15 @@ scalability group falls back to the pak's own `r.DefaultFeature.AntiAliasing=2` 
 
 **And 1:1 is the point.** Everything in §2.3 — the depth+stencil SRV pair over one resource, the
 dispatch over an output rect larger than the inputs — was measured at 3840×2160 with 50% screen
-percentage, i.e. `ETAAPassConfig::MainUpsampling`. At 1:1 the engine selects
-`ETAAPassConfig::Main`, a **different permutation** whose bindings we never characterised. The
-matcher is not broken; it is matching a shape the game no longer produces, and the passes it
-does find (which do exhibit the history round-trip) are other temporal effects.
+percentage, i.e. `ETAAPassConfig::MainUpsampling`.
+
+> **CORRECTED 2026-08-31.** This section went on to claim that 1:1 selects
+> `ETAAPassConfig::Main`, "a different permutation whose bindings we never characterised". Both
+> halves are wrong: the config stays `MainUpsampling` at every screen percentage, and all 27
+> cooked permutations declare the same registers. What genuinely does not survive 1:1 is "the
+> dispatch covers an output rect LARGER than the inputs" — at 1:1 `SetupViewRect` makes
+> `OutputViewRect == InputViewRect`, so that test is a *ratio* detector, not a TAA detector.
+> See the DLAA section in §5 for the source quotes and the fix.
 
 **Consequence:** §2.3's signature is configuration-specific and must be treated as such. Either
 characterise the `Main` permutation at 1:1, or drive the game back to the configuration §2.3 was
@@ -516,11 +521,18 @@ not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
 > The two known look-alikes were correctly **excluded** in the same run, so the exclusion rules
 > hold. **The hash is a PERMUTATION fingerprint, not the shader's identity — and the permutation
 > is chosen by the upsampling ratio, not by the pixel count.** 1440p and 4K at the same screen
-> percentage share a hash and differ only in dispatch size; going from 50% to 100% flips
-> `AA_UPSAMPLE` and compiles different code. That is why `0x901e…` declares a
-> `dcl_tgsm_structured` `float4[64]` that exists only under `AA_UPSAMPLE == 1`. Never gate on it alone; the depth+stencil-over-one-resource signature plus a
-> dispatch covering the output rect is what actually identifies the pass. Also measured in the
+> percentage share a hash and differ only in dispatch size; going from 50% to 100% changes the
+> code that is compiled. Never gate on the hash alone; the depth+stencil-over-one-resource
+> signature is what actually identifies the pass. Also measured in the
 > same frames: the View CB appeared at **b4**, not b1, so that register is not invariant either.
+>
+> **CORRECTED 2026-08-31 from UE 4.27.2 source.** The dimension that flips is
+> **`FTAAScreenPercentageDim`** (`TemporalAA.cpp:726-750`) — 1 below 71% of the output, 0 at 1:1
+> — *not* `AA_UPSAMPLE`. `ETAAPassConfig` stays `MainUpsampling` at every screen percentage
+> because `r.TemporalAA.Upsampling=True` and nothing consults the resolution fraction (see the
+> DLAA section in §5). `ShouldCompilePermutation` (`TemporalAA.cpp:228`) confirms the direction:
+> a non-zero `TAA_SCREEN_PERCENTAGE_RANGE` is only compiled *for* an upsampling config, so a
+> range-1 shader is by construction `MainUpsampling`.
 
 Captured live at 3840×2160 output. Note every input is **1920×1080**: the game already runs
 **temporal upsampling at 50% screen percentage**, so the pass is `ETAAPassConfig::MainUpsampling`,
@@ -717,10 +729,19 @@ The negative Y factor is real — **but only in the derivation**. **[derived] Do
 **[derived]** `TemporalAAParams` is `(JitterIndex, SequenceLength, JitterPixelsX, JitterPixelsY)`;
 `TemporalAAJitter` is `(CurX, CurY, PrevX, PrevY)` in clip/NDC units.
 
-**[derived]** In the shipped (non-upsampling) mode UE4 warps Halton through Box-Muller with
+**[derived]** In the non-upsampling mode UE4 warps Halton through Box-Muller with
 `sigma = 0.47 * r.TemporalAAFilterSize` — a distribution DLSS was **not** trained on. Forcing
 `r.TemporalAA.Upsampling=1` switches to plain Halton in `[-0.5, 0.5]`, which is what DLSS *was*
-trained on. See §4.
+trained on. See §4. Stray ships `r.TemporalAA.Upsampling=True`, so it is already on the Halton
+branch at every screen percentage (§5, DLAA section).
+
+**Both branches are bounded to `[-0.5, 0.5]` per axis** — verified in the 4.27.2 source
+(`SceneVisibility.cpp:3301-3327`). The Box-Muller path windows the RADIUS: `OutWindow = 0.5`,
+`InWindow = exp(-0.5·(OutWindow/Sigma)²)`, and `r = Sigma·sqrt(-2·ln((1-u1)·InWindow + u1))`
+gives `r = OutWindow` at `u1 = 0` and `r = 0` at `u1 = 1`, so the samples fill a disc of radius
+0.5. The difference from the upscaling branch is the **shape** — a truncated Gaussian disc
+versus Halton uniform over the square — not the range. `view_params_plausible`'s `|jitter| > 0.5`
+rejection is therefore correct in both modes and is not what blocks DLAA.
 
 ### 2.8 Camera cuts
 
@@ -1048,32 +1069,90 @@ phenomenon and hold the camera still.
 
 Measured offline 2026-08-31 by scanning **all 27 cooked FTAAStandaloneCS permutations** extracted
 from the pak (`tools/shaderlib_extract.py --dump-dir`, then a DXBC declaration scan). They split
-by `dcl_tgsm_structured`, which only compiles under `AA_UPSAMPLE == 1`:
+by `dcl_tgsm_structured`:
 
-* **15 upsampling** permutations (tgsm present) — what 4K/50% selects, what we hook today.
-* **12 non-upsampling** (`ETAAPassConfig::Main`, tgsm absent) — what 1:1 / DLAA selects.
+* **15** with the tgsm array — what 4K/50% selects, what we hook today.
+* **12** without it — the other half of the family.
 
-**Every non-upsampling permutation declares the SAME register shape as the upsampling ones:
-`SRVs t0-t5`, `UAV u0`.** Only two outliers exist (`2d67549bedef2c0a` with t0-t4, and
-`876f85dfc23213d0` with t0-t3) — camera-cut/edge variants, not the main pass.
+**Every one declares the SAME register shape: `SRVs t0-t5`, `UAV u0`.** Only two outliers exist
+(`2d67549bedef2c0a` with t0-t4, and `876f85dfc23213d0` with t0-t3) — camera-cut/edge variants,
+not the main pass.
 
 So §2.3's earlier claim that 1:1 "selects a different permutation whose bindings we never
 characterised" is **wrong at the shader level**: depth, stencil, velocity, colour and history sit
 in the same slots. There is no shader-declaration reason DLAA cannot work, and the 27-hash table
-already contains every Main permutation.
+already contains every one of them.
+
+> **CORRECTED 2026-08-31 against the UE 4.27.2 source** (public mirror
+> `AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`, `Build.version` reads 4.27.2 / `++UE4+Release-4.27`).
+> The split above is **not** upsampling vs non-upsampling, and 1:1 does **not** select
+> `ETAAPassConfig::Main`. `PrimaryScreenPercentageMethod` is set in `SceneView.cpp:837-841` on
+> `AntiAliasingMethod == AAM_TemporalAA && r.TemporalAA.Upsampling != 0` — **the resolution
+> fraction is never consulted**, and the only downgrade in
+> `PrepareViewRectsForRendering` (`SceneRendering.cpp:2546`) gates on the AA method and the
+> VisualizeBuffer showflag, nothing else. Stray ships `r.TemporalAA.Upsampling=True`, so the
+> game runs **`MainUpsampling` at every screen percentage, 100% included**. What changes at 1:1
+> is only `FTAAScreenPercentageDim` (`TemporalAA.cpp:726-750`): **1 below 71%, 0 at 1:1** — a
+> different permutation of the same config, hence a different DXBC and a different hash.
 
 **Confirmed not working live** (2026-08-31): at 100% screen percentage no DLSS feature is ever
 created — only `1920x1080 -> 3840x2160` (50%) and `2688x1512 -> 3840x2160` (70%) appear in the
-log, and the NVIDIA DLSS indicator is absent at 100% while present at 50% and 70%. The cause is
-therefore NOT the permutation's bindings; the remaining suspects are the dispatch-size check when
-render == output, the `render <= output` guard at equality, or the pass simply not being reached
-in the brief window tested. **One dedicated 100% session with the report throttle disabled
-settles it.**
+log, and the NVIDIA DLSS indicator is absent at 100% while present at 50% and 70%.
+
+### Why 1:1 is fragile and <100% is not: `GetOutputExtent()`'s `Max()` (UE 4.27 source)
+
+The dispatch and the output TEXTURE are **two different quantities**, and the engine ties them
+together only when it is really upscaling:
+
+```cpp
+// TemporalAA.cpp:950 — the DISPATCH
+GetGroupCount(PracticableDestRect.Size(), GTemporalAATileSizeX)   // = the OUTPUT VIEW RECT
+
+// TemporalAA.cpp:596 — the TEXTURE
+FIntPoint FTAAPassParameters::GetOutputExtent() const {
+    FIntPoint InputExtent = SceneColorInput->Desc.Extent;
+    if (!IsTAAUpsamplingConfig(Pass)) return InputExtent;
+    ...
+    return FIntPoint(Max(InputExtent.X, QuantizedPrimaryUpscaleViewSize.X),
+                     Max(InputExtent.Y, QuantizedPrimaryUpscaleViewSize.Y));
+}
+```
+
+**While the pass really upscales**, `InputExtent` is the smaller render buffer, so the `Max()`
+returns exactly `Quantize(OutputViewRect)` — the dispatched rect. An equality test between the
+dispatch and the output texture is then *guaranteed* to hold, which is why 50% and 70% always
+matched, and why the `Max()` also **absorbs** a scene buffer left oversized from an earlier
+resolution.
+
+**At 1:1 that term degenerates.** `Quantize(OutputViewRect)` can no longer exceed `InputExtent`
+(`SetupViewRect`: `OutputViewRect = InputViewRect` for non-upscaling, and `Validate()` asserts
+it), so `GetOutputExtent()` returns the scene-colour buffer's own extent and **nothing relates
+it to the dispatch**. Any scene buffer larger than the current view rect — UE4 shrinks the scene
+targets lazily, and this session has been observed at both 3840x2160 and 2560x1440 — flows
+straight into the output extent while the dispatch stays at the view rect, and an equality test
+rejects the real pass. Below 100% the identical inflation is invisible.
+
+**Fixed 2026-08-31** in `match_taa_dispatch`: the equality is now demanded only in the upscaling
+branch (where the engine guarantees it, so 50%/70% are byte-identical). Otherwise the dispatch
+must merely **fit inside** the output UAV and **cover at least the view rect**. `output_width`/
+`output_height` now report the rect the dispatch WRITES (`group count x 8`, clamped to the UAV),
+not the allocation — DLSS must be created for the rect, never the texture. Regression tests in
+`tests/test_taa_signature.cpp` ("DLAA: ...", "200% ... is still refused").
+
+**Also fixed: the DLSS pin could outlive its pass, silently.** `g_ngx_pass_hash` pins the first
+pass that evaluates and refuses every other one — but the pinned value is a *permutation* hash,
+and the permutation changes with the screen percentage (above). A pin taken at one ratio then
+refused the real pass at every other ratio for the rest of the session, and logged nothing.
+`taa_hook.cpp` now releases a pin whose pass has not dispatched for 300 presents, and every
+gate that used to refuse a matched TAA pass in silence — unknown hash, unreadable View CB, dead
+inputs, pinned elsewhere, no round-trip yet — emits one WARN per pass per reason
+(`log_gate_refusal`). **A matched pass that never reaches DLSS must never again be
+indistinguishable from a pass that was not there.**
 
 **Also measured: 200% can never work.** It renders 7680x4320 and downsamples to 3840x2160; DLSS
-upscales by definition and cannot accept an input larger than its output. The matcher correctly
-rejects it ("dispatch size does not cover the output UAV at 8x8"). 70% is the highest working
-setting and is sharper than 50%.
+upscales by definition and cannot accept an input larger than its output. The matcher still
+rejects it, now on the view-rect lower bound ("dispatch covers less than the view rect -
+downsampling, not TAA upscaling"). 70% is the highest working setting and is sharper than 50%.
 
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 

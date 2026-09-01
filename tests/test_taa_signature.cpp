@@ -130,7 +130,8 @@ TEST_CASE("a pass without the depth+stencil pair is rejected")
 TEST_CASE("the dispatch must cover the OUTPUT rect, not the render rect")
 {
 	// Matching against the render rect would reject the real pass outright, since the game
-	// upsamples 1080p to 4K.
+	// upsamples 1080p to 4K. A dispatch smaller than the pass's own inputs is downsampling,
+	// which DLSS cannot do.
 	auto sig = make_stray_taa();
 	sig.group_count_x = (1920 + 7) / 8;
 	sig.group_count_y = (1080 + 7) / 8;
@@ -147,6 +148,148 @@ TEST_CASE("a 1:1 render-to-output pass matches and reports no upsampling")
 	CHECK(r.verdict == MatchVerdict::hash_and_structural);
 	CHECK_FALSE(r.is_upsampling);
 	CHECK(r.output_width == 3840);
+}
+
+// ---------------------------------------------------------------------------------------
+// DLAA (1:1) — the shapes UE 4.27 actually produces at 100% screen percentage.
+//
+// The dispatch and the output TEXTURE are two different quantities in UE 4.27
+// (Release-4.27 branch, TemporalAA.cpp):
+//
+//   :950  the dispatch is GetGroupCount(PracticableDestRect.Size(), 8) — the output VIEW RECT
+//   :596  the texture is allocated at FTAAPassParameters::GetOutputExtent():
+//             Main:           SceneColorInput->Desc.Extent
+//             MainUpsampling: Max(InputExtent, Quantize(OutputViewRect.Size()))
+//
+// Stray ships r.TemporalAA.Upsampling=True and nothing downgrades TemporalUpscale at a
+// resolution fraction of 1.0 (SceneRendering.cpp:2546 gates only on the AA method), so the
+// game runs MainUpsampling at EVERY screen percentage — 100% included, where InputViewRect
+// and OutputViewRect are equal.
+//
+// That is the asymmetry. While the pass really upscales, InputExtent is the smaller buffer,
+// so the Max() pins the output texture to exactly Quantize(OutputViewRect) — the dispatched
+// rect — and an equality test is guaranteed to hold. At 1:1 the quantized output view size
+// can no longer exceed InputExtent, the Max() degenerates to InputExtent, and NOTHING relates
+// the texture's extent to the dispatch: any scene-colour buffer left larger than the current
+// view rect (UE4 shrinks the scene targets lazily, and this session has been seen at both
+// 3840x2160 and 2560x1440) flows straight into the output extent while the dispatch stays at
+// the view rect. Below 100% that same inflation is absorbed by the Max(); at 100% it rejects
+// the pass outright. These cases pin that down.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("DLAA: the output texture may be larger than the dispatched rect")
+{
+	// 1:1 with the scene buffer still sized for a larger earlier view rect — everything the
+	// pass binds is at the buffer extent, the dispatch is over the view rect. This is real
+	// FTAAStandaloneCS and must match. Before the fix it returned no_match ("dispatch size
+	// does not cover the output UAV at 8x8"), which is DLAA silently never engaging while
+	// 50% and 70% keep working.
+	auto sig = make_stray_taa(4096, 2304, 4096, 2304);
+	sig.group_count_x = (3840 + kTaaTileSize - 1) / kTaaTileSize; // OutputViewRect 3840x2160
+	sig.group_count_y = (2160 + kTaaTileSize - 1) / kTaaTileSize;
+
+	const auto r = match_taa_dispatch(sig, 3840, 2160);
+
+	REQUIRE(r.verdict == MatchVerdict::hash_and_structural);
+	CHECK(r.output_uav == 0);
+	// DLSS must be created for the rect the dispatch WRITES, never for the allocation: sizing
+	// the feature to 4096x2304 would ask it to produce pixels the engine never writes or reads.
+	CHECK(r.output_width == 3840);
+	CHECK(r.output_height == 2160);
+	CHECK_FALSE(r.is_upsampling);
+}
+
+TEST_CASE("DLAA: a clean 1:1 frame still reports the dispatched rect")
+{
+	const auto r = match_taa_dispatch(make_stray_taa(3840, 2160, 3840, 2160), 3840, 2160);
+
+	CHECK(r.verdict == MatchVerdict::hash_and_structural);
+	CHECK(r.output_width == 3840);
+	CHECK(r.output_height == 2160);
+	CHECK(r.render_width == 3840);
+	CHECK(r.render_height == 2160);
+}
+
+TEST_CASE("DLAA: the half-res TAA_DOWNSAMPLE UAV never steals the output slot")
+{
+	// TAA_DOWNSAMPLE puts OutComputeTexDownsampled at u1, half the output extent
+	// (TAAStandalone.usf; bDownsample = bAllowDownsampleSceneColor && bUseFast, and Stray
+	// runs r.PostProcessAAQuality=3 so bUseFast is true). u0 stays the output.
+	auto sig = make_stray_taa(3840, 2160, 3840, 2160);
+	sig.uavs.push_back({ 1, 0x8000, TexFormat::r11g11b10_float, 1920, 1080 });
+
+	const auto r = match_taa_dispatch(sig, 3840, 2160);
+
+	CHECK(r.verdict == MatchVerdict::hash_and_structural);
+	CHECK(r.output_uav == 0);
+	CHECK(r.output_width == 3840);
+	CHECK(r.has_downsample_uav);
+}
+
+TEST_CASE("200% screen percentage is still refused: the dispatch is smaller than the inputs")
+{
+	// Measured live: 7680x4320 rendered, downsampled to 3840x2160. DLSS upscales by
+	// definition and cannot take an input larger than its output, so the matcher must keep
+	// rejecting this — the relaxed coverage rule must not let it through.
+	auto sig = make_stray_taa(7680, 4320, 7680, 4320);
+	sig.group_count_x = (3840 + 7) / 8; // GetOutputExtent() = Max(7680x4320, 3840x2160)
+	sig.group_count_y = (2160 + 7) / 8; // while PracticableDestRect is 3840x2160
+
+	CHECK(match_taa_dispatch(sig, 7680, 4320).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("a dispatch that runs past its output UAV is refused")
+{
+	// Writing outside the UAV is not something FTAAStandaloneCS ever does; a pass whose
+	// dispatch exceeds its own output is something else entirely.
+	auto sig = make_stray_taa(1920, 1080, 3840, 2160); // dispatch sized for 3840x2160
+	sig.uavs[0].width = 1920;                          // ...into a 1920x1080 UAV
+	sig.uavs[0].height = 1080;
+
+	CHECK(match_taa_dispatch(sig, 1920, 1080).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("the view rect is a lower bound on the dispatch, not just decoration")
+{
+	// A 1:1-shaped pass whose dispatch covers only part of the view rect is not the TAA
+	// resolve. This is the bound that keeps the relaxed 1:1 rule honest.
+	auto sig = make_stray_taa(3840, 2160, 3840, 2160);
+	sig.group_count_x = (1920 + kTaaTileSize - 1) / kTaaTileSize;
+	sig.group_count_y = (1080 + kTaaTileSize - 1) / kTaaTileSize;
+
+	CHECK(match_taa_dispatch(sig, 3840, 2160).verdict == MatchVerdict::no_match);
+}
+
+TEST_CASE("the working SR configurations are unchanged")
+{
+	// 50% and 70% must behave EXACTLY as before the DLAA fix: these are the two settings
+	// confirmed working on the target, and the output rect they hand DLSS is load-bearing.
+	{
+		const auto r = match_taa_dispatch(make_stray_taa(1920, 1080, 3840, 2160), 1920, 1080);
+		CHECK(r.verdict == MatchVerdict::hash_and_structural);
+		CHECK(r.render_width == 1920);
+		CHECK(r.output_width == 3840);
+		CHECK(r.output_height == 2160);
+		CHECK(r.is_upsampling);
+	}
+	{
+		const auto r = match_taa_dispatch(make_stray_taa(2688, 1512, 3840, 2160), 2688, 1512);
+		CHECK(r.verdict == MatchVerdict::hash_and_structural);
+		CHECK(r.render_width == 2688);
+		CHECK(r.output_width == 3840);
+		CHECK(r.output_height == 2160);
+		CHECK(r.is_upsampling);
+	}
+	{
+		// The same 50% frame with depth/velocity/colour at the full scene-buffer extent,
+		// which is how they were captured at 1440p (taa_hook.cpp reads the render rect from
+		// View.ViewSizeAndInvSize for exactly this reason).
+		auto sig = make_stray_taa(2560, 1440, 2560, 1440);
+		const auto r = match_taa_dispatch(sig, 1280, 720);
+		CHECK(r.verdict == MatchVerdict::hash_and_structural);
+		CHECK(r.output_width == 2560);
+		CHECK(r.output_height == 1440);
+	}
 }
 
 TEST_CASE("a dispatch with no colour UAV is rejected")

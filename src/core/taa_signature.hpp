@@ -88,8 +88,10 @@ struct MatchResult
 	std::uint32_t output_uav = 0;
 	bool has_downsample_uav = false;
 
-	// The output rect, taken from the output UAV rather than assumed equal to the input. The
-	// game runs temporal upsampling, so these differ from the input extent.
+	// The output RECT — the rect the dispatch actually writes (group count x 8, clamped to the
+	// UAV), not the UAV's allocation. UE 4.27 dispatches over OutputViewRect while allocating
+	// at FTAAPassParameters::GetOutputExtent(), which is only ever >= that rect, so the two are
+	// different quantities and DLSS must be created for the rect.
 	std::uint32_t output_width = 0;
 	std::uint32_t output_height = 0;
 	// The render resolution, taken from the depth SRV rather than the View buffer, so it is
