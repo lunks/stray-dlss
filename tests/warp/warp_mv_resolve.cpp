@@ -1558,17 +1558,19 @@ bool test_static_vtables(Gpu &gpu)
 {
 	std::printf("\n[test] whether vtables are shared across objects of a class\n");
 
+	// One allocator may back only ONE open list at a time (D3D12 ERROR #540 otherwise), so
+	// each list is closed before the next is created on the same allocator.
 	ComPtr<ID3D12CommandAllocator> alloc;
 	ComPtr<ID3D12GraphicsCommandList> list_a, list_b;
 	if (FAILED(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
 		FAILED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list_a))) ||
-		FAILED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list_b))))
+		FAILED(list_a->Close()) ||
+		FAILED(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list_b))) ||
+		FAILED(list_b->Close()))
 	{
 		fail("could not create two command lists");
 		return false;
 	}
-	list_a->Close();
-	list_b->Close();
 
 	D3D12_COMMAND_QUEUE_DESC qd = {};
 	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

@@ -205,7 +205,9 @@ jobs:
 
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$env:BUILD_CONFIG
+        # Quoted: pwsh does not expand $env: inside a bare -D argument (measured: CMake received the
+        # literal text "$env:BUILD_CONFIG").
+        run: cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)"
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
