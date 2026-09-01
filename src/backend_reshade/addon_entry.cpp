@@ -354,9 +354,6 @@ void on_begin_effects(reshade::api::effect_runtime *runtime,
 	nrhook::on_begin_effects(rsb::context_for(cmd_list), rtv.handle);
 }
 
-	}
-}
-
 // Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
 // into the NGX parameter block on EVERY evaluate, and the codec's three are push constants on
 // every dispatch, so an edit lands on the next frame with no feature recreation. The values are

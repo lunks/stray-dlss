@@ -1,3 +1,7 @@
+// The test writes its fixtures with plain fopen; MSVC flags that as C4996 under /WX.
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "host/config.hpp"
 #include "host/ini.hpp"
 
