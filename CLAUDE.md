@@ -1811,6 +1811,63 @@ and the **resolution mismatch** — we hand it 3840x2160 colour with 1920x1080 d
 vectors, and if the runtime indexes depth at output resolution that is both the garbage image
 and a plausible fault.
 
+### DLSSNR's structure controls, read out of the binary (2026-09-01) — and the reset that fooled us
+
+Subject: `nvngx_dlssnr.dll` md5 `eea91faf`, PDB `...\snippets\rel_310_8\source\features\dlssnr\`.
+The feature's internal name is **CG2R**. All HARD, read from the disassembly and the decompressed
+PTX unless marked.
+
+**THE ONE THAT MATTERS IN PRACTICE: changing a structure strength WIPES THE TEMPORAL HISTORY.**
+`CG2R_ResetTemporalHistoryOnControlChange` (`0x180017ad8`) compares the previous frame's controls
+against this frame's with epsilon `1e-5` and sets `DLSSNR.Reset = 1` on any difference. In the
+list: Style, UseAutoMask, LocalToneStrength, LocalStructureStrength, SkinStructureStrength, and
+both resolved values. **`DLSSNR.Intensity` is NOT in the list.**
+
+* Dragging a structure slider holds `Reset = 1` every frame, so accumulation never runs and **the
+  whole screen changes** — which is exactly what we observed and nearly mis-diagnosed as "skin
+  affects everything". Set the value, release, wait 1-2 s, *then* judge. The runtime logs
+  `DLSSNR: reset temporal history for %s after control change` when it fires.
+* **Use `Intensity` for "how much NR".** It is the only strength knob that does not cost a
+  history reset.
+
+**"Skin" is a GLOBAL SCALAR, not a mask.** The evaluate path passes the strengths only to the
+`CCTinlayoutFusedPreBlockSwin1HLayer`, into its launch struct at `+0x98` (resolved skin) and
+`+0x9C` (resolved local) — adjacent floats, same setter. The PTX
+(`cc_tinlayout_fused_pre_block_swin_1h_32_1`, and its `_fp8`/`_ds` variants) converts them to
+fp16 and writes them into the shared-memory input tile as channels alongside style and local
+tone, **broadcast bit-identically to every pixel**. Five of the network's 16 input channels are
+host tuning scalars. There is no mask, no classifier, no segmentation head, and no branch on
+position anywhere.
+
+**So `UseAutoMask` classifies nothing in code.** It is a boolean deciding whether the two strength
+channels carry values or `-1`. Any *region* behaviour lives entirely in the trained weights.
+**The word "skin" appears ONCE in the whole 165 MB binary — in the parameter name — and zero times
+in 59 MB of decompressed cubins and PTX.** Whether it means literal skin is therefore
+**unknowable from the binary**; NVIDIA's DLSS 5 material talks about learned skin/subsurface
+behaviour, which is SOFT vendor marketing about the model, not about this parameter.
+
+**The sentinel, from the code rather than the reference's docs:** the test is `comiss`/`jae`, so
+**any** negative (and NaN) inherits local — it is a sign test, not `== -1`. The snippet's own
+defaults are skin `-1.0f`, local `+1.0f`. Binding a `ControlMask` forces `UseAutoMask` to 0, and
+`UseAutoMask = 0` drives both resolved values to `-1.0f`.
+
+**`DLSSNR.ControlMask` is an RGB control texture** — R is the per-pixel final blend weight, G
+scales local tone, B scales local structure. **It has no skin channel**, so skin is not
+expressible per-pixel. The explicit path is per-pixel with no skin term; the auto path is global
+and is the only place skin exists.
+
+**`DLSSNR.ScalingRatio` is INERT** — read, then unconditionally overwritten with `1.0f` at
+`0x18001a96a`. Neither it nor the absent `DLSSNR.Scale` ever mattered.
+
+**A correction to the reference's option docs:** they say that with the auto mask off the snippet
+forces `localStructureStrength` to -1 and it does nothing. **The RAW value still reaches the
+network** — when `max(skin, local) < 0` the kernel feeds the flag channel from raw
+`LocalStructureStrength` (`param_0+176`). Only the *resolved pair* is neutered.
+
+**Method note, because it is the reason this took a whole investigation:** the confound and the
+answer were both in the binary, and neither was in any documentation. When a knob "changes
+everything", suspect the machinery around the knob before theorising about its meaning.
+
 ### Three ways to hand feature 18 something that hangs the GPU rather than erroring
 
 All three were live in our code at the session's only successful NR run, and all three are now
