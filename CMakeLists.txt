@@ -34,8 +34,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # /MT makes the add-on self-contained and independent of whatever redist the user's prefix
 # happens to have. It pairs with nvsdk_ngx_s.lib (the _s suffix means static CRT); mixing that
 # up is an _ITERATOR_DEBUG_LEVEL link error, which is at least loud.
+#
+# ONE EXCEPTION, and it is the UE4SS plugin's ABI contract rather than a preference: a UE4SS
+# C++ mod must be /MD to match UE4SS.dll (mods/StrayDLSS/CMakeLists.txt). Its build configures
+# THIS tree with STRAY_DLSS_DYNAMIC_CRT=ON — one configure, one CRT, every stray_dlss_* target
+# consistent — and pairs it with nvsdk_ngx_d.lib. The two are never mixed in one build: the
+# add-on's CI asserts no MSVCP140 import, the plugin's asserts its presence.
+option(STRAY_DLSS_DYNAMIC_CRT "Link the dynamic CRT (/MD): ONLY for the UE4SS plugin build" OFF)
 if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    if(STRAY_DLSS_DYNAMIC_CRT)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    else()
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -129,42 +140,43 @@ set(STRAY_DLSS_NGX_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/lib"
     CACHE PATH "Directory containing nvsdk_ngx_d.lib")
 
 # ---------------------------------------------------------------------------------------
-# The add-on
+# The native library: everything that is Windows/D3D12 but framework-free. The application
+# (src/app), the NGX path, the resolve passes, the hooks and the shaders. Built ONCE per
+# configure with whichever CRT this configure chose, and linked by both hosts: the ReShade
+# add-on below (/MT) and the UE4SS plugin (mods/StrayDLSS, /MD, its own configure).
 # ---------------------------------------------------------------------------------------
-if(STRAY_DLSS_BUILD_ADDON)
+option(STRAY_DLSS_BUILD_NATIVE "Build the framework-free native library (Windows + MSVC)" ${WIN32})
+
+if(STRAY_DLSS_BUILD_NATIVE)
     if(NOT WIN32)
-        message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires Windows.")
+        message(FATAL_ERROR "STRAY_DLSS_BUILD_NATIVE requires Windows.")
     endif()
 
     if(STRAY_DLSS_ENABLE_NGX)
-        # _s = static CRT, to match /MT above.
+        # _s = static CRT (/MT), _d = dynamic CRT (/MD). Mixing them up is an
+        # _ITERATOR_DEBUG_LEVEL link error, which is at least loud.
+        if(STRAY_DLSS_DYNAMIC_CRT)
+            set(_ngx_lib_name nvsdk_ngx_d)
+        else()
+            set(_ngx_lib_name nvsdk_ngx_s)
+        endif()
         find_library(NGX_LIBRARY
-            NAMES nvsdk_ngx_s
+            NAMES ${_ngx_lib_name}
             PATHS ${STRAY_DLSS_NGX_LIB_DIR}
             NO_DEFAULT_PATH)
 
         if(NOT NGX_LIBRARY)
             message(FATAL_ERROR
-                "nvsdk_ngx_s.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
+                "${_ngx_lib_name}.lib not found in '${STRAY_DLSS_NGX_LIB_DIR}'.\n"
                 "Fetch it from https://github.com/NVIDIA/DLSS (lib/Windows_x86_64/x64/) or set "
                 "-DSTRAY_DLSS_NGX_LIB_DIR=<dir>.")
         endif()
     else()
         set(NGX_LIBRARY "")
-        message(STATUS "NGX disabled: building a no-DLSS diagnostic add-on")
+        message(STATUS "NGX disabled: building a no-DLSS diagnostic build")
     endif()
 
-    add_library(stray-dlss SHARED
-        # The ReShade host: the ONLY directory that includes ReShade's headers (CI enforces).
-        src/backend_reshade/addon_entry.cpp
-        src/backend_reshade/reshade_all.hpp
-        src/backend_reshade/reshade_backend.cpp
-        src/backend_reshade/reshade_backend.hpp
-        src/backend_reshade/reshade_bindings.cpp
-        src/backend_reshade/reshade_bindings.hpp
-        src/backend_reshade/reshade_config.cpp
-        src/backend_reshade/reshade_log.cpp
-        src/backend_reshade/reshade_host.hpp
+    add_library(stray_dlss_native STATIC
         # The framework-free application, behind the seam.
         src/app/dlss_app.cpp
         src/app/dlss_app.hpp
@@ -193,11 +205,82 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/nr_history.cpp
         src/nr_history.hpp
         src/ext_unhook.cpp
+        src/ext_unhook.hpp
         src/input_dump.cpp
+        src/input_dump.hpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp
         src/d3d12_restore.cpp
-        src/d3d12_restore.hpp
+        src/d3d12_restore.hpp)
+
+    target_include_directories(stray_dlss_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(stray_dlss_native PUBLIC
+        stray_dlss_core
+        ngx_sdk
+        ${NGX_LIBRARY}
+        d3d12
+        dxgi
+        d3dcompiler)  # for D3D12SerializeRootSignature only; D3DCompile is never called
+
+    target_compile_definitions(stray_dlss_native PUBLIC
+        STRAY_DLSS_ENABLE_NGX=$<BOOL:${STRAY_DLSS_ENABLE_NGX}>
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        UNICODE
+        _UNICODE
+        STRAY_DLSS_VERSION="${PROJECT_VERSION}"
+        # Belt and braces alongside /MT: keeps std::mutex on the pre-17.10 layout so even an
+        # accidental /MD build stays loadable against an old msvcp140.dll.
+        _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+
+    target_compile_options(stray_dlss_native PRIVATE
+        /W4 /permissive- /Zi
+        $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
+
+    # Shaders are compiled to DXBC here and embedded, never compiled at runtime.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
+                   main cs_5_0 g_mv_resolve_dxbc)
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
+                   main cs_5_0 g_gbuffer_resolve_dxbc)
+    # The DLSS-NR HDR colour codec. Both halves include shaders/nr_codec.hlsli, which is named
+    # as an extra dependency so editing the shared transfer functions rebuilds both.
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
+                   main cs_5_0 g_nr_encode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
+                   main cs_5_0 g_nr_decode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
+endif()
+
+# ---------------------------------------------------------------------------------------
+# The ReShade add-on: the native library plus the ReShade host.
+# ---------------------------------------------------------------------------------------
+if(STRAY_DLSS_BUILD_ADDON)
+    if(NOT WIN32)
+        message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires Windows.")
+    endif()
+    if(NOT STRAY_DLSS_BUILD_NATIVE)
+        message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires STRAY_DLSS_BUILD_NATIVE.")
+    endif()
+    if(STRAY_DLSS_DYNAMIC_CRT)
+        message(FATAL_ERROR
+            "The ReShade add-on must be /MT (see the CRT note at the top of this file); "
+            "STRAY_DLSS_DYNAMIC_CRT is for the UE4SS plugin build only.")
+    endif()
+
+    add_library(stray-dlss SHARED
+        # The ReShade host: the ONLY directory that includes ReShade's headers (CI enforces).
+        src/backend_reshade/addon_entry.cpp
+        src/backend_reshade/reshade_all.hpp
+        src/backend_reshade/reshade_backend.cpp
+        src/backend_reshade/reshade_backend.hpp
+        src/backend_reshade/reshade_bindings.cpp
+        src/backend_reshade/reshade_bindings.hpp
+        src/backend_reshade/reshade_config.cpp
+        src/backend_reshade/reshade_log.cpp
+        src/backend_reshade/reshade_host.hpp
         src/version.rc)
 
     # ReShade discovers add-ons by extension, not by name.
@@ -210,31 +293,11 @@ if(STRAY_DLSS_BUILD_ADDON)
     target_include_directories(stray-dlss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend_reshade)
 
     target_link_libraries(stray-dlss PRIVATE
-        stray_dlss_core
+        stray_dlss_native
         reshade_sdk
         reshade_utils
         reshade_utils_headers
-        imgui_headers
-        ngx_sdk
-        ${NGX_LIBRARY}
-        d3d12
-        dxgi
-        d3dcompiler)  # for D3D12SerializeRootSignature only; D3DCompile is never called
-
-    target_compile_definitions(stray-dlss PRIVATE
-        STRAY_DLSS_ENABLE_NGX=$<BOOL:${STRAY_DLSS_ENABLE_NGX}>)
-
-    target_compile_definitions(stray-dlss PRIVATE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
-        UNICODE
-        _UNICODE
-        # ReShade's add-on API is header-only. Defining RESHADE_API_LIBRARY would ask for an
-        # import lib that does not exist. (docs/RESEARCH.md §2.1)
-        STRAY_DLSS_VERSION="${PROJECT_VERSION}"
-        # Belt and braces alongside /MT: keeps std::mutex on the pre-17.10 layout so even an
-        # accidental /MD build stays loadable against an old msvcp140.dll.
-        _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+        imgui_headers)
 
     target_compile_options(stray-dlss PRIVATE
         /W4 /permissive- /Zi
@@ -242,21 +305,6 @@ if(STRAY_DLSS_BUILD_ADDON)
 
     # Keep symbols for field crash triage, but do not pay for them in the binary.
     target_link_options(stray-dlss PRIVATE /DEBUG /OPT:REF /OPT:ICF)
-
-    # Shaders are compiled to DXBC here and embedded, never compiled at runtime.
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
-    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
-                   main cs_5_0 g_mv_resolve_dxbc)
-    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
-                   main cs_5_0 g_gbuffer_resolve_dxbc)
-    # The DLSS-NR HDR colour codec. Both halves include shaders/nr_codec.hlsli, which is named
-    # as an extra dependency so editing the shared transfer functions rebuilds both.
-    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
-                   main cs_5_0 g_nr_encode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
-    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
-                   main cs_5_0 g_nr_decode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
 
     install(TARGETS stray-dlss RUNTIME DESTINATION .)
     install(FILES $<TARGET_PDB_FILE:stray-dlss> DESTINATION . OPTIONAL)
