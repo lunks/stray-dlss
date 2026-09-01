@@ -35,6 +35,7 @@ bool enabled() { return false; }
 void set_dll_path(const char *) {}
 void set_topology(Topology) {}
 void set_tuning(float, float, float) {}
+void set_renodx_tuning(float, unsigned int, unsigned int, unsigned int) {}
 void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
@@ -92,7 +93,20 @@ constexpr const char *kLocalTone    = "DLSSNR.LocalToneStrength";
 constexpr const char *kLocalStruct  = "DLSSNR.LocalStructureStrength";
 constexpr const char *kWidth        = "DLSSNR.Width";
 constexpr const char *kHeight       = "DLSSNR.Height";
-constexpr const char *kScale        = "DLSSNR.Scale";
+// "DLSSNR.ScalingRatio", NOT "DLSSNR.Scale". Both names appear in RenoDX's binary — it sets
+// each defensively across snippet builds — but only ScalingRatio is a real string in the
+// 310.8.0 runtime we load, so everything we ever wrote to "Scale" was silently discarded.
+// Verified by exact null-terminated string search over nvngx_dlssnr.dll.
+constexpr const char *kScalingRatio = "DLSSNR.ScalingRatio";
+// The remaining parameters RenoDX sets that we did not. Each one below is confirmed present
+// in the runtime; the seven RenoDX names that are ABSENT from this build (InputWidth,
+// InputHeight, OutputWidth, OutputHeight, Output.Width, Output.Height, Upscaling) are
+// deliberately not set here, because writing dead names is how "Scale" hid for so long.
+constexpr const char *kEnabled      = "DLSSNR.Enabled";
+constexpr const char *kPreset       = "DLSSNR.Hint.Render.Preset";
+constexpr const char *kSkinStruct   = "DLSSNR.SkinStructureStrength";
+constexpr const char *kUseAutoMask  = "DLSSNR.UseAutoMask";
+constexpr const char *kUICorrection = "DLSSNR.UICorrection";
 
 // Refusal indices, parallel to kNrRefusalNames.
 enum
@@ -132,9 +146,15 @@ bool g_use_direct = false;
 bool g_params_from_snippet = false;
 bool g_enabled = false;
 Topology g_topology = Topology::post_process;
-float g_intensity = 1.0f;
-float g_local_tone = 1.0f;
+// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values, not invented ones: NRIntensity=1.05,
+// NRLocalTone=1.74, NRSkinStructure=1.33, NRPreset=1, NRAutoMask=1, NRUICorrection=1.
+float g_intensity = 1.05f;
+float g_local_tone = 1.74f;
 float g_local_structure = 1.0f;
+float g_skin_structure = 1.33f;
+unsigned int g_preset = 1;
+unsigned int g_auto_mask = 1;
+unsigned int g_ui_correction = 1;
 float g_mvec_scale_override = 0.0f;
 char g_dll_path[512] = "";
 char g_last_error[256] = "";
@@ -354,18 +374,26 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 
 	g_params->Set(kWidth, in_w);
 	g_params->Set(kHeight, in_h);
-	g_params->Set(kScale, out_w > 0 && in_w > 0
+	g_params->Set(kScalingRatio, out_w > 0 && in_w > 0
 		? static_cast<float>(out_w) / static_cast<float>(in_w) : 1.0f);
 	// Reversed-Z: UE 4.27 throughout, same flag SR carries. (CLAUDE.md §2.4)
 	g_params->Set(kDepthInverted, 1u);
+	g_params->Set(kEnabled, 1u);
 	g_params->Set(kIntensity, g_intensity);
 	g_params->Set(kLocalTone, g_local_tone);
 	g_params->Set(kLocalStruct, g_local_structure);
+	g_params->Set(kSkinStruct, g_skin_structure);
+	g_params->Set(kPreset, g_preset);
+	g_params->Set(kUseAutoMask, g_auto_mask);
+	g_params->Set(kUICorrection, g_ui_correction);
 
 	STRAY_LOG_WARN("NR: creating NGX feature 18 (Reserved18 / DLSSNR) %ux%u -> %ux%u, "
-		"topology=%s, intensity=%.2f localTone=%.2f localStructure=%.2f...",
+		"topology=%s, intensity=%.2f localTone=%.2f localStructure=%.2f skinStructure=%.2f "
+		"preset=%u autoMask=%u uiCorrection=%u scalingRatio=%.3f...",
 		in_w, in_h, out_w, out_h, post ? "post-process" : "sr-shaped",
-		g_intensity, g_local_tone, g_local_structure);
+		g_intensity, g_local_tone, g_local_structure, g_skin_structure,
+		g_preset, g_auto_mask, g_ui_correction,
+		out_w > 0 && in_w > 0 ? static_cast<double>(out_w) / static_cast<double>(in_w) : 1.0);
 
 	result = nr_create_feature(cmd, g_params, &g_feature);
 	if (NVSDK_NGX_FAILED(result) || g_feature == nullptr)
@@ -628,6 +656,15 @@ void set_tuning(float intensity, float local_tone_strength, float local_structur
 	g_local_structure = local_structure_strength;
 }
 
+void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
+	unsigned int use_auto_mask, unsigned int ui_correction)
+{
+	g_skin_structure = skin_structure_strength;
+	g_preset = preset;
+	g_auto_mask = use_auto_mask;
+	g_ui_correction = ui_correction;
+}
+
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
 {
 	applied = g_applied.load(std::memory_order_relaxed);
@@ -802,9 +839,14 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kMVecScaleY, scale_y);
 	g_params->Set(kDepthInverted, 1u);
 	g_params->Set(kReset, in.reset ? 1 : 0);
+	g_params->Set(kEnabled, 1u);
 	g_params->Set(kIntensity, g_intensity);
 	g_params->Set(kLocalTone, g_local_tone);
 	g_params->Set(kLocalStruct, g_local_structure);
+	g_params->Set(kSkinStruct, g_skin_structure);
+	g_params->Set(kPreset, g_preset);
+	g_params->Set(kUseAutoMask, g_auto_mask);
+	g_params->Set(kUICorrection, g_ui_correction);
 
 	static bool s_params_logged = false;
 	if (!s_params_logged)

@@ -54,6 +54,13 @@ bool enabled();
 void set_dll_path(const char *utf8_path);
 void set_topology(Topology topology);
 void set_tuning(float intensity, float local_tone_strength, float local_structure_strength);
+
+// The rest of what RenoDX sets and we did not. Names verified present in the 310.8.0 runtime by
+// exact string search; RenoDX's seven other names (InputWidth/Height, OutputWidth/Height,
+// Output.Width/Height, Upscaling) are ABSENT from this build and are deliberately not written.
+// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values.
+void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
+	unsigned int use_auto_mask, unsigned int ui_correction);
 // Overrides the motion-vector scale handed to NR; <= 0 means "derive from the topology".
 void set_mvec_scale_override(float scale);
 

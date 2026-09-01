@@ -362,11 +362,23 @@ void on_init_device(reshade::api::device *device)
 	nr::set_topology(nr_sr_shaped ? nr::Topology::sr_shaped : nr::Topology::post_process);
 
 	// Live quality knobs (the study's DLSSNR.* tuning parameters, §2.2).
-	float nr_intensity = 1.0f, nr_local_tone = 1.0f, nr_local_structure = 1.0f;
+	// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values rather than a neutral 1.0 — we
+	// follow their configuration instead of inventing one.
+	float nr_intensity = 1.05f, nr_local_tone = 1.74f, nr_local_structure = 1.0f;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", nr_intensity);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", nr_local_tone);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", nr_local_structure);
 	nr::set_tuning(nr_intensity, nr_local_tone, nr_local_structure);
+
+	float nr_skin_structure = 1.33f;
+	int nr_preset = 1, nr_auto_mask = 1, nr_ui_correction = 1;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure", nr_skin_structure);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", nr_preset);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask", nr_auto_mask);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection", nr_ui_correction);
+	nr::set_renodx_tuning(nr_skin_structure, static_cast<unsigned int>(nr_preset < 0 ? 0 : nr_preset),
+		static_cast<unsigned int>(nr_auto_mask ? 1 : 0),
+		static_cast<unsigned int>(nr_ui_correction ? 1 : 0));
 
 	// [STRAYDLSS] NgxNRIdentity: what our GetModuleFileNameW hook reports to the snippet —
 	// "nvngx" (default), "passthrough", "snippet", "exe". The runtime requires the reported
