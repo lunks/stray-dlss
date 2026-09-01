@@ -3,6 +3,7 @@
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
 #include "ngx_nr.hpp"
+#include "nr_history.hpp"
 #include "nr_hook.hpp"
 #include "perf.hpp"
 
@@ -2046,6 +2047,32 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									if (nrhook::hook_mode() == nrplan::HookMode::taa)
 									{
 										perf::Scope perf_nr(perf::kNgxNr);
+
+										// END-OF-FRAME HISTORY RESTORE, half one of two.
+										//
+										// `ei.output` is `u0`, and UE 4.27 makes that ONE resource
+										// both this frame's scene colour AND the next frame's
+										// HistoryBuffer[0] (TemporalAA.cpp:696 / :969), which
+										// ScreenSpaceRayTracing.cpp:596-620 reads directly on the
+										// NEXT frame. So NR's residual compounds through the
+										// engine's temporal state — the measured slow drift.
+										//
+										// Copy the PRISTINE image aside here, before the decode
+										// writes into it, and src/nr_history.cpp puts it back at
+										// present, after every same-frame consumer has run. `u0`
+										// is in UNORDERED_ACCESS at this exact point (the SR/RR
+										// evaluate just wrote it through a UAV), which is the one
+										// state the snapshot needs and the one place in the frame
+										// where we know it for certain.
+										//
+										// The rect is the one the decode will write — ngx_nr's
+										// `cw`/`ch`, i.e. the same fd.output_* handed to apply()
+										// below — never the texture's allocation.
+										// ([STRAYDLSS] NgxNRRestoreHistory; default ON.)
+										nrhist::snapshot(reinterpret_cast<ID3D12Device *>(
+											device->get_native()), native, ei.output,
+											fd.output_width, fd.output_height);
+
 										nr::ApplyInputs ni;
 										ni.site = nr::Site::taa_dispatch;
 										ni.image = ei.output;
@@ -2079,8 +2106,15 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// the cause.
 										ni.pre_exposure_ok =
 											view_ok && ue4::pre_exposure_plausible(view);
-										nr::apply(reinterpret_cast<ID3D12Device *>(
-											device->get_native()), native, ni);
+										const bool nr_applied = nr::apply(
+											reinterpret_cast<ID3D12Device *>(
+												device->get_native()), native, ni);
+										// Half two of the history restore: only a frame NR really
+										// modified needs putting back. A refusal (warmup,
+										// validating, degenerate, codec failure) leaves `u0`
+										// exactly as SR/RR wrote it, and restoring it would be a
+										// 66 MB copy of identical pixels.
+										nrhist::note_nr_applied(nr_applied);
 									}
 								}
 							}
