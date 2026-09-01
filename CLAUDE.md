@@ -688,8 +688,8 @@ a third time by a recomputation that reproduced all seven measured anchors exact
 | `ViewSizeAndInvSize` | 130 | 2080 | measured |
 | `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 | measured — **decoy**, reads `(1,1,1,1)` |
 | `BufferSizeAndInvSize` | 132 | 2112 | [derived] |
-| `PreExposure` | 135.y | 2164 | [derived], **corroborated** — the SR path has used it correctly for a long time |
-| ~~`OneOverPreExposure`~~ | ~~135.z~~ | ~~2168~~ | **WRONG — measured 2026-09-01, do not use** |
+| `PreExposure` | 135.y | 2164 | [derived], corroborated by the SR path |
+| `OneOverPreExposure` | 135.z | 2168 | [derived] — **HARD**: assigned as `1.f / PreExposure` on the adjacent source line |
 | `NearPlane` | 142.x | 2272 | [derived] |
 | `DeltaTime` | 143.x | 2288 | [derived] |
 | `CameraCut` | 145.x | 2320 | [derived] |
@@ -698,23 +698,32 @@ a third time by a recomputation that reproduced all seven measured anchors exact
 Everything we need is in a single **2448-byte prefix**. **Rows beyond 152 were not verified — do
 not use them.**
 
-> **ROW 135.z IS NOT `OneOverPreExposure`. Measured live 2026-09-01 and it is not close.** In one
-> frame row 135.y read **0.456** while row 135.z read **6.6794**. Those are supposed to be
-> reciprocals; their product is **3.05**, not 1. Whatever 135.z holds, it is not the inverse
-> pre-exposure, and the NR codec was multiplying its proxy scale by it — roughly 3x too large.
-> That is what "track exposure is broken" looked like from the outside.
+> **RETRACTED 2026-09-01, same day, and the retraction is the lesson.** This block asserted that
+> row 135.z is not `OneOverPreExposure`, on the strength of one frame where 135.y read 0.456 and
+> 135.z read 6.6794 — a product of 3.05 rather than 1.
 >
-> **Derive the reciprocal from 135.y instead of reading a second row.** It is self-consistent by
-> construction and drops a dependency on an unverified offset entirely, which is strictly better
-> than hunting for the right one. 135.y is the corroborated half of the pair: the SR path has fed
-> it to `InPreExposure` correctly for a long time.
+> **The row mapping was right and the MEASUREMENT was wrong.** `SceneRendering.cpp:1563-1564`
+> assigns the pair on adjacent lines from the same float:
+> ```cpp
+> ViewUniformShaderParameters.PreExposure        = PreExposure;
+> ViewUniformShaderParameters.OneOverPreExposure = 1.f / PreExposure;
+> ```
+> Their product is 1.0 **by construction**. The two numbers I compared came from two different
+> reads at two different times — 6.6794 sits inside the sequence of exposure factors logged that
+> session while 1/0.456 = 2.193 does not.
 >
-> **The general lesson: two [derived] rows that are supposed to be related give you a free
-> self-check — use it.** A reciprocal pair whose product is not 1, or a matrix row that is not
-> unit-length, costs nothing to test and catches exactly this class of silent offset error.
-> `ue4::pre_exposure_plausible` does that here, checked at the point of USE rather than in
-> `view_params_plausible` — that gate governs the whole DLSS path, so folding an unverified-row
-> check into it would disable upscaling outright if the offset were ever wrong.
+> **Two costs, and the second is worse.** The "fix" derived the reciprocal instead of reading it,
+> which changed nothing; and it removed `ue4::pre_exposure_plausible` from the shipping path,
+> deleting the only runtime detector for a genuinely bad exposure read while CI kept testing the
+> now-orphaned function and stayed green. Both are reverted.
+>
+> **The rule this earns:** a self-checking pair is only a check if you read BOTH HALVES IN ONE
+> READ. Comparing a value from one log line against a value from another is not a measurement of
+> a relationship, it is a measurement of two unrelated moments. Row 135 offers a stronger free
+> check that does not depend on timing at all: it must read `(denormal, P, 1/P, 0.0)` — `135.x` is
+> `int32 NumSceneColorMSAASamples` reinterpreted as a float (≈1.4e-45) and `135.w` is padding,
+> exactly 0.0. Dump all four from ONE `memcpy` of the 2448-byte prefix and the mapping validates
+> itself.
 
 `ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
 analysis**, no reflection names involved.

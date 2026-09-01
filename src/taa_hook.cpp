@@ -2061,26 +2061,24 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// and only when NgxNRTrackExposure is on; a frame whose
 										// View CB did not decode leaves it 0 and the codec falls
 										// back to its static scale.
-										// DERIVED from PreExposure (row 135.y), never read from
-										// row 135.z. Measured 2026-09-01 live: 135.y read 0.456
-										// while 135.z read 6.6794 — their product is 3.05, not 1,
-										// so 135.z is NOT OneOverPreExposure. Both rows were
-										// [derived] in §2.6 and never measured; 135.y is
-										// corroborated by the SR path having used it correctly
-										// for a long time, 135.z is not corroborated by anything.
-										// Taking the reciprocal ourselves is self-consistent by
-										// construction and drops a dependency on an unverified row.
+										// Row 135.z IS OneOverPreExposure. SceneRendering.cpp:1563-1564
+										// assigns the pair on ADJACENT LINES from the same float:
+										//   PreExposure        = PreExposure;
+										//   OneOverPreExposure = 1.f / PreExposure;
+										// so their product is 1.0 by construction and the layout
+										// is right. An earlier "fix" here derived the reciprocal
+										// instead, on the strength of a measured product of 3.05
+										// — but that was two floats from two DIFFERENT reads, not
+										// a layout error. Reading the row back restores the
+										// self-check below, which is the only runtime detector we
+										// have for a genuinely bad read.
 										ni.one_over_pre_exposure =
-											(view_ok && view.pre_exposure > 0.0f)
-												? 1.0f / view.pre_exposure
-												: 0.0f;
-										// Self-checking pair (rows 135.y/135.z are reciprocals),
-										// verified at the point of USE rather than in the
-										// whole-view gate, which governs the entire DLSS path.
-										// Only PreExposure itself needs checking now: the
-										// reciprocal is computed, so the pair cannot disagree.
-										ni.pre_exposure_ok = view_ok && view.pre_exposure > 0.0f &&
-											std::isfinite(view.pre_exposure);
+											view_ok ? view.one_over_pre_exposure : 0.0f;
+										// The pair being reciprocals is what makes this free: a
+										// product that is not 1 means the read is bad, whatever
+										// the cause.
+										ni.pre_exposure_ok =
+											view_ok && ue4::pre_exposure_plausible(view);
 										nr::apply(reinterpret_cast<ID3D12Device *>(
 											device->get_native()), native, ni);
 									}
