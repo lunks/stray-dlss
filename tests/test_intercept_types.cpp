@@ -4,6 +4,7 @@
 
 #include <doctest/doctest.h>
 
+#include <string>
 #include <type_traits>
 
 using namespace stray_dlss;
