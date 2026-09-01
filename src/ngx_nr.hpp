@@ -87,6 +87,30 @@ bool preload();
 // device, queue and swapchain have demonstrably worked.
 void set_warmup_frames(unsigned int frames);
 
+// The HDR colour codec's three knobs. The codec is NOT optional: feature 18 is a
+// display-referred image network and we hook a raw linear HDR image, so without the
+// encode/decode pair the network sees an out-of-domain signal and answers near-black (measured:
+// neural output max luminance 0.0026 over the centre crop, red noise on screen). The runtime
+// carries no HDR, colour-space or exposure parameter of its own — established by exhaustive
+// string search over nvngx_dlssnr.dll — so the conversion has to be in our pixels. Math and
+// provenance: src/core/nr_codec.hpp.
+//
+//  paper_white       [STRAYDLSS] NgxNRPaperWhiteScale, default 1.0. The post-exposure value
+//                    treated as display white; the shader's multiplier is 1/paper_white
+//                    (`calcProxyScale` in the reference tree). Values BELOW 1.0 are legal and
+//                    are the likely direction here: Stray's scene colour at our hook point
+//                    already carries UE4's pre-exposure (CLAUDE.md §2.6 row 135.y, ~0.056
+//                    measured live), so it is already small, and our symptom is a near-black
+//                    neural output. Raise it if the proxy looks blown out, lower it if the
+//                    proxy looks black — and read the codec's own input/proxy/output luminance
+//                    line before choosing, which is exactly what it is there for.
+//  color_strength    [STRAYDLSS] NgxNRColorStrength, default 1.0. 0 keeps the ORIGINAL's
+//                    chromaticity and transfers only the network's luminance change; 1 takes
+//                    the network's colour too. Lower it for a colour cast.
+//  transfer_strength [STRAYDLSS] NgxNRTransferStrength, default 1.0. A global lerp back toward
+//                    the untouched original; 0 is an EXACT bypass, bit for bit.
+void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
+
 struct ApplyInputs
 {
 	// The image to improve: whatever our SR/RR evaluate just wrote (the engine's output
@@ -118,7 +142,8 @@ void shutdown();
 const char *last_error();
 
 // Telemetry for the periodic report: how often NR replaced the image versus refused, and why.
-constexpr int kNrRefusalCount = 9;
+// NOTE: the count is duplicated in src/ngx_nr.cpp's kNrRefusalNames — change both together.
+constexpr int kNrRefusalCount = 11;
 extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();

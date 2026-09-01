@@ -25,10 +25,15 @@ endif()
 
 message(STATUS "Using fxc: ${FXC_EXECUTABLE}")
 
-# compile_shader(<target> <hlsl-path> <entry> <profile> <c-symbol>)
+# compile_shader(<target> <hlsl-path> <entry> <profile> <c-symbol> [<extra-dependency>...])
 #
 # Emits a header defining `<c-symbol>` as a byte array, adds it to the target's sources so the
 # build orders correctly, and puts its directory on the include path.
+#
+# Any trailing arguments are added to the custom command's DEPENDS. fxc resolves #include
+# relative to the including file, but CMake cannot see through that, so a shader that includes a
+# shared .hlsli must name it here or an edit to the .hlsli will not rebuild anything — the kind
+# of staleness that ships a wrong image from a correct source tree.
 function(compile_shader TARGET SOURCE ENTRY PROFILE SYMBOL)
     get_filename_component(name ${SOURCE} NAME_WE)
     set(outdir "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders")
@@ -42,7 +47,7 @@ function(compile_shader TARGET SOURCE ENTRY PROFILE SYMBOL)
         # afford.
         COMMAND "${FXC_EXECUTABLE}" /nologo /T ${PROFILE} /E ${ENTRY}
                 /Fh "${out}" /Vn ${SYMBOL} /O3 /WX "${SOURCE}"
-        DEPENDS "${SOURCE}"
+        DEPENDS "${SOURCE}" ${ARGN}
         COMMENT "fxc ${name}.hlsl -> ${name}.h (${PROFILE})"
         VERBATIM)
 

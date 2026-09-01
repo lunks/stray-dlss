@@ -394,12 +394,47 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", nr_mvec_scale);
 	nr::set_mvec_scale_override(nr_mvec_scale);
 
+	// The HDR colour codec (src/core/nr_codec.hpp). NOT optional and not a quality knob: feature
+	// 18 is a display-referred image network, our hook point carries raw unbounded pre-exposed
+	// linear HDR, and the runtime has no colour-space or exposure parameter anywhere in it. Fed
+	// raw HDR it answered near-black (neural output max luminance 0.0026) and drew red noise.
+	//
+	// NgxNRPaperWhiteScale is the post-exposure value treated as display white; the shader's
+	// multiplier is 1/paperWhite ("calcProxyScale" in the reference tree, where the user-facing
+	// knob has this same name and RenoDX calls it NRPaperWhiteScale). The reference multiplies
+	// it by its tonemapper's auto-exposure texture — we have no such texture at a TAA dispatch,
+	// so this is the WHOLE scale, with nothing scene-adaptive underneath it.
+	//
+	// Default 1.0, and values BELOW 1.0 are legal and are the likely direction here: scale =
+	// 1/paperWhite, so raising it multiplies the colour DOWN, and Stray's scene colour already
+	// carries UE4's pre-exposure (CLAUDE.md §2.6 row 135.y, ~0.056 measured live) — already
+	// small, which is the direction our failure points. Do not guess: the codec logs the colour
+	// input, the encoded proxy and the neural output luminance over one crop on one line, and
+	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
+	float nr_paper_white = 1.0f, nr_color_strength = 1.0f, nr_transfer_strength = 1.0f;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", nr_paper_white);
+	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
+	// the escape hatch for a colour cast. 1 takes the network's colour too.
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", nr_color_strength);
+	// A global lerp back toward the untouched original; 0 is an EXACT bit-for-bit bypass, which
+	// makes it the honest A/B against "NR off" without changing anything else.
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength", nr_transfer_strength);
+	nr::set_codec_tuning(nr_paper_white, nr_color_strength, nr_transfer_strength);
+
 	if (ngx_nr)
 	{
 		STRAY_LOG_WARN("NgxNR=1: DLSS Neural Rendering (feature 18) topology=%s "
-			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f. "
-			"Grep 'NR' lines.", nr_sr_shaped ? "sr-shaped" : "post-process",
-			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale);
+			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f "
+			"paperWhite=%.4f colorStrength=%.2f transferStrength=%.2f. "
+			"Grep 'NR' lines, and 'NR CODEC LUMINANCE' for the one that picks paperWhite.",
+			nr_sr_shaped ? "sr-shaped" : "post-process",
+			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale,
+			nr_paper_white, nr_color_strength, nr_transfer_strength);
+		if (nr_sr_shaped)
+			STRAY_LOG_ERROR("NgxNRTopology=sr is INCOMPATIBLE with the HDR colour codec and NR "
+				"will refuse every frame ('codec-topology'). The codec's residual transfer needs "
+				"the proxy, the neural answer and the original to be the same pixels, which "
+				"sr-shaped does not give it. Use NgxNRTopology=post.");
 		// [STRAYDLSS] NgxNRPreload, default ON: LoadLibrary + export resolution + the
 		// identity IAT patch at device init — matching RenoDX's "signed NR runtime
 		// (nvngx_dlssnr.dll) pre-loaded at device init". All of it is pure memory work with
