@@ -1260,6 +1260,39 @@ and the **resolution mismatch** — we hand it 3840x2160 colour with 1920x1080 d
 vectors, and if the runtime indexes depth at output resolution that is both the garbage image
 and a plausible fault.
 
+### Three ways to hand feature 18 something that hangs the GPU rather than erroring
+
+All three were live in our code at the session's only successful NR run, and all three are now
+closed. They share a shape worth internalising: **the neural runtime validates almost nothing,
+so a malformed input is a hang or a garbage image, never a returned error.**
+
+1. **A mipped output texture is a documented `DXGI_ERROR_DEVICE_HUNG`**, arriving *a few seconds
+   after the neural pass starts*. `ensure_output_texture` did `D3D12_RESOURCE_DESC tex = src`,
+   inheriting `MipLevels`, `DepthOrArraySize` and `SampleDesc` from whatever UE4 had allocated.
+   The output is now always built as a plain single-mip, single-slice, non-MSAA 2D texture, and
+   the source's real counts are logged so one run answers whether it ever mattered. A **mipped
+   colour input** cannot be fixed by allocating our own texture and is now refused under a named
+   reason (`mipped-input`) rather than passed through.
+
+2. **An unknown parameter name is silently ignored** — an NGX parameter block is an untyped
+   string→value map with no validation, so a stale name is indistinguishable from a value that
+   was accepted. We wrote `DLSSNR.Scale`, which does not exist in the 310.8.0 runtime, so every
+   scaling ratio we ever sent was discarded. The real name is `DLSSNR.ScalingRatio`. **Confirm
+   every parameter name by exact null-terminated string search over the runtime binary before
+   writing it** — and do not copy a name list off another *caller*, since RenoDX writes seven
+   names this build does not implement. `docs/RESEARCH-RENODX-DLSS5.md` §2.2.1 carries the audit.
+
+3. **Declaring a guide's subrect AND scaling its vectors double-counts.** `MVecSubrectWidth/
+   Height` already state that the motion vectors live in their own 1920x1080 rect, so
+   `MVecScaleX/Y` must be **1.0**, not the output/render ratio. Reference integrations all send
+   1.0 and expect motion in pixels of the guide's own subrect.
+
+**Also worth knowing before the next attempt:** the runtime exports
+`DLSSNRComputeScalingRatioCallback` and `DLSSNRGetStatsCallback` as parameter names (verified
+present in our binary) which `nvngx.dll` would normally populate with function pointers inside
+the snippet itself. We leave them unset — guessing an RVA into a leaked DLL is not a bounded
+risk — and at least one working third-party integration omits them too.
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
