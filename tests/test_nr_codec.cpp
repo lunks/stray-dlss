@@ -470,3 +470,32 @@ TEST_CASE("the tracked scale is clamped to the same bounds as the static one")
 	CHECK(proxy_scale_tracked(0.01f, 1.0f, std::numeric_limits<float>::max()) ==
 		proxy_scale(0.01f, 1.0f));
 }
+
+// The exposure factor is smoothed because DLSSNR keeps its own temporal history: a scale that
+// moves frame to frame leaves that history in units that no longer match the current proxy.
+// The user observed the flicker tracking paper white, with intensity amplifying it.
+TEST_CASE("exposure smoothing is geometric, not arithmetic")
+{
+	// Exposure is multiplicative, so the halfway point between 1/16 and 16 is 1, not 8.
+	const float mid = stray_dlss::nrc::smooth_exposure_factor(0.0625f, 16.0f, 0.5f);
+	CHECK(mid == doctest::Approx(1.0f).epsilon(1e-4));
+}
+
+TEST_CASE("smoothing adopts the first sample rather than ramping from nothing")
+{
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(0.0f, 3.0f, 0.1f) == doctest::Approx(3.0f));
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(-1.0f, 3.0f, 0.1f) == doctest::Approx(3.0f));
+}
+
+TEST_CASE("a bad sample never poisons the running value")
+{
+	const float nan = std::numeric_limits<float>::quiet_NaN();
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, nan, 0.1f) == doctest::Approx(2.0f));
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, 0.0f, 0.1f) == doctest::Approx(2.0f));
+}
+
+TEST_CASE("rate 1.0 disables smoothing and rate 0 freezes it")
+{
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, 5.0f, 1.0f) == doctest::Approx(5.0f));
+	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, 5.0f, 0.0f) == doctest::Approx(2.0f));
+}

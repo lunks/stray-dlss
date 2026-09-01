@@ -112,6 +112,21 @@ float proxy_scale(float paper_white, float fallback_paper_white)
 	return scale;
 }
 
+float smooth_exposure_factor(float previous, float current, float rate)
+{
+	if (!std::isfinite(current) || current <= 0.0f)
+		return previous; // a bad sample never poisons the running value
+	if (!std::isfinite(previous) || previous <= 0.0f)
+		return current;  // first observation: adopt it rather than ramping from nothing
+	if (!std::isfinite(rate) || rate >= 1.0f)
+		return current;
+	if (rate <= 0.0f)
+		return previous;
+	// Log space: exposure is multiplicative, so the geometric mean is the meaningful average.
+	const float blended = std::exp(std::log(previous) + rate * (std::log(current) - std::log(previous)));
+	return std::isfinite(blended) && blended > 0.0f ? blended : current;
+}
+
 float proxy_scale_tracked(float paper_white, float fallback_paper_white, float exposure_factor)
 {
 	const float static_scale = proxy_scale(paper_white, fallback_paper_white);

@@ -164,6 +164,27 @@ float proxy_scale(float paper_white, float fallback_paper_white);
 // there is no pre-exposure left to undo, so tracking there would be actively wrong.
 float proxy_scale_tracked(float paper_white, float fallback_paper_white, float exposure_factor);
 
+// Exponentially smooth the tracked exposure factor. THIS IS NOT A NICETY.
+//
+// The scale appears on BOTH sides of the codec — encode multiplies by it, decode divides by it
+// — and within a frame the two share one value, so a frame is self-consistent. But DLSSNR keeps
+// its OWN temporal history, accumulated in display-referred units at whatever scale was in force
+// when each sample was encoded. If the scale moves frame to frame, the history no longer matches
+// the current proxy's units and the network reprojects against inconsistently-scaled samples.
+// Measured: the user reports the flicker tracks PAPER WHITE, with intensity merely amplifying it
+// — exactly this, since intensity scales the residual that the mismatch corrupts.
+//
+// The reference gets away with an unsmoothed factor for a reason it states explicitly: its
+// exposure "is heavily temporally smoothed (autoExposureSpeed defaults to 5 units/second), so a
+// one frame lag is not visible". UE4's PreExposure carries no such guarantee and can step. So we
+// smooth it ourselves rather than assuming the engine did.
+//
+// `previous` is the last smoothed value (0 or non-finite = no history yet, adopt `current`).
+// `rate` in (0, 1] is the per-frame weight of the new sample; 1.0 disables smoothing entirely.
+// Smoothed in LOG space because exposure is multiplicative — a linear average of 1/16 and 16
+// is 8, which is nobody's idea of the midpoint.
+float smooth_exposure_factor(float previous, float current, float rate);
+
 // --- the two halves of the codec ---
 
 // `proxy = SrgbEncode(SoftClip(max(rgb, 0) * scale))`.

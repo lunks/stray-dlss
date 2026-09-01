@@ -111,6 +111,12 @@ void set_warmup_frames(unsigned int frames);
 //                    the untouched original; 0 is an EXACT bypass, bit for bit.
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
 
+// [STRAYDLSS] NgxNRExposureSmoothing, default 0.05: per-frame weight of the new exposure sample
+// when NgxNRTrackExposure is on. 1.0 disables smoothing (the old behaviour). NOT cosmetic — see
+// nrc::smooth_exposure_factor: NR keeps its own temporal history, so a scale that moves frame to
+// frame leaves that history in units the current proxy no longer matches.
+void set_exposure_smoothing(float rate);
+
 // [STRAYDLSS] NgxNRTrackExposure, default ON — the reference's `trackAutoExposure`
 // (rtx_neural_rendering.h:137-140), which defaults to true and which we dropped in the port.
 //

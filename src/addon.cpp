@@ -220,6 +220,7 @@ struct NrUiState
 	bool  track_exposure = true;
 	float color_strength = 1.0f;
 	float transfer_strength = 1.0f;
+	float exposure_smoothing = 0.05f; // per-frame weight of the new exposure sample; 1.0 = off
 	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
 	int   mv_convention = 0;  // index into kMvConventions
 	bool  mv_invert_x = false;
@@ -247,6 +248,7 @@ void apply_nr_ui()
 		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
 		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
 	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
+	nr::set_exposure_smoothing(g_nr_ui.exposure_smoothing);
 	nr::set_track_exposure(g_nr_ui.track_exposure);
 	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
 
@@ -494,6 +496,8 @@ void on_init_device(reshade::api::device *device)
 	// makes it the honest A/B against "NR off" without changing anything else.
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
 		g_nr_ui.transfer_strength);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
+		g_nr_ui.exposure_smoothing);
 	g_nr_ui.enabled = ngx_nr;
 	apply_nr_ui();
 	const float nr_paper_white = g_nr_ui.paper_white;
@@ -1327,6 +1331,10 @@ void draw_nr_controls()
 	// 0 is an EXACT bit-for-bit bypass, which makes it the honest A/B against "NR off".
 	changed |= ImGui::SliderFloat("Transfer strength", &g_nr_ui.transfer_strength, 0.0f, 1.0f,
 		"%.2f");
+	// 1.0 reproduces the unsmoothed behaviour. Lower is steadier; NR's own history is
+	// accumulated at this scale, so jitter here shows up as flicker that intensity amplifies.
+	changed |= ImGui::SliderFloat("Exposure smoothing", &g_nr_ui.exposure_smoothing, 0.01f, 1.0f,
+		"%.3f");
 
 	// THE MOTION KNOB. Our motion vectors are render-resolution (1920x1080) while the colour is
 	// the output rect (3840x2160). Whether the runtime wants them in the guide's own pixels
@@ -1376,6 +1384,8 @@ void draw_nr_controls()
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
 			g_nr_ui.transfer_strength);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
+			g_nr_ui.exposure_smoothing);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure",

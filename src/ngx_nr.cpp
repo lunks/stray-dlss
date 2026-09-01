@@ -47,6 +47,7 @@ void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
 void set_codec_tuning(float, float, float) {}
+void set_exposure_smoothing(float) {}
 void set_track_exposure(bool) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
@@ -176,6 +177,11 @@ float g_mvec_scale_override = 0.0f;
 // because the reference multiplies it by its tonemapper's auto-exposure texture, which we have
 // no access to at a TAA-dispatch hook. It is 1.0 here because it is neutral and because the
 // direction this title needs is unknown until the codec's own luminance line is read once.
+// Running smoothed exposure factor. See nrc::smooth_exposure_factor for why this must not be
+// used raw: NR's own temporal history is accumulated at whatever scale was in force, so a scale
+// that jitters frame to frame leaves that history in the wrong units.
+float g_exposure_smoothed = 0.0f;
+float g_exposure_rate = 0.05f; // [STRAYDLSS] NgxNRExposureSmoothing; 1.0 = off
 float g_paper_white = 1.0f;
 float g_color_strength = 1.0f;
 float g_transfer_strength = 1.0f;
@@ -805,6 +811,8 @@ void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
 
 void set_track_exposure(bool enabled) { g_track_exposure = enabled; }
 
+void set_exposure_smoothing(float rate) { g_exposure_rate = rate; }
+
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
 {
 	g_paper_white = paper_white;
@@ -1005,8 +1013,13 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		// TRACKED EXPOSURE. `1.0f` is the fallback paper white, not an exposure — see
 		// nrc::proxy_scale's signature.
 		const float static_scale = nrc::proxy_scale(g_paper_white, 1.0f);
+		if (g_track_exposure)
+		{
+			g_exposure_smoothed = nrc::smooth_exposure_factor(g_exposure_smoothed,
+				in.one_over_pre_exposure, g_exposure_rate);
+		}
 		codec_scale = g_track_exposure
-			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, in.one_over_pre_exposure)
+			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, g_exposure_smoothed)
 			: static_scale;
 
 		// The decomposition, once. When the user reports "paper white 0.1 looks best", this line
