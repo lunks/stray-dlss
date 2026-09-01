@@ -18,6 +18,7 @@
 #include "gbuffer_resolve.hpp"
 #include "input_dump.hpp"
 #include "mv_resolve.hpp"
+#include "nr_history.hpp"
 #include "nr_hook.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
@@ -228,6 +229,11 @@ struct NrUiState
 	bool  mv_invert_x = false;
 	bool  mv_invert_y = false;
 	bool  mv_legacy_clip = false; // reproduce the pre-row_major transposed camera branch
+	// [STRAYDLSS] NgxNRRestoreHistory, default OFF (histplan::Config carries the reasoning).
+	// Live, and deliberately so: it is the A/B for the SSR drift, and every other hypothesis in
+	// this project was settled by flipping something inside ONE session rather than across two
+	// launches. Overwritten at startup with what the ini said. (src/nr_history.hpp)
+	bool  restore_history = false;
 };
 
 // Which branch of the resolve gets its sign flipped. UE4's velocity buffer is sparse, so the
@@ -256,6 +262,7 @@ void apply_nr_ui()
 	nr::set_scale_reset_tolerance(g_nr_ui.scale_reset_tol);
 	nr::set_track_exposure(g_nr_ui.track_exposure);
 	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
+	nrhist::set_enabled(g_nr_ui.restore_history);
 
 	// Branch flip, then the global axis flips on top of both.
 	const bool flip_sparse = g_nr_ui.mv_convention == 1 || g_nr_ui.mv_convention == 3;
@@ -710,6 +717,7 @@ void on_destroy_device(reshade::api::device *device)
 		return;
 
 	std::lock_guard<std::mutex> lock(g_state.mutex);
+	nrhist::shutdown();
 	nrhook::shutdown();
 	nr::shutdown();
 	if (g_state.ngx_attempted.load(std::memory_order_relaxed))
@@ -934,7 +942,6 @@ void on_present(
 	uint32_t dirty_rect_count,
 	const reshade::api::rect *dirty_rects)
 {
-	(void)queue;
 	(void)source_rect;
 	(void)dest_rect;
 	(void)dirty_rect_count;
@@ -949,6 +956,13 @@ void on_present(
 	// Per-present boundary for the post-tonemap hook sites: resets the back-buffer bind ordinal
 	// and the once-per-frame latch, retires staging allocations, and emits the periodic report.
 	nrhook::on_present(frame);
+	// END-OF-FRAME HISTORY RESTORE. Puts the pristine, pre-NR image back into the engine's `u0`
+	// so the next frame's screen-space reflections read the history UE 4.27 would have written,
+	// not the one DLSS Neural Rendering left behind. It records onto ReShade's OWN immediate
+	// command list, which the D3D12 present path flushes at dxgi_swapchain.cpp:1009 — after this
+	// event and after the game has submitted every command list of the frame to the same queue,
+	// so the copy executes after every same-frame consumer of `u0`. (src/nr_history.hpp)
+	nrhist::on_present(frame, queue);
 
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
@@ -1324,6 +1338,39 @@ void draw_nr_controls()
 		nr::set_enabled(g_nr_ui.enabled);
 	}
 
+	// THE SSR-DRIFT A/B. `u0` is both this frame's scene colour and the next frame's
+	// HistoryBuffer[0] (TemporalAA.cpp:696/:969), so NR's residual re-enters the engine's
+	// temporal state and compounds. With this on, the pristine pre-NR image is copied aside
+	// inside the TAA dispatch and copied back at present — after every same-frame consumer has
+	// run, so the DISPLAYED frame is identical either way and only the drift changes. Live on
+	// purpose: turning it off mid-session and watching a wet floor or the menu's light shafts is
+	// the measurement. (src/nr_history.hpp)
+	const nrhist::Counters histc = nrhist::counters();
+	if (hook == nrplan::HookMode::taa)
+	{
+		changed |= ImGui::Checkbox("Restore engine history (keeps NR out of TAA history)",
+			&g_nr_ui.restore_history);
+		ImGui::Text("  snapshots %llu  restores %llu  harmful misses %llu%s",
+			static_cast<unsigned long long>(histc.snapshots),
+			static_cast<unsigned long long>(histc.restores),
+			static_cast<unsigned long long>(histc.harmful_misses),
+			histc.harmful_misses != 0 ? "  <-- frames whose residual DID reach the history" : "");
+		for (int i = 0; i < histplan::kStepCount; ++i)
+		{
+			const std::uint32_t total = histc.snapshot_reasons[i] + histc.restore_reasons[i];
+			if (total != 0 && i != static_cast<int>(histplan::Step::ok))
+				ImGui::Text("    %-20s %u",
+					histplan::step_name(static_cast<histplan::Step>(i)), total);
+		}
+	}
+	else
+	{
+		// Not a control here, and saying so beats a greyed-out box nobody can explain: a
+		// post-tonemap site has no feedback path to close by construction.
+		ImGui::TextUnformatted("Restore engine history: INERT at this hook site (no feedback "
+			"path post-tonemap)");
+	}
+
 	ImGui::TextUnformatted("HDR colour codec");
 	// Below 1.0 is legal and is the useful direction here: the shader's multiplier is
 	// 1/paperWhite, so raising this multiplies the colour DOWN, and Stray's scene colour already
@@ -1430,6 +1477,8 @@ void draw_nr_controls()
 			g_nr_ui.auto_mask ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection",
 			g_nr_ui.ui_correction ? 1 : 0);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreHistory",
+			g_nr_ui.restore_history ? 1 : 0);
 		STRAY_LOG_WARN("NR: live settings saved to ReShade.ini.");
 	}
 	ImGui::SameLine();
@@ -1778,6 +1827,51 @@ void register_events()
 			reshade::register_event<reshade::addon_event::reshade_begin_effects>(
 				on_nr_begin_effects);
 		}
+
+		// [STRAYDLSS] NgxNRRestoreHistory, default ON. Keeps NR's residual out of the engine's
+		// temporal history at the `taa` site by snapshotting u0 before the decode and putting it
+		// back at present. Read alongside the hook mode because it is only meaningful for one of
+		// them, and inert (loudly) for the other two. Full argument: src/nr_history.hpp.
+		bool restore_history = false;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreHistory", restore_history);
+		nrhist::set_enabled(restore_history);
+		nrhist::set_site(mode);
+		g_nr_ui.restore_history = restore_history;
+
+		// The one hypothesis in that path: which D3D12_RESOURCE_STATES u0 is in at present time,
+		// where the restore copy is recorded on a different command list from the snapshot. 0
+		// keeps the derived default (0xC0 = NON_PIXEL|PIXEL_SHADER_RESOURCE); the derivation is
+		// in src/nr_history.cpp and is echoed in full on the first restore.
+		int restore_state_bits = 0;
+		reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreState", restore_state_bits);
+		nrhist::set_image_state_at_present(restore_state_bits <= 0
+			? 0u : static_cast<unsigned int>(restore_state_bits));
+
+		if (mode == nrplan::HookMode::taa)
+			STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
+				"the pre-NR image of u0 aside inside the TAA dispatch and copies it back at "
+				"present, so UE 4.27's TemporalAAHistory.RT[0] — which "
+				"ScreenSpaceRayTracing.cpp:596-620 reads on the NEXT frame — never holds the "
+				"neural residual; the DISPLAYED frame is unchanged either way, because every "
+				"same-frame consumer of u0 has already run by Present. It is OFF by default "
+				"because the SSR fade stopped reproducing on 2026-09-01 and the restore rests on "
+				"an INFERRED state for u0 at present (assumed 0x%X; [STRAYDLSS] NgxNRRestoreState "
+				"overrides) — four UE 4.27 source anchors, no measurement. Flip it live in the "
+				"DLSS Neural Rendering overlay the moment the fade returns; the whole diagnosis "
+				"is in src/nr_history.hpp.",
+				restore_history ? 1 : 0,
+				restore_history
+					? "ENABLED, so the engine's temporal history is being kept pristine."
+					: "Off, so NR's residual re-enters the engine's temporal state every frame "
+					  "exactly as it did before this feature existed — which is the SHIPPED "
+					  "behaviour, not a fault.",
+				nrhist::image_state_at_present());
+		else
+			STRAY_LOG_INFO("NgxNRRestoreHistory is INERT at NgxNRHook=%s: a post-tonemap site has "
+				"no feedback path to close by construction (every QueueTextureExtraction into "
+				"PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is "
+				"at 777), so nothing is snapshotted and nothing is restored.",
+				nrplan::hook_mode_name(mode));
 	}
 
 	if (pass_finder_enabled)

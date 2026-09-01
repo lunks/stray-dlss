@@ -1472,6 +1472,105 @@ effect that is stable frame-to-frame in a normal post-process chain can still di
 that porting a correct implementation is not sufficient when the target resource has a different
 role in the frame graph.
 
+### The drift, fixable WITHOUT moving the hook: `[STRAYDLSS] NgxNRRestoreHistory` (default **OFF**)
+
+**Built, CI-green on all three lanes, and SHIPPED OFF.** Read the two paragraphs under "Why it
+is off" before turning it on, and read the state ledger before trusting it.
+
+The placement argument above is right and the `preui` attempt that came out of it wrecked the
+frame (it clobbered state the next pass was about to use). But the loop can be broken at the
+`taa` site — whose image quality is the good one — without moving anything, because of an
+asymmetry the placement reading missed:
+
+**SSR reads the history on the NEXT frame, and every SAME-frame consumer of `u0` has already run
+by the time the game calls Present.** So there is a window at end of frame where `u0` can be put
+back to what the engine would have written, and nothing that has already consumed it notices.
+
+```
+TAA hook:  DLSS SR writes u0
+           -> CopyTextureRegion(scratch <- u0)     pristine, pre-NR
+           -> NR decode writes into u0 in place
+           ... the rest of the frame — post, tonemap, UI — uses the NR image ...
+present:   CopyTextureRegion(u0 <- scratch)        the engine's history never saw NR
+```
+
+The DISPLAYED frame is byte-identical to before. Only what the engine carries forward changes.
+
+**Ordering is HARD, from ReShade v6.8.0's own source.** `DXGISwapChain::on_present`, d3d12 case,
+runs `invoke_addon_event<present>` → `present_effect_runtime` → `flush_immediate_command_list()`,
+all inside the hooked `IDXGISwapChain::Present` — i.e. after the game has submitted every command
+list of the frame to that same queue. The flush is a plain `ExecuteCommandLists` on it, and one
+queue executes in submission order. **The trap:** `flush()` early-outs on `!_has_commands`
+(`d3d12_impl_command_list_immediate.cpp:122`), and `_has_commands` is set by ReShade's
+`command_list` API, NOT by recording onto the native list behind `get_native()`. With an empty
+preset nothing else records at present, so a purely native restore would sit unflushed in an open
+list. The barriers therefore go through `cmd_list->barrier()` (which sets it and records a real
+`D3D12_RESOURCE_BARRIER` — `api::resource_usage` is a bit-for-bit passthrough of
+`D3D12_RESOURCE_STATES`) and only the copy is native.
+
+**The one hypothesis, and it is a knob for that reason: which state `u0` is in at present.**
+D3D12 cannot be asked, and the restore runs on a different list from the snapshot. Derived from
+four UE 4.27 source anchors — `TemporalAA.cpp:969` extracts the history with the two-argument
+`QueueTextureExtraction`, whose `AccessFinal` is `RenderGraphBuilder.h:209`'s
+`kDefaultAccessFinal = ERHIAccess::SRVMask`; `D3D12Commands.cpp:398-414` maps a readable
+`AccessAfter` to `Resource->GetReadableState()`; `D3D12Resources.h:377/389` defines that as
+`NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE`. Hence **0xC0**, overridable with
+`[STRAYDLSS] NgxNRRestoreState`.
+
+**Why the constant matters more than it looks.** We transition back to the value we CLAIMED, so
+after our pair the resource really is in that state — while UE4's own CPU-side tracking believes
+whatever it last set. A wrong constant therefore desynchronises the ENGINE's bookkeeping, not
+just ours. On this target vkd3d-proton softens it (a `ALLOW_UNORDERED_ACCESS` image stays in
+`VK_IMAGE_LAYOUT_GENERAL`, so a wrong `StateBefore` costs an access mask rather than a layout),
+but that must not be relied on.
+
+**Scope, stated honestly.** This closes loops whose consumer reads the TEXTURE next frame — the
+SSR / `TemporalAAHistory.RT[0]` conduit. It does NOT close a loop whose consumer read `u0` within
+the same frame and stored the result elsewhere: the eye-adaptation histogram
+(`PostProcessing.cpp:626-648`) still sees the NR image. That one already has its own fix
+(`NgxNRTrackExposure`).
+
+**Cost:** two full-rect copies of the output texture per frame (~66 MB each way at 4K FP16). It
+is gated on `nr::validated()`, so a session with NR off, still warming up, or permanently
+refusing pays nothing at all. `snapshots`, `restores` and — the number that must stay zero —
+`harmfulMisses` are in the periodic `NR HISTORY` line and in the overlay, where the checkbox is
+live so the A/B happens inside one session. Inert and loudly so at the post-tonemap sites, which
+have no feedback path to close. Gate and refusal rules: `src/core/nr_history_plan.hpp`,
+`tests/test_nr_history_plan.cpp`.
+
+**Why it is OFF by default, and this is the part worth keeping.** Two reasons, and the second
+decides it:
+
+1. **As of 2026-09-01 the fade is no longer reproducing.** Something else landed the same day
+   fixed it — candidates are the `ClipToPrevClip` transposition fix, `MVecScale` returning to
+   1.0, the create-site shape gate (which cut feature creations from 11 to 1, each of which was
+   a full history reset), or the exposure work. Which one is unknown and, for this mechanism,
+   irrelevant.
+2. **The restore runs an unverified state assumption on every frame.** That is the same class of
+   assumption that made `preui` wreck a frame the same night. Paying it to fix a problem that is
+   not currently occurring is a bad trade even when the code is right.
+
+So it is a TOOL with its diagnosis already written down — reach for it the moment the fade
+returns, rather than rediscovering all of this. `tests/test_nr_history_plan.cpp` pins the default
+OFF so a future session flipping it does so knowingly.
+
+**What was and was not verified — the honest ledger.**
+
+| Claim | Status |
+|---|---|
+| `u0` is in `UNORDERED_ACCESS` at the snapshot | **HARD.** `ngx_nr.cpp`'s `image_state` derives the identical constant on the same resource at the same point |
+| `addon_event::present` fires before `flush_immediate_command_list()`, and both after the game's submissions | **HARD.** ReShade v6.8.0 `dxgi_swapchain.cpp`, d3d12 case, read directly |
+| The immediate list executes on the swapchain's own queue, in submission order | **HARD.** `d3d12_impl_command_list_immediate.cpp:154` |
+| `flush()` early-outs on `!_has_commands`, which only ReShade's `command_list` API sets | **HARD.** `d3d12_impl_command_list_immediate.cpp:122`; why the barriers go through `cmd_list->barrier()` |
+| `api::resource_usage` is a bit-for-bit passthrough of `D3D12_RESOURCE_STATES` | **HARD.** `convert_usage_to_resource_states:236` is a plain mask |
+| The present callback is inside the queue's own mutex, so using the immediate list there is safe | **HARD.** `dxgi_swapchain.cpp`'s `unique_direct3d_device_lock`, with a comment saying exactly that |
+| `u0` is in `NON_PIXEL \| PIXEL_SHADER_RESOURCE` (0xC0) at present | **[derived], four source anchors, ZERO measurements.** This is the risk |
+| The restore is invisible to the displayed frame | **[derived]** from the ordering facts above. Not seen on a screen |
+| Cost is ~1-2% of a 4090's bandwidth | **[derived]** arithmetic. Not measured |
+| vkd3d-proton softens a wrong `StateBefore` on a UAV-capable image | **SOFT.** Consistent with its GENERAL-layout policy; not verified against 3.1.0's source |
+
+The last four are what a live run would settle, in that order.
+
 ### The hook site is now a choice: `[STRAYDLSS] NgxNRHook` = taa | present | preui
 
 The drift above is a PLACEMENT problem, so the fix is a placement. Three sites, one NR path
