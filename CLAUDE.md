@@ -1276,14 +1276,43 @@ the reference (chroma valve, fade weight, guards and clamp all verified). The di
 
 * The reference writes into `m_finalOutput` — a **terminal** image, consumed downstream by bloom,
   motion blur and the tone curve. Nothing reads it back.
-* **We write into the TAA dispatch's `u0`, which §2.9 establishes UE 4.27 extracts as the NEXT
-  frame's `HistoryBuffer[0]`.** So every frame adds a residual `(n - p)/s` into the engine's
-  temporal history; the next frame's TAA reads a history that already contains it and we add
-  another on top. It compounds until something resets the history, then starts over.
+* **We write into the TAA dispatch's `u0`, which §2.9 establishes UE 4.27 extracts as the next
+  frame's `HistoryBuffer[0]` — and which is the SAME texture as the downstream scene colour.**
+  `TemporalAA.cpp:696` is literally `NewHistoryTexture[0] = Outputs.SceneColor =
+  NewHistoryTexture[0];`, and `:969` extracts that same texture. One resource, two roles, so
+  **the engine cannot be handed a different image for history than for display at this hook
+  point.**
 
-That also explains why the symptom is **accumulation-generic**: fog and SSR are composited into
-scene colour *before* TAA, so a drifting history drags everything with it, and fine
-high-contrast detail (light shafts, specular streaks) shows it first.
+> **CORRECTED against the UE 4.27.2 source.** This section first named the TAA shader's own
+> history read as the loop. **That consumer is DEAD:** we `return true` from `dispatch` and
+> suppress the engine's TAA every frame, so the shader that samples `HistoryBuffer_0` at `t5`
+> never runs. Do not chase it.
+>
+> **The live conduit is SCREEN-SPACE REFLECTIONS, which read the history directly and bypass the
+> TAA shader entirely.** `ScreenSpaceRayTracing.cpp:596-620`, inside
+> `RenderScreenSpaceReflections`, falls through to
+> `InputColor = View.PrevViewInfo.TemporalAAHistory.RT[0]` (the half-res branch needs
+> `GSSRHalfResSceneColor`, which defaults to 0). That is exactly the resource our decode writes.
+> So the residual enters the reflections, is composited back into scene colour, TAA'd, DLSS'd and
+> residualled again — a closed per-frame loop whose gain is the pixel's reflective contribution,
+> which is why a **wet floor** shows it worst. `FSSDTemporalAccumulationCS` on top supplies the
+> multi-second time constant.
+>
+> **A second, weaker loop runs through EYE ADAPTATION** and fits the *global* menu brightness
+> decay better than SSR does: `PostProcessing.cpp:626-648` downsamples the post-TAA scene colour
+> — our modified image — into the histogram that drives exposure on later frames. The reference
+> has this same coupling and is stable, but it also keeps `trackAutoExposure` (default true),
+> which we dropped in the port: its proxy scale follows the engine's exposure so the codec's
+> operating point cannot drift, while ours is a hardcoded constant.
+>
+> **And the fix this unlocks:** on the desktop deferred path **nothing after the tonemapper is
+> carried into the next frame** — every `QueueTextureExtraction` into `PrevFrameViewInfo` sits at
+> `PostProcessing.cpp` 576/599/643 while `AddTonemapPass` is at 777. A post-tonemap hook has zero
+> feedback path by construction, and needs no HDR codec either.
+
+**Diagnose before building.** `r.SSR.Quality=0` kills the first loop and `r.EyeAdaptationQuality=0`
+the second; one launch each with the menu burst says which fix is actually needed, and
+`r.SSR.Quality=0` doubles as an immediate workaround.
 
 **The general lesson, which outlives this feature: our interception point is a FEEDBACK NODE, not
 an output.** Any pass that modifies `u0` is writing into the engine's temporal state, so an
