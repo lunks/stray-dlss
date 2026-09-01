@@ -823,7 +823,6 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	// observation that 70% looks sharper than 50%. (CLAUDE.md §5 required deriving it.)
 	const DlssQuality derived = dlss_quality_for(desc.render_width, desc.render_height,
 		desc.output_width, desc.output_height);
-	const bool is_dlaa = derived == DlssQuality::dlaa;
 	NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
 	switch (derived)
 	{
