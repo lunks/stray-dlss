@@ -963,16 +963,27 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// from the resource's real state.
 	nrp::transition_proxy(cmd, /*to_shader_resource=*/true);
 
-	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels.
+	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels, y-down.
 	//
-	// The scale is 1.0, NOT the output/render ratio. We previously sent 2.0 under post-process,
-	// reasoning that MVs in render pixels must be stretched to move an output-res image — but
-	// the MVecSubrect{Width,Height} we set alongside them ALREADY declare the vectors' own rect
-	// as 1920x1080, so the ratio was being applied twice. Every reference integration of this
-	// runtime (dxvk-remix's NGXNeuralRenderingContext among them) sets MVecScaleX/Y to 1.0 and
-	// expects motion in pixels of the guide's own subrect. `[STRAYDLSS] NgxNRMVecScale`
-	// overrides it, because this is measured behaviour for a leaked runtime, not a spec.
+	// The scale is the COLOUR/GUIDE ratio, not 1.0. The snippet works on the COLOUR grid while
+	// our vectors are on the guide grid, and it receives the colour rect, the mvec rect and this
+	// scale as three INDEPENDENT values — it never derives one from the others, so declaring
+	// MVecSubrectWidth/Height does not make the ratio redundant.
+	//
+	// This was briefly 1.0, on a misreading of the reference. dxvk-remix's
+	// NGXNeuralRenderingContext sets exactly this ratio and its comment names our case:
+	// "2.0 for 4K colour over 1080p guides". The same codebase sets 1.0 for DLSS *SR* with the
+	// SAME buffer, because SR's working grid IS the render grid — which is also why our SR path
+	// correctly passes InMVScale = 1.
+	//
+	// Computed, never hardcoded: at 50% it is 2.0 but at 70% it is 1.42857, and this project
+	// runs both.
 	float scale_x = 1.0f, scale_y = 1.0f;
+	if (in.render_width > 0 && in.render_height > 0)
+	{
+		scale_x = static_cast<float>(in.output_width) / static_cast<float>(in.render_width);
+		scale_y = static_cast<float>(in.output_height) / static_cast<float>(in.render_height);
+	}
 	if (g_mvec_scale_override > 0.0f)
 		scale_x = scale_y = g_mvec_scale_override;
 
