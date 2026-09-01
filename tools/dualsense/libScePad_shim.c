@@ -123,10 +123,22 @@ static int  g_threshold = 0x20;   /* vibration amplitude counted as "active" */
 static int  g_onFrames  = 2;      /* consecutive active frames before engaging */
 static int  g_offFrames = 24;     /* consecutive quiet frames before releasing */
 /* Defaults only; overwritten by whatever the game authored, once we can read it. */
-static int  g_trigMode  = 1;  /* 1 = FEEDBACK (EPS5TriggerEffectMode) */
+static int  g_trigMode  = 3;  /* EPS5TriggerEffectMode: 3 = Feedback (NOT Sony's 1) */
 static int  g_position  = 0;  /* Feedback: where resistance starts (0..9) */
 static int  g_strength  = 2;  /* Feedback: resistance (0..8) */
 static int  g_trigV3    = 0;  /* only meaningful for Weapon / Vibration modes */
+
+/* EPS5TriggerEffectMode (game) -> ScePadTriggerEffectMode (Sony). */
+static int sony_trigger_mode(int game_mode)
+{
+    switch (game_mode) {
+    case 0: return 0;   /* None      -> Off       */
+    case 1: return 2;   /* Weapon    -> Weapon    */
+    case 2: return 3;   /* Vibration -> Vibration */
+    case 3: return 1;   /* Feedback  -> Feedback  */
+    default: return 1;  /* unknown -> Sony Feedback, the known-working effect */
+    }
+}
 
 static void log_open(void)
 {
@@ -212,17 +224,18 @@ static void set_triggers(unsigned long long handle, int onL, int onR)
 	const int wantL = onL, wantR = onR;
 	const int on = onL || onR;
 	P[0x00] = 0x03;                                  /* always address L2|R2 */
-	*(uint32_t *)(P + 0x08) = wantL ? (uint32_t)g_trigMode : 0u;
+	const uint32_t sony_mode = (uint32_t)sony_trigger_mode(g_trigMode);
+	*(uint32_t *)(P + 0x08) = wantL ? sony_mode : 0u;
 	P[0x10] = (unsigned char)g_position; P[0x11] = (unsigned char)g_strength;
 	P[0x12] = (unsigned char)g_trigV3;               /* ignored by Feedback, used by Weapon/Vibration */
-	*(uint32_t *)(P + 0x40) = wantR ? (uint32_t)g_trigMode : 0u;
+	*(uint32_t *)(P + 0x40) = wantR ? sony_mode : 0u;
 	P[0x48] = (unsigned char)g_position; P[0x49] = (unsigned char)g_strength;
 	P[0x4A] = (unsigned char)g_trigV3;
 	long long r = g_setTrigger(handle, (unsigned long long)(uintptr_t)P, 0, 0);
 	if (r == 0) { if (on) g_engaged++; else g_released++; }
 	else g_failed++;
-	LG("TRIGGERS %-8s L2=%d R2=%d mode=%d pos=%d str=%d -> 0x%08X   (engaged=%lu released=%lu failed=%lu)",
-		on ? "ENGAGE" : "release", wantL, wantR, g_trigMode, g_position, g_strength, (unsigned)r,
+	LG("TRIGGERS %-8s L2=%d R2=%d gameMode=%d sonyMode=%u pos=%d str=%d -> 0x%08X   (engaged=%lu released=%lu failed=%lu)",
+		on ? "ENGAGE" : "release", wantL, wantR, g_trigMode, (unsigned)sony_mode, g_position, g_strength, (unsigned)r,
 		g_engaged, g_released, g_failed);
 
 	/* hardware readback */

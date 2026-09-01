@@ -578,13 +578,7 @@ asks for**.
   fade API, but on the coil path we generate the samples so this is only a gain ramp.
 * **Concurrent haptics do not mix.** One playback slot: a new waveform supersedes the
   current one. On PS5 they sum on the coils (rain + purr + footstep).
-* **The authored trigger effect.** `HKPlayerController::m_scratchablePS5TriggerEffect` is a
-  `PS5TriggerEffectData {Mode, Value1, Value2, Value3}` and we send a fixed
-  `Feedback{pos 0, str 2}` instead. Sony's Feedback command takes two parameters, so the
-  shape is right for that mode — but the mode itself is assumed, not read. **An attempt to
-  read it via `FindFirstOf` inside the publish path broke the triggers entirely and was
-  reverted**; the shim still accepts the six-field state file, so only the Lua side needs
-  redoing, and off the hot path.
+* ~~The authored trigger effect~~ — **DONE**, see §13.
 
 ### The game never calls `scePadSetTriggerEffect` — HARD, measured
 
@@ -594,3 +588,64 @@ also did nothing. **There is no call to pass through; the shim must synthesise i
 proxy is otherwise a pure pass-through: all 25 exports forward unmodified, and only
 `scePadOpen` (records the handle) and `scePadSetVibrationMode` (logs) have custom wrappers,
 both still forwarding unchanged.
+
+
+---
+
+## 13. The trigger effect is authored data, and the two enums disagree — HARD
+
+`HKPlayerController::m_scratchablePS5TriggerEffect` is a
+`PS5TriggerEffectData {Mode, Value1, Value2, Value3}` and it is the game's own definition
+of the scratch resistance. It reads **`mode=3 v1=0 v2=2 v3=0`**.
+
+**`EPS5TriggerEffectMode` and Sony's `ScePadTriggerEffectMode` are in DIFFERENT orders.**
+Read the exe's enum strings in **binary (declaration) order**, never sorted:
+
+| value | game | Sony |
+|---|---|---|
+| 0 | None | Off |
+| 1 | **Weapon** | **Feedback** |
+| 2 | **Vibration** | **Weapon** |
+| 3 | **Feedback** | **Vibration** |
+
+So the game's `3` means Feedback, and passing it through unchanged asks Sony for
+*Vibration* — an effect that wants `{position, amplitude, frequency}` and does nothing with
+`{0, 2}`. The triggers go dead with no error. `sony_trigger_mode()` translates.
+
+Two corollaries:
+
+* The authored values are `Feedback{position 0, strength 2}` — **exactly the constants that
+  were hardcoded before**, so the original observation was right. They are now read rather
+  than asserted, and will follow if any surface ever specifies something else.
+* A default written as `1` meaning "Feedback" became **Weapon** the moment translation was
+  added. Defaults must be stated in the enum space they are used in.
+
+### Both triggers, for the whole scratch — HARD, measured
+
+```
+21:00:28  state=true  side=0
+21:00:28  state=true  side=1      <- same instant
+   ... 9 s of scratching, ZERO calls ...
+21:00:37  state=false side=0
+21:00:37  state=false side=1      <- same instant
+```
+
+The game sets both sides together and clears them together, and issues **nothing during the
+scratch**. So it hardens **both** triggers for the duration and does **not** alternate them
+per paw — the on-screen paw prompt is visual only. Accumulate per side; do not treat a call
+as authoritative for the whole state, or the second call of the pair silently wins and only
+the right trigger fires.
+
+`SetPS5TriggersState` (the higher-level `_triggersState`/`_triggerSide` function) is never
+called — **0 times** in a session with triggers working. Only the component's
+`SetPS5TriggerActivated` matters, and it passes exactly `State` + `Side`; the `Trigger
+State` / `TriggerSide` entries in the object dump are Blueprint locals, not parameters.
+
+### Lua scope order fails silently — and `luac -p` cannot see it
+
+A `local function` is invisible to functions defined **above** it, so an earlier caller
+resolves the name as a **global**, gets `nil`, and throws at runtime. That is what killed
+the trigger state write when the effect reader was added below `publish`. The file is
+syntactically perfect, so the syntax gate passes it. This is the same declaration-order
+mistake the C shim hit five times, except C fails at compile time and Lua does not:
+**declare before use, and check it explicitly.**

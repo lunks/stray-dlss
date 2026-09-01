@@ -14,9 +14,38 @@ local COMP  = "/Game/Technical/Components/COMP_CatScratchableComponent.COMP_CatS
 local PC    = "/Game/Technical/BP_HKPlayerController.BP_HKPlayerController_C:"
 local PS5   = 2
 
+local trigFx = nil        -- {mode, v1, v2, v3} read from the game, nil until seen
+local function readTriggerEffect()
+    local ok, r = pcall(function()
+        local pc = FindFirstOf("HKPlayerController")
+        if not pc or not pc:IsValid() then return nil end
+        local e = pc.m_scratchablePS5TriggerEffect
+        if not e then return nil end
+        local function num(v)
+            if type(v) == "number" then return v end
+            local n; pcall(function() n = tonumber(tostring(v)) end)
+            return n
+        end
+        return { mode = num(e.Mode) or 1, v1 = num(e.Value1) or 0,
+                 v2   = num(e.Value2) or 0, v3 = num(e.Value3) or 0 }
+    end)
+    if ok and r then return r end
+    return nil
+end
+
 local function publish(on, side)
+    if not trigFx then pcall(function() trigFx = readTriggerEffect() end) end
     local f = io.open(STATE, "w")
-    if f then f:write(tostring(on) .. " " .. tostring(side) .. "\n") f:close() end
+    if f then
+        local x = trigFx
+        if x then
+            f:write(string.format("%s %s %d %d %d %d\n", tostring(on), tostring(side),
+                    x.mode, x.v1, x.v2, x.v3))
+        else
+            f:write(tostring(on) .. " " .. tostring(side) .. "\n")
+        end
+        f:close()
+    end
 end
 
 local function overrideOn()
@@ -34,14 +63,32 @@ local function want(path, short, fn, post)
 end
 
 -- (working) scratch-driven triggers
+local loggedFx = false
 want(COMP .. "SetPS5TriggerActivated", "SetPS5TriggerActivated", function(...)
+    if not loggedFx then
+        loggedFx = true
+        local x = readTriggerEffect()
+        if x then
+            log(string.format("TRIGGER EFFECT (authored): mode=%d v1=%d v2=%d v3=%d",
+                x.mode, x.v1, x.v2, x.v3))
+        else
+            log("TRIGGER EFFECT: could not read m_scratchablePS5TriggerEffect; using defaults")
+        end
+    end
     local A = table.pack(...)
     pcall(function()
         local st, sd
         pcall(function() st = A[2]:get() end)
         pcall(function() sd = A[3]:get() end)
         if type(sd) ~= "number" then sd = 0 end
-        sideOn[sd] = (st == true or st == 1) and 1 or 0
+        local on = (st == true or st == 1) and 1 or 0
+        if trigAccumulate then
+            sideOn[sd] = on
+        else
+            -- authoritative: this call defines the whole state
+            sideOn[0] = (on == 1 and sd == 0) and 1 or 0
+            sideOn[1] = (on == 1 and sd == 1) and 1 or 0
+        end
         publish(sideOn[0], sideOn[1])
         log(string.format("SetPS5TriggerActivated state=%s side=%d -> L=%d R=%d",
             tostring(st), sd, sideOn[0], sideOn[1]))
@@ -105,7 +152,8 @@ local function shortName(full)
     return n
 end
 playingComponent = nil   -- which AudioComponent owns the current haptic, if any
-sideOn = {[0] = 0, [1] = 0}   -- per-side trigger state; the game sets each separately
+sideOn = {[0] = 0, [1] = 0}
+trigAccumulate = true    -- the game drives BOTH triggers, one call per side (confirmed by feel)
 local vibN = 0
 local function startVibration(...)
     local A = table.pack(...)
@@ -133,6 +181,11 @@ local function startVibration(...)
         playingComponent = comp          -- nil for the non-component path
         local full = findSound(A)
         local name = full and shortName(full)
+        local fadeIn = 0
+        for i = 2, A.n do
+            local v; pcall(function() v = A[i]:get() end)
+            if type(v) == "number" then fadeIn = v break end   -- FadeInTime precedes Level
+        end
         local lv, seen = findLevel(A)
         -- Component-attached vibrations carry their level in the submix send (constant 1.0
         -- per PS5VibrationAttenuation), not in this argument, which measures 0.0 for rain.
@@ -146,7 +199,8 @@ local function startVibration(...)
             log("VIB suppressed: PadVibrationEnabled is off")
             vibecmd("hapstop")
         elseif name then
-            vibecmd(string.format("hap %s %d 1", name, amp))
+            vibecmd(string.format("hap %s %d 1 %d", name, amp,
+                math.floor(math.max(0, math.min(10, tonumber(fadeIn) or 0)) * 1000)))
         end
     end)
 end
