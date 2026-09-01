@@ -1044,6 +1044,37 @@ and screenshot bursts spaced ~15 s apart alias any periodic effect — a "3-stat
 measured that way turned out to be the camera rotating between captures. Sample faster than the
 phenomenon and hold the camera still.
 
+### DLAA (1:1) is NOT blocked by the shader — the old "different bindings" assumption is wrong
+
+Measured offline 2026-08-31 by scanning **all 27 cooked FTAAStandaloneCS permutations** extracted
+from the pak (`tools/shaderlib_extract.py --dump-dir`, then a DXBC declaration scan). They split
+by `dcl_tgsm_structured`, which only compiles under `AA_UPSAMPLE == 1`:
+
+* **15 upsampling** permutations (tgsm present) — what 4K/50% selects, what we hook today.
+* **12 non-upsampling** (`ETAAPassConfig::Main`, tgsm absent) — what 1:1 / DLAA selects.
+
+**Every non-upsampling permutation declares the SAME register shape as the upsampling ones:
+`SRVs t0-t5`, `UAV u0`.** Only two outliers exist (`2d67549bedef2c0a` with t0-t4, and
+`876f85dfc23213d0` with t0-t3) — camera-cut/edge variants, not the main pass.
+
+So §2.3's earlier claim that 1:1 "selects a different permutation whose bindings we never
+characterised" is **wrong at the shader level**: depth, stencil, velocity, colour and history sit
+in the same slots. There is no shader-declaration reason DLAA cannot work, and the 27-hash table
+already contains every Main permutation.
+
+**Confirmed not working live** (2026-08-31): at 100% screen percentage no DLSS feature is ever
+created — only `1920x1080 -> 3840x2160` (50%) and `2688x1512 -> 3840x2160` (70%) appear in the
+log, and the NVIDIA DLSS indicator is absent at 100% while present at 50% and 70%. The cause is
+therefore NOT the permutation's bindings; the remaining suspects are the dispatch-size check when
+render == output, the `render <= output` guard at equality, or the pass simply not being reached
+in the brief window tested. **One dedicated 100% session with the report throttle disabled
+settles it.**
+
+**Also measured: 200% can never work.** It renders 7680x4320 and downsamples to 3840x2160; DLSS
+upscales by definition and cannot accept an input larger than its output. The matcher correctly
+rejects it ("dispatch size does not cover the output UAV at 8x8"). 70% is the highest working
+setting and is sharper than 50%.
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
