@@ -19,12 +19,19 @@ namespace {
 
 // Matches the cbuffer in shaders/mv_resolve.hlsl. Kept in the same order deliberately; a
 // mismatch here produces a plausible-looking but wrong motion field rather than an error.
+// Live per-branch motion-vector signs ([STRAYDLSS] NgxMVConvention / MVInvertX / MVInvertY, and
+// the overlay). Defaults are (1,1)/(1,1) — exactly the behaviour before this existed.
+float g_sparse_sign[2] = { 1.0f, 1.0f };
+float g_camera_sign[2] = { 1.0f, 1.0f };
+
 struct Params
 {
 	float clip_to_prev_clip[16];
 	float render_size[2];
 	float view_rect_min[2];
 	float buffer_size[2];
+	float sparse_sign[2];
+	float camera_sign[2];
 	float padding[2];
 };
 static_assert(sizeof(Params) % 16 == 0, "constant buffer must be 16-byte aligned");
@@ -402,6 +409,14 @@ void retire_expired()
 
 } // namespace
 
+void set_signs(float sparse_x, float sparse_y, float camera_x, float camera_y)
+{
+	g_sparse_sign[0] = sparse_x;
+	g_sparse_sign[1] = sparse_y;
+	g_camera_sign[0] = camera_x;
+	g_camera_sign[1] = camera_y;
+}
+
 const char *last_error() { return g_state.error; }
 
 const Stats &stats()
@@ -610,6 +625,10 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	params.view_rect_min[1] = in.view->view_rect_min.y;
 	params.buffer_size[0] = in.view->buffer_size_and_inv_size.x;
 	params.buffer_size[1] = in.view->buffer_size_and_inv_size.y;
+	params.sparse_sign[0] = g_sparse_sign[0];
+	params.sparse_sign[1] = g_sparse_sign[1];
+	params.camera_sign[0] = g_camera_sign[0];
+	params.camera_sign[1] = g_camera_sign[1];
 
 	void *mapped = nullptr;
 	D3D12_RANGE no_read = { 0, 0 };

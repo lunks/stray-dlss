@@ -76,6 +76,14 @@ void transition_output(ID3D12GraphicsCommandList *cmd, bool to_shader_resource);
 // and everything downstream of it was noise.
 bool paint(ID3D12GraphicsCommandList *cmd, ID3D12Resource *target);
 
+// Per-branch motion-vector sign. The resolve has two paths — decoded object velocity for the
+// pixels UE4's SPARSE velocity buffer actually wrote, and reconstructed camera motion for the
+// rest — and their conventions were derived separately, so one can be inverted while the other
+// is right. That failure is branch-selective: it shows on moving objects while static geometry
+// stays clean, which is not decidable by reading either path. Every DLSS injector ships this as
+// a switch for the same reason. (1,1)/(1,1) is the long-standing behaviour.
+void set_signs(float sparse_x, float sparse_y, float camera_x, float camera_y);
+
 // Allocation accounting. The GPU ran out of memory during a real run, and resource churn in
 // initialise() is the prime suspect: the render resolution is taken from whichever dispatch
 // matched, so a flapping size reallocates the heap, constant buffer and output texture. These

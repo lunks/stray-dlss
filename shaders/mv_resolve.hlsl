@@ -18,6 +18,16 @@ cbuffer Params : register(b0)
 	float2   RenderSize;       // View.ViewSizeAndInvSize.xy
 	float2   ViewRectMin;      // View.ViewRectMin.xy
 	float2   BufferSize;       // View.BufferSizeAndInvSize.xy
+	// Per-branch sign control. UE4's velocity buffer is SPARSE, so this shader has two paths —
+	// decoded object velocity and reconstructed camera motion — and they arrive by different
+	// routes with independently-derived conventions. A user-reported artifact that appears ONLY
+	// on moving objects while static geometry stays clean is exactly what one inverted branch
+	// looks like, and it is not decidable by inspection here: both paths are documented as
+	// current-minus-previous, but one of those is [derived], not measured. So expose it rather
+	// than argue about it — the injector plugins all ship this as a switch for the same reason.
+	// (1,1) is the current behaviour.
+	float2   SparseSign;       // multiplies the decoded moving-object velocity
+	float2   CameraSign;       // multiplies the reconstructed camera motion
 	float2   Padding;
 };
 
@@ -59,7 +69,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 	// (CLAUDE.md §2.5)
 	if (encoded.x > 0.0f)
 	{
-		velocity_ndc = DecodeVelocity(encoded);
+		velocity_ndc = DecodeVelocity(encoded) * SparseSign;
 	}
 	else
 	{
@@ -74,7 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 		if (prev_clip.w > 0.0f)
 		{
 			const float2 prev_screen = prev_clip.xy / prev_clip.w;
-			velocity_ndc = screen_pos - prev_screen;
+			velocity_ndc = (screen_pos - prev_screen) * CameraSign;
 		}
 		else
 		{
