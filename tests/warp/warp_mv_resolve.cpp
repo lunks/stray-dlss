@@ -24,8 +24,11 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -267,6 +270,12 @@ bool create_game_resources(Gpu &gpu, GameResources &out, UINT w, UINT h)
 	return true;
 }
 
+// A minimal View for tests that only care whether the pass is LEGAL.
+//
+// ClipToPrevClip is the IDENTITY here, which is deliberately not enough to judge the camera
+// branch's arithmetic: the identity is the one matrix whose transpose is itself, so it cannot
+// tell mul(v, M) from mul(M, v). That blind spot is exactly how a missing `row_major` qualifier
+// shipped. Test 3 below overrides this member with a matrix that does distinguish them.
 stray_dlss::ue4::ViewParams make_view(UINT w, UINT h)
 {
 	stray_dlss::ue4::ViewParams v;
@@ -390,7 +399,561 @@ bool test_no_allocation_churn(Gpu &gpu)
 }
 
 
-// ---- test 3: the restore puts the game's state back exactly ------------------------------
+// ---- test 3: the camera branch applies ClipToPrevClip, not its transpose --------------------
+//
+// The bug this pins, and it shipped: shaders/mv_resolve.hlsl declared `float4x4 ClipToPrevClip`
+// with no `row_major` qualifier while cmake/CompileShaders.cmake invokes fxc with neither /Zpr
+// nor /Zpc. HLSL packs constant-buffer matrices COLUMN-major by default, so fxc read our
+// row-major upload as columns and `mul(v, M)` computed `v * transpose(M)`. UE 4.27 compiles its
+// own shaders with D3D10_SHADER_PACK_MATRIX_ROW_MAJOR (D3DShaderCompiler.cpp:947-949) and
+// src/mv_resolve.cpp memcpys those 16 floats verbatim, so the transpose was ours alone.
+//
+// Why every existing test missed it, which is the gap this closes:
+//   * make_view() sets ClipToPrevClip to the IDENTITY, and the identity is the one matrix
+//     whose transpose is itself — the single blind spot a transpose test can have;
+//   * nothing in this harness read the motion-vector texture back at all, so even a
+//     non-identity matrix would have gone unjudged.
+//
+// So: a matrix carrying BOTH a camera yaw and a translation, every pixel forced down the
+// camera-reconstruction branch, mv::output() read back, and each sample compared against a
+// scalar transcription of the shader. On a mismatch the transposed reference is evaluated too
+// and reported, so a future regression reads as "the matrix is transposed again" rather than
+// "the numbers are wrong".
+
+using stray_dlss::ue4::Matrix4;
+
+// The test's own render rect. 200 texels of R16G16_FLOAT is 800 bytes, which is NOT a multiple
+// of D3D12_TEXTURE_DATA_PITCH_ALIGNMENT — deliberately, so the readback below really exercises
+// the row padding rather than getting away with a tightly packed copy.
+constexpr UINT kMvW = 200;
+constexpr UINT kMvH = 120;
+
+// UE's default near plane. §2.4 says to read View.NearPlane rather than assume 10 uu; this is
+// the test's own synthetic camera, so it picks one and the reference uses the same number.
+constexpr float kMvNearPlane = 10.0f;
+
+// The constant device-Z the whole depth target is cleared to. UE 4.27 is reversed-Z with an
+// infinite far plane, so DeviceZ = Near / ViewZ: 1.0 at the near plane, 0.0 at infinity
+// (CLAUDE.md §2.4). 0.02 against a 10-unit near plane puts the plane 500 unreal units out —
+// clear of both ends, so neither a degenerate w nor a divide by zero can flatter the result.
+constexpr float kMvDeviceZ = 0.02f;
+
+// Row-vector convention throughout: v' = v * M, storage row-major with m[r*4+c] == M[r][c].
+// That is FMatrix's own layout and what the shader sees once `row_major` is present.
+// (core/view_params.hpp Matrix4, docs/RESEARCH.md §4.7)
+Matrix4 mat_mul(const Matrix4 &a, const Matrix4 &b)
+{
+	Matrix4 out;
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c)
+		{
+			float acc = 0.0f;
+			for (int k = 0; k < 4; ++k)
+				acc += a.m[r * 4 + k] * b.m[k * 4 + c];
+			out.m[r * 4 + c] = acc;
+		}
+	return out;
+}
+
+// A ClipToPrevClip built the way UE builds it: clip -> view -> previous view -> clip, composed
+// under the row-vector convention. Every term is named so a future reader can check it rather
+// than trust it.
+Matrix4 make_clip_to_prev_clip()
+{
+	// Projection, row-vector: p_clip = p_view * P. Reversed-Z with an infinite far plane is
+	//     x' = sx*x     y' = sy*y     z' = Near*w     w' = z
+	// so DeviceZ = z'/w' = Near/z, which is exactly the relation §2.4 records.
+	const float sx = 1.0f; // 45-degree horizontal half-FOV: 1/tan(45) == 1
+	const float sy = static_cast<float>(kMvW) / static_cast<float>(kMvH) * sx;
+	Matrix4 proj;
+	proj.m[0 * 4 + 0] = sx;
+	proj.m[1 * 4 + 1] = sy;
+	proj.m[2 * 4 + 3] = 1.0f;          // w' = z
+	proj.m[3 * 4 + 2] = kMvNearPlane;  // z' = Near * w
+
+	// Its exact inverse: x = X/sx, y = Y/sy, z = W, w = Z/Near. Non-symmetric on its own, so a
+	// transpose cannot hide anywhere in the chain.
+	Matrix4 proj_inv;
+	proj_inv.m[0 * 4 + 0] = 1.0f / sx;
+	proj_inv.m[1 * 4 + 1] = 1.0f / sy;
+	proj_inv.m[3 * 4 + 2] = 1.0f;                  // view z comes from the clip w
+	proj_inv.m[2 * 4 + 3] = 1.0f / kMvNearPlane;   // view w comes from the clip z
+
+	// The camera's own motion between the two frames, in view space: a small yaw about Y AND a
+	// translation. Both are required and neither alone is sufficient.
+	//   * a yaw-only matrix, transposed, inverts the sign of the rotation and roughly halves
+	//     the magnitude — visible, but only in one term;
+	//   * a translation-only matrix collapses to EXACTLY zero, because a row-vector
+	//     translation lives in ROW 3 and the transpose moves it into column 3, where it
+	//     perturbs w and nothing else.
+	// Only a matrix carrying both proves the whole transform.
+	const float yaw = 0.02f; // ~1.15 degrees of pan in a single frame
+	const float cos_yaw = std::cos(yaw);
+	const float sin_yaw = std::sin(yaw);
+	Matrix4 view_to_prev;
+	view_to_prev.m[0 * 4 + 0] = cos_yaw;
+	view_to_prev.m[0 * 4 + 2] = -sin_yaw;
+	view_to_prev.m[1 * 4 + 1] = 1.0f;
+	view_to_prev.m[2 * 4 + 0] = sin_yaw;
+	view_to_prev.m[2 * 4 + 2] = cos_yaw;
+	// Translation in ROW 3 — the row-vector convention's tell, and the term the transpose
+	// destroys. Unreal units of camera movement in one frame: right, down, forward.
+	view_to_prev.m[3 * 4 + 0] = 1.5f;
+	view_to_prev.m[3 * 4 + 1] = -4.0f;
+	view_to_prev.m[3 * 4 + 2] = -3.0f;
+	view_to_prev.m[3 * 4 + 3] = 1.0f;
+
+	// p_prevclip = p_clip * ProjInv * ViewToPrevView * Proj.
+	return mat_mul(mat_mul(proj_inv, view_to_prev), proj);
+}
+
+// IEEE binary16 -> binary32. Deliberately hand-written rather than pulled in from anywhere:
+// mv::output() is R16G16_FLOAT and this is the only place in the project that has to decode
+// one, so a dependency would cost more than the twelve lines.
+float half_to_float(std::uint16_t h)
+{
+	const bool negative = (h & 0x8000u) != 0;
+	const int exponent = static_cast<int>((h >> 10) & 0x1Fu);
+	const int mantissa = static_cast<int>(h & 0x03FFu);
+
+	float v;
+	if (exponent == 0)
+		v = static_cast<float>(mantissa) * 5.9604645e-8f; // subnormal: mantissa * 2^-24
+	else if (exponent == 31)
+		v = mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+		                  : std::numeric_limits<float>::infinity();
+	else
+		v = std::ldexp(static_cast<float>(mantissa + 1024), exponent - 25); // (1+m/1024)*2^(e-15)
+
+	return negative ? -v : v;
+}
+
+// A scalar transcription of the camera branch of shaders/mv_resolve.hlsl, written against the
+// shader statement by statement. If the two ever disagree the SHADER is the specification and
+// this is what has to change — the point of writing it out is that a silent divergence becomes
+// a failing test rather than a wrong image.
+struct Mv
+{
+	float x = 0.0f;
+	float y = 0.0f;
+};
+
+Mv reference_camera_mv(UINT ix, UINT iy, const Matrix4 &clip_to_prev, bool transposed)
+{
+	const float w = static_cast<float>(kMvW);
+	const float h = static_cast<float>(kMvH);
+
+	// uv = (float2(tid.xy) + 0.5f) / RenderSize
+	const float u = (static_cast<float>(ix) + 0.5f) / w;
+	const float v = (static_cast<float>(iy) + 0.5f) / h;
+	// ViewportUVToScreenPos: (2u - 1, 1 - 2v). NDC, Y-up.
+	const float screen_x = 2.0f * u - 1.0f;
+	const float screen_y = 1.0f - 2.0f * v;
+
+	// this_clip = float4(screen_pos, device_z, 1.0f)
+	const float in4[4] = { screen_x, screen_y, kMvDeviceZ, 1.0f };
+
+	float prev[4] = {};
+	for (int i = 0; i < 4; ++i)
+	{
+		float acc = 0.0f;
+		for (int k = 0; k < 4; ++k)
+		{
+			// mul(v, M) — row-vector, the correct form: prev[c] = sum_r v[r] * M[r][c].
+			// mul(M, v) — what the missing row_major qualifier produced, and what
+			// LegacyTransposedClip reproduces: prev[r] = sum_c M[r][c] * v[c].
+			acc += transposed ? clip_to_prev.m[i * 4 + k] * in4[k]
+			                  : in4[k] * clip_to_prev.m[k * 4 + i];
+		}
+		prev[i] = acc;
+	}
+
+	float ndc_x = 0.0f, ndc_y = 0.0f;
+	if (prev[3] > 0.0f)
+	{
+		// prev_screen = prev_clip.xy / prev_clip.w; velocity_ndc = screen_pos - prev_screen.
+		// CameraSign is (1,1) here — see set_signs() in the test body.
+		ndc_x = screen_x - prev[0] / prev[3];
+		ndc_y = screen_y - prev[1] / prev[3];
+	}
+	// mv_pixels = velocity_ndc * float2(0.5*W, -0.5*H); OutMV = -mv_pixels.
+	Mv out;
+	out.x = -(ndc_x * 0.5f * w);
+	out.y = -(ndc_y * -0.5f * h);
+	return out;
+}
+
+// R16G16_FLOAT keeps 11 bits of mantissa, so the readback's own error is RELATIVE (~5e-4) and
+// the absolute floor only matters near zero. Both terms, so a 5-pixel vector is not judged by a
+// tolerance sized for a 0.05-pixel one, and neither is the reverse.
+float mv_tolerance(float expected)
+{
+	return 0.01f + std::fabs(expected) * 1e-3f;
+}
+
+// Depth and velocity for the camera-branch test, both filled with KNOWN contents. The harness's
+// create_game_resources() leaves them undefined, which is fine when only legality is being
+// judged and useless when the pixels are.
+//
+// Velocity is cleared to zero so `encoded.x > 0.0f` is false everywhere and every pixel takes
+// the camera-reconstruction branch — which is also the real game's situation for all static
+// geometry, since UE 4.27 writes velocity only for movable primitives (§2.5). It carries
+// ALLOW_RENDER_TARGET, unlike create_game_resources()'s copy, purely so it can be cleared; the
+// game's own velocity target is a render target anyway.
+struct CameraScene
+{
+	ComPtr<ID3D12Resource> depth;
+	ComPtr<ID3D12Resource> velocity;
+	ComPtr<ID3D12DescriptorHeap> dsv;
+	ComPtr<ID3D12DescriptorHeap> rtv;
+};
+
+bool build_camera_scene(Gpu &gpu, CameraScene &s, UINT w, UINT h)
+{
+	D3D12_HEAP_PROPERTIES def = {};
+	def.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_RESOURCE_DESC d = {};
+	d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	d.Width = w;
+	d.Height = h;
+	d.DepthOrArraySize = 1;
+	d.MipLevels = 1;
+	d.SampleDesc.Count = 1;
+
+	// The game's depth target: R32G8X24_TYPELESS, read through an R32_FLOAT_X8X24 SRV (§2.4).
+	// An optimized clear value is supplied so the clear below does not trip the debug layer's
+	// mismatched-clear-value warning.
+	d.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+	d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+	D3D12_CLEAR_VALUE depth_clear = {};
+	depth_clear.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+	depth_clear.DepthStencil.Depth = kMvDeviceZ;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d,
+		D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear, IID_PPV_ARGS(&s.depth)));
+
+	d.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+	d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	D3D12_CLEAR_VALUE velocity_clear = {};
+	velocity_clear.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d,
+		D3D12_RESOURCE_STATE_RENDER_TARGET, &velocity_clear, IID_PPV_ARGS(&s.velocity)));
+
+	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+	hd.NumDescriptors = 1;
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.dsv)));
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.rtv)));
+
+	D3D12_DEPTH_STENCIL_VIEW_DESC dsvd = {};
+	dsvd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+	dsvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+	const D3D12_CPU_DESCRIPTOR_HANDLE dsv = s.dsv->GetCPUDescriptorHandleForHeapStart();
+	gpu.device->CreateDepthStencilView(s.depth.Get(), &dsvd, dsv);
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtvd = {};
+	rtvd.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+	rtvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	const D3D12_CPU_DESCRIPTOR_HANDLE rtv = s.rtv->GetCPUDescriptorHandleForHeapStart();
+	gpu.device->CreateRenderTargetView(s.velocity.Get(), &rtvd, rtv);
+
+	gpu.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, kMvDeviceZ, 0, 0, nullptr);
+	const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	gpu.list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+
+	D3D12_RESOURCE_BARRIER to_srv[2] = {};
+	for (auto &b : to_srv)
+	{
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	}
+	to_srv[0].Transition.pResource = s.depth.Get();
+	to_srv[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+	to_srv[1].Transition.pResource = s.velocity.Get();
+	to_srv[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	gpu.list->ResourceBarrier(2, to_srv);
+
+	return flush(gpu);
+}
+
+// Reads mv::output() back as interleaved (x, y) floats, w*h pairs.
+//
+// Unlike read_probe() above, which copies a BUFFER and so has no layout to get wrong, a texture
+// copied into a buffer must have 256-byte-aligned rows (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT):
+// 200 texels of R16G16_FLOAT is 800 bytes of data in a 1024-byte row. Reading it as though it
+// were tightly packed shears the image and would make every sample below wrong in a way that
+// looks like a shader bug.
+//
+// The source may be LARGER than w*h — mv_resolve allocates grow-only and an earlier test in
+// this file will already have taken it to 1920x1080 — so the copy is bounded by an explicit box.
+bool read_mv_texture(Gpu &gpu, UINT w, UINT h, std::vector<float> &out)
+{
+	ID3D12Resource *const mv = stray_dlss::mv::output();
+	if (mv == nullptr)
+	{
+		fail("mv::output() is null, so there is nothing to read back");
+		return false;
+	}
+
+	constexpr UINT kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+	const UINT row_bytes = w * 4; // R16G16_FLOAT
+	const UINT row_pitch = ((row_bytes + kPitchAlign - 1) / kPitchAlign) * kPitchAlign;
+	const UINT64 total = static_cast<UINT64>(row_pitch) * h;
+
+	D3D12_HEAP_PROPERTIES rb = {};
+	rb.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = total;
+	bd.Height = 1;
+	bd.DepthOrArraySize = 1;
+	bd.MipLevels = 1;
+	bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ComPtr<ID3D12Resource> readback;
+	HR(gpu.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd,
+		D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = mv;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	gpu.list->ResourceBarrier(1, &barrier);
+
+	D3D12_TEXTURE_COPY_LOCATION dst = {};
+	dst.pResource = readback.Get();
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst.PlacedFootprint.Offset = 0;
+	dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+	dst.PlacedFootprint.Footprint.Width = w;
+	dst.PlacedFootprint.Footprint.Height = h;
+	dst.PlacedFootprint.Footprint.Depth = 1;
+	dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
+
+	D3D12_TEXTURE_COPY_LOCATION src = {};
+	src.pResource = mv;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src.SubresourceIndex = 0;
+
+	const D3D12_BOX box = { 0, 0, 0, w, h, 1 };
+	gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+
+	// Back to UNORDERED_ACCESS: every other test in this file assumes that is where the
+	// resolve's output lives.
+	std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+	gpu.list->ResourceBarrier(1, &barrier);
+
+	if (!flush(gpu))
+		return false;
+
+	void *mapped = nullptr;
+	const D3D12_RANGE range = { 0, static_cast<SIZE_T>(total) };
+	HR(readback->Map(0, &range, &mapped));
+
+	const auto *const bytes = static_cast<const std::uint8_t *>(mapped);
+	out.assign(static_cast<std::size_t>(w) * h * 2, 0.0f);
+	for (UINT y = 0; y < h; ++y)
+	{
+		const auto *const row = reinterpret_cast<const std::uint16_t *>(
+			bytes + static_cast<std::size_t>(y) * row_pitch);
+		for (UINT x = 0; x < w; ++x)
+		{
+			const std::size_t i = (static_cast<std::size_t>(y) * w + x) * 2;
+			out[i + 0] = half_to_float(row[x * 2 + 0]);
+			out[i + 1] = half_to_float(row[x * 2 + 1]);
+		}
+	}
+	readback->Unmap(0, nullptr);
+	return true;
+}
+
+// Spread across the image on purpose. The transpose error grows with distance from the centre
+// — screen_pos is (0,0) there, so most of the matrix multiplies zero — and a centre-only sample
+// is the second-weakest test possible after an identity matrix.
+struct MvSample
+{
+	UINT x;
+	UINT y;
+	const char *where;
+};
+
+constexpr MvSample kMvSamples[] = {
+	{ kMvW / 2, kMvH / 2, "centre" },
+	{ 0, 0, "top-left" },
+	{ kMvW - 1, 0, "top-right" },
+	{ 0, kMvH - 1, "bottom-left" },
+	{ kMvW - 1, kMvH - 1, "bottom-right" },
+	{ 37, 101, "lower-left quadrant" },
+	{ 163, 18, "upper-right quadrant" },
+};
+
+// Compares one readback against the reference and, on a mismatch, says whether the TRANSPOSED
+// reference explains it. That is the whole diagnostic value of this test: it turns "the numbers
+// are wrong" into "the matrix is transposed again".
+bool compare_against_reference(const std::vector<float> &got, const Matrix4 &clip_to_prev,
+	bool expect_transposed, const char *phase)
+{
+	bool all_ok = true;
+	for (const MvSample &sp : kMvSamples)
+	{
+		const std::size_t i = (static_cast<std::size_t>(sp.y) * kMvW + sp.x) * 2;
+		const float gx = got[i + 0], gy = got[i + 1];
+
+		const Mv want = reference_camera_mv(sp.x, sp.y, clip_to_prev, expect_transposed);
+		const Mv other = reference_camera_mv(sp.x, sp.y, clip_to_prev, !expect_transposed);
+
+		const bool ok = std::fabs(gx - want.x) <= mv_tolerance(want.x) &&
+		                std::fabs(gy - want.y) <= mv_tolerance(want.y);
+		if (ok)
+			continue;
+
+		all_ok = false;
+		std::printf("  MISMATCH [%s] %s (%u,%u): got (% .5f, % .5f), expected (% .5f, % .5f)\n",
+			phase, sp.where, sp.x, sp.y, static_cast<double>(gx), static_cast<double>(gy),
+			static_cast<double>(want.x), static_cast<double>(want.y));
+
+		const bool matches_other = std::fabs(gx - other.x) <= mv_tolerance(other.x) &&
+		                           std::fabs(gy - other.y) <= mv_tolerance(other.y);
+		if (matches_other && !expect_transposed)
+		{
+			std::printf("    ...and it MATCHES the TRANSPOSED reference (% .5f, % .5f).\n"
+				"    ClipToPrevClip is reaching the shader transposed again. Look first at the\n"
+				"    `row_major` qualifier on the ClipToPrevClip declaration in\n"
+				"    shaders/mv_resolve.hlsl, then at cmake/CompileShaders.cmake for a /Zpc, then\n"
+				"    at the memcpy in mv_resolve.cpp's record().\n",
+				static_cast<double>(other.x), static_cast<double>(other.y));
+		}
+		else if (matches_other)
+		{
+			std::printf("    ...and it MATCHES the NON-transposed reference (% .5f, % .5f), so\n"
+				"    LegacyTransposedClip is not reaching the shader.\n",
+				static_cast<double>(other.x), static_cast<double>(other.y));
+		}
+		else
+		{
+			std::printf("    ...and it matches NEITHER orientation (the other is % .5f, % .5f),\n"
+				"    so this is some other change to the camera branch, not a transpose.\n",
+				static_cast<double>(other.x), static_cast<double>(other.y));
+		}
+	}
+	return all_ok;
+}
+
+bool test_camera_branch_matrix_orientation(Gpu &gpu)
+{
+	std::printf("\n[test] the camera branch applies ClipToPrevClip, not its transpose\n");
+
+	CameraScene scene;
+	if (!build_camera_scene(gpu, scene, kMvW, kMvH))
+		return false;
+	drain_validation(gpu, "camera-branch-setup");
+
+	if (!stray_dlss::mv::initialise(gpu.device.Get(), kMvW, kMvH))
+	{
+		fail(stray_dlss::mv::last_error());
+		return false;
+	}
+
+	// Both per-branch signs at their shipped defaults, so this measures the matrix and nothing
+	// else; set_signs() is otherwise a live tunable and a previous test could have moved it.
+	stray_dlss::mv::set_signs(1.0f, 1.0f, 1.0f, 1.0f);
+	stray_dlss::mv::set_legacy_transposed_clip(false);
+
+	const Matrix4 clip_to_prev = make_clip_to_prev_clip();
+	std::printf("  ClipToPrevClip (row-major, m[r*4+c] == M[r][c]):\n");
+	for (int r = 0; r < 4; ++r)
+		std::printf("    % .6f % .6f % .6f % .6f\n",
+			static_cast<double>(clip_to_prev.m[r * 4 + 0]),
+			static_cast<double>(clip_to_prev.m[r * 4 + 1]),
+			static_cast<double>(clip_to_prev.m[r * 4 + 2]),
+			static_cast<double>(clip_to_prev.m[r * 4 + 3]));
+
+	stray_dlss::ue4::ViewParams view = make_view(kMvW, kMvH);
+	view.clip_to_prev_clip = clip_to_prev;
+
+	stray_dlss::mv::ResolveInputs in;
+	in.depth_resource = reinterpret_cast<std::uint64_t>(scene.depth.Get());
+	in.velocity_resource = reinterpret_cast<std::uint64_t>(scene.velocity.Get());
+	in.render_width = kMvW;
+	in.render_height = kMvH;
+	in.view = &view;
+
+	// --- the shipped orientation ---
+	if (!stray_dlss::mv::record(gpu.list.Get(), in, 2))
+	{
+		fail(stray_dlss::mv::last_error());
+		return false;
+	}
+	std::vector<float> got;
+	if (!read_mv_texture(gpu, kMvW, kMvH, got))
+		return false;
+	check(drain_validation(gpu, "camera-branch") == 0,
+		"no D3D12 validation errors from the camera-branch dispatch and readback");
+
+	for (const MvSample &sp : kMvSamples)
+	{
+		const std::size_t i = (static_cast<std::size_t>(sp.y) * kMvW + sp.x) * 2;
+		const Mv want = reference_camera_mv(sp.x, sp.y, clip_to_prev, false);
+		const Mv bad = reference_camera_mv(sp.x, sp.y, clip_to_prev, true);
+		std::printf("  %-20s (%3u,%3u) got (% .5f,% .5f)  row-vector (% .5f,% .5f)"
+			"  transposed (% .5f,% .5f)\n",
+			sp.where, sp.x, sp.y,
+			static_cast<double>(got[i + 0]), static_cast<double>(got[i + 1]),
+			static_cast<double>(want.x), static_cast<double>(want.y),
+			static_cast<double>(bad.x), static_cast<double>(bad.y));
+	}
+
+	check(compare_against_reference(got, clip_to_prev, /*expect_transposed=*/false, "shipped"),
+		"every sampled pixel matches mul(v, ClipToPrevClip), the row-vector orientation");
+
+	// --- the A/B toggle, which is also this test's own negative control ---
+	//
+	// A regression test that has never been seen to fail is not yet a regression test.
+	// LegacyTransposedClip reproduces the shipped bug exactly — HLSL's default column-major
+	// packing of a row-major upload is `mul(M, v)`, which is what the legacy path issues — so
+	// running it here proves two things at once: that the A/B switch does what
+	// mv_resolve.hpp claims, and that the assertion above genuinely rejects the old behaviour
+	// rather than passing on anything the GPU happens to write.
+	stray_dlss::mv::set_legacy_transposed_clip(true);
+	if (!stray_dlss::mv::record(gpu.list.Get(), in, 2))
+	{
+		fail(stray_dlss::mv::last_error());
+		return false;
+	}
+	std::vector<float> legacy;
+	if (!read_mv_texture(gpu, kMvW, kMvH, legacy))
+		return false;
+	stray_dlss::mv::set_legacy_transposed_clip(false);
+
+	check(compare_against_reference(legacy, clip_to_prev, /*expect_transposed=*/true, "legacy"),
+		"LegacyTransposedClip=1 reproduces mul(ClipToPrevClip, v) exactly");
+
+	// And the half that makes it a negative control: the shipped assertion must REJECT it.
+	bool legacy_would_fail = false;
+	for (const MvSample &sp : kMvSamples)
+	{
+		const std::size_t i = (static_cast<std::size_t>(sp.y) * kMvW + sp.x) * 2;
+		const Mv want = reference_camera_mv(sp.x, sp.y, clip_to_prev, false);
+		if (std::fabs(legacy[i + 0] - want.x) > mv_tolerance(want.x) ||
+			std::fabs(legacy[i + 1] - want.y) > mv_tolerance(want.y))
+		{
+			legacy_would_fail = true;
+			break;
+		}
+	}
+	check(legacy_would_fail,
+		"the old transposed behaviour FAILS the check above - this test can actually fire");
+
+	check(drain_validation(gpu, "camera-branch-legacy") == 0,
+		"no D3D12 validation errors from the legacy A/B pass");
+	return true;
+}
+
+// ---- test 4: the restore puts the game's state back exactly ------------------------------
 //
 // This is the corruption test. A mock "game" dispatch reads a root constant, a root CBV and a
 // descriptor-table SRV, and writes them out. Run it once to get a golden result; then run it
@@ -970,6 +1533,7 @@ int main(int argc, char **argv)
 	test_validation_catches_wrong_root_parameter_type(gpu);
 	test_dispatch_is_valid(gpu);
 	test_no_allocation_churn(gpu);
+	test_camera_branch_matrix_orientation(gpu);
 	test_restore_preserves_game_state(gpu);
 	test_reshade_restore_call_pattern(gpu);
 	test_vkd3d_ext_hook_reachability(gpu);
