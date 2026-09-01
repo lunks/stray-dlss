@@ -161,6 +161,60 @@ DLSS 5 as taking "a rendered 2D frame and motion vectors as input, while materia
 from that frame*" [SOFT/HARD, web: videocardz.com DLSS-5 coverage]. **Materials are inferred by
 the network, not supplied as guides.** That is the architectural reason it needs none.
 
+### 2.2.1 Which of those names the RUNTIME actually knows — and the one that bit us [HARD]
+
+Measured 2026-08-31 by exact null-terminated string search over `nvngx_dlssnr.dll` (DLSSNR
+310.8.0, the `dlssnr-remix` copy, md5 `eea91faf…`), cross-referenced against `strings` over
+`renodx-dlss5.addon64`. **RenoDX's parameter set is a strict superset of ours: it writes 14
+names we never did, and we write none it does not.** But only half of those 14 are real:
+
+| RenoDX writes | In the 310.8.0 runtime? |
+|---|---|
+| `DLSSNR.Enabled` | **yes** |
+| `DLSSNR.Hint.Render.Preset` | **yes** |
+| `DLSSNR.ScalingRatio` | **yes** |
+| `DLSSNR.SkinStructureStrength` | **yes** |
+| `DLSSNR.Style` | **yes** |
+| `DLSSNR.UICorrection` | **yes** |
+| `DLSSNR.UseAutoMask` | **yes** |
+| `DLSSNR.Scale` | **no** |
+| `DLSSNR.InputWidth` / `InputHeight` | **no** |
+| `DLSSNR.OutputWidth` / `OutputHeight` | **no** |
+| `DLSSNR.Output.Width` / `Output.Height` | **no** |
+| `DLSSNR.Upscaling` | **no** |
+
+RenoDX writes the absent names too — defensive coverage across snippet builds, harmless because
+an unknown key is simply never read. **That is exactly why the bug was invisible on our side:**
+we set `DLSSNR.Scale`, which does not exist in this runtime, so **every scaling ratio we ever
+sent was silently discarded**. §2.2's listing of `DLSSNR.Width/Height/Scale` is RenoDX's name
+set, not the runtime's — do not read a parameter list off a *caller* and assume the callee
+honours it.
+
+**Consequence, and the general rule:** an NGX parameter block is an untyped string→value map
+with no validation and no error for an unknown key, so a typo or a stale name is
+indistinguishable from a value that was accepted and ignored. Any name we write must be
+confirmed present in the runtime binary first.
+
+The mapping from RenoDX's shipped `[RenoDX.DLSS5]` ini keys to runtime parameters:
+
+| ini key | value | runtime parameter |
+|---|---|---|
+| `NRIntensity` | 1.05 | `DLSSNR.Intensity` |
+| `NRLocalTone` | 1.74 | `DLSSNR.LocalToneStrength` |
+| `NRSkinStructure` | 1.33 | `DLSSNR.SkinStructureStrength` |
+| `NRPreset` | 1 | `DLSSNR.Hint.Render.Preset` |
+| `NRAutoMask` | 1 | `DLSSNR.UseAutoMask` |
+| `NRUICorrection` | 1 | `DLSSNR.UICorrection` |
+| `NREnableUpscaling` | 0 | (`DLSSNR.Upscaling` is absent; `ScalingRatio` carries it) |
+| `NRPaperWhiteScale` | 1.605 | **none — RenoDX-side pre-processing** |
+| `NRDepthMode` | 2 | **none — RenoDX-side** |
+| `NeuralUplift` | 1 | **none — RenoDX-side** |
+
+The last three are the interesting ones: they have no NGX parameter at all, so RenoDX must apply
+them to the data before handing it over. A **paper-white scale in particular means they
+normalise input luminance**, which is a live hypothesis for our near-black neural output
+(validated at `max luminance 0.002709`) and the red-noise image.
+
 ### 2.3 It clones the game's own DLSS contract at the detour [HARD for the read; SOFT for flow]
 
 The addon reads the standard NGX SR parameter keys straight off the game's intercepted
