@@ -208,7 +208,7 @@ ID3D12Device *reshade_proxy_device(ID3D12Device *native)
 struct NrUiState
 {
 	bool  enabled = false;
-	float intensity = 1.05f;
+	float intensity = 1.0f;
 	float local_tone = 1.74f;
 	float local_structure = 1.0f;
 	float skin_structure = 1.33f;
@@ -1379,12 +1379,17 @@ void draw_nr_controls()
 
 	ImGui::Separator();
 	ImGui::TextUnformatted("Network");
-	changed |= ImGui::SliderFloat("Intensity", &g_nr_ui.intensity, 0.0f, 2.0f, "%.2f");
+	// 0-1: values above 1 change nothing, so the extra range was only a way to waste a test.
+	changed |= ImGui::SliderFloat("Intensity", &g_nr_ui.intensity, 0.0f, 1.0f, "%.2f");
 	// Named LocalToneStrength, but it is the style blend weight rather than a tone control.
-	changed |= ImGui::SliderFloat("Local tone", &g_nr_ui.local_tone, 0.0f, 4.0f, "%.2f");
-	changed |= ImGui::SliderFloat("Local structure", &g_nr_ui.local_structure, 0.0f, 4.0f, "%.2f");
+	// RenoDX ships NRLocalTone=1.74, so the range has to reach it comfortably. Despite the name
+	// this is the STYLE BLEND WEIGHT, not a tone control.
+	changed |= ImGui::SliderFloat("Local tone", &g_nr_ui.local_tone, 0.0f, 2.0f, "%.2f");
+	changed |= ImGui::SliderFloat("Local structure", &g_nr_ui.local_structure, 0.0f, 2.0f, "%.2f");
 	// -1 is a sentinel meaning "use local structure", so the range deliberately reaches it.
-	changed |= ImGui::SliderFloat("Skin structure", &g_nr_ui.skin_structure, -1.0f, 4.0f, "%.2f");
+	// RenoDX ships NRSkinStructure=1.33. -1 is a SENTINEL meaning "inherit local structure" (the
+	// reference's default), so the range keeps reaching it — 0 is not the neutral value here.
+	changed |= ImGui::SliderFloat("Skin structure", &g_nr_ui.skin_structure, -1.0f, 2.0f, "%.2f");
 	// 310.8 ships one weight set registered as preset 1 and falls back to it for every other
 	// value, so this is expected to change nothing — exposed to confirm that rather than assume.
 	changed |= ImGui::SliderInt("Preset", &g_nr_ui.preset, 0, 4);

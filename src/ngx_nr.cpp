@@ -165,7 +165,7 @@ bool g_enabled = false;
 Topology g_topology = Topology::post_process;
 // Defaults are RenoDX's own shipped [RenoDX.DLSS5] values, not invented ones: NRIntensity=1.05,
 // NRLocalTone=1.74, NRSkinStructure=1.33, NRPreset=1, NRAutoMask=1, NRUICorrection=1.
-float g_intensity = 1.05f;
+float g_intensity = 1.0f;
 float g_local_tone = 1.74f;
 float g_local_structure = 1.0f;
 float g_skin_structure = 1.33f;
