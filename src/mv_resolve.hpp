@@ -84,6 +84,13 @@ bool paint(ID3D12GraphicsCommandList *cmd, ID3D12Resource *target);
 // a switch for the same reason. (1,1)/(1,1) is the long-standing behaviour.
 void set_signs(float sparse_x, float sparse_y, float camera_x, float camera_y);
 
+// A/B for the row_major fix in shaders/mv_resolve.hlsl. TRUE reproduces the old, transposed
+// camera branch (HLSL's default column-major packing reading UE's row-major upload), so the
+// fix can be confirmed live in one session. Judge it while MOVING: with a still camera
+// ClipToPrevClip is ~identity and a transposed identity is still the identity, which is exactly
+// why the bug was invisible for so long.
+void set_legacy_transposed_clip(bool legacy);
+
 // Allocation accounting. The GPU ran out of memory during a real run, and resource churn in
 // initialise() is the prime suspect: the render resolution is taken from whichever dispatch
 // matched, so a flapping size reallocates the heap, constant buffer and output texture. These
