@@ -148,6 +148,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/taa_hook.hpp
         src/pass_finder.cpp
         src/pass_finder.hpp
+        src/perf.cpp
+        src/perf.hpp
         src/gbuffer_finder.cpp
         src/gbuffer_finder.hpp
         src/gbuffer_resolve.cpp

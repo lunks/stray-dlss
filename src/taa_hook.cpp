@@ -2,6 +2,7 @@
 
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
+#include "perf.hpp"
 
 #include "frame_state.hpp"
 #include "log.hpp"
@@ -479,7 +480,12 @@ bool record_guides(reshade::api::device *device, ID3D12GraphicsCommandList *nati
 		}
 	}
 
-	if (!gbr::record(native, gi, /*dispatch_mode=*/2))
+	bool gbr_recorded;
+	{
+		perf::Scope perf_gbuf(perf::kGBufferResolve);
+		gbr_recorded = gbr::record(native, gi, /*dispatch_mode=*/2);
+	}
+	if (!gbr_recorded)
 	{
 		if (rr_refuse(kRrResolveFailed))
 			STRAY_LOG_ERROR("RR: gbuffer_resolve record failed (%s); SR carries the frames. "
@@ -649,7 +655,10 @@ void maybe_record_guides_at_ssd(reshade::api::command_list *cmd_list, std::uint6
 	// under its group counts, its own output never written, its root state corrupted for
 	// everything downstream of it on this list. Restore replays the game's captured root
 	// state natively, exactly as the TAA site does after NGX clobbers it.
-	restore_game_compute_state(cmd_list);
+	{
+		perf::Scope perf_restore(perf::kRestore);
+		restore_game_compute_state(cmd_list);
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
@@ -747,7 +756,10 @@ bool try_evaluate_rr(reshade::api::device *device, ID3D12GraphicsCommandList *na
 		er.have_matrices = true;
 		er.frame_time_delta_ms = view.delta_time * 1000.0f;
 
-		ok = ngx::evaluate_rr(native, er);
+		{
+			perf::Scope perf_rr(perf::kNgxRr);
+			ok = ngx::evaluate_rr(native, er);
+		}
 
 		if (ok)
 		{
@@ -1035,6 +1047,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 	// Anything smaller than a plausible full-screen tile grid cannot be the TAA pass.
 	if (z != 1 || x < 32 || y < 18)
 		return false;
+
+	// Everything from here is OUR work on the dispatch path. Placed after the size gate on
+	// purpose: the gate rejects thousands of dispatches per frame and must stay free, while
+	// the few dozen that survive are exactly the ones worth attributing. (src/perf.hpp)
+	perf::Scope perf_dispatch(perf::kDispatchPath);
 
 	std::uint64_t hash = 0;
 	{
@@ -1442,7 +1459,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 
 				mark(4, "heaps-collected");
 
-				const bool recorded = mv::record(native, inputs, g_mv_dispatch_mode);
+				bool recorded;
+				{
+					perf::Scope perf_mv(perf::kMvResolve);
+					recorded = mv::record(native, inputs, g_mv_dispatch_mode);
+				}
 				if (tracing && !g_ngx_gate2_logged)
 				{
 					g_ngx_gate2_logged = true;
@@ -1855,7 +1876,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 									update_rr1_arm(ok);
 								}
 								if (!ok)
-									ok = ngx::evaluate(native, ei);
+									{
+										perf::Scope perf_sr(perf::kNgxSr);
+										ok = ngx::evaluate(native, ei);
+									}
 							}
 							if (ok)
 							{
@@ -1931,7 +1955,10 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 					if (g_restore_state)
 					{
 						NGX_TRACE("%s", "restore begin");
-						restore_game_compute_state(cmd_list);
+						{
+							perf::Scope perf_restore(perf::kRestore);
+							restore_game_compute_state(cmd_list);
+						}
 						NGX_TRACE("%s", "restore done");
 						mark(6, "state-restored");
 					}

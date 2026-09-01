@@ -16,6 +16,7 @@
 #include "gbuffer_resolve.hpp"
 #include "input_dump.hpp"
 #include "pass_finder.hpp"
+#include "perf.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
 
@@ -244,6 +245,14 @@ void on_init_device(reshade::api::device *device)
 	bool ngx_evaluate = false;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	// [STRAYDLSS] PerfLog, default ON: frame-time + our-CPU-share reports every 600 presents.
+	// Left on by default because the instrumentation is cheap (one clock read per present;
+	// per-call timers only on the few size-gated dispatches) and a perf report nobody enabled
+	// is a wasted round trip. Set 0 to silence it.
+	bool perf_log = true;
+	reshade::get_config_value(nullptr, "STRAYDLSS", "PerfLog", perf_log);
+	perf::set_enabled(perf_log);
 
 	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
 	// stack (one CreateFeature attempt, released; SR keeps running), 2 = full RR-first
@@ -706,6 +715,11 @@ void on_present(
 	(void)dirty_rects;
 
 	const uint64_t frame = g_state.frame_index.fetch_add(1, std::memory_order_relaxed);
+
+	// Frame-time sampling and the periodic CPU-share report. Fed the cumulative counters we
+	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
+	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
+		taa_hook::diagnostics().large_dispatches);
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
 	// identifies which state produced it.
