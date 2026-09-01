@@ -1079,32 +1079,20 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels, y-down.
 	//
-	// The scale is the COLOUR/GUIDE ratio, not 1.0. The snippet works on the COLOUR grid while
-	// our vectors are on the guide grid, and it receives the colour rect, the mvec rect and this
-	// scale as three INDEPENDENT values — it never derives one from the others, so declaring
-	// MVecSubrectWidth/Height does not make the ratio redundant.
+	// SCALE 1.0, NOT the colour/guide ratio — MEASURED on the user's machine 2026-09-01, which
+	// overturns a code-reading argument I had recorded as settled the same day.
 	//
-	// This was briefly 1.0, on a misreading of the reference. dxvk-remix's
-	// NGXNeuralRenderingContext sets exactly this ratio and its comment names our case:
-	// "2.0 for 4K colour over 1080p guides". The same codebase sets 1.0 for DLSS *SR* with the
-	// SAME buffer, because SR's working grid IS the render grid — which is also why our SR path
-	// correctly passes InMVScale = 1.
+	// The argument for the ratio was good: dxvk-remix's NGXNeuralRenderingContext sets
+	// colourExtent/guideExtent and its comment names our exact 4K-colour-over-1080p-guides case,
+	// and a comment in its NGX wrapper states the snippet receives the colour rect, the mvec rect
+	// and this scale as three INDEPENDENT values. But that last claim is from reverse
+	// engineering, not from a header or a measurement — and we already declare the guides' own
+	// rect through DLSSNR.MVecSubrectWidth/Height, so if the runtime normalises by the subrect
+	// then the ratio is applied twice. A/B'd live while moving: 1.0 is visibly more stable.
 	//
-	// Computed, never hardcoded: at 50% it is 2.0 but at 70% it is 1.42857, and this project
-	// runs both.
+	// Keep this in mind before "fixing" it back: an argument from someone else's source, however
+	// well cited, loses to a measurement on the machine that actually runs the code.
 	float scale_x = 1.0f, scale_y = 1.0f;
-	if (in.render_width > 0 && in.render_height > 0)
-	{
-		scale_x = static_cast<float>(in.output_width) / static_cast<float>(in.render_width);
-		scale_y = static_cast<float>(in.output_height) / static_cast<float>(in.render_height);
-	}
-	// A caller whose colour rect is NOT the TAA output rect — the post-tonemap sites, whose rect
-	// is the back buffer's — computes the ratio against its own rect and passes it here.
-	if (in.mvec_scale_x > 0.0f && in.mvec_scale_y > 0.0f)
-	{
-		scale_x = in.mvec_scale_x;
-		scale_y = in.mvec_scale_y;
-	}
 	if (g_mvec_scale_override > 0.0f)
 		scale_x = scale_y = g_mvec_scale_override;
 
