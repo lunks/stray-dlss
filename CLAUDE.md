@@ -1296,6 +1296,35 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### The SSR fade and most of the flicker: resolved, cause not fully isolated (2026-09-01)
+
+The long-running "reflections and fine detail fade over tens of seconds, then recover" stopped
+reproducing. **Several fixes landed together, so the attribution is not clean — record it that
+way rather than crediting whichever story reads best.** In likely order of contribution:
+
+1. **`DLSSNR.MVecScaleX/Y` back to 1.0** (the user's live A/B, which overturned a code-reading
+   argument for the colour/guide ratio). This is the user's own attribution and the mechanism is
+   the strongest: **feature 18 reprojects its OWN temporal history with these vectors**, so a 2x
+   scale error fetches every history sample from twice the distance it should. That yields both
+   symptoms from one cause — instability during motion, and a persistently wrong accumulation
+   that reads as drift when the camera is still.
+2. **The create-site shape gate.** Before it, cubemap faces and reflection captures were accepted
+   as the primary view and DLSS features were created **11 times a session instead of once**.
+   Every spurious creation is a full teardown of DLSS's temporal accumulation, and a periodic
+   history wipe is a textbook "degrades, then snaps back".
+3. The `ClipToPrevClip` transposition fix, which corrected the camera-reconstruction branch for
+   all static geometry.
+
+**Timeline caveat, stated so nobody over-credits #1:** MVecScale went 2.0 -> 1.0 -> 2.0 -> 1.0
+across one day, and the fade was reported in more than one of those states. So the scale was
+probably the dominant term but cannot have been the whole of it.
+
+**The durable lesson: bad motion vectors do not produce one bad frame, they compound through the
+accumulation.** Any temporal consumer — DLSS SR, feature 18, the engine's own TAA — integrates a
+motion error over its history, so a scale or convention mistake surfaces as drift, smearing and
+instability rather than as anything that looks like a motion-vector bug. When a temporal artefact
+resists every explanation in the temporal machinery itself, check what you are feeding it.
+
 ### Exposure tracking: needed, but only with a LONG time constant (measured 2026-09-01)
 
 Three findings that only make sense together, and the third is the one that settles it:
