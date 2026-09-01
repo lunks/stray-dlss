@@ -1250,6 +1250,48 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### NR's output feeds the engine's temporal history, and that compounds (measured 2026-09-01)
+
+**Symptom, user-reported and then measured:** with NR on, everything temporally accumulated
+slowly degrades and then snaps back — screen-space reflections on a wet floor drain to flat, and
+the **volumetric light shafts in the MAIN MENU** do the same. It is not reflection-specific.
+
+**Measured in the menu** (16 shots, 3 s apart, camera static, no input):
+
+```
+frame  3  mean=82.9  sd=96.5  hf=14863
+frame  7  mean=62.0  sd=72.9  hf=16403
+frame 13  mean=52.6  sd=68.5  hf=18899   <- darkest, flattest, noisiest
+frame 16  mean=71.0  sd=86.8  hf=14933   <- recovered
+```
+
+Brightness and contrast decay over ~30 s while **high-frequency energy RISES as they fall**. That
+inverse relationship is an accumulator degrading, not scene animation. `NgxNR=0` removes most of
+it. Whole-frame metrics nearly hide the effect in gameplay (mean varied 1.7%) while the affected
+quadrant swung 11% — **measure the region, hold the camera still.**
+
+**Cause: placement, not arithmetic.** `src/core/nr_codec.cpp` is a faithful line-for-line port of
+the reference (chroma valve, fade weight, guards and clamp all verified). The divergence is
+*where* the result lands:
+
+* The reference writes into `m_finalOutput` — a **terminal** image, consumed downstream by bloom,
+  motion blur and the tone curve. Nothing reads it back.
+* **We write into the TAA dispatch's `u0`, which §2.9 establishes UE 4.27 extracts as the NEXT
+  frame's `HistoryBuffer[0]`.** So every frame adds a residual `(n - p)/s` into the engine's
+  temporal history; the next frame's TAA reads a history that already contains it and we add
+  another on top. It compounds until something resets the history, then starts over.
+
+That also explains why the symptom is **accumulation-generic**: fog and SSR are composited into
+scene colour *before* TAA, so a drifting history drags everything with it, and fine
+high-contrast detail (light shafts, specular streaks) shows it first.
+
+**The general lesson, which outlives this feature: our interception point is a FEEDBACK NODE, not
+an output.** Any pass that modifies `u0` is writing into the engine's temporal state, so an
+effect that is stable frame-to-frame in a normal post-process chain can still diverge here. Ask
+"what reads this next frame?" before writing anything into an intercepted TAA output — and note
+that porting a correct implementation is not sufficient when the target resource has a different
+role in the frame graph.
+
 ### The NR luminance diagnostic must not run during a loading screen
 
 `NR CODEC LUMINANCE` reports input -> proxy -> output max Rec.709 over one crop, and is how
