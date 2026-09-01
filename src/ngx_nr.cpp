@@ -124,6 +124,10 @@ constexpr unsigned long long kNrApplicationId = 0x5354524159444C53ull; // "STRAY
 // feature-18 then goes through the snippet rather than the NGX core, because the core has no
 // knowledge of a pre-release snippet and answers FAIL_OutOfDate (measured: 0xbad0000c).
 bool g_use_direct = false;
+// Which runtime allocated g_params. An NVSDK_NGX_Parameter is just an interface object, so the
+// snippet happily consumes one the CORE allocated — but whatever allocated it must also destroy
+// it, so this flag pairs the two and we never cross-call.
+bool g_params_from_snippet = false;
 bool g_enabled = false;
 Topology g_topology = Topology::post_process;
 float g_intensity = 1.0f;
@@ -234,15 +238,32 @@ void retire_keep_alive(bool all)
 // --- route every feature-18 NGX call to the snippet when the direct path is live ---
 NVSDK_NGX_Result nr_alloc_params(NVSDK_NGX_Parameter **out)
 {
-	if (g_use_direct)
-		return static_cast<NVSDK_NGX_Result>(
-			snippet::allocate_parameters(reinterpret_cast<void **>(out)));
-	return NVSDK_NGX_D3D12_AllocateParameters(out);
+	// Prefer the snippet's own allocator when it has one; otherwise use the CORE's, which we
+	// already allocate from successfully for SR/RR. Measured: this snippet exports none of the
+	// parameter helpers, and that is fine — only the block's interface matters to it.
+	const bool from_snippet = g_use_direct && snippet::has_allocate_parameters();
+	const NVSDK_NGX_Result r = from_snippet
+		? static_cast<NVSDK_NGX_Result>(
+			snippet::allocate_parameters(reinterpret_cast<void **>(out)))
+		: NVSDK_NGX_D3D12_AllocateParameters(out);
+	if (NVSDK_NGX_SUCCEED(r))
+		g_params_from_snippet = from_snippet;
+	static bool s_logged = false;
+	if (!s_logged)
+	{
+		s_logged = true;
+		STRAY_LOG_INFO("NR: parameter block allocated by the %s (0x%08x). The snippet consumes "
+			"a block whichever runtime made it; only the destroy must match.",
+			from_snippet ? "SNIPPET's own allocator" : "NGX CORE",
+			static_cast<unsigned int>(r));
+	}
+	return r;
 }
 
 NVSDK_NGX_Result nr_destroy_params(NVSDK_NGX_Parameter *p)
 {
-	if (g_use_direct)
+	// Destroy with whichever API allocated it — never cross-call.
+	if (g_params_from_snippet)
 		return static_cast<NVSDK_NGX_Result>(snippet::destroy_parameters(p));
 	return NVSDK_NGX_D3D12_DestroyParameters(p);
 }

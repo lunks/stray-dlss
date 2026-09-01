@@ -48,8 +48,17 @@ const char *identity_name();
 // Returns true only when the required exports are all present, i.e. the direct path is usable.
 bool load(const char *utf8_path);
 
-// True when load() succeeded and the required exports resolved.
+// True when load() succeeded and the four REQUIRED exports resolved (Init_Ext,
+// CreateFeature, EvaluateFeature, ReleaseFeature).
 bool available();
+
+// Which OPTIONAL helpers this snippet provides. The parameter block may be allocated by the
+// NGX core instead and handed to the snippet — an NVSDK_NGX_Parameter is just an interface
+// object, so the allocator and the consumer need not be the same runtime. Whatever allocates
+// it MUST also destroy it, so callers pair these two.
+bool has_allocate_parameters();
+bool has_destroy_parameters();
+bool has_shutdown1();
 
 const char *last_error();
 

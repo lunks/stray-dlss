@@ -212,6 +212,18 @@ bool patch_identity_import()
 	return false;
 }
 
+// Optional export: absence is normal and must never abort the direct path. An
+// NVSDK_NGX_Parameter is just an interface object — whoever allocates it, the snippet can
+// consume it — so a snippet without the parameter helpers is still fully drivable.
+template <typename T>
+bool resolve_optional(T &fn, const char *name)
+{
+	fn = reinterpret_cast<T>(reinterpret_cast<void *>(::GetProcAddress(g_module, name)));
+	STRAY_LOG_INFO("NR: snippet export %s: %s (optional)",
+		fn != nullptr ? "ok" : "absent", name);
+	return fn != nullptr;
+}
+
 template <typename T>
 bool resolve(T &fn, const char *name, int &missing)
 {
@@ -262,6 +274,9 @@ void set_identity_from_string(const char *name)
 
 const char *last_error() { return g_last_error; }
 bool available() { return g_available; }
+bool has_allocate_parameters() { return g_alloc_params != nullptr; }
+bool has_destroy_parameters() { return g_destroy_params != nullptr; }
+bool has_shutdown1() { return g_shutdown1 != nullptr; }
 
 void log_identity_calls()
 {
@@ -323,17 +338,23 @@ bool load(const char *utf8_path)
 		"through its own NGX exports — the NGX core does not know this pre-release snippet, which is "
 		"why asking the core for feature 18 returned FAIL_OutOfDate.", g_module_path, path);
 
+	// REQUIRED: exactly the four calls needed to DRIVE the feature. Measured on the staged
+	// build, the snippet exports all four but none of the parameter helpers — and it does not
+	// need to: the parameter block can come from the NGX core (which we already allocate from
+	// for SR/RR) and be handed to the snippet's CreateFeature/EvaluateFeature.
 	int missing = 0;
 	resolve(g_init_ext, "NVSDK_NGX_D3D12_Init_Ext", missing);
-	resolve(g_alloc_params, "NVSDK_NGX_D3D12_AllocateParameters", missing);
 	resolve(g_create_feature, "NVSDK_NGX_D3D12_CreateFeature", missing);
 	resolve(g_evaluate_feature, "NVSDK_NGX_D3D12_EvaluateFeature", missing);
 	resolve(g_release_feature, "NVSDK_NGX_D3D12_ReleaseFeature", missing);
-	resolve(g_destroy_params, "NVSDK_NGX_D3D12_DestroyParameters", missing);
-	resolve(g_shutdown1, "NVSDK_NGX_D3D12_Shutdown1", missing);
-	// Optional: only used to interrogate capabilities; absence is not fatal.
-	int caps_missing = 0;
-	resolve(g_get_caps, "NVSDK_NGX_D3D12_GetCapabilityParameters", caps_missing);
+
+	// OPTIONAL: preferred when present, but their absence must not abort anything.
+	// Shutdown1 is optional-but-preferred; without it we simply skip the snippet's own
+	// shutdown (the device is torn down immediately afterwards anyway).
+	resolve_optional(g_shutdown1, "NVSDK_NGX_D3D12_Shutdown1");
+	resolve_optional(g_alloc_params, "NVSDK_NGX_D3D12_AllocateParameters");
+	resolve_optional(g_destroy_params, "NVSDK_NGX_D3D12_DestroyParameters");
+	resolve_optional(g_get_caps, "NVSDK_NGX_D3D12_GetCapabilityParameters");
 
 	// The identity hook is best-effort: without it the runtime may refuse, but the direct
 	// export path is still worth attempting and the failure is named.
@@ -341,8 +362,9 @@ bool load(const char *utf8_path)
 
 	g_available = missing == 0;
 	if (!g_available)
-		STRAY_LOG_ERROR("NR: %d required snippet export(s) missing — the direct path is "
-			"unusable; NR falls back to the NGX core path.", missing);
+		STRAY_LOG_ERROR("NR: %d REQUIRED snippet export(s) missing (of Init_Ext, "
+			"CreateFeature, EvaluateFeature, ReleaseFeature) — the direct path is unusable; "
+			"NR falls back to the NGX core path.", missing);
 	else
 		STRAY_LOG_WARN("NR: all required snippet exports resolved; the DIRECT snippet path is "
 			"available.");
