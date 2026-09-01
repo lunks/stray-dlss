@@ -199,6 +199,7 @@ enum GateReason
 	kGateDeadInputs,       // depth or velocity missing, or not known live
 	kGatePinnedElsewhere,  // DLSS is pinned to a different pass
 	kGateNoRoundTrip,      // this pass has not proved it owns the temporal history
+	kGateNotPrimaryView,   // aspect ratio or upscale factor says cubemap face / reflection capture
 	kGateReasonCount,
 };
 const char *const kGateReasonText[kGateReasonCount] = {
@@ -208,6 +209,8 @@ const char *const kGateReasonText[kGateReasonCount] = {
 	"its depth or velocity SRV is missing or not known live",
 	"DLSS is pinned to a different pass",
 	"it has not proved it owns the temporal history yet (no u0 round-trip seen)",
+	"its render/output shape is not the primary view - the aspect ratio or the upscale factor "
+	"is out of range, so it is a cubemap face or a reflection capture, not FTAAStandaloneCS",
 };
 std::unordered_map<std::uint64_t, std::uint32_t> g_gate_logged; // hash -> reason bitmask
 
@@ -1787,9 +1790,44 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 						//    (1280 x 720)"
 						// which is a half-res pass being handed the full-res view rect. Skip
 						// those rather than thrashing CreateFeature against them.
-						const bool dims_ok = fd.output_width >= fd.render_width &&
+						// A real primary-view upscale also PRESERVES THE ASPECT RATIO and lands
+						// inside DLSS's range. Measured 2026-09-01: without this the creates
+						// included 1024x176 (5.8:1), 512x88, 512x479 and, in an earlier session,
+						// 248x248 and 1016x1016 — cubemap faces and reflection captures, which
+						// bind the same shapes as FTAAStandaloneCS. Each cost an NGX feature
+						// create/release, i.e. a frame spike, and put a differently-oriented view
+						// of the scene on the display chain ("the cat sideways").
+						//
+						// This test lives HERE, not in match_taa_dispatch, because the two use
+						// different sources: the matcher sees the depth SRV's extent while the
+						// descriptor's render size comes from the View CB's view rect (see the
+						// comment above). Gating the matcher left this path untouched — the
+						// bogus creates continued with zero rejections logged.
+						bool shape_ok = true;
+						if (fd.render_width > 0 && fd.render_height > 0 &&
+							fd.output_width > 0 && fd.output_height > 0)
+						{
+							const double in_aspect = static_cast<double>(fd.render_width) /
+								static_cast<double>(fd.render_height);
+							const double out_aspect = static_cast<double>(fd.output_width) /
+								static_cast<double>(fd.output_height);
+							// 4% absorbs UE4's 8-pixel tile quantisation at every ratio we run;
+							// a genuine mismatch (5.8:1 against 1.78:1) is out by 225%.
+							if (in_aspect > out_aspect * 1.04 || in_aspect < out_aspect * 0.96)
+								shape_ok = false;
+							// Ultra Performance is 3x linear; 3.5 leaves room for a future mode.
+							if (static_cast<double>(fd.output_width) /
+								static_cast<double>(fd.render_width) > 3.5)
+								shape_ok = false;
+						}
+
+						const bool dims_ok = shape_ok &&
+							fd.output_width >= fd.render_width &&
 							fd.output_height >= fd.render_height &&
 							fd.render_width > 0 && fd.output_width > 0;
+
+						if (!shape_ok)
+							log_gate_refusal(hash, kGateNotPrimaryView);
 						if (!dims_ok && !g_ngx_dims_logged)
 						{
 							g_ngx_dims_logged = true;
