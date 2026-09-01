@@ -1,0 +1,276 @@
+name: StrayDualSense plugin
+
+# A UE4SS C++ plugin cannot be built or tested on the machine that writes it — no Windows, no
+# MSVC, no game, no pad (CLAUDE.md §0). This workflow is the ONLY build. It is staged
+# cheapest-first so a typo is caught in seconds rather than after a 20-minute SDK build.
+#
+#   1. tests    the pure-logic test, the one thing provable without hardware
+#   2. mingw    proves the Win32 half (pad, WASAPI, threads) COMPILES AND LINKS, with no SDK
+#   3. plugin   the artifact; builds RE-UE4SS from source and links against it
+#
+# Lane 2 is a proxy, not the product: mingw is not MSVC and the plugin MUST be MSVC-built,
+# because UE4SS passes std::wstring and std::function across the DLL boundary. It exists
+# because it catches the overwhelmingly most common failure — a missing include, a bad format
+# specifier — in two minutes and with no dependency on lane 3 succeeding.
+#
+# ---------------------------------------------------------------------------------------
+# READ THIS BEFORE DEBUGGING LANE 3: there is NO released UE4SS C++ SDK.
+#
+# Verified 2026-09-01 against the v3.0.1 release: its four assets are UE4SS_v3.0.1.zip,
+# zCustomGameConfigs.zip, zDEV-UE4SS_v3.0.1.zip and zMapGenBP.zip. zDEV is the DEV BUILD of
+# UE4SS (UE4SS.dll + .pdb + Lua mods) — zero .lib, zero .hpp. A C++ mod must therefore be
+# built inside a checkout of UE4SS-RE/RE-UE4SS, as the official template does.
+#
+# And that checkout has a wall in it: `deps/first/Unreal` is a submodule pointing at
+# git@github.com:Re-UE4SS/UEPseudo.git, and BOTH that repo and the Re-UE4SS org return 404
+# unauthenticated. RE-UE4SS's own CI clones it with `token: ${{ secrets.UEPSEUDO_PAT }}`
+# (.github/workflows/cmake_build_ue4ss.yml). Without such a token the submodule cannot be
+# fetched, so this workflow falls back to a PINNED PUBLIC MIRROR and says so loudly.
+# ---------------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ main, dualsense ]
+    paths:
+      - 'mods/StrayDualSense/**'
+      - '.github/workflows/dualsense.yml'
+  pull_request:
+    paths:
+      - 'mods/StrayDualSense/**'
+      - '.github/workflows/dualsense.yml'
+  workflow_dispatch:
+
+env:
+  # The UE4SS running on the target box: banner "v3.0.1 Beta", Git SHA 68caddcf,
+  # Game__Shipping__Win64 (MSVC).
+  #
+  # TRAP, measured: 68caddcf is a MAIN-BRANCH commit dated 2026-08-31, NOT the v3.0.1 release
+  # tag (which is d935b5b2, 2024-02-14). The banner says 3.0.1 only because main's version
+  # macros still do while UE4SS_LIB_IS_BETA is set. Building against the TAG would be a
+  # different API and a different ABI. Pin the SHA, never the tag.
+  UE4SS_SHA: 68caddcf36804b7405424e03e911e6b278324f47
+
+  # Public mirror used only when UEPSEUDO_PAT is absent. It vendors RE-UE4SS's whole tree,
+  # `deps/first/Unreal` included. Verified 2026-09-01: its copies of UE4SS/include/Mod/
+  # CppUserModBase.hpp and the root CMakeLists.txt are BYTE-IDENTICAL to RE-UE4SS at
+  # UE4SS_SHA. That is evidence, not proof, that the Unreal headers match the submodule pin
+  # (eb40a05f) — hence the loud warning the job prints when it uses this path.
+  UEPSEUDO_MIRROR_REPO: FottenSC/HorseMod
+  UEPSEUDO_MIRROR_SHA: e6313df89272949081e298aab1579aeaf2d5866a
+  UEPSEUDO_MIRROR_SUBDIR: RE-UE4SS/deps/first/Unreal
+
+  BUILD_CONFIG: Game__Shipping__Win64
+
+jobs:
+  tests:
+    name: Pure-logic tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S mods/StrayDualSense -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  mingw:
+    name: Win32 half compiles (mingw proxy)
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+
+      # Every source EXCEPT src/Mod.cpp, which is the only file that includes a UE4SS header.
+      # That split is why this lane is possible at all, and it is worth preserving.
+      - name: Compile and link the Win32 sources
+        working-directory: mods/StrayDualSense
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/obj
+          for f in AssetName Config Haptics Log Runtime ScePad Speaker Triggers; do
+            echo "--- $f"
+            x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
+              -Isrc -c "src/$f.cpp" -o "/tmp/obj/$f.o"
+          done
+          cat > /tmp/obj/stub.cpp <<'STUB'
+          #include <windows.h>
+          #include "Runtime.hpp"
+          // Calls every entry point the UE4SS glue uses, so an unresolved symbol in the Win32
+          // half surfaces here rather than as a DLL that will not load in the game.
+          extern "C" __declspec(dllexport) void sds_stub_entry()
+          {
+              sds::Rt().Startup(reinterpret_cast<void*>(&sds_stub_entry));
+              sds::Rt().Tick();
+              sds::Rt().OnTriggerActivated(true, 0);
+              sds::Rt().OnUseStarted();
+              sds::Rt().OnAfterUseDone();
+              sds::Rt().OnStartVibration("SoundWave /G/Scratch_VIBE.Scratch_VIBE", 1.0f, true);
+              sds::Rt().OnSetVibrationLevel(0.5f);
+              sds::Rt().OnStopVibration();
+              sds::Rt().OnStartControllerSound("SoundWave /G/a_CONTROL.a_CONTROL", 1.0f, true);
+              sds::Rt().OnSetControllerSoundLevel(0.5f);
+              sds::Rt().OnStopControllerSound();
+              sds::Rt().OnPadVibrationEnabled(true);
+              sds::Rt().Shutdown();
+          }
+          BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
+          STUB
+          x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror -Isrc -shared \
+            -o /tmp/obj/stub.dll /tmp/obj/stub.cpp /tmp/obj/*.o \
+            -lole32 -loleaut32 -lwinmm -luuid -static-libgcc -static-libstdc++
+          ls -la /tmp/obj/stub.dll
+
+  plugin:
+    name: Plugin DLL (Windows, MSVC)
+    runs-on: windows-latest
+    needs: tests
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Rust is needed: deps/first/patternsleuth is a Rust crate that RE-UE4SS's CMake drives
+      # through corrosion. windows-latest ships a toolchain; assert it rather than discover it
+      # halfway through a 20-minute build.
+      - name: Check the toolchain
+        shell: pwsh
+        run: |
+          cargo --version
+          cmake --version
+          ninja --version
+
+      - name: Clone RE-UE4SS at the pinned SHA
+        shell: pwsh
+        env:
+          UEPSEUDO_PAT: ${{ secrets.UEPSEUDO_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The submodule URLs are git@github.com:..., which has no credentials in CI.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git clone --no-checkout https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
+          git -C RE-UE4SS fetch --depth 1 origin $env:UE4SS_SHA
+          git -C RE-UE4SS checkout --detach FETCH_HEAD
+          Write-Host "RE-UE4SS at $(git -C RE-UE4SS rev-parse HEAD)"
+
+          if ($env:UEPSEUDO_PAT) {
+            Write-Host "UEPSEUDO_PAT is present: fetching every submodule at its recorded pin."
+            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "https://github.com/"
+            git -C RE-UE4SS submodule update --init --recursive
+          } else {
+            $warn = "UEPSEUDO_PAT is not set. deps/first/Unreal points at the PRIVATE repo " +
+                    "Re-UE4SS/UEPseudo (404 unauthenticated), so the Unreal headers are being " +
+                    "taken from the public mirror " +
+                    "$($env:UEPSEUDO_MIRROR_REPO)@$($env:UEPSEUDO_MIRROR_SHA) instead of the " +
+                    "recorded submodule pin eb40a05f. If the resulting DLL fails to load, or " +
+                    "loads and then misbehaves, SUSPECT THIS FIRST."
+            Write-Host "::warning::$warn"
+            # Everything except deps/first/Unreal can come from its real remote.
+            git -C RE-UE4SS submodule update --init --recursive -- deps/first/patternsleuth
+            git clone --no-checkout https://github.com/$env:UEPSEUDO_MIRROR_REPO.git mirror
+            git -C mirror fetch --depth 1 origin $env:UEPSEUDO_MIRROR_SHA
+            git -C mirror checkout --detach FETCH_HEAD
+            $src = Join-Path (Resolve-Path mirror) $env:UEPSEUDO_MIRROR_SUBDIR
+            if (-not (Test-Path (Join-Path $src 'include/Unreal/UObjectGlobals.hpp'))) {
+              throw "The mirror does not contain deps/first/Unreal/include/Unreal/UObjectGlobals.hpp at $src"
+            }
+            $dst = Join-Path (Resolve-Path RE-UE4SS) 'deps/first/Unreal'
+            Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+            Copy-Item -Recurse $src $dst
+          }
+
+          # Whichever route was taken, the header a C++ mod cannot build without must exist.
+          foreach ($h in @('RE-UE4SS/UE4SS/include/Mod/CppUserModBase.hpp',
+                           'RE-UE4SS/deps/first/Unreal/include/Unreal/UObjectGlobals.hpp',
+                           'RE-UE4SS/deps/first/Unreal/include/Unreal/UFunctionStructs.hpp')) {
+            if (-not (Test-Path $h)) { throw "missing required header: $h" }
+          }
+          Write-Host "UE4SS sources are complete."
+
+      # The layout RE-UE4SS documents for C++ mods: a parent project that adds RE-UE4SS and
+      # then the mod. mods/StrayDualSense/CMakeLists.txt detects the UE4SS target and builds
+      # the DLL only in that case.
+      - name: Lay out the parent project
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path StrayDualSense | Out-Null
+          Copy-Item -Recurse -Force repo/mods/StrayDualSense/* StrayDualSense/
+          Set-Content CMakeLists.txt @(
+            'cmake_minimum_required(VERSION 3.22)',
+            'project(StrayDualSenseBuild)',
+            'add_subdirectory(RE-UE4SS)',
+            'add_subdirectory(StrayDualSense)')
+          Get-Content CMakeLists.txt
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$env:BUILD_CONFIG
+
+      # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
+      # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
+      - name: Build the plugin
+        run: cmake --build build --target StrayDualSense --parallel
+
+      - name: Run the portable tests
+        run: ctest --test-dir build --output-on-failure
+
+      # A DLL that does not export start_mod/uninstall_mod is FreeLibrary'd by UE4SS with a
+      # warning and nothing else happens (UE4SS/src/Mod/CppMod.cpp resolves both by literal
+      # name). Check it here rather than discovering it in the game.
+      - name: Verify the mod exports
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter StrayDualSense.dll build | Select-Object -First 1
+          if (-not $dll) { throw "StrayDualSense.dll was not produced" }
+          Write-Host "$($dll.FullName)  $($dll.Length) bytes"
+          $exports = & dumpbin /EXPORTS $dll.FullName | Out-String
+          Write-Host $exports
+          foreach ($sym in @('start_mod', 'uninstall_mod')) {
+            if ($exports -notmatch "\b$sym\b") { throw "missing required export: $sym" }
+          }
+          # /MD is an ABI contract with UE4SS (see mods/StrayDualSense/CMakeLists.txt). A /MT
+          # build would allocate in its own heap and free in UE4SS's, which is silent
+          # corruption rather than a load failure — so assert the dependency is THERE.
+          $deps = & dumpbin /DEPENDENTS $dll.FullName | Out-String
+          Write-Host $deps
+          if ($deps -notmatch 'MSVCP140') {
+            throw "MSVCP140.dll is NOT imported: the mod was built with the static CRT (/MT). " +
+                  "UE4SS passes std::wstring and std::function across the DLL boundary and is " +
+                  "built /MD; mixing them corrupts the heap."
+          }
+          if ($deps -notmatch 'UE4SS.dll') {
+            throw "UE4SS.dll is not imported - the mod did not actually link against UE4SS."
+          }
+          "dll=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        id: verify
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/StrayDualSense/dlls | Out-Null
+          # UE4SS loads <Mods>/<ModName>/dlls/main.dll, so ship it pre-named.
+          Copy-Item "${{ steps.verify.outputs.dll }}" dist/StrayDualSense/dlls/main.dll
+          $pdb = [IO.Path]::ChangeExtension("${{ steps.verify.outputs.dll }}", '.pdb')
+          if (Test-Path $pdb) { Copy-Item $pdb dist/StrayDualSense/dlls/main.pdb }
+          Copy-Item StrayDualSense/StrayDualSense.ini dist/StrayDualSense/
+          Copy-Item StrayDualSense/README.md dist/
+          Copy-Item repo/docs/STRAY-DUALSENSE.md dist/
+          Set-Content dist/mods.txt.fragment @(
+            '; Add this line to <game>/ue4ss/Mods/mods.txt, ABOVE the Keybinds line.',
+            'StrayDualSense : 1')
+          Get-ChildItem -Recurse dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stray-dualsense-plugin
+          path: dist/
+          if-no-files-found: error

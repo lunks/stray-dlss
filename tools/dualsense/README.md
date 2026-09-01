@@ -5,6 +5,12 @@ audio, and PS5 glyphs. The PC build implements all of it and simply never asks f
 
 Full findings: `docs/STRAY-DUALSENSE.md`. Design overview: §11 there.
 
+> **This two-part arrangement is superseded by `mods/StrayDualSense/`**, a single UE4SS C++
+> plugin that does both halves in one DLL — no `libScePad.dll` rename, no command files. The
+> files here remain the reference implementation of the behaviour (and the asset extraction
+> scripts are still the way to populate `vibe/` and `spk/`), but the plugin is what should be
+> installed. Do not run both: they will fight over the pad.
+
 ## Layout
 
 | file | what it is |

@@ -446,3 +446,35 @@ only record requests; worker threads do the long work and abort on a sequence bu
 
 **Give each path its own command file.** Vibration and speaker events fire in the same frame
 for the purr; sharing one one-shot file loses whichever wrote first.
+
+### SUPERSEDED 2026-09-01 by a single UE4SS C++ plugin — `mods/StrayDualSense/`
+
+The three-part design above was forced by ONE constraint: a UE4SS **Lua** mod cannot call
+Sony's API, so the pad half had to live somewhere that could — hence the `libScePad.dll`
+shim, the rename to `libScePad_orig.dll` and the command files bridging two runtimes.
+
+**A UE4SS C++ plugin removes the constraint entirely.** It runs in the game's own process, so
+it can resolve libScePad's exports out of the module the game has already mapped
+(`GetModuleHandleW(L"libScePad.dll")` + `GetProcAddress`) while hooking the same Blueprint
+UFunctions. No proxy DLL, no rename, no `stray_trigger.state` / `stray_vibe.cmd` /
+`stray_spk.cmd`.
+
+Everything measured above is unchanged and is what the plugin implements. Three notes:
+
+* **A plugin cannot intercept `scePadOpen`**, which is how the shim obtained its handle.
+  `scePadGetHandle(userId, 0, 0)` is used instead — verified to return the same handles.
+* **Pad selection was a real bug in the shim, not a port detail.** It bound to the first
+  positive handle. Measured: the game opens user slots 1..4 and **all four return positive
+  handles** (`0x101`, `0x202`, `0x303`, `0x404`), and `scePadGetControllerInformation` returns
+  **success for empty slots too** — they simply come back all-zero, where an occupied slot
+  decodes as `pixelDensity 44.86, touchpad 1920x1080, deadzones 13/13, connectedCount 1,
+  connected 1`. **The `connected` byte at offset 12 is the only reliable discriminator.**
+  Nothing in this API can be judged by its return code.
+* **The threading rule of §11 survives, with one addition.** UE4SS fires `on_update` from its
+  **own event-loop jthread**, not the game thread (RE-UE4SS `UE4SSProgram.cpp:431,
+  m_event_loop = std::jthread{&UE4SSProgram::update, this}`, looping on a 5 ms sleep). UFunction
+  hooks DO run on the game thread. So any UE reflection — reading
+  `HKGameUserSettings.PadVibrationEnabled`, for one — belongs in a hook, never in `on_update`.
+
+**None of the plugin has been run.** `mods/StrayDualSense/README.md` lists what is unverified
+and in what order to check it.
