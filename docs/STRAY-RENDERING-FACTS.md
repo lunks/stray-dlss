@@ -250,3 +250,63 @@ Not a property of the game, but needed to drive it unattended:
   Injecting it on the real keyboard node makes ReShade write a 4K PNG into the game directory.
 * gamescope's `SIGUSR2` screenshot produced no file. `ffmpeg`'s `kmsgrab` cannot read its
   framebuffer, which is `XB30` (`XBGR2101010`, 10-bit HDR).
+
+---
+
+## 11. vkd3d-proton's object model, measured (2026-09-01)
+
+For the native D3D12 hook layer (`docs/superpowers/plans/2026-09-01-dlss-sr-ue4ss-plugin.md`,
+Task 1). Run on the box through `tools/run-harness-proton.sh` — the real RTX 4090, vkd3d-proton
+3.1.0, private Wine prefix and Xvfb display, no ReShade — from the harness built by CI at
+commit `2a597a2`. Verbatim:
+
+```
+[test] whether vtables are shared across objects of a class
+  vtable-static: list=1 queue=1 resource=1 device=1 (second device SAME object)
+  vtables: list=00006FFFFCC60F40/00006FFFFCC60F40 queue=00006FFFFCC61FE0/00006FFFFCC61FE0 resource=00006FFFFCC64740/00006FFFFCC64740 device=00006FFFFCC625E0/00006FFFFCC625E0
+  (recorded, not asserted)
+
+[test] whether private-data interfaces are released at object destruction
+  SetPrivateDataInterface hr=0x00000000
+  private-data-release: fired=1 (fired_before_destroy=0)
+  (recorded, not asserted)
+```
+
+* **`ID3D12GraphicsCommandList`, `ID3D12CommandQueue` and `ID3D12Resource` each share ONE
+  vtable across distinct objects** (two lists on one allocator, two queues, two committed
+  buffers — different objects, identical vtable pointers). Patching a slot in that vtable
+  therefore reaches every existing and future object of the class, process-wide. HARD.
+* **A second `D3D12CreateDevice` on the same adapter returns THE SAME device object**, so the
+  device row is trivially 1; whether two *distinct* vkd3d devices would share a vtable was not
+  measured and does not matter — there is only ever one.
+* **`SetPrivateDataInterface`'s interface is released when the resource is destroyed**, and not
+  before (`fired_before_destroy=0`): the final `Release()` is a usable destruction callback.
+  HARD on vkd3d-proton 3.1.0, as it is documented on Microsoft's runtime.
+
+Same run, the earlier probes: no `ID3D12InfoQueue` on vkd3d (validation is a CI/WARP property),
+the resolve pass, the camera-branch orientation and the clobber/restore golden test all PASS.
+
+## 12. UE4SS attach timing, from two logs of one session (2026-09-01)
+
+Not from a probe — from the box's own `ReShade.log` (local time, America/Sao_Paulo = UTC-3) and
+`ue4ss/UE4SS.log` (UTC, "Timezone: UTC (local disabled due to wine)") of the same launch, laid
+side by side. Both are wall clocks in one process.
+
+```
+ReShade.log  18:10:03:386  Initializing crosire's ReShade version '6.8.0.2155' ... dxgi.dll
+UE4SS.log    21:10:03.440  Console created / UE4SS - v3.0.1 Beta #0 - Git SHA #68caddcf
+UE4SS.log    21:10:03.444  Starting mods (from mods.txt ...)            <- start_cpp_mods() here
+ReShade.log  18:10:04:235  Redirecting CreateDXGIFactory1(...)
+ReShade.log  18:10:04:390  Installing delayed hooks for 'C:\windows\system32\d3d12.dll' (Just loaded via LoadLibrary('d3d12.dll'))
+ReShade.log  18:10:04:414  Redirecting D3D12CreateDevice(...)
+```
+
+* **UE4SS starts its mods ~970 ms BEFORE the game's `D3D12CreateDevice`** (21:10:03.444 against
+  21:10:04.414 UTC), and ~790 ms before the game even creates its DXGI factory. A C++ mod's
+  `start_mod()` runs in `UE4SSProgram`'s constructor at that point (HARD from the UE4SS source,
+  `UE4SSProgram.cpp:386-420`), so early attach is available to a UE4SS mod on this title.
+* **`d3d12.dll` is NOT yet loaded at that moment**: the game `LoadLibrary`s it at 04.390, 24 ms
+  before creating the device. An export hook on `D3D12CreateDevice` from `start_mod()` therefore
+  has to load `d3d12.dll` itself or wait for it — and whatever installs a hook on that export
+  after ReShade's delayed hooks (04.390) sits ABOVE ReShade's and sees ReShade's proxy, not
+  vkd3d's device. The probe build (`mods/StrayDLSS` 0.0.1) measures that directly.
