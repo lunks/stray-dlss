@@ -185,6 +185,21 @@ float proxy_scale_tracked(float paper_white, float fallback_paper_white, float e
 // is 8, which is nobody's idea of the midpoint.
 float smooth_exposure_factor(float previous, float current, float rate);
 
+// Has the codec scale moved far enough from the one NR's history was accumulated at that the
+// history is no longer usable? Same reasoning as the reference's guide-extent latch: feature 18
+// keeps its OWN temporal accumulation, in display-referred units, and the scale defines those
+// units. A scale change silently invalidates the history and nothing else in the pipeline
+// notices — so detect it and force one DLSSNR.Reset frame.
+//
+// Smoothing alone cannot solve this: it makes the mismatch gradual rather than abrupt, which is
+// why a static camera recovers quickly while movement — where the engine's exposure genuinely
+// swings — keeps re-triggering it.
+//
+// Compared as a RATIO, not a difference, because the scale is multiplicative: 1.0 -> 1.1 and
+// 10.0 -> 11.0 are the same relative change and should behave identically. `latched` of 0 or
+// non-finite means "no history yet", which is not a change.
+bool codec_scale_invalidates_history(float latched, float current, float tolerance);
+
 // --- the two halves of the codec ---
 
 // `proxy = SrgbEncode(SoftClip(max(rgb, 0) * scale))`.

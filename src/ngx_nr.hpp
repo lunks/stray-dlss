@@ -117,6 +117,12 @@ void set_codec_tuning(float paper_white, float color_strength, float transfer_st
 // frame leaves that history in units the current proxy no longer matches.
 void set_exposure_smoothing(float rate);
 
+// [STRAYDLSS] NgxNRScaleResetTolerance, default 0.15: how far the codec scale may drift, as a
+// RATIO, before NR's temporal history is discarded with a forced DLSSNR.Reset. The scale defines
+// the display-referred units that history is accumulated in, so a change invalidates it as
+// surely as a guide-grid change does. 0 disables the latch.
+void set_scale_reset_tolerance(float tolerance);
+
 // [STRAYDLSS] NgxNRTrackExposure, default ON — the reference's `trackAutoExposure`
 // (rtx_neural_rendering.h:137-140), which defaults to true and which we dropped in the port.
 //

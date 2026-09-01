@@ -127,6 +127,18 @@ float smooth_exposure_factor(float previous, float current, float rate)
 	return std::isfinite(blended) && blended > 0.0f ? blended : current;
 }
 
+bool codec_scale_invalidates_history(float latched, float current, float tolerance)
+{
+	if (!std::isfinite(latched) || latched <= 0.0f)
+		return false; // no history to invalidate yet
+	if (!std::isfinite(current) || current <= 0.0f)
+		return false; // a bad reading is not evidence of a change
+	if (!std::isfinite(tolerance) || tolerance <= 0.0f)
+		return false; // tolerance 0 disables the latch entirely
+	const float ratio = current > latched ? current / latched : latched / current;
+	return ratio > 1.0f + tolerance;
+}
+
 float proxy_scale_tracked(float paper_white, float fallback_paper_white, float exposure_factor)
 {
 	const float static_scale = proxy_scale(paper_white, fallback_paper_white);

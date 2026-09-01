@@ -48,6 +48,7 @@ bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
 void set_codec_tuning(float, float, float) {}
 void set_exposure_smoothing(float) {}
+void set_scale_reset_tolerance(float) {}
 void set_track_exposure(bool) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
@@ -181,6 +182,10 @@ float g_mvec_scale_override = 0.0f;
 // used raw: NR's own temporal history is accumulated at whatever scale was in force, so a scale
 // that jitters frame to frame leaves that history in the wrong units.
 float g_exposure_smoothed = 0.0f;
+// The codec scale NR's current temporal history was accumulated at, and how far it may drift
+// before that history is discarded. See nrc::codec_scale_invalidates_history.
+float g_scale_latched = 0.0f;
+float g_scale_tolerance = 0.15f; // [STRAYDLSS] NgxNRScaleResetTolerance; 0 disables the latch
 float g_exposure_rate = 0.05f; // [STRAYDLSS] NgxNRExposureSmoothing; 1.0 = off
 float g_paper_white = 1.0f;
 float g_color_strength = 1.0f;
@@ -812,6 +817,7 @@ void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
 void set_track_exposure(bool enabled) { g_track_exposure = enabled; }
 
 void set_exposure_smoothing(float rate) { g_exposure_rate = rate; }
+void set_scale_reset_tolerance(float tol) { g_scale_tolerance = tol; }
 
 void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
 {
@@ -1108,6 +1114,28 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// nothing else in the pipeline notices. Latch the extent and force ONE reset frame when it
 	// moves, exactly as the reference deployment does. (src/core/nr_hook_plan.hpp)
 	bool reset = in.reset;
+
+	// THE CODEC SCALE DEFINES THE UNITS NR'S HISTORY IS ACCUMULATED IN, so a scale change
+	// invalidates that history exactly as a guide-grid change does — and just as silently.
+	// Smoothing damps the jitter but cannot remove this: it makes the mismatch gradual rather
+	// than absent, which is why a static camera recovers quickly while MOVEMENT — where the
+	// engine's exposure genuinely swings — keeps re-triggering it. Measured live: the exposure
+	// factor moved 6.68 -> 7.37 between two readings in one session.
+	//
+	// So latch the scale and force ONE reset when it drifts past the tolerance, the same shape
+	// as the guide-extent latch below. With smoothing on, this should fire rarely.
+	if (nrc::codec_scale_invalidates_history(g_scale_latched, codec_scale, g_scale_tolerance))
+	{
+		reset = true;
+		STRAY_LOG_WARN("NR: the codec scale moved %.4f -> %.4f (past the %.0f%% tolerance). "
+			"Feature 18's temporal accumulation is in display-referred units DEFINED by that "
+			"scale, so it is stale; DLSSNR.Reset is forced for this one frame.",
+			static_cast<double>(g_scale_latched), static_cast<double>(codec_scale),
+			static_cast<double>(g_scale_tolerance * 100.0f));
+	}
+	if (reset || g_scale_latched <= 0.0f)
+		g_scale_latched = codec_scale;
+
 	if (nrplan::latch_guide_extent(g_guide_latch, in.render_width, in.render_height))
 	{
 		reset = true;

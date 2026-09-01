@@ -499,3 +499,27 @@ TEST_CASE("rate 1.0 disables smoothing and rate 0 freezes it")
 	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, 5.0f, 1.0f) == doctest::Approx(5.0f));
 	CHECK(stray_dlss::nrc::smooth_exposure_factor(2.0f, 5.0f, 0.0f) == doctest::Approx(2.0f));
 }
+
+// Feature 18 keeps its own temporal accumulation in display-referred units, and the codec scale
+// defines those units. A scale change invalidates that history silently. Smoothing makes the
+// mismatch gradual rather than absent — which is why a static camera recovers fast while
+// movement keeps re-triggering it — so the scale is latched and a change forces one Reset.
+TEST_CASE("the scale latch compares ratios, not differences")
+{
+	using stray_dlss::nrc::codec_scale_invalidates_history;
+	// Same RELATIVE change at very different magnitudes must behave identically.
+	CHECK(codec_scale_invalidates_history(1.0f, 1.2f, 0.1f));
+	CHECK(codec_scale_invalidates_history(10.0f, 12.0f, 0.1f));
+	// A large absolute difference that is a small relative one must NOT trip.
+	CHECK_FALSE(codec_scale_invalidates_history(100.0f, 105.0f, 0.1f));
+	// Symmetric: a drop of the same ratio trips too.
+	CHECK(codec_scale_invalidates_history(1.2f, 1.0f, 0.1f));
+}
+
+TEST_CASE("the scale latch is inert without history or with bad input")
+{
+	using stray_dlss::nrc::codec_scale_invalidates_history;
+	CHECK_FALSE(codec_scale_invalidates_history(0.0f, 5.0f, 0.1f));  // no history yet
+	CHECK_FALSE(codec_scale_invalidates_history(5.0f, 0.0f, 0.1f));  // bad reading
+	CHECK_FALSE(codec_scale_invalidates_history(5.0f, 50.0f, 0.0f)); // tolerance 0 = disabled
+}
