@@ -647,8 +647,11 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 		return false;
 	}
 
-	const bool is_dlaa = desc.render_width == desc.output_width &&
-		desc.render_height == desc.output_height;
+	// Same derivation as the SR path: NGX picks its reconstruction parameters from
+	// InPerfQualityValue, so it must describe the rect we actually hand it. RR carried the same
+	// hardcoded MaxQuality this file had on the SR side.
+	const DlssQuality rr_quality = dlss_quality_for(desc.render_width, desc.render_height,
+		desc.output_width, desc.output_height);
 
 	NVSDK_NGX_DLSSD_Create_Params create = {};
 	create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
@@ -663,9 +666,18 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	create.InHeight = desc.render_height;
 	create.InTargetWidth = desc.output_width;
 	create.InTargetHeight = desc.output_height;
-	create.InPerfQualityValue = is_dlaa
-		? NVSDK_NGX_PerfQuality_Value_DLAA
-		: NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	NVSDK_NGX_PerfQuality_Value rr_perf = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	switch (rr_quality)
+	{
+	case DlssQuality::dlaa: rr_perf = NVSDK_NGX_PerfQuality_Value_DLAA; break;
+	case DlssQuality::max_quality: rr_perf = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+	case DlssQuality::balanced: rr_perf = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+	case DlssQuality::max_performance: rr_perf = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+	case DlssQuality::ultra_performance:
+		rr_perf = NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+		break;
+	}
+	create.InPerfQualityValue = rr_perf;
 	// SR's flags minus AutoExposure (RR ignores auto-exposure; Remix masks it off —
 	// RESEARCH-RR-GBUFFER.md §2.1). Preset: Default — the RR guide recommends games stick
 	// to Preset_Default (the defs only bless D and E as named alternates), so no
@@ -694,7 +706,7 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	STRAY_LOG_INFO("DLSS RR feature created: %ux%u -> %ux%u, %s, preset=Default, flags=0x%x "
 		"(DLUnified, Unpacked roughness, HW depth)",
 		desc.render_width, desc.render_height, desc.output_width, desc.output_height,
-		is_dlaa ? "DLAA" : "MaxQuality",
+		dlss_quality_name(rr_quality),
 		static_cast<unsigned>(create.InFeatureCreateFlags));
 	return true;
 }
