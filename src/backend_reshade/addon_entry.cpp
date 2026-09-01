@@ -582,7 +582,7 @@ void draw_nr_controls()
 	if (ImGui::Button("Reset to defaults"))
 	{
 		const bool was_enabled = g_nr_ui.enabled;
-		g_nr_ui = NrUiState{};
+		g_nr_ui = app::NrLive{};
 		g_nr_ui.enabled = was_enabled;
 		app::instance().apply_nr_live();
 	}
