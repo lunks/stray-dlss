@@ -2099,6 +2099,28 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// a layout error. Reading the row back restores the
 										// self-check below, which is the only runtime detector we
 										// have for a genuinely bad read.
+										// Once per session, print the WHOLE of row 135 from one read
+										// so the [derived] offset validates itself. Expect
+										// (~1.4e-45, P, 1/P, 0.0): .x is an int32 MSAA count
+										// reinterpreted as float and .w is padding. If .x is a
+										// normal float or .w is not zero, we are reading the wrong
+										// row and everything derived from it is suspect.
+										static bool s_row135_logged = false;
+										if (view_ok && !s_row135_logged)
+										{
+											s_row135_logged = true;
+											const auto &r = view.pre_exposure_row;
+											const bool x_denormal = r.x > 0.0f && r.x < 1e-30f;
+											STRAY_LOG_WARN("View row 135 (one read): x=%.9g y=%.6f "
+												"z=%.6f w=%.9g | y*z=%.6f (want 1.0) | x denormal=%d "
+												"(want 1, it is an int32 MSAA count) | w==0=%d "
+												"(want 1, it is padding). All three must hold or "
+												"kPreExposureRow is the wrong offset.",
+												static_cast<double>(r.x), static_cast<double>(r.y),
+												static_cast<double>(r.z), static_cast<double>(r.w),
+												static_cast<double>(r.y) * static_cast<double>(r.z),
+												x_denormal ? 1 : 0, r.w == 0.0f ? 1 : 0);
+										}
 										ni.one_over_pre_exposure =
 											view_ok ? view.one_over_pre_exposure : 0.0f;
 										// The pair being reciprocals is what makes this free: a

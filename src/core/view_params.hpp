@@ -50,6 +50,10 @@ struct ViewParams
 	Float4 temporal_aa_params{};  // (Index, Count, JitterPixelsX, JitterPixelsY)
 	float pre_exposure = 1.0f;
 	float one_over_pre_exposure = 1.0f;
+	// All four components of row 135 from ONE read, so the offset can be validated structurally
+	// (.x a denormal, .w exactly 0.0) rather than by comparing numbers sampled at different
+	// moments — which is the mistake that produced a wrong "fix" to this very row.
+	Float4 pre_exposure_row{};
 	float near_plane = 0.0f;
 	float delta_time = 0.0f;
 	float camera_cut = 0.0f;

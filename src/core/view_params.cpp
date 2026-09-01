@@ -66,6 +66,15 @@ bool parse_view_params(const void *data, std::size_t size, ViewParams &out)
 
 	out.pre_exposure = read_scalar(data, ViewRow::kPreExposureRow, kPreExposureComponent);
 	out.one_over_pre_exposure = read_scalar(data, ViewRow::kPreExposureRow, kOneOverPreExposureComponent);
+	// The WHOLE row, from this same read, so the mapping can prove itself. Row 135 must look
+	// like (NumSceneColorMSAASamples-as-float, P, 1/P, padding):
+	//   .x  an int32 1 or 4 reinterpreted as float — a DENORMAL near 1.4e-45, never a sane float
+	//   .w  struct padding — exactly 0.0
+	// Those two are structural fingerprints that cannot arise by coincidence at a wrong offset,
+	// which makes them a stronger check than the reciprocal test: they do not depend on the two
+	// halves being sampled at the same instant. `kPreExposureRow` is [derived] and has never been
+	// verified against the running game; this is how that gets settled.
+	out.pre_exposure_row = read_float4(data, ViewRow::kPreExposureRow);
 	out.near_plane = read_scalar(data, ViewRow::kNearPlaneRow, kNearPlaneComponent);
 	out.delta_time = read_scalar(data, ViewRow::kDeltaTimeRow, kDeltaTimeComponent);
 	out.camera_cut = read_scalar(data, ViewRow::kCameraCutRow, kCameraCutComponent);
