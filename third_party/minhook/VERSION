@@ -1,0 +1,9 @@
+MinHook, vendored from https://github.com/TsudaKageyu/minhook
+commit 8fda4f5481fed5797dc2651cd91e238e9b3928c6
+
+That is the commit ReShade v6.8.0 pins as its own `deps/minhook` submodule (read from the
+crosire/reshade tree at tag v6.8.0), so the copy running in ReShade's dxgi.dll and the copy in
+our plugin are the same code. Licence: BSD-2-Clause (LICENSE.txt).
+
+Only the x64 sources are kept: hde32.c / table32.h are not needed for a 64-bit-only build.
+The 32-bit half of hde64.c's neighbours is compiled out by _M_X64 / __x86_64__ in hook.c.
