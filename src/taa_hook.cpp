@@ -16,6 +16,7 @@
 
 #include <d3d12.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -2060,13 +2061,26 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// and only when NgxNRTrackExposure is on; a frame whose
 										// View CB did not decode leaves it 0 and the codec falls
 										// back to its static scale.
+										// DERIVED from PreExposure (row 135.y), never read from
+										// row 135.z. Measured 2026-09-01 live: 135.y read 0.456
+										// while 135.z read 6.6794 — their product is 3.05, not 1,
+										// so 135.z is NOT OneOverPreExposure. Both rows were
+										// [derived] in §2.6 and never measured; 135.y is
+										// corroborated by the SR path having used it correctly
+										// for a long time, 135.z is not corroborated by anything.
+										// Taking the reciprocal ourselves is self-consistent by
+										// construction and drops a dependency on an unverified row.
 										ni.one_over_pre_exposure =
-											view_ok ? view.one_over_pre_exposure : 0.0f;
+											(view_ok && view.pre_exposure > 0.0f)
+												? 1.0f / view.pre_exposure
+												: 0.0f;
 										// Self-checking pair (rows 135.y/135.z are reciprocals),
 										// verified at the point of USE rather than in the
 										// whole-view gate, which governs the entire DLSS path.
-										ni.pre_exposure_ok =
-											view_ok && ue4::pre_exposure_plausible(view);
+										// Only PreExposure itself needs checking now: the
+										// reciprocal is computed, so the pair cannot disagree.
+										ni.pre_exposure_ok = view_ok && view.pre_exposure > 0.0f &&
+											std::isfinite(view.pre_exposure);
 										nr::apply(reinterpret_cast<ID3D12Device *>(
 											device->get_native()), native, ni);
 									}

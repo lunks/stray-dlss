@@ -1033,7 +1033,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		{
 			s_scale_logged = true;
 			STRAY_LOG_WARN("NR codec scale: paperWhite=%.4f -> staticScale=%.4f x exposure=%.4f "
-				"(View row 135.z OneOverPreExposure; tracking=%s%s) = EFFECTIVE %.4f. The 0.75 "
+				"(1/PreExposure, derived from View row 135.y; tracking=%s%s) = EFFECTIVE %.4f. The 0.75 "
 				"soft-clip knee is what this has to land the frame near. Stray's scene colour "
 				"here carries UE4's pre-exposure (~0.056 measured), so an untracked scale near "
 				"1.0 shows the network a nearly black image — which is why hand-dialling paper "
