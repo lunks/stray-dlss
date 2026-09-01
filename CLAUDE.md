@@ -1250,6 +1250,46 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### The drift was mostly EXPOSURE COUPLING, and we caused it by dropping a feature in the port
+
+> **CORRECTED 2026-09-01, on the user's report that `NgxNRTrackExposure` "seem[s] to fix a lot of
+> it".** The section below diagnoses the drift as PLACEMENT — NR's residual re-entering the TAA
+> `u0`. That is real but was **not the dominant term**. Read this first.
+
+The reference ships **`trackAutoExposure`, default TRUE** (`rtx_neural_rendering.h:137-140`): its
+proxy scale is multiplied by the engine's live exposure, so the codec's soft-clip knee follows
+scene brightness. **We dropped it in the port and hardcoded a static scale.** The consequence is
+a feedback loop we introduced ourselves:
+
+* `u0` feeds the eye-adaptation histogram (`PostProcessing.cpp:626-648`), which drives exposure
+  on later frames.
+* With a FIXED knee and a MOVING exposure, the codec's operating point drifts, so the residual
+  `(n - p)/s` becomes a function of the exposure that the residual just perturbed.
+* That compounds — and it is *global*, which fits the measured signature (a whole-frame mean
+  decay of 82.9 -> 52.6) far better than a reflection-specific mechanism ever did. It is also
+  why `r.SSR.Quality=0` did not stop it.
+
+`[STRAYDLSS] NgxNRTrackExposure` (default ON) multiplies the scale by `OneOverPreExposure` (View
+CB row 135.z) on the `taa` site only — post-tonemap sites have no pre-exposure to undo.
+
+**Two lessons, and the second is the general one:**
+
+1. **A hand-tuned constant that works is a bug report.** The user found `NgxNRPaperWhiteScale`
+   ≈ 0.1 looked best. `1/PreExposure` measured 0.056, i.e. ~18 — the same quantity. They were
+   hand-dialling a value the engine already knew. When a knob's best setting turns out to equal
+   something the engine publishes, the knob is standing in for a missing wire.
+2. **When porting a working implementation, an omitted feature is a defect even if the code
+   compiles and the image looks plausible.** We reproduced the codec's arithmetic faithfully —
+   and verified it line by line — while dropping the control loop around it, then spent
+   considerable effort diagnosing the resulting instability as an architectural property of our
+   hook point. Check what the reference's OPTIONS do, not only what its shaders compute.
+
+**What this does NOT retract:** `u0` genuinely is both scene colour and next-frame history
+(`TemporalAA.cpp:696`), NR genuinely does keep its own temporal history, and the user reports the
+drift is present with DLSS SR alone and merely amplified by NR. So a residual placement effect
+remains, and the SR-only baseline still wants its own explanation. But the dominant, fixable term
+was ours.
+
 ### NR's output feeds the engine's temporal history, and that compounds (measured 2026-09-01)
 
 **Symptom, user-reported and then measured:** with NR on, everything temporally accumulated
