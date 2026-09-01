@@ -28,6 +28,21 @@ struct Status
 	unsigned int feature_init_result = 0;
 };
 
+// [STRAYDLSS] NgxSnippetPath: an extra directory for NGX to search for feature DLLs
+// ("snippets"). Must be set BEFORE initialise(). Empty = auto (the game executable's
+// directory, then our own add-on's directory).
+//
+// Why this exists: NGX resolves its snippets INDEPENDENTLY of anything we LoadLibrary. The
+// driver ships nvngx_dlss/nvngx_dlssd, so SR and RR resolve by default — but a
+// side-loaded snippet like nvngx_dlssnr.dll exists only in the game directory, and if NGX
+// does not search there, feature creation fails with FAIL_OutOfDate no matter what we have
+// loaded into the process. NVSDK_NGX_FeatureCommonInfo::PathListInfo is the documented
+// mechanism (nvsdk_ngx.h:133-135: "a list of paths where feature DLLs can be located, other
+// than the default path (application directory)"). There is NO per-feature path override in
+// the SDK — Snippet.OptLevel / Snippet.IsDevBranch are read-back diagnostics only — so this
+// init-time list is the only lever.
+void set_snippet_path(const char *utf8_path);
+
 // Returns the status either way; a failed init is a reportable outcome, not an exception.
 Status initialise(ID3D12Device *device);
 void shutdown(ID3D12Device *device);

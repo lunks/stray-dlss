@@ -142,6 +142,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/ngx_backend.hpp
         src/ngx_nr.cpp
         src/ngx_nr.hpp
+        src/ngx_snippet.cpp
+        src/ngx_snippet.hpp
         src/shader_dump.cpp
         src/shader_dump.hpp
         src/frame_state.cpp

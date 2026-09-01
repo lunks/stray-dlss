@@ -10,6 +10,7 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_nr.hpp"
+#include "ngx_snippet.hpp"
 #include "core/taa_hashes.hpp"
 #include "ext_unhook.hpp"
 #include "frame_state.hpp"
@@ -336,6 +337,14 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNR", ngx_nr);
 	nr::set_enabled(ngx_nr);
 
+	// [STRAYDLSS] NgxSnippetPath: extra directory for NGX's own snippet search (additive to
+	// its default application-directory search). Must be set before ngx::initialise.
+	char snippet_path[480] = "";
+	size_t snippet_path_size = sizeof(snippet_path);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxSnippetPath", snippet_path,
+		&snippet_path_size);
+	ngx::set_snippet_path(snippet_path);
+
 	char nr_dll[480] = "";
 	size_t nr_dll_size = sizeof(nr_dll);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRDll", nr_dll, &nr_dll_size);
@@ -359,6 +368,16 @@ void on_init_device(reshade::api::device *device)
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", nr_local_structure);
 	nr::set_tuning(nr_intensity, nr_local_tone, nr_local_structure);
 
+	// [STRAYDLSS] NgxNRIdentity: what our GetModuleFileNameW hook reports to the snippet —
+	// "passthrough" (default: answer truthfully, only log), "snippet", "nvngx", "exe". The
+	// runtime interrogates module identity and we do not know what it demands, so the default
+	// changes nothing and the logged call trace is the diagnostic.
+	char nr_identity[24] = "passthrough";
+	size_t nr_identity_size = sizeof(nr_identity);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIdentity", nr_identity,
+		&nr_identity_size);
+	snippet::set_identity_from_string(nr_identity);
+
 	float nr_mvec_scale = 0.0f;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", nr_mvec_scale);
 	nr::set_mvec_scale_override(nr_mvec_scale);
@@ -370,8 +389,9 @@ void on_init_device(reshade::api::device *device)
 			"Grep 'NR' lines.", nr_sr_shaped ? "sr-shaped" : "post-process",
 			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale);
 		// MUST precede NVSDK_NGX_D3D12_Init_* — the runtime is pre-loaded at device init.
-		// (docs/RESEARCH-RENODX-DLSS5.md §3.2)
-		nr::load_runtime();
+		// (docs/RESEARCH-RENODX-DLSS5.md §3.2). This also resolves the snippet's own NGX
+		// exports and patches its GetModuleFileNameW import, then initialises it directly.
+		nr::load_runtime(native);
 	}
 
 	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip

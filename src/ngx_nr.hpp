@@ -61,7 +61,10 @@ void set_mvec_scale_override(float scale);
 // NVSDK_NGX_D3D12_Init_* (§3.2: the addon pre-loads it at device creation). Logs the exact
 // path tried and whether the load succeeded — a missing or blocked DLL must be unmistakable.
 // Returns false and records last_error() on failure; NR then stays off for the session.
-bool load_runtime();
+// `device` is used for the snippet's own Init_Ext. Returns false only when the snippet could
+// not be loaded/resolved at all; a snippet that loads but fails Init_Ext still returns true and
+// falls back to the NGX core path, with the failure logged.
+bool load_runtime(ID3D12Device *device);
 
 struct ApplyInputs
 {

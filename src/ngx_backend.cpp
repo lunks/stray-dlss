@@ -47,6 +47,7 @@ void set_rr_mode(int) {}
 int rr_mode() { return 0; }
 void set_exposure_from_texture(bool) {}
 bool exposure_from_texture() { return false; }
+void set_snippet_path(const char *) {}
 void set_exposure_scale(float) {}
 float exposure_scale() { return 1.0f; }
 const RRStatus &rr_status() { return g_rr_status; }
@@ -102,6 +103,92 @@ char g_last_error[256] = "";
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
 bool g_exposure_from_texture = false;
+
+// --- NGX snippet search paths (ngx_backend.hpp: set_snippet_path) ---
+//
+// ALL FILE-STATIC ON PURPOSE. NVSDK_NGX_PathListInfo holds `wchar_t const* const* Path` — a
+// borrowed array of borrowed strings — and NVSDK_NGX_FeatureCommonInfo additionally carries an
+// InternalData pointer that NGX writes into, so NGX plainly retains the struct. Passing any of
+// this from the stack is the classic lifetime trap with this API: the paths are read long after
+// Init returns and a stack temporary is a dangling read.
+constexpr unsigned int kMaxSnippetPaths = 3;
+constexpr std::size_t kSnippetPathChars = 512;
+wchar_t g_snippet_paths[kMaxSnippetPaths][kSnippetPathChars] = {};
+const wchar_t *g_snippet_path_ptrs[kMaxSnippetPaths] = {};
+unsigned int g_snippet_path_count = 0;
+char g_snippet_path_override[kSnippetPathChars] = "";
+NVSDK_NGX_FeatureCommonInfo g_common_info = {};
+
+// Strips the file name from a full module path, leaving the directory (no trailing slash).
+void strip_to_directory(wchar_t *path)
+{
+	wchar_t *last = nullptr;
+	for (wchar_t *p = path; *p != 0; ++p)
+		if (*p == L'\\' || *p == L'/')
+			last = p;
+	if (last != nullptr)
+		*last = 0;
+}
+
+bool add_snippet_path(const wchar_t *dir)
+{
+	if (dir == nullptr || dir[0] == 0 || g_snippet_path_count >= kMaxSnippetPaths)
+		return false;
+	// Skip duplicates: a repeated directory just wastes a search slot.
+	for (unsigned int i = 0; i < g_snippet_path_count; ++i)
+		if (::lstrcmpiW(g_snippet_paths[i], dir) == 0)
+			return false;
+	std::size_t n = 0;
+	while (dir[n] != 0 && n + 1 < kSnippetPathChars)
+	{
+		g_snippet_paths[g_snippet_path_count][n] = dir[n];
+		++n;
+	}
+	g_snippet_paths[g_snippet_path_count][n] = 0;
+	g_snippet_path_ptrs[g_snippet_path_count] = g_snippet_paths[g_snippet_path_count];
+	++g_snippet_path_count;
+	return true;
+}
+
+// Builds the search list, in descending order of preference:
+//   1. [STRAYDLSS] NgxSnippetPath, when the operator set one (testing / non-standard staging).
+//   2. The GAME EXECUTABLE's directory — where the operator stages nvngx_dlssnr.dll, and what
+//      the header calls the "application directory". Resolved from GetModuleFileNameW(nullptr)
+//      rather than the CWD, which under Proton is not reliably the exe directory, and rather
+//      than hardcoding anything.
+//   3. Our own add-on's directory, in case a snippet is staged beside the add-on instead.
+void build_snippet_paths()
+{
+	g_snippet_path_count = 0;
+
+	if (g_snippet_path_override[0] != 0)
+	{
+		wchar_t wide[kSnippetPathChars] = {};
+		if (::MultiByteToWideChar(CP_UTF8, 0, g_snippet_path_override, -1, wide,
+				static_cast<int>(kSnippetPathChars) - 1) > 0)
+			add_snippet_path(wide);
+	}
+
+	wchar_t exe[kSnippetPathChars] = {};
+	if (::GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(kSnippetPathChars)) > 0)
+	{
+		strip_to_directory(exe);
+		add_snippet_path(exe);
+	}
+
+	HMODULE self = nullptr;
+	if (::GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&build_snippet_paths), &self) && self != nullptr)
+	{
+		wchar_t own[kSnippetPathChars] = {};
+		if (::GetModuleFileNameW(self, own, static_cast<DWORD>(kSnippetPathChars)) > 0)
+		{
+			strip_to_directory(own);
+			add_snippet_path(own);
+		}
+	}
+}
 // [STRAYDLSS] NgxExposureScale (ngx_backend.hpp): InExposureScale under texture mode.
 float g_exposure_scale = 1.0f;
 
@@ -233,16 +320,34 @@ Status initialise(ID3D12Device *device)
 	logging_info.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
 	logging_info.DisableOtherLoggingSinks = false;
 
-	NVSDK_NGX_FeatureCommonInfo common_info = {};
-	common_info.LoggingInfo = logging_info;
+	// PathListInfo: extra directories NGX searches for feature DLLs, "other than the default
+	// path (application directory)" (nvsdk_ngx.h:133-135). Additive — the driver-shipped
+	// SR/RR snippets keep resolving exactly as before; this only ADDS places to look, which
+	// is what a side-loaded snippet needs. g_common_info is FILE-STATIC because NGX retains
+	// it (it writes through InternalData) and the path array is borrowed, not copied.
+	build_snippet_paths();
+	g_common_info = NVSDK_NGX_FeatureCommonInfo{};
+	g_common_info.LoggingInfo = logging_info;
+	g_common_info.PathListInfo.Path = g_snippet_path_ptrs;
+	g_common_info.PathListInfo.Length = g_snippet_path_count;
 
+	for (unsigned int i = 0; i < g_snippet_path_count; ++i)
+		STRAY_LOG_INFO("NGX snippet search path[%u] = '%ls'", i, g_snippet_paths[i]);
+	if (g_snippet_path_count == 0)
+		STRAY_LOG_WARN("NGX snippet search list is EMPTY; only NGX's own default (the "
+			"application directory) will be searched.");
+
+	// InApplicationDataPath stays L"." deliberately: the header defines it as the directory
+	// "to store logs and other temporary files" (nvsdk_ngx.h:125-127), NOT a snippet search
+	// path, so changing it cannot affect feature resolution and would only move NGX's log
+	// files. Left alone to keep SR/RR byte-identical.
 	const NVSDK_NGX_Result init_result = NVSDK_NGX_D3D12_Init_with_ProjectID(
 		kProjectId,
 		NVSDK_NGX_ENGINE_TYPE_CUSTOM,
 		kEngineVersion,
 		L".",
 		device,
-		&common_info,
+		&g_common_info,
 		NVSDK_NGX_Version_API);
 
 	g_status.init_result = static_cast<unsigned int>(init_result);
@@ -475,6 +580,14 @@ void set_rr_mode(int mode)
 
 int rr_mode() { return g_rr_mode; }
 const RRStatus &rr_status() { return g_rr_status; }
+
+void set_snippet_path(const char *utf8_path)
+{
+	if (utf8_path == nullptr)
+		g_snippet_path_override[0] = 0;
+	else
+		std::snprintf(g_snippet_path_override, sizeof(g_snippet_path_override), "%s", utf8_path);
+}
 
 void set_exposure_from_texture(bool use_texture) { g_exposure_from_texture = use_texture; }
 bool exposure_from_texture() { return g_exposure_from_texture; }

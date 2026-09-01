@@ -3,6 +3,7 @@
 #include "ext_unhook.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
+#include "ngx_snippet.hpp"
 
 #include <d3d12.h>
 
@@ -35,7 +36,7 @@ void set_dll_path(const char *) {}
 void set_topology(Topology) {}
 void set_tuning(float, float, float) {}
 void set_mvec_scale_override(float) {}
-bool load_runtime() { return false; }
+bool load_runtime(ID3D12Device *) { return false; }
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
 void shutdown() {}
@@ -114,7 +115,15 @@ constexpr int kValidateLatency = 5;
 // Luminance floor. The addon's own shader uses `neural_y <= 1e-5` (§4.1); we accept any texel
 // above it anywhere in the crop.
 constexpr double kLumaFloor = 1e-5;
+// Application id for the snippet's own Init_Ext. NGX's ProjectID form is not exported by the
+// snippet, so the numeric-id form is used; the value is ours and needs no NVIDIA registration
+// (same reasoning as the SR path's self-generated project GUID).
+constexpr unsigned long long kNrApplicationId = 0x5354524159444C53ull; // "STRAYDLS"
 
+// True once the snippet's OWN exports are resolved AND its Init_Ext succeeded. Everything
+// feature-18 then goes through the snippet rather than the NGX core, because the core has no
+// knowledge of a pre-release snippet and answers FAIL_OutOfDate (measured: 0xbad0000c).
+bool g_use_direct = false;
 bool g_enabled = false;
 Topology g_topology = Topology::post_process;
 float g_intensity = 1.0f;
@@ -124,7 +133,9 @@ float g_mvec_scale_override = 0.0f;
 char g_dll_path[512] = "";
 char g_last_error[256] = "";
 
-HMODULE g_runtime = nullptr;
+// The snippet module is owned by src/ngx_snippet.cpp; this only records that the load was
+// attempted and succeeded, so apply() can tell "never loaded" from "loaded but not initialised".
+bool g_runtime_loaded = false;
 bool g_runtime_tried = false;
 
 NVSDK_NGX_Handle *g_feature = nullptr;
@@ -220,17 +231,58 @@ void retire_keep_alive(bool all)
 	g_keep_alive_count = kept;
 }
 
+// --- route every feature-18 NGX call to the snippet when the direct path is live ---
+NVSDK_NGX_Result nr_alloc_params(NVSDK_NGX_Parameter **out)
+{
+	if (g_use_direct)
+		return static_cast<NVSDK_NGX_Result>(
+			snippet::allocate_parameters(reinterpret_cast<void **>(out)));
+	return NVSDK_NGX_D3D12_AllocateParameters(out);
+}
+
+NVSDK_NGX_Result nr_destroy_params(NVSDK_NGX_Parameter *p)
+{
+	if (g_use_direct)
+		return static_cast<NVSDK_NGX_Result>(snippet::destroy_parameters(p));
+	return NVSDK_NGX_D3D12_DestroyParameters(p);
+}
+
+NVSDK_NGX_Result nr_create_feature(ID3D12GraphicsCommandList *cmd, NVSDK_NGX_Parameter *p,
+                                   NVSDK_NGX_Handle **out)
+{
+	if (g_use_direct)
+		return static_cast<NVSDK_NGX_Result>(snippet::create_feature(cmd,
+			static_cast<unsigned int>(NVSDK_NGX_Feature_Reserved18), p,
+			reinterpret_cast<void **>(out)));
+	return NVSDK_NGX_D3D12_CreateFeature(cmd, NVSDK_NGX_Feature_Reserved18, p, out);
+}
+
+NVSDK_NGX_Result nr_evaluate_feature(ID3D12GraphicsCommandList *cmd, NVSDK_NGX_Handle *h,
+                                     NVSDK_NGX_Parameter *p)
+{
+	if (g_use_direct)
+		return static_cast<NVSDK_NGX_Result>(snippet::evaluate_feature(cmd, h, p));
+	return NVSDK_NGX_D3D12_EvaluateFeature(cmd, h, p, nullptr);
+}
+
+NVSDK_NGX_Result nr_release_feature(NVSDK_NGX_Handle *h)
+{
+	if (g_use_direct)
+		return static_cast<NVSDK_NGX_Result>(snippet::release_feature(h));
+	return NVSDK_NGX_D3D12_ReleaseFeature(h);
+}
+
 void release_feature()
 {
 	retire_keep_alive(/*all=*/true);
 	if (g_feature != nullptr)
 	{
-		NVSDK_NGX_D3D12_ReleaseFeature(g_feature);
+		nr_release_feature(g_feature);
 		g_feature = nullptr;
 	}
 	if (g_params != nullptr)
 	{
-		NVSDK_NGX_D3D12_DestroyParameters(g_params);
+		nr_destroy_params(g_params);
 		g_params = nullptr;
 	}
 	g_feature_render_w = g_feature_render_h = g_feature_out_w = g_feature_out_h = 0;
@@ -254,7 +306,7 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 
 	release_feature();
 
-	NVSDK_NGX_Result result = NVSDK_NGX_D3D12_AllocateParameters(&g_params);
+	NVSDK_NGX_Result result = nr_alloc_params(&g_params);
 	if (NVSDK_NGX_FAILED(result) || g_params == nullptr)
 	{
 		set_error("AllocateParameters", result);
@@ -284,8 +336,7 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 		in_w, in_h, out_w, out_h, post ? "post-process" : "sr-shaped",
 		g_intensity, g_local_tone, g_local_structure);
 
-	result = NVSDK_NGX_D3D12_CreateFeature(cmd, NVSDK_NGX_Feature_Reserved18, g_params,
-		&g_feature);
+	result = nr_create_feature(cmd, g_params, &g_feature);
 	if (NVSDK_NGX_FAILED(result) || g_feature == nullptr)
 	{
 		set_error("CreateFeature(18)", result);
@@ -303,7 +354,11 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	g_feature_out_w = out_w;
 	g_feature_out_h = out_h;
 	g_last_error[0] = 0;
-	STRAY_LOG_WARN("NR: NGX feature 18 CREATED. DLSS Neural Rendering is live; the result is "
+	STRAY_LOG_WARN("NR: NGX feature 18 CREATED via the %s.%s",
+		g_use_direct ? "SNIPPET's own exports (direct path)" : "NGX core",
+		g_use_direct ? "" : " The core does not know this pre-release snippet, so this is "
+			"unexpected — if it works, note it.");
+	STRAY_LOG_WARN("NR: feature 18 live. DLSS Neural Rendering is live; the result is "
 		"validated against a black/degenerate output before it is allowed on screen.");
 	return true;
 }
@@ -550,48 +605,50 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 		out[i] = g_refusals[i].load(std::memory_order_relaxed);
 }
 
-bool load_runtime()
+bool load_runtime(ID3D12Device *device)
 {
 	if (!g_enabled || g_runtime_tried)
-		return g_runtime != nullptr;
+		return g_runtime_loaded;
 	g_runtime_tried = true;
 
-	// Default: beside the game executable, which is where the operator staged it and where the
-	// NGX loader looks. (docs/RESEARCH-RENODX-DLSS5.md §3.2)
-	const char *path = g_dll_path[0] != 0 ? g_dll_path : "nvngx_dlssnr.dll";
-
-	wchar_t wide[512] = {};
-	const int n = ::MultiByteToWideChar(CP_UTF8, 0, path, -1, wide,
-		static_cast<int>(sizeof(wide) / sizeof(wide[0])) - 1);
-	if (n <= 0)
+	// Load the snippet and resolve ITS OWN NGX exports (src/ngx_snippet.hpp). Also patches the
+	// snippet's GetModuleFileNameW import so its identity queries are observable.
+	const bool direct = snippet::load(g_dll_path);
+	g_runtime_loaded = direct;
+	if (!direct)
 	{
-		std::snprintf(g_last_error, sizeof(g_last_error), "bad NgxNRDll path '%s'", path);
-		STRAY_LOG_ERROR("NR: %s", g_last_error);
+		std::snprintf(g_last_error, sizeof(g_last_error), "%s", snippet::last_error());
+		STRAY_LOG_ERROR("NR: the snippet's direct NGX path is unavailable (%s). NR stays OFF; "
+			"SR/RR are unaffected.", g_last_error);
 		return false;
 	}
 
-	g_runtime = ::LoadLibraryExW(wide, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-	if (g_runtime == nullptr)
-		g_runtime = ::LoadLibraryW(wide);
-
-	if (g_runtime == nullptr)
+	// Initialise the snippet through its OWN Init_Ext, not the NGX core. This is the whole
+	// point: the core resolves only driver-shipped snippets, so asking it for feature 18
+	// returns FAIL_OutOfDate (measured 0xbad0000c) however the DLL is staged. RenoDX drives
+	// this same runtime the same way ("direct Init_Ext failed with 0x..." is its own error
+	// string for this call).
+	const auto init = static_cast<NVSDK_NGX_Result>(snippet::init_ext(
+		kNrApplicationId, L".", device, static_cast<unsigned int>(NVSDK_NGX_Version_API),
+		nullptr));
+	if (NVSDK_NGX_FAILED(init))
 	{
-		const unsigned err = static_cast<unsigned>(::GetLastError());
-		std::snprintf(g_last_error, sizeof(g_last_error),
-			"LoadLibrary('%s') failed, GetLastError=%u", path, err);
-		STRAY_LOG_ERROR("NR: nvngx_dlssnr.dll NOT LOADED — %s", g_last_error);
-		STRAY_LOG_ERROR("  Tried exactly this path: '%s'. Stage NVIDIA's nvngx_dlssnr.dll "
-			"beside the game executable, or set [STRAYDLSS] NgxNRDll to its full path. "
-			"NR stays OFF for this session; SR/RR are unaffected.", path);
-		return false;
+		set_error("snippet Init_Ext", init);
+		STRAY_LOG_ERROR("  The snippet loaded and exported the API but refused to initialise. "
+			"If it is an identity check, the GetModuleFileNameW trace above/below shows what "
+			"it asked for — try [STRAYDLSS] NgxNRIdentity=snippet|nvngx|exe. NR falls back to "
+			"the NGX core path, which is expected to answer FAIL_OutOfDate.");
+		snippet::log_identity_calls();
+		g_use_direct = false;
+		// Stay "loaded": the core path is still worth attempting, and its failure is itself
+		// the evidence that the direct path is the only viable one.
+		return true;
 	}
 
-	char loaded[MAX_PATH] = {};
-	::GetModuleFileNameA(g_runtime, loaded, MAX_PATH);
-	STRAY_LOG_WARN("NR: nvngx_dlssnr.dll LOADED from '%s' (requested '%s'). This is a leaked "
-		"pre-release runtime; on an RTX 4090 it must be an Ada-patched build or feature-18 "
-		"create will fail. (docs/RESEARCH-RENODX-DLSS5.md §3.2)",
-		loaded[0] ? loaded : "<unknown>", path);
+	g_use_direct = true;
+	STRAY_LOG_WARN("NR: snippet Init_Ext SUCCEEDED — feature 18 will be created and evaluated "
+		"through the SNIPPET's own exports, bypassing the NGX core entirely.");
+	snippet::log_identity_calls();
 	return true;
 }
 
@@ -599,7 +656,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 {
 	if (!g_enabled)
 		return false;
-	if (g_runtime == nullptr)
+	if (!g_runtime_loaded)
 		return refuse(kRefDllMissing, "nvngx_dlssnr.dll was never loaded.");
 	if (device == nullptr || cmd == nullptr || in.image == nullptr || in.depth == nullptr ||
 		in.motion_vectors == nullptr || in.render_width == 0 || in.output_width == 0)
@@ -681,7 +738,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	}
 
 	const NVSDK_NGX_Result result =
-		NVSDK_NGX_D3D12_EvaluateFeature(cmd, g_feature, g_params, nullptr);
+		nr_evaluate_feature(cmd, g_feature, g_params);
 	if (NVSDK_NGX_FAILED(result))
 	{
 		set_error("EvaluateFeature(18)", result);
@@ -827,12 +884,11 @@ void shutdown()
 	release_feature();
 	release(g_validate_readback);
 	release(g_nr_output);
-	if (g_runtime != nullptr)
-	{
-		// Deliberately NOT FreeLibrary'd: NGX may still hold references into the runtime and
-		// unloading a 165 MB neural DLL under a live device is not worth the teardown risk.
-		g_runtime = nullptr;
-	}
+	// The snippet module is deliberately NOT FreeLibrary'd: it may still hold references, and
+	// unloading a 165 MB neural DLL under a live device is not worth the teardown risk. Its
+	// own Shutdown1 is likewise skipped — the caller tears the device down immediately after.
+	g_runtime_loaded = false;
+	g_use_direct = false;
 	g_validation.store(Validation::pending, std::memory_order_release);
 	g_nr_width = g_nr_height = 0;
 	g_nr_format = DXGI_FORMAT_UNKNOWN;
