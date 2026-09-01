@@ -72,7 +72,13 @@ bool IniFile::load(const std::string &utf8_path)
 {
 	m_values.clear();
 	m_path = utf8_path;
-	std::FILE *f = std::fopen(utf8_path.c_str(), "r");
+	std::FILE *f = nullptr;
+#ifdef _WIN32
+	if (fopen_s(&f, utf8_path.c_str(), "r") != 0)
+		f = nullptr;
+#else
+	f = std::fopen(utf8_path.c_str(), "r");
+#endif
 	if (f == nullptr)
 		return false;
 
