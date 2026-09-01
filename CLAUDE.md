@@ -1205,6 +1205,65 @@ than RenoDX, whose behaviour is effectively 1; set 0 to match them exactly). `ap
 reached after a successful SR/RR evaluate, so the warmup counts frames in which the device,
 queue and swapchain demonstrably worked.
 
+### DLSS Neural Rendering WORKS — the missing piece was an HDR colour codec (2026-09-01)
+
+**Confirmed on the user's machine: a correct image.** Feature 18 initialises, creates, evaluates
+and its result reaches the screen without corruption, at 61.7 fps, past 4800 frames with a clean
+`dmesg` — where the previous (red-noise) build died at ~2800 frames.
+
+**The cause of the red noise was never the parameters, the arch gates, the mips or the colour
+space flag.** It was that the network is **display-referred** and our hook point carries **raw,
+unbounded, pre-exposed linear HDR**. There is no `isHDR` in the runtime — verified by
+case-insensitive search in both ASCII and UTF-16, along with no `ColorSpace`, `PaperWhite`,
+`Exposure`, `Pre.Exposure` or `Feature.Create.Flags` — so the runtime **cannot be told** about
+the input encoding and the conversion is entirely the caller's job.
+
+The fix, ported from a working dxvk-remix integration (`github.com/lunks/dxvk-remix-plus-dlssnr`,
+branch `dlssnr`, commits `aa90a180` and `fc4de144`), wraps the evaluate in two compute passes:
+
+```
+encode:   proxy = SrgbEncode(SoftClip(max(image, 0) * s))   ->  DLSSNR.Color = the PROXY
+evaluate:                                                   ->  neural output
+decode:   image += (SrgbDecode(neural) - SrgbDecode(proxy)) / s      IN PLACE
+```
+
+* Soft clip: knee `0.75`, shoulder `5.770780`, taken verbatim from RenoDX's encoder. It is C0 but
+  **not** C1 — reproduced rather than "corrected", because that is what the working deployment
+  ships. **It reaches exactly 1.0 at an input near 3.474**, so anything brighter than ~3.5x
+  display white encodes to flat white; that bounds how far paper white can usefully move.
+* **Exact piecewise sRGB**, both directions — never an `x^2.2` approximation. The network was
+  trained on true sRGB.
+* The transfer `result = o + (n - p) / s` carries back the network's *change* rather than its
+  output, so **HDR headroom survives** and identity is bit-exact: `n == p` gives a `+0.0` delta
+  and returns the original unchanged. CI proves this across 8 paper whites x 9 radiances (to
+  60000, far above the knee) x 9 strength pairs. A no-op network must produce a no-op frame.
+* `[STRAYDLSS] NgxNRPaperWhiteScale` (default 1.0, `scale = 1/paperWhite`, values below 1.0
+  legal), `NgxNRColorStrength`, `NgxNRTransferStrength` (0 is an exact bypass).
+
+**A second, independent bug fixed in the same change: the copy-back.** The pass used to end with a
+full-RGBA `CopyResource` of the neural output over the engine image. That clamped the HDR range
+*and* overwrote alpha with the network's meaningless one — and on this title **that resource
+becomes the next frame's `HistoryBuffer[0]`** (§2.9), so the engine read the damage straight back
+in. The decode now writes in place and carries the original alpha through.
+
+**`NgxNRTopology=sr` is refused by design.** The residual needs proxy, neural and original to be
+the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
+Refusing loudly beats silently reverting to the raw-HDR path.
+
+### The NR luminance diagnostic must not run during a loading screen
+
+`NR CODEC LUMINANCE` reports input -> proxy -> output max Rec.709 over one crop, and is how
+`NgxNRPaperWhiteScale` is meant to be chosen. **Its first reading was worthless**: it fired at
+`00:29:42` while the game did not reach gameplay until `00:29:56`, so it measured a **black
+loading frame** — input `0.000000`, and an absurd recommendation of `scale ~6291456`
+(`paperWhite ~0.0000`). That is the §2.4 menu/load trap again, in a new place.
+
+The warmup gate (`NgxNRWarmupFrames`, default 60) elapses about a second after the first SR
+evaluate, which is still on the loading screen. **Raise it (~3000) to push initialisation and the
+measurement into gameplay before trusting any luminance number.** Note this did NOT stop the
+codec from working — `paperWhite=1.0` produced a correct image regardless — so the knob is a
+refinement, not a prerequisite, and its real value remains unmeasured.
+
 ### The DLSSNR snippet is ARCHITECTURE-GATED, and Ada support is a 13.5 MB graft
 
 `~/Downloads/dlssnr-remix/patch_dlssnr.py` (signature-driven, survives build offset changes)
