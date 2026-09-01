@@ -173,9 +173,19 @@ if [ "$PRESS_INPUT" -eq 0 ]; then
     exit 0
 fi
 
-PAD_NODE=$(find_pad_node)
+# Steam Input creates the virtual pad node some seconds AFTER the game process appears,
+# and the add-on's heartbeat now arrives within ~3 s of that (it is written from the first
+# presents), so the node is routinely not there yet at this point. Poll for it: measured
+# 2026-09-01, an immediate lookup failed on a box whose DualSense was connected all along.
+PAD_NODE=""
+for _ in $(seq 1 60); do
+    PAD_NODE=$(find_pad_node)
+    [ -n "$PAD_NODE" ] && break
+    game_running || { log "FAILED: the game exited while waiting for the pad node."; exit 1; }
+    sleep 2
+done
 if [ -z "$PAD_NODE" ]; then
-    log "FAILED: could not find the '$PAD_NAME' node."
+    log "FAILED: could not find the '$PAD_NAME' node within 120s."
     log "  Steam Input creates it when the game starts; check /proc/bus/input/devices"
     exit 1
 fi
