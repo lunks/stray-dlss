@@ -197,6 +197,39 @@ ID3D12Device *reshade_proxy_device(ID3D12Device *native)
 	return proxy;
 }
 
+// Live NR tuning, owned by the overlay (see draw_nr_controls). Seeded from ReShade.ini at
+// device init and thereafter editable in-game: every one of these is re-sent to the NGX
+// parameter block on EVERY evaluate, and the codec's three ride in push constants on every
+// dispatch, so a change takes effect on the next frame with no feature recreation and no
+// restart. Only the geometry (Width/Height/ScalingRatio) is create-time, and none of that is
+// a user knob.
+struct NrUiState
+{
+	bool  enabled = false;
+	float intensity = 1.05f;
+	float local_tone = 1.74f;
+	float local_structure = 1.0f;
+	float skin_structure = 1.33f;
+	int   preset = 1;
+	bool  auto_mask = true;
+	bool  ui_correction = true;
+	float paper_white = 1.0f;
+	float color_strength = 1.0f;
+	float transfer_strength = 1.0f;
+};
+NrUiState g_nr_ui;
+
+// Push the whole live set down at once. Cheap (three stores plus a few globals) and called only
+// when a control actually changed, so there is no per-frame cost to having the overlay open.
+void apply_nr_ui()
+{
+	nr::set_tuning(g_nr_ui.intensity, g_nr_ui.local_tone, g_nr_ui.local_structure);
+	nr::set_renodx_tuning(g_nr_ui.skin_structure,
+		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
+		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
+	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
+}
+
 void on_init_device(reshade::api::device *device)
 {
 	if (device->get_api() != reshade::api::device_api::d3d12)
@@ -364,21 +397,20 @@ void on_init_device(reshade::api::device *device)
 	// Live quality knobs (the study's DLSSNR.* tuning parameters, §2.2).
 	// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values rather than a neutral 1.0 — we
 	// follow their configuration instead of inventing one.
-	float nr_intensity = 1.05f, nr_local_tone = 1.74f, nr_local_structure = 1.0f;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", nr_intensity);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", nr_local_tone);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", nr_local_structure);
-	nr::set_tuning(nr_intensity, nr_local_tone, nr_local_structure);
-
-	float nr_skin_structure = 1.33f;
-	int nr_preset = 1, nr_auto_mask = 1, nr_ui_correction = 1;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure", nr_skin_structure);
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", nr_preset);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure", g_nr_ui.local_structure);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure", g_nr_ui.skin_structure);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
+	int nr_auto_mask = g_nr_ui.auto_mask ? 1 : 0;
+	int nr_ui_correction = g_nr_ui.ui_correction ? 1 : 0;
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask", nr_auto_mask);
 	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection", nr_ui_correction);
-	nr::set_renodx_tuning(nr_skin_structure, static_cast<unsigned int>(nr_preset < 0 ? 0 : nr_preset),
-		static_cast<unsigned int>(nr_auto_mask ? 1 : 0),
-		static_cast<unsigned int>(nr_ui_correction ? 1 : 0));
+	g_nr_ui.auto_mask = nr_auto_mask != 0;
+	g_nr_ui.ui_correction = nr_ui_correction != 0;
+	const float nr_intensity = g_nr_ui.intensity;
+	const float nr_local_tone = g_nr_ui.local_tone;
+	const float nr_local_structure = g_nr_ui.local_structure;
 
 	// [STRAYDLSS] NgxNRIdentity: what our GetModuleFileNameW hook reports to the snippet —
 	// "nvngx" (default), "passthrough", "snippet", "exe". The runtime requires the reported
@@ -411,15 +443,19 @@ void on_init_device(reshade::api::device *device)
 	// small, which is the direction our failure points. Do not guess: the codec logs the colour
 	// input, the encoded proxy and the neural output luminance over one crop on one line, and
 	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
-	float nr_paper_white = 1.0f, nr_color_strength = 1.0f, nr_transfer_strength = 1.0f;
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", nr_paper_white);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
 	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
 	// the escape hatch for a colour cast. 1 takes the network's colour too.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", nr_color_strength);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
 	// A global lerp back toward the untouched original; 0 is an EXACT bit-for-bit bypass, which
 	// makes it the honest A/B against "NR off" without changing anything else.
-	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength", nr_transfer_strength);
-	nr::set_codec_tuning(nr_paper_white, nr_color_strength, nr_transfer_strength);
+	reshade::get_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
+		g_nr_ui.transfer_strength);
+	g_nr_ui.enabled = ngx_nr;
+	apply_nr_ui();
+	const float nr_paper_white = g_nr_ui.paper_white;
+	const float nr_color_strength = g_nr_ui.color_strength;
+	const float nr_transfer_strength = g_nr_ui.transfer_strength;
 
 	if (ngx_nr)
 	{
@@ -1169,6 +1205,95 @@ void load_hash_override_file()
 	}
 }
 
+// Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
+// into the NGX parameter block on EVERY evaluate, and the codec's three are push constants on
+// every dispatch, so an edit lands on the next frame with no feature recreation. The values are
+// NOT written back to ReShade.ini automatically — "Save to ReShade.ini" does that on demand,
+// because ReShade rewrites its config on exit and a silent autosave would make an experiment
+// permanent without the user deciding it should be.
+void draw_nr_controls()
+{
+	if (!ImGui::CollapsingHeader("DLSS Neural Rendering (feature 18)"))
+		return;
+
+	std::uint64_t applied = 0, refused = 0;
+	std::uint32_t reasons[nr::kNrRefusalCount] = {};
+	nr::counters(applied, refused, reasons);
+	ImGui::Text("applied %llu  refused %llu  validated %s",
+		static_cast<unsigned long long>(applied), static_cast<unsigned long long>(refused),
+		nr::validated() ? "yes" : "no");
+	ImGui::Separator();
+
+	bool changed = false;
+
+	// The master switch only gates whether apply() runs; the runtime stays loaded either way,
+	// so this toggles cleanly in both directions without touching the GPU.
+	if (ImGui::Checkbox("Enabled", &g_nr_ui.enabled))
+	{
+		nr::set_enabled(g_nr_ui.enabled);
+	}
+
+	ImGui::TextUnformatted("HDR colour codec");
+	// Below 1.0 is legal and is the useful direction here: the shader's multiplier is
+	// 1/paperWhite, so raising this multiplies the colour DOWN, and Stray's scene colour already
+	// carries UE4's pre-exposure. The soft clip saturates at an input near 3.474, so there is no
+	// point going far above that.
+	changed |= ImGui::SliderFloat("Paper white", &g_nr_ui.paper_white, 0.01f, 8.0f, "%.3f");
+	// 0 keeps the ORIGINAL's chromaticity and carries only the network's luminance change — the
+	// escape hatch for a colour cast.
+	changed |= ImGui::SliderFloat("Colour strength", &g_nr_ui.color_strength, 0.0f, 1.0f, "%.2f");
+	// 0 is an EXACT bit-for-bit bypass, which makes it the honest A/B against "NR off".
+	changed |= ImGui::SliderFloat("Transfer strength", &g_nr_ui.transfer_strength, 0.0f, 1.0f,
+		"%.2f");
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Network");
+	changed |= ImGui::SliderFloat("Intensity", &g_nr_ui.intensity, 0.0f, 2.0f, "%.2f");
+	// Named LocalToneStrength, but it is the style blend weight rather than a tone control.
+	changed |= ImGui::SliderFloat("Local tone", &g_nr_ui.local_tone, 0.0f, 4.0f, "%.2f");
+	changed |= ImGui::SliderFloat("Local structure", &g_nr_ui.local_structure, 0.0f, 4.0f, "%.2f");
+	// -1 is a sentinel meaning "use local structure", so the range deliberately reaches it.
+	changed |= ImGui::SliderFloat("Skin structure", &g_nr_ui.skin_structure, -1.0f, 4.0f, "%.2f");
+	// 310.8 ships one weight set registered as preset 1 and falls back to it for every other
+	// value, so this is expected to change nothing — exposed to confirm that rather than assume.
+	changed |= ImGui::SliderInt("Preset", &g_nr_ui.preset, 0, 4);
+	changed |= ImGui::Checkbox("Auto mask", &g_nr_ui.auto_mask);
+	ImGui::SameLine();
+	changed |= ImGui::Checkbox("UI correction", &g_nr_ui.ui_correction);
+
+	if (changed)
+		apply_nr_ui();
+
+	ImGui::Separator();
+	if (ImGui::Button("Save to ReShade.ini"))
+	{
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
+			g_nr_ui.transfer_strength);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure",
+			g_nr_ui.local_structure);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure",
+			g_nr_ui.skin_structure);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRAutoMask",
+			g_nr_ui.auto_mask ? 1 : 0);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection",
+			g_nr_ui.ui_correction ? 1 : 0);
+		STRAY_LOG_WARN("NR: live settings saved to ReShade.ini.");
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Reset to defaults"))
+	{
+		const bool was_enabled = g_nr_ui.enabled;
+		g_nr_ui = NrUiState{};
+		g_nr_ui.enabled = was_enabled;
+		apply_nr_ui();
+	}
+}
+
 void draw_status(reshade::api::effect_runtime *runtime)
 {
 	(void)runtime;
@@ -1198,6 +1323,8 @@ void draw_status(reshade::api::effect_runtime *runtime)
 		g_state.saw_bind_pipeline.load() ? "yes" : "no",
 		g_state.saw_push_descriptors.load() ? "yes" : "no");
 }
+
+	draw_nr_controls();
 
 void draw_osd(reshade::api::effect_runtime *runtime)
 {
