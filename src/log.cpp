@@ -33,8 +33,12 @@ void init_file_sink()
 
 	// Deliberately a fixed name next to the game executable's working directory rather than
 	// anything clever: the user has to be able to find and paste it.
+#ifdef _WIN32
 	if (fopen_s(&g_file, "stray-dlss.log", "w") != 0)
 		g_file = nullptr;
+#else
+	g_file = std::fopen("stray-dlss.log", "w");
+#endif
 }
 
 void shutdown_file_sink()

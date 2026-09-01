@@ -66,7 +66,16 @@ add_library(stray_dlss_core STATIC
     src/host/ini.cpp
     src/host/ini.hpp
     src/host/config.cpp
-    src/host/config.hpp)
+    src/host/config.hpp
+    src/core/dxgi_format.cpp
+    src/core/dxgi_format.hpp
+    src/intercept/types.hpp
+    src/intercept/backend.hpp
+    src/intercept/backend.cpp
+    # The file sink is plain stdio and lives here so the seam can log under every host. The
+    # WARP harness links its own log_stub.cpp first, so the archive member is never pulled.
+    src/log.cpp
+    src/log.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -150,8 +159,6 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/backend_reshade/reshade_config.cpp
         src/backend_reshade/reshade_log.cpp
         src/backend_reshade/reshade_host.hpp
-        src/log.cpp
-        src/log.hpp
         src/ngx_backend.cpp
         src/ngx_backend.hpp
         src/ngx_nr.cpp
@@ -314,7 +321,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_hook_plan.cpp
         tests/test_nr_history_plan.cpp
         tests/test_ring.cpp
-        tests/test_ini.cpp)
+        tests/test_ini.cpp
+        tests/test_intercept_types.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)
