@@ -178,11 +178,50 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 		return r;
 	}
 
-	// The dispatch covers the OUTPUT rect. Under temporal upsampling that is the display
-	// resolution while the inputs are at render resolution, so matching against the render
-	// rect would reject the real pass. (docs/RESEARCH.md §4.12)
-	if (sig.group_count_x != group_count(output->width) ||
-		sig.group_count_y != group_count(output->height))
+	// The dispatch covers the OUTPUT VIEW RECT — which is NOT the output texture's extent.
+	//
+	// UE 4.27, verbatim (Release-4.27 branch, TemporalAA.cpp):
+	//   :950  GetGroupCount(PracticableDestRect.Size(), GTemporalAATileSizeX)  <- the DISPATCH
+	//   :653  PracticableDestRect = DivideAndRoundUp(Inputs.OutputViewRect, ResolutionDivisor)
+	//   :596  FTAAPassParameters::GetOutputExtent()                            <- the TEXTURE
+	//           Main:           SceneColorInput->Desc.Extent
+	//           MainUpsampling: Max(InputExtent, Quantize(OutputViewRect.Size()))
+	// so the texture is only ever >= the dispatched rect, never tied to it.
+	//
+	// Under a real upscale the Max() pins the extent to the output view rect exactly, which is
+	// why an equality test always matched at 50% and 70%. AT 1:1 THAT TERM DEGENERATES: the
+	// quantized output view size can no longer exceed InputExtent, so GetOutputExtent() returns
+	// the scene-colour buffer's own extent and NOTHING relates it to the dispatch. An equality
+	// test then makes DLAA depend on UE4's scene-buffer allocation rather than on the pass. That
+	// equality can reject a real FTAAStandaloneCS dispatch is not hypothetical: at 200% screen
+	// percentage it fired live on the genuine pass (extent 7680x4320, dispatch 3840x2160).
+	//
+	// Two bounds that hold in BOTH configurations:
+	//   * the dispatch must FIT INSIDE the output UAV — it writes it, so it cannot run past it;
+	//   * the dispatch must COVER AT LEAST the input view rect — OutputViewRect is equal to
+	//     InputViewRect in Main and larger in MainUpsampling, never smaller, so a dispatch
+	//     below the view rect is downsampling. That is what keeps 200% rejected.
+	// `view_width`/`view_height` are View.ViewSizeAndInvSize, i.e. UE4's InputViewRect.
+	if (sig.group_count_x > group_count(output->width) ||
+		sig.group_count_y > group_count(output->height))
+	{
+		r.reason = "dispatch runs past the output UAV at 8x8";
+		return r;
+	}
+	if (sig.group_count_x < group_count(view_width) ||
+		sig.group_count_y < group_count(view_height))
+	{
+		r.reason = "dispatch covers less than the view rect - downsampling, not TAA upscaling";
+		return r;
+	}
+	// When the pass really is UPSCALING — the output UAV is larger than its own inputs — the
+	// Max() above pins GetOutputExtent() to exactly Quantize(OutputViewRect), because the input
+	// buffer is by definition the smaller of the two. Equality is then guaranteed by the engine
+	// and is worth demanding: it is what rejects a pass that writes only part of a large UAV.
+	// This branch is every measured 50% and 70% frame, and its behaviour is unchanged.
+	if ((output->width > depth->width || output->height > depth->height) &&
+		(sig.group_count_x != group_count(output->width) ||
+		 sig.group_count_y != group_count(output->height)))
 	{
 		r.reason = "dispatch size does not cover the output UAV at 8x8";
 		return r;
@@ -191,14 +230,21 @@ MatchResult match_taa_dispatch(const DispatchSignature &sig,
 	r.depth_srv = depth->slot;
 	r.stencil_srv = stencil->slot;
 	r.output_uav = output->slot;
-	r.output_width = output->width;
-	r.output_height = output->height;
-	// Compare against the DEPTH SRV's extent, which is the true render resolution, rather than
-	// the passed-in view rect: that comes from the View constant buffer, which is not always
-	// readable, and falling back to the dispatch size makes every pass look 1:1.
-	(void)view_width;
-	(void)view_height;
-	r.is_upsampling = output->width > depth->width || output->height > depth->height;
+	// The output RECT — what the dispatch writes — not the texture's allocation. They differ
+	// whenever UE4's scene-colour buffer is larger than the view rect, and DLSS must be created
+	// for the rect: telling it the allocation would size the feature for pixels the engine
+	// never writes and never reads back. Clamped to the extent so a partial trailing tile
+	// cannot name pixels the texture does not have. Identical to the old value whenever the
+	// two agree, which is every measured 50%/70% frame.
+	const std::uint32_t covered_w = sig.group_count_x * kTaaTileSize;
+	const std::uint32_t covered_h = sig.group_count_y * kTaaTileSize;
+	r.output_width = covered_w < output->width ? covered_w : output->width;
+	r.output_height = covered_h < output->height ? covered_h : output->height;
+	// REPORT the render resolution from the DEPTH SRV's extent rather than the passed-in view
+	// rect: that comes from the View constant buffer, which is not always readable, and falling
+	// back to the dispatch size makes every pass look 1:1. (The view rect is used above only as
+	// a lower bound on the dispatch, where the fallback is harmless.)
+	r.is_upsampling = r.output_width > depth->width || r.output_height > depth->height;
 	r.render_width = depth->width;
 	r.render_height = depth->height;
 
