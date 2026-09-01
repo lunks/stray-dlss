@@ -997,6 +997,53 @@ absorb the screen-space denoiser's job; SSR/SSGI noise shimmers straight through
 "suppress the denoiser and let SR handle it" is dead, and DLSS Ray Reconstruction is the only
 candidate for replacing UE's denoiser — with a quantified 3.4x stability gap as its target.
 
+### r.RayTracing=True is the single biggest problem in this game — 3x the frame rate AND the noise (measured 2026-08-31)
+
+**Setting `r.RayTracing=False` in `Engine.ini [SystemSettings]` nearly TRIPLED the frame rate and
+eliminated the shimmer artifact we had spent a whole session chasing.** Measured from our own
+frame checkpoints, same scene, same save, DLSS RR active in both:
+
+```
+                          RT ON      RT OFF     gain
+menu      (frames 300-1200)   99.7 fps   131.6 fps   1.3x
+load+play (frames 1200-3600)  32.4 fps    95.4 fps   2.9x
+```
+
+**Why.** Stray ships `r.RayTracing=True` and the game is launched with `-dx12`, so UE 4.27 builds
+ray-tracing acceleration structures (BLAS/TLAS) for scene geometry **every frame** — skinned
+meshes included — whether or not any RT effect consumes them. The cost scales with scene
+complexity, which is exactly why an almost-empty menu ran at ~100 fps while a dense street ran at
+30. Meanwhile the game's world lighting is **baked**, so the RT effects that did run bought
+almost nothing visually.
+
+**The artifact was ray-traced noise.** The cyan/red "blips" on neon sources — chased through the
+exposure path, both RR-1 variants, and the B/C guide order, all fruitlessly — were RT noise.
+Turning the subsystem off removed them at the source.
+
+**This retroactively explains the RR-vs-SR observation.** DLSS SR looked noisier than DLSS RR on
+this content because the noise really was ray-traced, and Ray Reconstruction is purpose-built to
+denoise exactly that. RR was doing its job; the noise simply should not have been there.
+
+**Operational rules:**
+
+* **Default `r.RayTracing=False` for this title.** `-dx12` is still required (D3D12 is what NGX
+  needs); RT is a separate switch and DLSS/RR do not need it.
+* When triaging *any* performance or noise report here, check the RT subsystem FIRST. It is
+  scene-dependent, so a menu benchmark will hide it completely.
+* **A visual artifact and a performance problem sharing one root cause is not a coincidence to
+  dismiss.** The user's hunch that they were linked was correct and was what cracked it.
+
+### Measure frame rate from the addon's own frame checkpoints
+
+`[frame N]` log lines carry timestamps, so average fps over any span is
+`(N2 - N1) / (t2 - t1)` with no extra tooling — that is how the table above was produced.
+`src/perf.{hpp,cpp}` (`[STRAYDLSS] PerfLog`, default ON) now reports this every 600 presents
+along with the worst frame time and our own CPU share by bucket. **Two traps:** the
+frames-1200-to-3600 span includes the loading screen, so it understates steady-state gameplay;
+and screenshot bursts spaced ~15 s apart alias any periodic effect — a "3-state lighting cycle"
+measured that way turned out to be the camera rotating between captures. Sample faster than the
+phenomenon and hold the camera still.
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
