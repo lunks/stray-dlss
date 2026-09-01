@@ -34,6 +34,14 @@ done
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+# inject.py ships beside this script. Resolving it relatively means staging the two
+# together is enough — /tmp gets wiped and a hardcoded path there silently stops working.
+INJECT="${INJECT:-$(cd "$(dirname "$0")" && pwd)/inject.py}"
+if [ ! -f "$INJECT" ]; then
+    echo "inject.py not found at $INJECT — stage it next to launch-stray.sh" >&2
+    exit 2
+fi
+
 # Restarting Steam is cheap here and clears the states that no amount of process killing
 # fixes: a wedged launch chain, a stale app-running flag, or an error dialog left on screen.
 # The gamescope session respawns Steam automatically.
@@ -194,7 +202,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         exit 0
     fi
 
-    python3 /tmp/inject.py pad "/dev/input/$PAD_NODE" "$BTN_SOUTH" 60 >/dev/null 2>&1
+    python3 "$INJECT" pad "/dev/input/$PAD_NODE" "$BTN_SOUTH" 60 >/dev/null 2>&1
     sleep 0.5
 done
 
