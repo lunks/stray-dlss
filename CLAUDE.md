@@ -1048,7 +1048,15 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 **Operational rules:**
 
 * **Default `r.RayTracing=False` for this title.** `-dx12` is still required (D3D12 is what NGX
-  needs); RT is a separate switch and DLSS/RR do not need it.
+  needs), and **DLSS SR does not need RT** — SR is the configuration to ship.
+* **DLSS RR is NOT independently usable here, because RR REQUIRES `r.RayTracing=True`.** Ray
+  Reconstruction is a denoiser for ray-traced input; with RT off there is nothing for it to
+  denoise and it does not run. So the two findings in this section are **coupled**, and the
+  coupling is what decides the matter: turning RT on to get RR costs 2.9x the frame time and
+  brings back the neon noise, which is most of what RR would then be denoising. **RR therefore
+  stays off (`NgxRR=0`) — it works, but only in a configuration this title should not run in.**
+  Do not read the 3.4x denoiser-stability result above as "enable RR": that measurement was
+  taken with RT on and only establishes that SR cannot replace the screen-space denoiser.
 * When triaging *any* performance or noise report here, check the RT subsystem FIRST. It is
   scene-dependent, so a menu benchmark will hide it completely.
 * **A visual artifact and a performance problem sharing one root cause is not a coincidence to
