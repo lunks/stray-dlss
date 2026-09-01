@@ -1022,6 +1022,15 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 			g_exposure_smoothed = nrc::smooth_exposure_factor(g_exposure_smoothed,
 				in.one_over_pre_exposure, g_exposure_rate);
 		}
+		else if (!g_track_exposure)
+		{
+			// Drop the running value while tracking is OFF so re-enabling ADOPTS the current
+			// frame instead of resuming from a stale one and ramping. The user observed exactly
+			// this: turning tracking off made the artefact appear at once, and toggling it back
+			// on cleared it — the toggle was re-syncing a value that had gone stale. Making the
+			// re-sync automatic means it cannot go stale in the first place.
+			g_exposure_smoothed = 0.0f;
+		}
 		codec_scale = g_track_exposure
 			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, g_exposure_smoothed)
 			: static_scale;
