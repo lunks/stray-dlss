@@ -55,6 +55,8 @@ add_library(stray_dlss_core STATIC
     src/core/gbuffer_classify.hpp
     src/core/envbrdf.cpp
     src/core/envbrdf.hpp
+    src/core/nr_codec.cpp
+    src/core/nr_codec.hpp
     src/core/ring.hpp)
 
 target_include_directories(stray_dlss_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -158,6 +160,8 @@ if(STRAY_DLSS_BUILD_ADDON)
         src/gbuffer_finder.hpp
         src/gbuffer_resolve.cpp
         src/gbuffer_resolve.hpp
+        src/nr_codec_pass.cpp
+        src/nr_codec_pass.hpp
         src/ext_unhook.cpp
         src/input_dump.cpp
         src/mv_resolve.cpp
@@ -212,6 +216,14 @@ if(STRAY_DLSS_BUILD_ADDON)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
                    main cs_5_0 g_gbuffer_resolve_dxbc)
+    # The DLSS-NR HDR colour codec. Both halves include shaders/nr_codec.hlsli, which is named
+    # as an extra dependency so editing the shared transfer functions rebuilds both.
+    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
+                   main cs_5_0 g_nr_encode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
+    compile_shader(stray-dlss "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
+                   main cs_5_0 g_nr_decode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
 
     install(TARGETS stray-dlss RUNTIME DESTINATION .)
     install(FILES $<TARGET_PDB_FILE:stray-dlss> DESTINATION . OPTIONAL)
@@ -281,6 +293,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_pass_walk.cpp
         tests/test_gbuffer_classify.cpp
         tests/test_envbrdf.cpp
+        tests/test_nr_codec.cpp
         tests/test_ring.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 

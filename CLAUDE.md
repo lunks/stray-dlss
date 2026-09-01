@@ -1301,6 +1301,74 @@ present in our binary) which `nvngx.dll` would normally populate with function p
 the snippet itself. We leave them unset — guessing an RVA into a leaked DLL is not a bounded
 risk — and at least one working third-party integration omits them too.
 
+### The near-black NR output has a ROOT CAUSE: we fed a display-referred network raw HDR
+
+**Feature 18 is a DISPLAY-REFERRED image network.** It expects a [0,1], sRGB-encoded signal, and
+we were handing it Stray's raw unbounded pre-exposed linear HDR straight off the TAA hook. That
+is the "open, and the whole problem" from the section above: `max luminance 0.002709` with red
+noise on screen is what an out-of-domain input looks like, not a broken runtime.
+
+**There is no HDR, colour-space or exposure parameter anywhere in the runtime** (exhaustive
+null-terminated string search over `nvngx_dlssnr.dll`), so the conversion has to happen in OUR
+pixels, on both sides of the evaluate. Two compute dispatches now wrap the NGX call:
+
+```
+encode:  proxy  = SrgbEncode(SoftClip(max(image,0) * s))      -> DLSSNR.Color = the PROXY
+evaluate:                                                        -> our neural texture
+decode:  image  = image + (SrgbDecode(neural) - SrgbDecode(proxy)) / s
+```
+
+Ported from the only known working, 4090-tested deployment of this codec —
+`github.com/lunks/dxvk-remix-plus-dlssnr` commit `aa90a180`, with `calcProxyScale` from
+`fc4de144`. Every constant is that tree's. **HARD.**
+
+**The transfer is a RESIDUAL, and that is the whole design.** `n == p` gives a delta of exactly
++0.0, so a no-op network returns the frame bit for bit — pinned in CI across scales and
+radiances (`tests/test_nr_codec.cpp`, "EXACT IDENTITY"). HDR headroom survives because the
+original is added to, never reconstructed: a pixel at radiance 100 stays near 100 where a naive
+`SrgbDecode(neural)/s` would have crushed the frame into SDR. Below the knee it reduces to
+`n/s`, i.e. the network's answer verbatim. The full derivation is in `src/core/nr_codec.hpp`
+above `decode`; read it before touching either shader.
+
+**Consequences and traps:**
+
+* **The codec is MANDATORY, and `NgxNRTopology=sr` now refuses** (`codec-topology`). The residual
+  needs the proxy, the neural answer and the original to be the same pixels; sr-shaped puts
+  colour at render res and output at display res, so no residual exists. Falling back to the raw
+  HDR path would be silently reverting to the broken configuration.
+* **The copy-back is gone.** It was a full-RGBA `CopyResource`, which discarded the HDR range AND
+  overwrote alpha with the network's meaningless one — and on this title that resource becomes
+  the next frame's TAA history (§2.9), so the engine read the damage straight back in. The decode
+  writes RGB in place and carries the original alpha.
+* **Soft clip: knee 0.75, shoulder 5.770780, C0 but NOT C1** (the slope jumps to 1/ln2 at the
+  knee). That is what the working deployment ships. Reproduce, do not "fix".
+* **Exact piecewise sRGB, both directions.** Not an x^2.2 approximation — the network was trained
+  on true sRGB.
+* **MEASURED: in float32 the soft clip reaches exactly 1.0 at an input of ~3.474.** Anything
+  brighter than ~3.5x display white encodes to pure white, so a paper white that leaves the frame
+  up there hands the network a flat clipped image.
+
+**`[STRAYDLSS] NgxNRPaperWhiteScale`, default 1.0.** The shader multiplier is `1/paperWhite`
+(`calcProxyScale`: `staticExposure / max(paperWhiteScale, 0.01f)`, staticExposure 1), bounded to
+the reference's own [0.01, 64]. The reference multiplies this by its tonemapper's auto-exposure
+texture; **we have no such texture at a TAA-dispatch hook**, so this is the whole scale.
+**Values below 1.0 are legal and are the likely direction here** — `scale = 1/paperWhite`, so
+raising it multiplies the colour DOWN, and Stray's scene colour already carries UE4's
+pre-exposure (§2.6 row 135.y, ~0.056 measured live). The 16.0 that appears in the reference's
+option help is a remark about what a RenoDX-style fixed scale "would use", not a measured
+default; RenoDX ships 1.605, and paper white above 1.0 reportedly does nothing in its HDR path.
+
+**Do not guess the value — one log line picks it.** `NR CODEC LUMINANCE` reports the max Rec.709
+luminance of the colour INPUT, the encoded PROXY and the neural OUTPUT over the *same* 128x128
+centre crop, all linear (the proxy and output are sRGB-decoded first, so they are directly
+comparable to the 0.75 knee), plus the effective scale and the paper white that would put this
+frame's peak exactly at the knee. Below the knee the codec is just a multiply, so `proxy` should
+be about `input x scale`; a proxy far below the knee means paper white is too HIGH, a proxy
+pinned at 1.0 means it is too LOW, and a healthy proxy with a black output means the fault is the
+runtime rather than the codec. Also added: `NgxNRColorStrength` (0 keeps the original's
+chromaticity and transfers only the network's luminance change — the escape hatch for a colour
+cast) and `NgxNRTransferStrength` (0 is an EXACT bit-for-bit bypass, so it is the honest A/B).
+
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in

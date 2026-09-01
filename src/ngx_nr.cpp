@@ -4,6 +4,9 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_snippet.hpp"
+#include "nr_codec_pass.hpp"
+
+#include "core/nr_codec.hpp"
 
 #include <d3d12.h>
 
@@ -21,6 +24,9 @@ namespace stray_dlss::nr {
 const char *const kNrRefusalNames[kNrRefusalCount] = {
 	"dll-missing", "create-failed", "evaluate-failed", "degenerate-output",
 	"bad-inputs", "alloc-failed", "validating", "warmup", "mipped-input",
+	// The HDR colour codec. It is mandatory (ngx_nr.hpp): refusing loudly is strictly better
+	// than silently reverting to the raw-HDR path that produced the near-black neural output.
+	"codec-failed", "codec-topology",
 };
 
 } // namespace stray_dlss::nr
@@ -39,6 +45,7 @@ void set_renodx_tuning(float, unsigned int, unsigned int, unsigned int) {}
 void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
+void set_codec_tuning(float, float, float) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present() {}
 void shutdown() {}
@@ -120,6 +127,8 @@ enum
 	kRefValidating,
 	kRefWarmup,
 	kRefMippedInput,
+	kRefCodecFailed,
+	kRefCodecTopology,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -132,6 +141,9 @@ constexpr int kValidateLatency = 5;
 // Luminance floor. The addon's own shader uses `neural_y <= 1e-5` (§4.1); we accept any texel
 // above it anywhere in the crop.
 constexpr double kLumaFloor = 1e-5;
+// The proxy is always FP16 RGBA, whatever the engine image is (src/nr_codec_pass.cpp explains
+// why), so its readback decodes with a fixed format rather than g_nr_format.
+constexpr DXGI_FORMAT kProxyReadbackFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // Application id for the snippet's own Init_Ext. NGX's ProjectID form is not exported by the
 // snippet, so the numeric-id form is used; the value is ours and needs no NVIDIA registration
 // (same reasoning as the SR path's self-generated project GUID).
@@ -157,6 +169,18 @@ unsigned int g_preset = 1;
 unsigned int g_auto_mask = 1;
 unsigned int g_ui_correction = 1;
 float g_mvec_scale_override = 0.0f;
+// --- HDR colour codec tuning (ngx_nr.hpp documents each; math in core/nr_codec.hpp) ---
+// 1.0 is deliberately NOT copied from the reference tree's default: that default exists only
+// because the reference multiplies it by its tonemapper's auto-exposure texture, which we have
+// no access to at a TAA-dispatch hook. It is 1.0 here because it is neutral and because the
+// direction this title needs is unknown until the codec's own luminance line is read once.
+float g_paper_white = 1.0f;
+float g_color_strength = 1.0f;
+float g_transfer_strength = 1.0f;
+// The rect the codec actually processed this frame — the OUTPUT subrect, which can be smaller
+// than the colour texture's allocation (the GetOutputExtent Max() lesson, CLAUDE.md §5). Every
+// validation crop is centred on this rect so the three luminances describe the same pixels.
+std::uint32_t g_codec_rect_w = 0, g_codec_rect_h = 0;
 char g_dll_path[512] = "";
 char g_last_error[256] = "";
 
@@ -192,9 +216,26 @@ enum class Validation { pending, in_flight, ok, failed };
 // PRESENT thread after loading `in_flight` (acquire). A plain enum here would be a real data
 // race — the fields would not be guaranteed visible with the state that advertises them.
 std::atomic<Validation> g_validation{ Validation::pending };
-ID3D12Resource *g_validate_readback = nullptr;
-D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_validate_footprint = {};
-std::uint64_t g_validate_bytes = 0;
+
+// One readback per stage of the codec. Reading only the NEURAL output told us it was near black
+// (0.0026) but not WHY, and picking NgxNRPaperWhiteScale by guesswork costs a round trip per
+// guess. Input -> proxy -> output in one line says immediately whether the input is already
+// tiny, whether the proxy landed near the 0.75 soft-clip knee, and whether the network answered
+// at all. (CLAUDE.md §0.1: each round trip must carry the maximum diagnostic payload.)
+struct CropReadback
+{
+	ID3D12Resource *buffer = nullptr;
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+	std::uint64_t bytes = 0;
+	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+CropReadback g_crop_input;  // the engine's linear HDR image, before the encode
+CropReadback g_crop_proxy;  // what we actually handed the network
+CropReadback g_crop_neural; // what it answered
+// The crop's own extent, for the diagnostic line. Written on the recording thread before the
+// release-store that publishes `in_flight`, read on the present thread after the acquire-load —
+// same handoff as the readback fields themselves.
+std::uint32_t g_validate_crop_w = 0, g_validate_crop_h = 0;
 int g_validate_presents_left = 0;
 
 std::atomic<std::uint64_t> g_applied{ 0 };
@@ -434,7 +475,9 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 		return true;
 
 	release(g_nr_output);
-	release(g_validate_readback);
+	release(g_crop_input.buffer);
+	release(g_crop_proxy.buffer);
+	release(g_crop_neural.buffer);
 	g_validation.store(Validation::pending, std::memory_order_release);
 
 	D3D12_HEAP_PROPERTIES heap = {};
@@ -479,18 +522,13 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 	return true;
 }
 
-// Records a copy of a centred crop of the neural output into a readback buffer. Mapped a few
-// presents later by on_present(); until then NR does not touch the screen.
-void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd)
+// Records a copy of a centred crop of one resource into its own readback buffer. Mapped a few
+// presents later by on_present(). `res` is expected in UNORDERED_ACCESS and is left in it.
+bool copy_crop(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
+               DXGI_FORMAT format, const D3D12_BOX &box, CropReadback &out)
 {
-	if (g_validation.load(std::memory_order_acquire) != Validation::pending ||
-		g_nr_output == nullptr)
-		return;
-
-	const UINT crop_w = g_nr_width < kValidateSize ? g_nr_width : kValidateSize;
-	const UINT crop_h = g_nr_height < kValidateSize ? g_nr_height : kValidateSize;
-	if (crop_w == 0 || crop_h == 0)
-		return;
+	const UINT crop_w = box.right - box.left;
+	const UINT crop_h = box.bottom - box.top;
 
 	D3D12_RESOURCE_DESC crop = {};
 	crop.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -498,13 +536,13 @@ void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd)
 	crop.Height = crop_h;
 	crop.DepthOrArraySize = 1;
 	crop.MipLevels = 1;
-	crop.Format = g_nr_format;
+	crop.Format = format;
 	crop.SampleDesc.Count = 1;
 	UINT64 total = 0;
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
 	device->GetCopyableFootprints(&crop, 0, 1, 0, &footprint, nullptr, nullptr, &total);
 	if (total == 0)
-		return;
+		return false;
 
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_READBACK;
@@ -517,32 +555,23 @@ void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd)
 	buf.SampleDesc.Count = 1;
 	buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 	if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf,
-			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_validate_readback))))
-		return;
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out.buffer))))
+		return false;
 
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = g_nr_output;
+	barrier.Transition.pResource = res;
 	barrier.Transition.Subresource = 0;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
 	cmd->ResourceBarrier(1, &barrier);
 
-	// The centre of the frame: the most likely place for real content.
-	D3D12_BOX box = {};
-	box.left = (g_nr_width - crop_w) / 2;
-	box.top = (g_nr_height - crop_h) / 2;
-	box.front = 0;
-	box.right = box.left + crop_w;
-	box.bottom = box.top + crop_h;
-	box.back = 1;
-
 	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-	src_loc.pResource = g_nr_output;
+	src_loc.pResource = res;
 	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 	src_loc.SubresourceIndex = 0;
 	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-	dst_loc.pResource = g_validate_readback;
+	dst_loc.pResource = out.buffer;
 	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	dst_loc.PlacedFootprint = footprint;
 	cmd->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
@@ -551,19 +580,72 @@ void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd)
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 	cmd->ResourceBarrier(1, &barrier);
 
-	g_validate_footprint = footprint;
-	g_validate_bytes = total;
+	out.footprint = footprint;
+	out.bytes = total;
+	out.format = format;
+	return true;
+}
+
+// Records the three validation crops — colour input, encoded proxy, neural output — over the
+// SAME centred box, so their luminances are directly comparable. Until this passes, NR runs but
+// the decode never touches the engine image.
+void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+                      ID3D12Resource *image)
+{
+	if (g_validation.load(std::memory_order_acquire) != Validation::pending ||
+		g_nr_output == nullptr || image == nullptr || nrp::proxy() == nullptr)
+		return;
+
+	// Centre the crop on the rect the codec PROCESSED, not on the texture allocation: UE4's
+	// scene targets can be left larger than the current view rect, and a crop centred on the
+	// allocation would land outside the region NGX wrote.
+	const UINT rect_w = g_codec_rect_w;
+	const UINT rect_h = g_codec_rect_h;
+	const UINT crop_w = rect_w < kValidateSize ? rect_w : kValidateSize;
+	const UINT crop_h = rect_h < kValidateSize ? rect_h : kValidateSize;
+	if (crop_w == 0 || crop_h == 0)
+		return;
+
+	D3D12_BOX box = {};
+	box.left = (rect_w - crop_w) / 2;
+	box.top = (rect_h - crop_h) / 2;
+	box.front = 0;
+	box.right = box.left + crop_w;
+	box.bottom = box.top + crop_h;
+	box.back = 1;
+
+	// The neural crop is the one the verdict rests on; the other two are diagnostics, so a
+	// failure to capture them must not block validation.
+	if (!copy_crop(device, cmd, g_nr_output, g_nr_format, box, g_crop_neural))
+	{
+		release(g_crop_neural.buffer);
+		return;
+	}
+	if (!copy_crop(device, cmd, image, g_nr_format, box, g_crop_input))
+		release(g_crop_input.buffer);
+	if (!copy_crop(device, cmd, nrp::proxy(), kProxyReadbackFormat, box, g_crop_proxy))
+		release(g_crop_proxy.buffer);
+
+	g_validate_crop_w = crop_w;
+	g_validate_crop_h = crop_h;
 	g_validate_presents_left = kValidateLatency;
 	// Publish LAST: everything above must be visible to the present thread that sees this.
 	g_validation.store(Validation::in_flight, std::memory_order_release);
-	STRAY_LOG_INFO("NR: validating the neural output (%ux%u centre crop). Until it passes, NR "
-		"runs but does NOT touch the screen — a degenerate runtime cannot show a black frame.",
-		crop_w, crop_h);
+	STRAY_LOG_INFO("NR: validating the neural output (%ux%u crop centred on the %ux%u processed "
+		"rect, with matching colour-input and proxy crops). Until it passes, NR runs but the "
+		"decode does NOT touch the screen - a degenerate runtime cannot show a black frame.",
+		crop_w, crop_h, rect_w, rect_h);
 }
 
-// Decodes one texel's luminance for the formats the engine output can be. Anything we cannot
-// decode is treated as "cannot validate", which fails safe (NR stays off).
-bool decode_luma(const unsigned char *p, DXGI_FORMAT fmt, double &luma, bool &known)
+// Decodes one texel to three channel values, for the formats the engine output can be. Anything
+// we cannot decode is treated as "cannot validate", which fails safe (NR stays off).
+//
+// Returns the CHANNELS rather than a luminance because the codec's diagnostic needs two
+// luminances from the same texel: the raw code-value one (which is what the degeneracy verdict
+// has always used, and its threshold is calibrated against) and the sRGB-DECODED one, which is
+// the only one comparable to the 0.75 soft-clip knee. Both the proxy and the neural answer are
+// sRGB-encoded display-referred images; the colour input is not.
+bool decode_rgb(const unsigned char *p, DXGI_FORMAT fmt, double c[3], bool &known)
 {
 	known = true;
 	switch (fmt)
@@ -571,7 +653,6 @@ bool decode_luma(const unsigned char *p, DXGI_FORMAT fmt, double &luma, bool &kn
 	case DXGI_FORMAT_R16G16B16A16_FLOAT:
 	{
 		// half -> float, three channels.
-		double c[3];
 		for (int i = 0; i < 3; ++i)
 		{
 			std::uint16_t h = 0;
@@ -588,7 +669,6 @@ bool decode_luma(const unsigned char *p, DXGI_FORMAT fmt, double &luma, bool &kn
 				v = (1.0 + man / 1024.0) * std::pow(2.0, exp - 15);
 			c[i] = sign * v;
 		}
-		luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
 		return true;
 	}
 	case DXGI_FORMAT_R11G11B10_FLOAT:
@@ -602,25 +682,25 @@ bool decode_luma(const unsigned char *p, DXGI_FORMAT fmt, double &luma, bool &kn
 				return man / static_cast<double>(1 << mant_bits) * std::pow(2.0, -14);
 			return (1.0 + man / static_cast<double>(1 << mant_bits)) * std::pow(2.0, exp - 15);
 		};
-		const double r = ufloat(v & 0x7FF, 6, 5);
-		const double g = ufloat((v >> 11) & 0x7FF, 6, 5);
-		const double b = ufloat((v >> 22) & 0x3FF, 5, 5);
-		luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		c[0] = ufloat(v & 0x7FF, 6, 5);
+		c[1] = ufloat((v >> 11) & 0x7FF, 6, 5);
+		c[2] = ufloat((v >> 22) & 0x3FF, 5, 5);
 		return true;
 	}
 	case DXGI_FORMAT_R10G10B10A2_UNORM:
 	{
 		std::uint32_t v = 0;
 		std::memcpy(&v, p, sizeof(v));
-		const double r = (v & 0x3FF) / 1023.0;
-		const double g = ((v >> 10) & 0x3FF) / 1023.0;
-		const double b = ((v >> 20) & 0x3FF) / 1023.0;
-		luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		c[0] = (v & 0x3FF) / 1023.0;
+		c[1] = ((v >> 10) & 0x3FF) / 1023.0;
+		c[2] = ((v >> 20) & 0x3FF) / 1023.0;
 		return true;
 	}
 	case DXGI_FORMAT_R8G8B8A8_UNORM:
 	case DXGI_FORMAT_B8G8R8A8_UNORM:
-		luma = (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) / 255.0;
+		c[0] = p[0] / 255.0;
+		c[1] = p[1] / 255.0;
+		c[2] = p[2] / 255.0;
 		return true;
 	default:
 		known = false;
@@ -692,6 +772,23 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 }
 
 void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
+
+void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
+{
+	g_paper_white = paper_white;
+	// Both strengths are lerp weights and are meaningless outside [0,1]; the reference tree
+	// clamps them the same way through its RTX_OPTION min/max.
+	g_color_strength = color_strength < 0.0f ? 0.0f : (color_strength > 1.0f ? 1.0f : color_strength);
+	g_transfer_strength = transfer_strength < 0.0f ? 0.0f
+		: (transfer_strength > 1.0f ? 1.0f : transfer_strength);
+	STRAY_LOG_INFO("NR codec: paperWhite=%.4f -> scale=%.4f, colorStrength=%.2f, "
+		"transferStrength=%.2f. The codec is MANDATORY: feature 18 is a display-referred "
+		"network and our hook point carries raw linear HDR, so without it the network answers "
+		"near-black. transferStrength=0 is an exact bypass if you need one.",
+		static_cast<double>(g_paper_white),
+		static_cast<double>(nrc::proxy_scale(g_paper_white, 1.0f)),
+		static_cast<double>(g_color_strength), static_cast<double>(g_transfer_strength));
+}
 
 // The CHEAP half: LoadLibrary + export resolution + the identity IAT patch. No GPU contact, no
 // Init_Ext. Safe to call at device init, but off by default — see ngx_nr.hpp for why the init
@@ -799,10 +896,22 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		in.motion_vectors == nullptr || in.render_width == 0 || in.output_width == 0)
 		return refuse(kRefBadInputs, "a required resource or dimension was missing.");
 
+	// The HDR colour codec only makes sense on the post-process topology, and it is MANDATORY.
+	//
+	// The transfer is a RESIDUAL carried back onto the original — result = o + (n - p)/s — so
+	// the proxy, the neural answer and the original must describe the SAME pixels. Under
+	// sr-shaped, Color would be the render-res scene colour while Output is at display res:
+	// there is no per-pixel correspondence to subtract across, so no residual exists to carry.
+	// Refuse loudly rather than fall back to the raw-HDR path, which is the exact configuration
+	// that produced red noise and a 0.0026 neural output (src/core/nr_codec.hpp).
 	const bool post = g_topology == Topology::post_process;
-	ID3D12Resource *colour = post ? in.image : in.render_color;
-	if (colour == nullptr)
-		return refuse(kRefBadInputs, "no colour input for the selected topology.");
+	if (!post)
+		return refuse(kRefCodecTopology,
+			"NgxNRTopology=sr cannot use the HDR colour codec: the residual transfer needs the "
+			"proxy, the neural answer and the original to be the same pixels, and sr-shaped puts "
+			"the colour input at render resolution and the output at display resolution. Use "
+			"NgxNRTopology=post.");
+	ID3D12Resource *colour = in.image;
 
 	// A mipped / arrayed / multisampled colour input is the one hazard we cannot fix by
 	// allocating our own texture, and feeding one is a documented DXGI_ERROR_DEVICE_HUNG rather
@@ -825,10 +934,34 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	ext_unhook::repair();
 
-	// Colour rect: the output rect under post-process (already upscaled), the render rect
-	// under sr-shaped.
-	const std::uint32_t cw = post ? in.output_width : in.render_width;
-	const std::uint32_t ch = post ? in.output_height : in.render_height;
+	// Colour rect: the output rect, since post-process consumes the already-upscaled image.
+	const std::uint32_t cw = in.output_width;
+	const std::uint32_t ch = in.output_height;
+	g_codec_rect_w = cw;
+	g_codec_rect_h = ch;
+
+	// --- HDR colour codec, stage 1 of 2 ---
+	//
+	// Feature 18 is a DISPLAY-REFERRED image network and `in.image` is unbounded pre-exposed
+	// linear HDR, so what the snippet gets is the PROXY, never the engine's raw image. Nothing
+	// below reads `in.image` again until the decode. (src/core/nr_codec.hpp)
+	if (!nrp::initialise(device, in.image, cw, ch))
+		return refuse(kRefCodecFailed, nrp::last_error());
+
+	const float codec_scale = nrc::proxy_scale(g_paper_white, 1.0f);
+	if (!nrp::record_encode(cmd, in.image, cw, ch, codec_scale, g_color_strength,
+			g_transfer_strength))
+		return refuse(kRefCodecFailed, nrp::last_error());
+
+	colour = nrp::proxy();
+	if (colour == nullptr)
+		return refuse(kRefCodecFailed, "the codec produced no proxy texture.");
+
+	// NVIDIA's guide wants NGX inputs in NON_PIXEL_SHADER_RESOURCE. The proxy is ours, so this
+	// costs nothing and removes one way to get a silently black result (docs/RESEARCH.md §3.5).
+	// It MUST be undone on every path out of the evaluate below, or the recorded state diverges
+	// from the resource's real state.
+	nrp::transition_proxy(cmd, /*to_shader_resource=*/true);
 
 	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels.
 	//
@@ -882,9 +1015,12 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (!s_params_logged)
 	{
 		s_params_logged = true;
-		STRAY_LOG_INFO("NR params: topology=%s Color=%p (%ux%u) Depth=%p (%ux%u) MVec=%p "
-			"(%ux%u, scale %.3f/%.3f) Output=%p (%ux%u) depthInverted=1 intensity=%.2f",
-			post ? "post-process" : "sr-shaped", static_cast<void *>(colour), cw, ch,
+		STRAY_LOG_INFO("NR params: topology=post-process Color=%p = the CODEC PROXY (%ux%u, "
+			"FP16, sRGB-encoded soft-clipped, paperWhite=%.4f scale=%.4f) NOT the raw HDR image "
+			"%p; Depth=%p (%ux%u) MVec=%p (%ux%u, scale %.3f/%.3f) Output=%p (%ux%u) "
+			"depthInverted=1 intensity=%.2f",
+			static_cast<void *>(colour), cw, ch, static_cast<double>(g_paper_white),
+			static_cast<double>(codec_scale), static_cast<void *>(in.image),
 			static_cast<void *>(in.depth), in.render_width, in.render_height,
 			static_cast<void *>(in.motion_vectors), in.render_width, in.render_height,
 			scale_x, scale_y, static_cast<void *>(g_nr_output), in.output_width,
@@ -893,6 +1029,14 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	const NVSDK_NGX_Result result =
 		nr_evaluate_feature(cmd, g_feature, g_params);
+
+	// UNCONDITIONALLY, and before the result is even looked at: barriers are recorded, so an
+	// early return here would leave the command list describing a proxy in
+	// NON_PIXEL_SHADER_RESOURCE while the next frame's encode transitions it out of
+	// UNORDERED_ACCESS. That mismatch is a validation error on WARP and undefined behaviour on
+	// the target, where there is no debug layer to say so.
+	nrp::transition_proxy(cmd, /*to_shader_resource=*/false);
+
 	if (NVSDK_NGX_FAILED(result))
 	{
 		set_error("EvaluateFeature(18)", result);
@@ -919,99 +1063,157 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (g_validation.load(std::memory_order_acquire) != Validation::ok)
 	{
 		if (g_validation.load(std::memory_order_acquire) == Validation::pending)
-			begin_validation(device, cmd);
+			begin_validation(device, cmd, in.image);
 		if (g_validation.load(std::memory_order_acquire) == Validation::failed)
 			return refuse(kRefDegenerate,
 				"the neural output validated as black/degenerate.");
 		return refuse(kRefValidating, "the neural output is still being validated.");
 	}
 
-	// Validated: replace the engine's image with the neural result. Both are in states we
-	// know — the engine output is the UAV our SR/RR just wrote, ours is a UAV we own.
-	D3D12_RESOURCE_BARRIER to_copy[2] = {};
-	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[0].Transition.pResource = in.image;
-	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[1].Transition.pResource = g_nr_output;
-	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	cmd->ResourceBarrier(2, to_copy);
-
-	cmd->CopyResource(in.image, g_nr_output);
-
-	for (int i = 0; i < 2; ++i)
-	{
-		const D3D12_RESOURCE_STATES before = to_copy[i].Transition.StateBefore;
-		to_copy[i].Transition.StateBefore = to_copy[i].Transition.StateAfter;
-		to_copy[i].Transition.StateAfter = before;
-	}
-	cmd->ResourceBarrier(2, to_copy);
+	// --- HDR colour codec, stage 2 of 2 ---
+	//
+	// Validated, so carry the network's change back onto the engine image IN PLACE. This
+	// replaces the full-RGBA CopyResource this used to end with, which was wrong twice over:
+	// it discarded the HDR range (the network's answer is display-referred and bounded to
+	// [0,1]) and it overwrote the alpha channel with the network's meaningless one — and on
+	// this title that resource becomes the next frame's TAA history (CLAUDE.md §2.9), so the
+	// engine would have read the damage straight back in.
+	if (!nrp::record_decode(cmd, in.image, g_nr_output, cw, ch))
+		return refuse(kRefCodecFailed, nrp::last_error());
 
 	g_applied.fetch_add(1, std::memory_order_relaxed);
 	static bool s_applied_logged = false;
 	if (!s_applied_logged)
 	{
 		s_applied_logged = true;
-		STRAY_LOG_WARN("NR APPLIED: the DLSS Neural Rendering result now replaces the SR/RR "
-			"image on screen (validated non-degenerate). First occurrence only.");
+		STRAY_LOG_WARN("NR APPLIED: the DLSS Neural Rendering result is now carried onto the "
+			"SR/RR image as a residual (validated non-degenerate), preserving its HDR range and "
+			"its alpha. First occurrence only.");
 	}
 	return true;
 }
 
+namespace {
+
+// The two luminances one crop yields, plus whether it could be decoded at all.
+struct CropLuma
+{
+	// Rec.709 over the stored code values. The degeneracy verdict has always used this and its
+	// 1e-5 threshold is calibrated against it, so it stays the verdict's input, unchanged.
+	double raw = -1.0;
+	// Rec.709 after sRGB-DECODING each channel. For the proxy and the neural answer — both
+	// sRGB-encoded display-referred images — this is the number that is directly comparable to
+	// the 0.75 soft-clip knee, and to `colour input x scale`. Meaningless for the linear HDR
+	// colour input, which is why the log prints `raw` for that one.
+	double linear = -1.0;
+	bool known = false;
+};
+
+// Maps one crop readback, reduces it, and releases it. A crop that was never captured comes back
+// with the -1.0 sentinels.
+CropLuma drain_crop(CropReadback &crop)
+{
+	CropLuma out;
+	if (crop.buffer == nullptr)
+		return out;
+
+	void *data = nullptr;
+	const D3D12_RANGE range = { 0, static_cast<SIZE_T>(crop.bytes) };
+	if (SUCCEEDED(crop.buffer->Map(0, &range, &data)) && data != nullptr)
+	{
+		const std::uint32_t bpp = format_bytes(crop.format);
+		if (bpp != 0)
+		{
+			out.raw = 0.0;
+			out.linear = 0.0;
+			const auto *base = static_cast<const unsigned char *>(data);
+			for (UINT y = 0; y < crop.footprint.Footprint.Height; ++y)
+			{
+				const unsigned char *row =
+					base + static_cast<std::size_t>(y) * crop.footprint.Footprint.RowPitch;
+				for (UINT x = 0; x < crop.footprint.Footprint.Width; ++x)
+				{
+					double c[3] = {};
+					bool texel_known = false;
+					if (!decode_rgb(row + static_cast<std::size_t>(x) * bpp, crop.format, c,
+							texel_known))
+						continue;
+					out.known = out.known || texel_known;
+
+					const double raw = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+					if (raw > out.raw)
+						out.raw = raw;
+
+					// The shader's own sRGB decode, through the twin CI pins
+					// (src/core/nr_codec.cpp), so this number means the same thing the decode
+					// pass means by it.
+					double lin[3];
+					for (int i = 0; i < 3; ++i)
+						lin[i] = static_cast<double>(
+							nrc::srgb_decode_channel(static_cast<float>(c[i])));
+					const double linear = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+					if (linear > out.linear)
+						out.linear = linear;
+				}
+			}
+		}
+		const D3D12_RANGE no_write = { 0, 0 };
+		crop.buffer->Unmap(0, &no_write);
+	}
+
+	release(crop.buffer);
+	return out;
+}
+
+} // namespace
+
 void on_present()
 {
-	if (!g_enabled || g_validation.load(std::memory_order_acquire) != Validation::in_flight ||
-		g_validate_readback == nullptr)
+	if (!g_enabled || g_validation.load(std::memory_order_acquire) != Validation::in_flight)
 		return;
 	if (--g_validate_presents_left > 0)
 		return;
 
-	void *data = nullptr;
-	const D3D12_RANGE range = { 0, static_cast<SIZE_T>(g_validate_bytes) };
-	if (FAILED(g_validate_readback->Map(0, &range, &data)) || data == nullptr)
+	const CropLuma neural = drain_crop(g_crop_neural);
+	const CropLuma input = drain_crop(g_crop_input);
+	const CropLuma proxy = drain_crop(g_crop_proxy);
+	const double max_luma = neural.raw;
+
+	// THE line that chooses NgxNRPaperWhiteScale, and the reason all three crops are taken over
+	// the same texels. Reading only the neural output told us it was near black (0.0026) but not
+	// why, and every guess at the scale costs a round trip on a machine we do not have.
+	//
+	// How to read it. `input` is scene-linear HDR; `proxy` and `output` are sRGB-DECODED, so all
+	// three are linear and directly comparable. Below the soft-clip knee the codec is just a
+	// multiply, so `proxy` should be about `input x scale`; if it is far below the 0.75 knee the
+	// network is being shown a black image and paper white must come DOWN (scale = 1/paperWhite).
+	// If `proxy` is pinned at 1.0 the frame is crushed into the shoulder and paper white must go
+	// UP. A healthy proxy with a black output means the fault is the runtime, not the codec.
+	const float scale = nrc::proxy_scale(g_paper_white, 1.0f);
+	const bool can_suggest = input.known && input.raw > 0.0;
+	const double want_scale = can_suggest
+		? static_cast<double>(nrc::kSoftClipKnee) / input.raw : -1.0;
+	STRAY_LOG_WARN("NR CODEC LUMINANCE (max Rec.709 over one %ux%u centre crop, all linear): "
+		"colour INPUT %.6f (scene-linear HDR%s) -> encoded PROXY %.6f (sRGB-decoded%s, raw code "
+		"value %.6f) -> neural OUTPUT %.6f (sRGB-decoded%s, raw %.6f). "
+		"paperWhite=%.4f effectiveScale=%.4f colorStrength=%.2f transferStrength=%.2f. "
+		"Below the %.2f knee the proxy is just input x scale, so to put this frame's peak AT the "
+		"knee use scale ~%.4f, i.e. NgxNRPaperWhiteScale ~%.4f. A -1 means that crop was not "
+		"captured or its format could not be decoded.",
+		g_validate_crop_w, g_validate_crop_h,
+		input.raw, input.known ? "" : ", NOT DECODED",
+		proxy.linear, proxy.known ? "" : ", NOT DECODED", proxy.raw,
+		neural.linear, neural.known ? "" : ", NOT DECODED", neural.raw,
+		static_cast<double>(g_paper_white), static_cast<double>(scale),
+		static_cast<double>(g_color_strength), static_cast<double>(g_transfer_strength),
+		static_cast<double>(nrc::kSoftClipKnee),
+		want_scale, can_suggest ? 1.0 / want_scale : -1.0);
+
+	if (!neural.known)
 	{
 		g_validation.store(Validation::failed, std::memory_order_release);
-		release(g_validate_readback);
-		STRAY_LOG_ERROR("NR: could not map the validation readback; NR stays OFF and the SR/RR "
-			"image is kept.");
-		return;
-	}
-
-	const std::uint32_t bpp = format_bytes(g_nr_format);
-	double max_luma = 0.0;
-	bool any_known = false;
-	if (bpp != 0)
-	{
-		const auto *base = static_cast<const unsigned char *>(data);
-		for (UINT y = 0; y < g_validate_footprint.Footprint.Height; ++y)
-		{
-			const unsigned char *row = base + static_cast<std::size_t>(y) *
-				g_validate_footprint.Footprint.RowPitch;
-			for (UINT x = 0; x < g_validate_footprint.Footprint.Width; ++x)
-			{
-				double luma = 0.0;
-				bool known = false;
-				if (decode_luma(row + static_cast<std::size_t>(x) * bpp, g_nr_format, luma,
-						known) && luma > max_luma)
-					max_luma = luma;
-				any_known = any_known || known;
-			}
-		}
-	}
-
-	const D3D12_RANGE no_write = { 0, 0 };
-	g_validate_readback->Unmap(0, &no_write);
-	release(g_validate_readback);
-
-	if (!any_known)
-	{
-		g_validation.store(Validation::failed, std::memory_order_release);
-		STRAY_LOG_ERROR("NR: cannot decode the output format (%d) to validate it, so NR stays "
-			"OFF rather than risk a black frame. The SR/RR image is kept.",
+		STRAY_LOG_ERROR("NR: could not read back or decode the neural output (format %d), so NR "
+			"stays OFF rather than risk a black frame. The SR/RR image is kept.",
 			static_cast<int>(g_nr_format));
 		return;
 	}
@@ -1020,23 +1222,27 @@ void on_present()
 	{
 		g_validation.store(Validation::ok, std::memory_order_release);
 		STRAY_LOG_WARN("NR VALIDATED: neural output max luminance %.6f over the centre crop "
-			"(> %.0e). NR will now replace the SR/RR image.", max_luma, kLumaFloor);
+			"(> %.0e). The decode will now carry the network's change onto the SR/RR image.",
+			max_luma, kLumaFloor);
 	}
 	else
 	{
 		g_validation.store(Validation::failed, std::memory_order_release);
 		STRAY_LOG_ERROR("NR DEGENERATE: the neural output is black (max luminance %.8f <= "
-			"%.0e over the centre crop). This is the documented DLSSNR failure on some HDR "
-			"inputs (docs/RESEARCH-RENODX-DLSS5.md §4.1). NR stays OFF permanently this "
-			"session; the SR/RR image is kept. Nothing black ever reached the screen.",
-			max_luma, kLumaFloor);
+			"%.0e over the centre crop). Read the NR CODEC LUMINANCE line above before changing "
+			"anything: it says whether the network was shown a usable image at all. NR stays OFF "
+			"permanently this session; the SR/RR image is kept. Nothing black reached the "
+			"screen.", max_luma, kLumaFloor);
 	}
 }
 
 void shutdown()
 {
 	release_feature();
-	release(g_validate_readback);
+	release(g_crop_input.buffer);
+	release(g_crop_proxy.buffer);
+	release(g_crop_neural.buffer);
+	nrp::shutdown();
 	release(g_nr_output);
 	// A snippet that was loaded but never initialised is a NORMAL, safe resting state — RenoDX
 	// says as much in its own words ("nvngx_dlssnr.dll was loaded but never initialized;
