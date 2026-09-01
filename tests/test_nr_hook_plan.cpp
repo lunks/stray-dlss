@@ -10,6 +10,10 @@
 #include "core/nr_hook_plan.hpp"
 
 #include <cstring>
+// The range-for over a braced list in the mode round-trip test needs this explicitly on
+// libstdc++; libc++ happens to pull it in transitively, which is exactly the kind of
+// difference the Linux lane exists to catch.
+#include <initializer_list>
 
 using namespace stray_dlss::nrplan;
 
