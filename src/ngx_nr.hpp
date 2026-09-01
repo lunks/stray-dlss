@@ -187,6 +187,9 @@ struct ApplyInputs
 	// View constant buffer was not readable this frame, and the codec falls back to its static
 	// scale rather than multiplying by a garbage value.
 	float one_over_pre_exposure = 0.0f;
+	// ue4::pre_exposure_plausible on the View CB this frame. False means keep the previous
+	// smoothed exposure rather than walking it somewhere wrong on a stale read.
+	bool pre_exposure_ok = false;
 
 	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from output/render", which
 	// is what the TAA site does. The post-tonemap sites pass the ratio their own gate computed,

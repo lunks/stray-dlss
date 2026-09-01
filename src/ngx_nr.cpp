@@ -1013,7 +1013,11 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		// TRACKED EXPOSURE. `1.0f` is the fallback paper white, not an exposure — see
 		// nrc::proxy_scale's signature.
 		const float static_scale = nrc::proxy_scale(g_paper_white, 1.0f);
-		if (g_track_exposure)
+		// Only feed the smoother a pair that checks out. A stale or zero read would otherwise
+		// walk the running value somewhere wrong and stay there, and NGX silently rewrites a
+		// zero InPreExposure to 1.0 rather than complaining. On a bad frame we simply keep the
+		// previous smoothed value — the scene has not changed brightness in one frame anyway.
+		if (g_track_exposure && in.pre_exposure_ok)
 		{
 			g_exposure_smoothed = nrc::smooth_exposure_factor(g_exposure_smoothed,
 				in.one_over_pre_exposure, g_exposure_rate);

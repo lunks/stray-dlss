@@ -63,6 +63,12 @@ bool parse_view_params(const void *data, std::size_t size, ViewParams &out);
 // right buffer at offsets that have slipped (row 131 is a (1,1,1,1) decoy).
 bool view_params_plausible(const ViewParams &p);
 
+// Is the PreExposure / OneOverPreExposure pair (rows 135.y and 135.z) self-consistent? Separate
+// from view_params_plausible ON PURPOSE — that gate governs the whole DLSS path, and those rows
+// are [derived], so a wrong offset there would disable upscaling entirely. Callers that consume
+// the value check this and fall back to a static scale.
+bool pre_exposure_plausible(const ViewParams &p);
+
 // TemporalAAParams.zw IS TemporalJitterPixels, already in render-resolution pixels. NGX takes
 // it with NO sign flip. (docs/RESEARCH.md §3.3)
 Float2 ngx_jitter_offset(const ViewParams &p);

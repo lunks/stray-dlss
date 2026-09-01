@@ -99,6 +99,23 @@ bool view_params_plausible(const ViewParams &p)
 	return true;
 }
 
+bool pre_exposure_plausible(const ViewParams &p)
+{
+	// DELIBERATELY NOT part of view_params_plausible, which gates the ENTIRE DLSS path: rows
+	// 135.y/135.z are [derived], and if they are ever not where we believe, folding this into
+	// that gate would reject every frame and silently disable DLSS altogether — a far worse
+	// failure than the one it prevents. Checked at the point of USE instead, where the fallback
+	// is a static scale rather than no upscaling at all.
+	//
+	// Worth checking because the value is load-bearing: the NR codec derives its whole proxy
+	// scale from OneOverPreExposure, and nvsdk_ngx_helpers.h:507 rewrites a zero InPreExposure
+	// to 1.0 without a word. The two rows are reciprocals by construction, which makes the pair
+	// self-checking — a pair that does not multiply to 1 is not the pre-exposure pair.
+	if (!(p.pre_exposure > 0.0f) || !(p.one_over_pre_exposure > 0.0f))
+		return false;
+	return std::fabs(p.pre_exposure * p.one_over_pre_exposure - 1.0f) <= 1e-3f;
+}
+
 Float2 ngx_jitter_offset(const ViewParams &p)
 {
 	return Float2{ p.temporal_aa_params.z, p.temporal_aa_params.w };

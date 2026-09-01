@@ -2062,6 +2062,11 @@ bool intercept_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32
 										// back to its static scale.
 										ni.one_over_pre_exposure =
 											view_ok ? view.one_over_pre_exposure : 0.0f;
+										// Self-checking pair (rows 135.y/135.z are reciprocals),
+										// verified at the point of USE rather than in the
+										// whole-view gate, which governs the entire DLSS path.
+										ni.pre_exposure_ok =
+											view_ok && ue4::pre_exposure_plausible(view);
 										nr::apply(reinterpret_cast<ID3D12Device *>(
 											device->get_native()), native, ni);
 									}

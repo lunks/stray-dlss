@@ -294,3 +294,38 @@ TEST_CASE("nov_rotation_rows applies the row-vector convention, provably")
 		rot.m[1 * 4 + 2] * n_world[2];
 	CHECK(wrong == doctest::Approx(-1.0f));
 }
+
+// Pre-exposure is now load-bearing: the NR codec derives its whole proxy scale from
+// OneOverPreExposure, and nvsdk_ngx_helpers.h:507 silently rewrites a zero InPreExposure to 1.0.
+// One stale frame is a large history mis-scale with no log line, so the gate has to catch it.
+// Rows 135.y and 135.z are reciprocals by construction, which makes the pair self-checking.
+TEST_CASE("a zero or inconsistent pre-exposure pair is rejected")
+{
+	const auto buf = make_view_buffer();
+	ue4::ViewParams good;
+	REQUIRE(ue4::parse_view_params(buf.data(), buf.size(), good));
+	// A real measured pair from the live game must pass.
+	good.pre_exposure = 0.056f;
+	good.one_over_pre_exposure = 1.0f / 0.056f;
+	REQUIRE(ue4::pre_exposure_plausible(good));
+	// The whole-view gate must stay INDIFFERENT to pre-exposure: it governs the entire DLSS
+	// path, so folding this check into it would disable upscaling outright if the [derived]
+	// rows were ever wrong.
+	ue4::ViewParams no_exposure = good;
+	no_exposure.pre_exposure = 0.0f;
+	no_exposure.one_over_pre_exposure = 0.0f;
+	CHECK(ue4::view_params_plausible(no_exposure));
+
+	ue4::ViewParams zero = good;
+	zero.pre_exposure = 0.0f;
+	CHECK_FALSE(ue4::pre_exposure_plausible(zero));
+
+	ue4::ViewParams zero_inv = good;
+	zero_inv.one_over_pre_exposure = 0.0f;
+	CHECK_FALSE(ue4::pre_exposure_plausible(zero_inv));
+
+	// Both non-zero but not reciprocals: not the pre-exposure pair at all.
+	ue4::ViewParams mismatched = good;
+	mismatched.one_over_pre_exposure = 3.0f;
+	CHECK_FALSE(ue4::pre_exposure_plausible(mismatched));
+}
