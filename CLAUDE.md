@@ -1232,6 +1232,78 @@ upscales by definition and cannot accept an input larger than its output. The ma
 rejects it, now on the view-rect lower bound ("dispatch covers less than the view rect -
 downsampling, not TAA upscaling"). 70% is the highest working setting and is sharper than 50%.
 
+### OptiScaler frame generation: the hook-up WORKS, the FG swapchain does not (measured 2026-09-01)
+
+**The inversion is real and is now measured.** OptiScaler only replaces upscalers in games that
+already call DLSS/FSR2+/XeSS — Stray calls none, which is why this project exists. But **we** call
+DLSS, and OptiScaler's `LoadLibrary` hook is process-wide and suffix-matched, so it intercepts
+OUR NGX calls. Its log prints our own project GUID:
+
+```
+NVSDK_NGX_D3D12_Init_ProjectID InProjectId: 6f2d1c84-9b3e-4a17-8e55-1d0c7a3f6b92
+NVSDK_NGX_D3D12_CreateFeature Creating new dlss upscaler
+DLSSG_Dx12::SetResource SetTagForFrame type: Velocity result: eOk (0)
+DLSSG_Dx12::SetResource SetTagForFrame type: Depth    result: eOk (0)
+DLSSG_Dx12::Dispatch Result: Ok
+```
+
+So `FGInput=upscaler` harvests the depth, velocity and jitter our TAA hook already computes, and
+real DLSS Frame Generation dispatches against them. **The earlier "OptiScaler cannot help" note
+was half wrong and is retracted**: the "only works in games that already call DLSS" objection is
+answered by us being the caller.
+
+**What actually blocks it: the game dies at a fixed point in the FG pipeline.** Deterministic,
+six launches:
+
+| Config | Died at |
+|---|---|
+| FSR-FG output | FG frame **11**, right after `numGeneratedFrames: 1` |
+| DLSSG output | FG frame **32** |
+| DLSSG + fakenvapi Reflex | FG frame **36** |
+| DLSSG + fakenvapi + **our NgxNR=0** | FG frame **36**, identical |
+
+UE4 reports `EXCEPTION_ACCESS_VIOLATION writing address 0x000000020000000d` — a bit-packed
+handle-shaped value, the same signature section 1 documents for a descriptor handle dereferenced
+as a pointer. It survives the swapchain `ResizeBuffers` (result 0) and dies about a second after
+`SetFullscreenState Fullscreen: 1`.
+
+**Ruled OUT, so do not re-test:** load order (see below), OptiScaler's Vulkan overlay
+(`OverlayMenu=false` changed nothing), Reflex (fakenvapi fixed `setReflexTiming ... status -3`
+and moved the death by 4 frames, not past it), and **our own NR path** — `NgxNR=0` died at the
+identical frame, so feature 18 writing into `u0` is not the cause.
+
+**Solved along the way, and worth keeping:**
+
+* **Coexistence with ReShade is a solved problem, and the answer is OptiScaler's own wiki.**
+  Install OptiScaler AS `dxgi.dll`, copy ReShade's DLL to **`ReShade64.dll`** beside it, set
+  `LoadReshade=true`. Two independent DXGI proxies racing is wrong; OptiScaler must load ReShade.
+  Verified: `CheckWorkingMode Loading ReShade64.dll` then `hkD3D12CreateDevice Caller:
+  ReShade64.dll`. **With FG off this configuration reaches gameplay and is stable** — so the
+  coexistence is fine and only frame generation breaks.
+* **No published OptiScaler build can do `FGOutput=dlssg`.** v0.9.4 and the newest nightly
+  (v0.9.5-pre3 / `d12f554`, 2026-08-22) both end `CheckForFGStatus` with
+  `if (activeFgOutput != FSRFG && != XeFG) { LOG_WARN("FGOutput is not set to FSR-FG or XeFG"); return false; }`
+  — verbatim the warning our first run produced. It exists only on master.
+  `.github/workflows/build-optiscaler.yml` builds it and **fails loudly if handed a ref that
+  still contains that string**, so a stale ref cannot quietly produce a binary that refuses dlssg.
+* **`FGOutput=dlssg` genuinely requires Streamline** (`DLSSG_Dx12.cpp` hard-errors without
+  `sl.interposer.dll`). SL 2.13 in `OptiScaler/streamline/` + `nvngx_dlssg.dll` works: loads
+  clean, `arch=0x190` Ada, driver 610.43.
+* **DXVK-NVAPI's Reflex is not enough for DLSS-G.** `setReflexTiming NvAPI call failed with
+  status -3` every frame until `fakenvapi.dll` + `force_reflex=2` was added.
+* **The upscaler silently fell back to FSR2** under master (`FSR2FeatureDx12_212::EvaluateInternal
+  Dispatch!!`) despite `Dx12Upscaler=dlss`, with `Config::CheckUpscalerFiles nvngx.dll not found!`
+  — but the older nightly used DLSS with the same warning, so the fallback is not just that file.
+  **Consequence worth remembering: while OptiScaler owns the upscaler, our carefully built NGX
+  parameter block can be replaced by FSR2 without anything failing.**
+* **GE-Proton 11-1+ ships OptiScaler behind `PROTON_USE_OPTISCALER=1`**, a cleaner packaging than
+  hand-installing. The target's own `GE-Proton-dxvk301-ds5-clean-nowl` has the env-var CHECK but
+  **no OptiScaler binary**, so the flag is inert there.
+
+**Status: dropped by the user 2026-09-01, box fully reverted to ReShade-as-dxgi.dll.** Everything
+above is preserved because the hard part — proving OptiScaler can drive FG from our DLSS hooks —
+is done and measured; only the FG swapchain remains.
+
 ### DLSS Neural Rendering (feature 18): the identity check, solved (measured 2026-08-31)
 
 Two independent walls stand between a ReShade add-on and NGX feature 18. Both are now
