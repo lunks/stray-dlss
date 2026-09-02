@@ -290,7 +290,7 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 		d.Format = f; d.SampleDesc.Count = 1; d.Flags = flags;
 		return SUCCEEDED(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d, state, nullptr, IID_PPV_ARGS(&out)));
 	};
-	ComPtr<ID3D12Resource> eye, colour, depth, velocity, history, output;
+	ComPtr<ID3D12Resource> eye, colour, depth, velocity, history, output, out_buf;
 	if (!make_tex(1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, eye) ||
 		!make_tex(320, 180, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, colour) ||
 		!make_tex(320, 180, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, depth) ||
@@ -346,6 +346,26 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 	ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	gpu.device->CreateUnorderedAccessView(output.Get(), nullptr, &ud, off(6));
+	// The probe shader writes a STRUCTURED BUFFER at u0 (GPU-based validation checks the
+	// UAV dimension against the shader), so the dispatch phase below rebinds u0 to this one;
+	// the resolve phase keeps the texture UAV, which is what the TAA pass binds.
+	{
+		D3D12_HEAP_PROPERTIES dh = {};
+		dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = 256; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+		bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		HR(gpu.device->CreateCommittedResource(&dh, D3D12_HEAP_FLAG_NONE, &bd,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out_buf)));
+		D3D12_UNORDERED_ACCESS_VIEW_DESC bu = {};
+		bu.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		bu.Format = DXGI_FORMAT_UNKNOWN;
+		bu.Buffer.NumElements = 4;
+		bu.Buffer.StructureByteStride = 16;
+		gpu.device->CreateUnorderedAccessView(out_buf.Get(), nullptr, &bu, off(7));
+	}
 
 	// UE4 copies its offline descriptors into the online heap in one call per table.
 	gpu.device->CopyDescriptorsSimple(6, on(0), off(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -354,6 +374,7 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 		const UINT one = 1;
 		gpu.device->CopyDescriptors(1, &dst, &one, 1, &src, &one, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	}
+	gpu.device->CopyDescriptorsSimple(1, on(9), off(7), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
 	// --- bind, exactly as a game would ---
 	ID3D12DescriptorHeap *heaps[] = { online.Get() };
@@ -368,6 +389,10 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	const UINT consts[4] = { 0x2222u, 0, 0, 0 };
 	gpu.list->SetComputeRoot32BitConstants(3, 4, consts, 0);
 	gpu.list->SetPipelineState(pso.Get());
+
+	// Cumulative across the harness (an earlier test counts one on purpose), so the check is
+	// that a fully shadowed frame adds NONE.
+	const std::uint64_t unknown_at_start = sh::unknown_lookups();
 
 	// --- the native resolve ---
 	icept::CommandContext ctx;
@@ -410,11 +435,18 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 		}
 	}
 	const std::uint64_t unknown_before = sh::unknown_lookups();
-	check(unknown_before == 0, "no unknown lookups on a fully shadowed frame");
+	check(unknown_before == unknown_at_start, "no unknown lookups on a fully shadowed frame");
 
 	// --- the differential machinery, end to end: the oracle's answer published, the hooked
 	//     Dispatch consumes it and compares against a fresh native resolve ---
-	icept::DispatchBindings expected = b;
+	// u0 -> the structured buffer the probe shader expects, so the Dispatch is legal.
+	D3D12_GPU_DESCRIPTOR_HANDLE gbuf = gsrv;
+	gbuf.ptr += 9 * inc;
+	gpu.list->SetComputeRootDescriptorTable(2, gbuf);
+	icept::DispatchBindings expected;
+	check(native::backend().resolve_compute_bindings(ctx, expected) && find(expected.uavs, 0) != nullptr &&
+		find(expected.uavs, 0)->resource == id_of(out_buf.Get()) && find(expected.uavs, 0)->width == 0,
+		"rebinding the UAV table is seen: u0 is now the buffer (no extent)");
 	stray_dlss::diff::publish_expected(ctx.native, pso_hash, 40, 23, expected);
 	gpu.list->Dispatch(1, 1, 1);
 	const stray_dlss::diff::Summary sum = stray_dlss::diff::summary();
@@ -438,7 +470,7 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	gpu.list->SetComputeRootSignature(rs.Get());
 	gpu.list->SetComputeRootDescriptorTable(0, gsrv);
 	gpu.list->SetComputeRootConstantBufferView(1, view_cb->GetGPUVirtualAddress());
-	gpu.list->SetComputeRootDescriptorTable(2, guav);
+	gpu.list->SetComputeRootDescriptorTable(2, gbuf);
 	icept::DispatchBindings after;
 	native::backend().resolve_compute_bindings(ctx, after);
 	check(find(after.srvs, 2) == nullptr && find(after.srvs, 4) == nullptr, "after the depth texture died, t2 and t4 are absent");
