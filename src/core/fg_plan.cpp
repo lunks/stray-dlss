@@ -173,6 +173,7 @@ const char *crop_verdict_name(CropVerdict v)
 	case CropVerdict::identical: return "identical-to-real";
 	case CropVerdict::first: return "first-look";
 	case CropVerdict::suspect: return "suspect-unchanged";
+	case CropVerdict::dark: return "dark-both";
 	default: return "?";
 	}
 }
@@ -192,8 +193,18 @@ CropWeight crop_weight(CropVerdict v)
 CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 {
 	CropVerdict verdict = CropVerdict::ok;
-	if (generated.total == 0 ||
-		static_cast<double>(generated.nonzero) < black_fraction * static_cast<double>(generated.total))
+	const bool generated_black = generated.total == 0 ||
+		static_cast<double>(generated.nonzero) < black_fraction * static_cast<double>(generated.total);
+	const bool real_black = real.total == 0 ||
+		static_cast<double>(real.nonzero) < black_fraction * static_cast<double>(real.total);
+	if (generated_black && real_black)
+	{
+		// MEASURED on the box (facts §31.9): a loading screen / fade makes the REAL crop black
+		// too, and revoking there flickered FG off and on around every dark moment. Nothing
+		// to judge; neutral, and no reference for the next look.
+		verdict = CropVerdict::dark;
+	}
+	else if (generated_black)
 	{
 		verdict = CropVerdict::black;
 	}
@@ -216,10 +227,10 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 			verdict = generated.hash == real.hash ? CropVerdict::identical : CropVerdict::ok;
 		}
 	}
-	if (verdict != CropVerdict::black)
+	if (verdict != CropVerdict::black && verdict != CropVerdict::dark)
 	{
-		// A black look is not a reference for the next one: the first valid look after it is
-		// a first look again.
+		// A black or dark look is not a reference for the next one: the first valid look after
+		// it is a first look again.
 		prev_gen_hash2 = prev_gen_hash;
 		have_prev2 = have_prev;
 		prev_gen_hash = generated.hash;

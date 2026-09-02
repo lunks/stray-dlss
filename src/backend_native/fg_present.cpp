@@ -557,6 +557,7 @@ void drain_crops_locked(Chain &c)
 			case core::fg::CropVerdict::stale: ++g_stats.crop_stale; break;
 			case core::fg::CropVerdict::identical: ++g_stats.crop_identical; break;
 			case core::fg::CropVerdict::suspect: ++g_stats.crop_suspect; break;
+			case core::fg::CropVerdict::dark: ++g_stats.crop_dark; break;
 			default: break;
 			}
 		}
@@ -1191,7 +1192,7 @@ void log_stats(const char *when)
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
 	const reflex::Status rs = reflex::status();
-	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer %.2f ms hitches=%llu | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
+	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer %.2f ms hitches=%llu | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),
 		s.game_presents != 0 ? static_cast<double>(s.presents_issued) / static_cast<double>(s.game_presents) : 0.0,
@@ -1200,7 +1201,7 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(s.worker_waits), static_cast<unsigned long long>(s.epoch), static_cast<unsigned long long>(s.reconfigures),
 		s.width, s.height, s.format, static_cast<int>(s.color_space),
 		static_cast<unsigned long long>(s.crop_ok), static_cast<unsigned long long>(s.crop_identical),
-		static_cast<unsigned long long>(s.crop_black), static_cast<unsigned long long>(s.crop_stale), static_cast<unsigned long long>(s.crop_suspect), s.validated ? 1 : 0,
+		static_cast<unsigned long long>(s.crop_black), static_cast<unsigned long long>(s.crop_stale), static_cast<unsigned long long>(s.crop_suspect), static_cast<unsigned long long>(s.crop_dark), s.validated ? 1 : 0,
 		rs.dll_found ? 1 : 0, rs.initialised ? 1 : 0, rs.sleep_mode_set ? 1 : 0, rs.set_sleep_mode_status,
 		static_cast<unsigned long long>(rs.sleeps), rs.last_sleep_status, static_cast<unsigned long long>(rs.markers), rs.last_marker_status);
 }

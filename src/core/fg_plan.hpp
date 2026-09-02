@@ -157,6 +157,7 @@ enum class CropVerdict
 	identical,   // generated == real byte for byte (a copy, not an interpolation) — informational, counts as ok
 	first,       // the first look: nothing to compare against; neutral
 	suspect,     // the real frame moved and the generated one did not, but not yet `stale_limit` times; neutral
+	dark,        // BOTH crops are black (a loading screen, a fade): a black generated frame is correct; neutral
 	count
 };
 // Whether a verdict counts TOWARD validation (ok, identical), AGAINST it (black, stale) or

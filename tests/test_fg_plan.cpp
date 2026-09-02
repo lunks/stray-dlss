@@ -193,9 +193,17 @@ TEST_CASE("CropJudge: black is caught on the first look; stale needs the real fr
 	CHECK(alt.judge(b, r) == CropVerdict::suspect);
 	r.hash = 0x5;
 	CHECK(alt.judge(a, r) == CropVerdict::stale);
-	// An empty crop is black, never a division by zero.
+	// Both crops black (a loading screen): neutral, never a revoke, and no reference kept.
+	CropJudge dk;
+	CHECK(dk.judge(CropStats{ 0x1, 0, 4096 }, CropStats{ 0x1, 0, 4096 }) == CropVerdict::dark);
+	CHECK(crop_weight(CropVerdict::dark) == CropWeight::neutral);
+	CHECK_FALSE(dk.have_prev);
+	CHECK(dk.judge(CropStats{ 0x2, 3000, 4096 }, CropStats{ 0x3, 3000, 4096 }) == CropVerdict::first);
+	// A black generated crop over a LIT real frame is the real failure.
+	CHECK(dk.judge(CropStats{ 0x4, 0, 4096 }, CropStats{ 0x5, 3000, 4096 }) == CropVerdict::black);
+	// Empty crops are dark (both empty), never a division by zero.
 	CropJudge z;
-	CHECK(z.judge(CropStats{}, CropStats{}) == CropVerdict::black);
+	CHECK(z.judge(CropStats{}, CropStats{}) == CropVerdict::dark);
 	for (int i = 0; i < static_cast<int>(CropVerdict::count); ++i)
 		CHECK(crop_verdict_name(static_cast<CropVerdict>(i))[0] != '?');
 }

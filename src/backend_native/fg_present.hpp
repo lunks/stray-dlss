@@ -133,7 +133,7 @@ struct Stats
 	std::uint32_t issued_p50_ms = 0, issued_p99_ms = 0; // intervals between the presents WE issued
 	int issued_second_peak_ms = -1;                     // >= 0: bimodal (back-to-back)
 	std::uint64_t worker_waits = 0;      // game-thread waits on a busy worker
-	std::uint64_t crop_black = 0, crop_stale = 0, crop_ok = 0, crop_identical = 0, crop_suspect = 0;
+	std::uint64_t crop_black = 0, crop_stale = 0, crop_ok = 0, crop_identical = 0, crop_suspect = 0, crop_dark = 0;
 	bool validated = false;
 };
 Stats stats();
