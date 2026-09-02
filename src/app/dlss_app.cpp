@@ -998,9 +998,10 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
 			std::fprintf(f, "ngx_attempted=%d\n",
 				g_state.ngx_attempted.load(std::memory_order_relaxed) ? 1 : 0);
-			// The measured census is ~150 in the main menu and ~728 in gameplay, so a
-			// threshold in between separates them with wide margin either side.
-			std::fprintf(f, "in_game=%d\n", census >= 400 ? 1 : 0);
+			// The measured census is ~110-150 in the main menu and 390 (The Slums, slot 1,
+			// measured 2026-09-01) to ~728 (the apartment) in gameplay, so a threshold of 300
+			// separates them with margin either side. 400 was wrong for the Slums save.
+			std::fprintf(f, "in_game=%d\n", census >= 300 ? 1 : 0);
 			const auto &d = taa_hook::diagnostics();
 			std::fprintf(f, "large_dispatches=%llu\n", (unsigned long long)d.large_dispatches);
 			std::fprintf(f, "no_bound_pipeline=%llu\n", (unsigned long long)d.no_bound_pipeline);

@@ -6,8 +6,9 @@
 # is tapped twice a second to get through the splash and menu.
 #
 # Stopping is driven by evidence rather than a timer: the add-on writes a shader census to
-# stray-dlss-status.txt, and the measured census is ~150 in the main menu against ~728 in
-# gameplay (CLAUDE.md 2.3). The threshold sits between them with wide margin either side.
+# stray-dlss-status.txt, and the measured census is ~110-150 in the main menu against 390
+# (The Slums save) to ~728 (the apartment) in gameplay (CLAUDE.md 2.3). The add-on's
+# in_game threshold is 300, between them with margin either side.
 #
 #   ./launch-stray.sh [--no-input] [--timeout SECONDS]
 
