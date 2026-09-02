@@ -1169,3 +1169,14 @@ the host contention. load1, load5 and nproc are written into every CSV row (gpu_
 starved run can never again be mistaken for a code regression. Pass 1 (the thread-local caches) and
 the build bisection (c90be36 vs bde9184 artifacts staged, accumulation counters at cycle
 boundaries) are ready to run in one go the moment the host is quiet (load1/nproc < 0.3).
+
+**Host scheduling change (2026-09-02, coordinator).** The Proxmox host now sets the SteamOS
+container (113) to `cpu.weight 1000` and the work container (105) to 50 (live + persisted via
+`pct set --cpuunits`), so under contention the game wins ~20:1 rather than splitting evenly. It
+does NOT lift the pause: a loaded host still perturbs timing even when the game wins the
+scheduler, so the load guard stays and benches wait for a quiet host. On release, the arm-A
+add-on control is the first run - it also tells whether the weight alone restored the add-on's
+morning 113-117. stray-bench.sh writes a per-cycle accumulation snapshot (NATIVE SHADOW GROWTH,
+native-hooks buckets, NATIVE DRIVE, live-resource/root-signature counts) to stray-bench-accum.log
+so the bisection can see whether any counter climbs monotonically while fps falls (a leak) versus
+moves with the host load (contention).

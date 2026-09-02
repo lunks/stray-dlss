@@ -60,6 +60,20 @@ for i in $(seq 1 "$RUNS"); do
     bash "$TOOLS_DIR/stray-reload.sh" ${shot:+--shot "$shot"} || { rc=$?; log "bench: reload $i failed (exit $rc)"; exit "$rc"; }
     sleep 3   # let the load settle before moving
     bash "$TOOLS_DIR/stray-traverse.sh" --label "$LABEL-$i" ${REPLAY:+--replay "$REPLAY"} || { rc=$?; log "bench: traverse $i failed (exit $rc)"; exit "$rc"; }
+    # Accumulation snapshot at the cycle boundary (facts §31): whichever plugin counter climbs
+    # monotonically across cycles while fps falls is a leak, not host noise. Appended to
+    # stray-bench-accum.log for the bisection to read.
+    plog="$GAME_DIR/stray-dlss-plugin.log"; accum="$GAME_DIR/stray-bench-accum.log"
+    if [ -f "$plog" ]; then
+        {
+            echo "== $(date +%H:%M:%S) cycle $LABEL-$i =="
+            grep "NATIVE SHADOW GROWTH" "$plog" | tail -1
+            grep "native hooks/frame" "$plog" | tail -1
+            grep -E "NATIVE DRIVE \[" "$plog" | tail -1
+            grep -E "NATIVE SHADOW \[" "$plog" | tail -1 | grep -oE "resources live=[0-9]+ .registered [0-9]+|root-signatures=[0-9]+ pipelines=[0-9]+"
+        } >> "$accum"
+        chown deck:deck "$accum" 2>/dev/null
+    fi
 done
 log "bench: $RUNS runs completed; rows tagged $LABEL-* in $GAME_DIR/stray-bench.csv"
 tail -n "$RUNS" "$GAME_DIR/stray-bench.csv"
