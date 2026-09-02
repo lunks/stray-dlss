@@ -28,7 +28,9 @@ BTN_START=315
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
-field() { awk -F= -v k="$2" '$1 == k { print $2; f = 1 } END { if (!f) print "" }' "$1" 2>/dev/null; }
+# The probe is written through Wine's C runtime in text mode, so lines end in \r\n; strip
+# the CR or "ingame=1\r" never equals "1" (bit the first launch, 2026-09-02).
+field() { awk -F= -v k="$2" '{ sub(/\r$/, "", $2) } $1 == k { print $2; f = 1 } END { if (!f) print "" }' "$1" 2>/dev/null; }
 probe() { field "$PROBE" "$1"; }
 probe_age() { echo $(( $(date +%s) - $(mtime "$PROBE") )); }
 hb_frame() { field "$STATUS" frame; }
