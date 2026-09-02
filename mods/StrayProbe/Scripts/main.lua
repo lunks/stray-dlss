@@ -57,19 +57,35 @@ local function controllerPresent()
     return ok and v == true
 end
 
+-- paused=1 while the pause menu is up (UGameplayStatics::IsGamePaused). This is what lets
+-- stray-reload.sh KNOW the menu opened instead of firing a key sequence into the void:
+-- measured 2026-09-02, the sequence sent 2 s after reaching gameplay did nothing (the
+-- level's intro still had the menu locked), and nothing distinguished that from a
+-- mis-keyed sequence without this field.
+local function isPaused()
+    local ok, v = pcall(function()
+        local gs = UEHelpers.GetGameplayStatics()
+        local world = UEHelpers.GetWorld()
+        if gs == nil or world == nil or not world:IsValid() then return false end
+        return gs:IsGamePaused(world) == true
+    end)
+    return ok and v == true
+end
+
 local function write()
     seq = seq + 1
     local pawn = pawnPresent() and 1 or 0
     local pc = controllerPresent() and 1 or 0
     local map = mapName()
+    local paused = isPaused() and 1 or 0
     local menu = map:lower():find("menu", 1, true) ~= nil
     local ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
     -- "wb": the game's C runtime is Windows', and text mode turns "\n" into "\r\n", which
     -- the shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
     local f = io.open(STATE, "wb")
     if not f then return end
-    f:write(string.format("seq=%d\nt=%d\npawn=%d\npc=%d\nmap=%s\ningame=%d\n",
-        seq, os.time(), pawn, pc, map, ingame))
+    f:write(string.format("seq=%d\nt=%d\npawn=%d\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
+        seq, os.time(), pawn, pc, map, paused, ingame))
     f:close()
 end
 

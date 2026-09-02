@@ -27,12 +27,33 @@ done
 require_ingame
 T0=$(date +%s)
 seq0=$(probe seq)
-log "reload: START, DOWN, DOWN, ENTER, RIGHT, ENTER (pad=${PAD:-none}, keyboard=$KBD)"
-if [ -n "$PAD" ]; then python3 "$INJECT" pad "/dev/input/$PAD" $BTN_START 80 >/dev/null 2>&1; else tap_key $KEY_ESC; fi
-sleep 1.0
+
+# Step 1: open the pause menu and SEE it open (probe paused=1). Right after a load the
+# level's intro keeps the menu locked for a while (measured 2026-09-02: a sequence sent
+# 2 s after reaching gameplay did nothing), so retry the pause press with gaps rather
+# than fire the whole sequence blind.
+log "reload: opening the pause menu (pad=${PAD:-none}, keyboard=$KBD)"
+opened=0
+for attempt in $(seq 1 12); do
+    tick_checks "pause" "$T0"
+    if [ -n "$PAD" ]; then python3 "$INJECT" pad "/dev/input/$PAD" $BTN_START 80 >/dev/null 2>&1; else tap_key $KEY_ESC; fi
+    for _ in $(seq 1 6); do sleep 0.5; [ "$(probe paused)" = "1" ] && break; done
+    [ "$(probe paused)" = "1" ] && { opened=1; break; }
+    log "  attempt $attempt: not paused yet (map=$(probe map)); waiting 3 s"
+    sleep 3
+done
+[ "$opened" -eq 1 ] || { log "FAILED: the pause menu never opened (probe paused stays 0); START/Esc is not reaching the game or the level keeps it locked"; exit 1; }
+log "  paused=1 at +$(( $(date +%s) - T0 ))s"
+[ -n "$SHOT" ] && bash "$TOOLS_DIR/screenshot-gamescope.sh" "${SHOT%.png}-pause.png" 4 >/dev/null 2>&1
+
+# Step 2: DOWN, DOWN, ENTER (reload checkpoint), RIGHT, ENTER (confirm; the dialog
+# defaults to the No side).
+log "reload: DOWN, DOWN, ENTER, RIGHT, ENTER"
+sleep 0.5
 tap_key $KEY_DOWN;  sleep 0.5
 tap_key $KEY_DOWN;  sleep 0.5
 tap_key $KEY_ENTER; sleep 1.0
+[ -n "$SHOT" ] && bash "$TOOLS_DIR/screenshot-gamescope.sh" "${SHOT%.png}-confirm.png" 4 >/dev/null 2>&1
 tap_key $KEY_RIGHT; sleep 0.5
 tap_key $KEY_ENTER
 

@@ -59,7 +59,14 @@ crash_message() { grep -oE "<ErrorMessage>[^<]*" "$CRASH_DIR/$1/CrashContext.run
 # first if a screenshot path is set, then clear, then kill only if it will not go.
 crash() {   # $1 = reason, $2 = since-epoch
     log "CRASH: $1"
-    [ -n "${SHOT:-}" ] && bash "$TOOLS_DIR/screenshot-gamescope.sh" "${SHOT%.png}-crash.png" 4 >/dev/null 2>&1 && log "  dialog captured to ${SHOT%.png}-crash.png"
+    # Two captures: the screen buffer (4) came back black on the first crash (the game's
+    # last frame was a black load frame and the dialog is its own window), so also take
+    # the full composition (3), which includes every layer.
+    if [ -n "${SHOT:-}" ]; then
+        bash "$TOOLS_DIR/screenshot-gamescope.sh" "${SHOT%.png}-crash.png" 4 >/dev/null 2>&1
+        bash "$TOOLS_DIR/screenshot-gamescope.sh" "${SHOT%.png}-crash-comp.png" 3 >/dev/null 2>&1
+        log "  dialog captured to ${SHOT%.png}-crash.png and -crash-comp.png"
+    fi
     {
         echo "VERDICT: CRASH: $1"
         echo "--- probe"; cat "$PROBE" 2>/dev/null
