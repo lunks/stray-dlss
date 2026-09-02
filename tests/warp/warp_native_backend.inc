@@ -675,3 +675,154 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	stray_dlss::diff::set_enabled(false);
 	return true;
 }
+
+// ---- NativeMode=drive (plan Stage 3) ----
+//
+// The native backend as THE driver: its hooks deliver the seam's events to a sink, and the
+// Dispatch hook does not forward the game's call when the sink says so. This sink behaves as
+// the application does at the TAA site — records our motion-vector resolve onto the game's
+// list (clobbering root signature, PSO, heaps and root arguments), puts the game's compute
+// state back through the NATIVE restore (the root shadow's replay, root CBVs and 32-bit
+// constants included), and then either lets the game's dispatch run or suppresses it.
+namespace {
+
+struct DriveTestSink final : stray_dlss::icept::Sink
+{
+	Gpu *gpu = nullptr;
+	GameResources *game = nullptr;
+	const stray_dlss::ue4::ViewParams *view = nullptr;
+	bool clobber = false;
+	bool suppress = false;
+	int dispatches = 0, pipelines = 0, binds = 0, resets = 0;
+	bool restore_ran = false;
+
+	void on_device(::ID3D12Device *, bool) override {}
+	void on_pipeline(std::uint64_t, const void *, std::size_t, stray_dlss::icept::ShaderKind, bool) override { ++pipelines; }
+	void on_command_list(const stray_dlss::icept::CommandContext &, bool) override {}
+	void on_command_list_reset(const stray_dlss::icept::CommandContext &) override { ++resets; }
+	void on_bind_pipeline(const stray_dlss::icept::CommandContext &, std::uint64_t) override { ++binds; }
+	bool on_dispatch(const stray_dlss::icept::CommandContext &ctx, std::uint32_t, std::uint32_t, std::uint32_t) override
+	{
+		++dispatches;
+		if (clobber)
+		{
+			// Exactly the application's discipline: everything we record is OUR state and
+			// must not enter the shadow (assessment §8.3).
+			stray_dlss::native::OwnCodeScope own;
+			const auto view_copy = *view;
+			stray_dlss::mv::ResolveInputs in;
+			in.depth_resource = reinterpret_cast<std::uint64_t>(game->depth.Get());
+			in.velocity_resource = reinterpret_cast<std::uint64_t>(game->velocity.Get());
+			in.render_width = 1920;
+			in.render_height = 1080;
+			in.view = &view_copy;
+			stray_dlss::mv::record(ctx.native, in, 2);
+			stray_dlss::native::backend().restore_game_compute_state(ctx);
+			restore_ran = true;
+		}
+		return suppress;
+	}
+	void on_render_targets(const stray_dlss::icept::CommandContext &, std::uint32_t, const stray_dlss::icept::DescriptorId *, stray_dlss::icept::DescriptorId) override {}
+	void on_draw(const stray_dlss::icept::CommandContext &, std::uint32_t) override {}
+	void on_copy(const stray_dlss::icept::CommandContext &, stray_dlss::icept::ResourceId, stray_dlss::icept::ResourceId) override {}
+	void on_execute(const stray_dlss::icept::CommandContext &) override {}
+	void on_swapchain(const stray_dlss::icept::ResourceId *, std::uint32_t, bool) override {}
+	void on_present(const stray_dlss::icept::PresentContext &) override {}
+};
+
+} // namespace
+
+// Runs LAST: it re-installs the hooks in drive mode, which is where they stay.
+bool test_drive_mode_restore_is_complete(Gpu &gpu)
+{
+	std::printf("\n[test] NativeMode=drive: the hooks deliver, the native restore is complete, the Dispatch hook suppresses\n");
+	namespace native = stray_dlss::native;
+	ID3D12Device *dev = real_device(gpu);
+
+	static DriveTestSink sink;
+	sink = DriveTestSink{};
+	sink.gpu = &gpu;
+	native::uninstall(); // the observer life ends (hooks restored, sentinels made inert)
+	native::set_sink(&sink);
+	if (!native::install(dev, native::Mode::drive))
+	{
+		fail("native::install(drive) failed");
+		return false;
+	}
+	std::printf("  %s\n", native::attach_report());
+	check(native::mode() == native::Mode::drive, "the backend is in drive mode");
+
+	// Pipeline creation is delivered through the creation hook (the application hashes it).
+	const int pipelines_before = sink.pipelines;
+	Probe p;
+	if (!build_probe(gpu, p))
+		return false;
+	check(sink.pipelines == pipelines_before + 1, "CreateComputePipelineState delivered on_pipeline exactly once");
+	check(native::pipeline_hash(p.pso.Get()) == stray_dlss::fnv1a64(g_warp_probe_dxbc, sizeof(g_warp_probe_dxbc)),
+		"...and the shadow hashed the same bytecode");
+
+	GameResources game;
+	if (!create_game_resources(gpu, game, 1920, 1080))
+		return false;
+	if (!stray_dlss::mv::initialise(dev, 1920, 1080))
+		return false;
+	const auto view = make_view(1920, 1080);
+	sink.game = &game;
+	sink.view = &view;
+	drain_validation(gpu, "drive-setup");
+
+	// GOLDEN: the game's dispatch, delivered to the sink, let through untouched.
+	UINT golden[4] = {};
+	const int binds_before = sink.binds;
+	bind_probe_state(gpu, p, 0x1111u);
+	check(sink.binds == binds_before + 1, "SetPipelineState delivered on_bind_pipeline");
+	gpu.list->Dispatch(1, 1, 1);
+	check(sink.dispatches == 1, "Dispatch delivered on_dispatch");
+	if (!read_probe(gpu, p, golden))
+		return false;
+	std::printf("  golden   = %08X %08X %08X %08X\n", golden[0], golden[1], golden[2], golden[3]);
+	check(sink.resets >= 1, "the list's Reset (inside flush) delivered on_command_list_reset");
+
+	// CLOBBER + NATIVE RESTORE inside on_dispatch, then the game's dispatch runs: the output
+	// must be the golden one, or the restore lost a root argument.
+	sink.clobber = true;
+	bind_probe_state(gpu, p, 0x1111u);
+	gpu.list->Dispatch(1, 1, 1);
+	check(sink.restore_ran, "the sink clobbered and restored through the native backend");
+	UINT restored[4] = {};
+	if (!read_probe(gpu, p, restored))
+		return false;
+	std::printf("  restored = %08X %08X %08X %08X\n", restored[0], restored[1], restored[2], restored[3]);
+	check(memcmp(golden, restored, sizeof(golden)) == 0,
+		"the game's dispatch produces identical output after our clobber and the NATIVE restore");
+	check(drain_validation(gpu, "drive-restore") == 0, "no validation errors across the drive-mode clobber and restore");
+
+	// SUPPRESSION: the sink says true, the game's Dispatch is never forwarded. Prove it with
+	// a marker the probe writes: after a suppressed dispatch the output is unchanged; after
+	// an allowed one with the same marker it changes.
+	sink.clobber = false;
+	sink.suppress = true;
+	bind_probe_state(gpu, p, 0x2222u);
+	gpu.list->Dispatch(1, 1, 1);
+	UINT suppressed[4] = {};
+	if (!read_probe(gpu, p, suppressed))
+		return false;
+	check(memcmp(golden, suppressed, sizeof(golden)) == 0, "a suppressed dispatch leaves the output untouched (the original was NOT forwarded)");
+	sink.suppress = false;
+	bind_probe_state(gpu, p, 0x2222u);
+	gpu.list->Dispatch(1, 1, 1);
+	UINT allowed[4] = {};
+	if (!read_probe(gpu, p, allowed))
+		return false;
+	std::printf("  suppressed= %08X ... allowed= %08X (golden %08X)\n", suppressed[0], allowed[0], golden[0]);
+	check(memcmp(golden, allowed, sizeof(golden)) != 0, "...and the same marker, let through, changes it (the control)");
+	const native::Stats st = native::stats();
+	std::printf("  drive: dispatches delivered=%llu suppressed=%llu pipelines=%llu\n",
+		static_cast<unsigned long long>(st.drive_dispatches), static_cast<unsigned long long>(st.drive_suppressed),
+		static_cast<unsigned long long>(st.drive_pipelines));
+	check(st.drive_dispatches == 4 && st.drive_suppressed == 1, "the drive counters agree: 4 delivered, 1 suppressed");
+	check(drain_validation(gpu, "drive-suppress") == 0, "no validation errors across the suppression");
+	native::log_stats("harness-drive");
+	native::set_sink(nullptr);
+	return true;
+}

@@ -26,8 +26,22 @@ std::atomic<bool> g_use_sentinel{ true };
 char g_report[512] = "native backend: not installed";
 std::atomic<std::uint64_t> g_resolves{ 0 };
 std::atomic<std::uint64_t> g_resolves_no_layout{ 0 };
+std::atomic<icept::Sink *> g_sink{ nullptr };
+std::atomic<std::uint64_t> g_drive_dispatches{ 0 };
+std::atomic<std::uint64_t> g_drive_suppressed{ 0 };
+std::atomic<std::uint64_t> g_drive_pipelines{ 0 };
 
 } // namespace
+
+void set_sink(icept::Sink *s) { g_sink.store(s, std::memory_order_release); }
+icept::Sink *sink() { return g_sink.load(std::memory_order_acquire); }
+void count_drive_dispatch(bool suppressed)
+{
+	g_drive_dispatches.fetch_add(1, std::memory_order_relaxed);
+	if (suppressed)
+		g_drive_suppressed.fetch_add(1, std::memory_order_relaxed);
+}
+void count_drive_pipeline() { g_drive_pipelines.fetch_add(1, std::memory_order_relaxed); }
 
 Mode mode_from_string(const char *s)
 {
@@ -78,10 +92,10 @@ bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope, bo
 		std::snprintf(g_report, sizeof(g_report), "native backend: off (NativeMode=%s)", mode_name(requested));
 		return false;
 	}
-	if (requested == Mode::drive)
+	if (requested == Mode::drive && sink() == nullptr)
 	{
-		STRAY_LOG_ERROR("NativeMode=drive is NOT IMPLEMENTED in this version (Stage 3); running as "
-			"observe instead. The ReShade backend keeps driving.");
+		STRAY_LOG_ERROR("NativeMode=drive with NO SINK installed (set_sink was never called): the hooks "
+			"would deliver to nothing. Running as observe instead.");
 		requested = Mode::observe;
 	}
 	if (g_device != nullptr)
@@ -404,6 +418,9 @@ Stats stats()
 	s.slots = sh.slots;
 	s.heaps = sh.heaps;
 	s.patches = patch_count();
+	s.drive_dispatches = g_drive_dispatches.load(std::memory_order_relaxed);
+	s.drive_suppressed = g_drive_suppressed.load(std::memory_order_relaxed);
+	s.drive_pipelines = g_drive_pipelines.load(std::memory_order_relaxed);
 	return s;
 }
 
@@ -423,6 +440,10 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),
 		static_cast<unsigned long long>(r.unarmed),
 		static_cast<unsigned long long>(s.slots), static_cast<unsigned long long>(s.heaps));
+	if (mode() == Mode::drive)
+		STRAY_LOG_INFO("NATIVE DRIVE [%s] dispatches delivered=%llu suppressed=%llu compute-pipelines delivered=%llu",
+			when, static_cast<unsigned long long>(s.drive_dispatches), static_cast<unsigned long long>(s.drive_suppressed),
+			static_cast<unsigned long long>(s.drive_pipelines));
 }
 
 std::uint64_t pipeline_hash(void *pso)

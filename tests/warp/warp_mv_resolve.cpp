@@ -1749,6 +1749,7 @@ int main(int argc, char **argv)
 	test_descriptor_shadow_copy_chain(gpu);
 	test_native_stream_walk();
 	test_native_hooks_ue4_shaped_frame(gpu);
+	test_drive_mode_restore_is_complete(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");

@@ -217,13 +217,34 @@ void store_layout(ID3D12RootSignature *rs, const void *blob, SIZE_T len)
 	g_layouts[rs] = std::move(layout);
 }
 
+// drive mode: the sink to deliver to, or null (observe, off, no sink, or our own code).
+icept::Sink *drive_sink()
+{
+	if (mode() != Mode::drive || in_own_code())
+		return nullptr;
+	return sink();
+}
+
 void store_pipeline(void *pso, const void *code, std::size_t len)
 {
 	if (pso == nullptr)
 		return;
 	const std::uint64_t hash = (code != nullptr && len != 0) ? fnv1a64(code, len) : 0;
-	std::lock_guard<std::mutex> lock(g_mutex);
-	g_pipeline_hashes[pso] = hash;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_pipeline_hashes[pso] = hash;
+	}
+	// drive: the application hashes and identifies the shader itself (on_pipeline), exactly
+	// as the ReShade host's init_pipeline fed it. Compute only; the graphics PSOs the finders
+	// want are still the ReShade host's while it is loaded.
+	if (code != nullptr && len != 0)
+	{
+		if (icept::Sink *sk = drive_sink())
+		{
+			count_drive_pipeline();
+			sk->on_pipeline(reinterpret_cast<std::uint64_t>(pso), code, len, icept::ShaderKind::compute, true);
+		}
+	}
 }
 
 // ---- device hooks ----
@@ -463,11 +484,24 @@ HRESULT STDMETHODCALLTYPE hk_CreatePipelineState(ID3D12Device2 *self, const D3D1
 
 // ---- command-list hooks ----
 
+icept::CommandContext context_for(ID3D12GraphicsCommandList *list)
+{
+	icept::CommandContext ctx;
+	ctx.native = list;
+	ctx.device = game_device();
+	ctx.backend_cookie = 0; // the native backend needs none
+	return ctx;
+}
+
 HRESULT STDMETHODCALLTYPE hk_List_Reset(ID3D12GraphicsCommandList *self, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
 	const HRESULT hr = g_orig_List_Reset(self, alloc, pso);
 	if (!in_own_code())
+	{
 		root::on_reset(self, pso);
+		if (icept::Sink *sk = drive_sink())
+			sk->on_command_list_reset(context_for(self));
+	}
 	return hr;
 }
 
@@ -485,7 +519,14 @@ void STDMETHODCALLTYPE hk_List_SetPipelineState(ID3D12GraphicsCommandList *self,
 {
 	g_orig_List_SetPipelineState(self, pso);
 	if (!in_own_code())
+	{
 		root::on_set_pso(self, pso);
+		// The pipeline handle is the ID3D12PipelineState* under both hosts (ReShade's
+		// pipeline.handle is the same pointer on D3D12), so the application's per-list
+		// "which shader is bound" map keys agree whichever side fed it.
+		if (icept::Sink *sk = drive_sink())
+			sk->on_bind_pipeline(context_for(self), reinterpret_cast<std::uint64_t>(pso));
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootSignature(ID3D12GraphicsCommandList *self, ID3D12RootSignature *rs)
@@ -539,6 +580,19 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootUnorderedAccessView(ID3D12GraphicsC
 
 void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x, UINT y, UINT z)
 {
+	// DRIVE: the sink decides. `true` means it produced this pass's output itself (DLSS wrote
+	// u0 and the game's compute state was put back), so the game's dispatch must NOT run —
+	// the one skip-capable event on our path, now ours to skip. Everything the sink records
+	// onto this list in between arrives here under OwnCodeScope and passes straight through.
+	if (icept::Sink *sk = drive_sink())
+	{
+		const bool suppress = sk->on_dispatch(context_for(self), x, y, z);
+		count_drive_dispatch(suppress);
+		if (suppress)
+			return;
+		g_orig_List_Dispatch(self, x, y, z);
+		return;
+	}
 	// OBSERVE: the driver has already decided; this fires inside its forward of the call.
 	// The expectation it parked for this list on this thread is consumed here.
 	if (!in_own_code() && diff::enabled() && diff::has_expected(self))

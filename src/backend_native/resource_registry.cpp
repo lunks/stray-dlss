@@ -158,9 +158,12 @@ void note_created(::ID3D12Resource *res)
 	// Committed and placed resources answer this; reserved ones fail and stay "not upload".
 	D3D12_HEAP_PROPERTIES hp = {};
 	D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+	// "Mappable for a CPU read": UPLOAD, or a CUSTOM heap with any CPU page property (write-
+	// combine or write-back). The ReShade path also accepted heaps it could not classify.
 	if (SUCCEEDED(res->GetHeapProperties(&hp, &hf)))
 		info.upload_heap = hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
-			(hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE);
+			(hp.Type == D3D12_HEAP_TYPE_CUSTOM && hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
+			 hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN);
 	const std::uint64_t va = info.is_buffer ? res->GetGPUVirtualAddress() : 0;
 
 	{

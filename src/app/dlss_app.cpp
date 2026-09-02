@@ -681,10 +681,15 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		"changes the image; EnableNGX alone only brings NGX up.",
 		ngx_evaluate ? "ENABLED" : "disabled");
 
-	// [STRAYDLSS] NativeMode: off (default) | observe. `observe` installs our own D3D12 vtable
-	// hooks on the ORIGINAL device BESIDE the driving backend and diffs every size-gated
+	// [STRAYDLSS] NativeMode: off (default) | observe | drive. `observe` installs our own D3D12
+	// vtable hooks on the ORIGINAL device BESIDE the driving backend and diffs every size-gated
 	// dispatch's bindings against the driver's answer (src/app/diff_observer.hpp). It changes
 	// nothing on screen; it is how the native backend earns the right to drive (plan Task 15).
+	// `drive` (plan Stage 3) makes those hooks THE driver: they deliver the seam's events to
+	// this application (the host stops forwarding the ones the hooks now own), the native
+	// resolve, View-CB read and restore answer the TAA hook, and the Dispatch hook suppresses
+	// the engine's TAA when DLSS produced its output. Which icept::Backend the seam hands out
+	// is the HOST's decision, made from native::mode() after this returns.
 	{
 		char native_mode[16] = "off";
 		host::cfg::get_string("NativeMode", native_mode, sizeof(native_mode));
@@ -719,11 +724,23 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 						"installing on the real device instead.");
 				}
 			}
+			// The hooks deliver to this application in drive mode; harmless otherwise.
+			native::set_sink(this);
 			const bool ok = native::install(install_on, mode, native::install_scope_from_string(scope),
 				install_on != native);
 			diff::set_enabled(ok && native::mode() == native::Mode::observe);
 			STRAY_LOG_WARN("NativeMode=%s ([STRAYDLSS] NativeMode, read as \"%s\"): %s. Grep 'DIFF' and "
 				"'NATIVE SHADOW'.", native::mode_name(native::mode()), native_mode, native::attach_report());
+			if (mode == native::Mode::drive && (!ok || native::mode() != native::Mode::drive))
+				STRAY_LOG_ERROR("NativeMode=drive was requested but the native backend is %s - the ReShade "
+					"backend keeps driving. Nothing DLSS does this session comes from the native path.",
+					ok ? native::mode_name(native::mode()) : "INCOMPLETE");
+			else if (native::mode() == native::Mode::drive)
+				STRAY_LOG_WARN("NATIVE DRIVE: the D3D12 vtable hooks now deliver pipeline creation, pipeline "
+					"binds, list resets and every Dispatch to this application; the native resolve, "
+					"View-CB read, liveness and restore answer the TAA hook; the engine's TAA is "
+					"suppressed from the Dispatch hook. ReShade stays loaded as the host (present, "
+					"screenshots, overlay) and no longer decides. Grep 'NATIVE DRIVE'.");
 		}
 		else
 		{
@@ -1416,6 +1433,7 @@ void DlssApp::shutdown()
 {
 	diff::set_enabled(false);
 	native::uninstall();
+	native::set_sink(nullptr);
 }
 
 void DlssApp::load_hash_override_file()

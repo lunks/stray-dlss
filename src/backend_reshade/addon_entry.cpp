@@ -10,6 +10,7 @@
 #include "reshade_host.hpp"
 
 #include "app/dlss_app.hpp"
+#include "backend_native/native_backend.hpp"
 #include "core/nr_hook_plan.hpp"
 #include "core/nr_history_plan.hpp"
 #include "core/taa_hashes.hpp"
@@ -49,6 +50,50 @@ std::atomic<bool> g_reported_capability_verdict{ false };
 
 app::EventNeeds g_needs;
 
+// NativeMode=drive while ReShade is still the host (plan Stage 3): the native backend answers
+// everything the TAA hook asks — bindings, the View CB, liveness, the restore — and the
+// ReShade backend keeps exactly the parts that belong to ReShade's own objects: the barrier
+// on ITS immediate list at present (recorded through ReShade's API so the list is flushed,
+// CLAUDE.md §5), and the graphics-side state its trackers still watch (viewports/scissors for
+// the pre-UI NR site, the pass finder's graphics SRVs). Stage 4 replaces those with our own.
+class DriveBackend final : public icept::Backend
+{
+public:
+	const char *name() const override { return "native(drive)+reshade(present)"; }
+	bool resolve_compute_bindings(const icept::CommandContext &ctx, icept::DispatchBindings &out) override { return native::backend().resolve_compute_bindings(ctx, out); }
+	bool resolve_graphics_srvs(const icept::CommandContext &ctx, std::vector<BoundTexture> &out) override { return rsb::backend().resolve_graphics_srvs(ctx, out); }
+	void describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out) override { native::backend().describe_view(view, reg, out); }
+	bool describe_resource(icept::ResourceId res, icept::ResourceInfo &out) override { return native::backend().describe_resource(res, out); }
+	bool resource_from_view(icept::DescriptorId view, icept::ResourceId &out) override { return native::backend().resource_from_view(view, out); }
+	bool read_buffer(const icept::BufferRange &range, std::uint64_t bytes, void *out) override { return native::backend().read_buffer(range, bytes, out); }
+	bool is_resource_live(icept::ResourceId res) override { return native::backend().is_resource_live(res); }
+	void restore_game_compute_state(const icept::CommandContext &ctx) override { native::backend().restore_game_compute_state(ctx); }
+	void restore_viewports_and_scissors(const icept::CommandContext &ctx) override { rsb::backend().restore_viewports_and_scissors(ctx); }
+	void present_barrier(const icept::PresentContext &ctx, icept::ResourceId res, std::uint32_t before, std::uint32_t after) override { rsb::backend().present_barrier(ctx, res, before, after); }
+	void dump_tracker_state(const icept::CommandContext &ctx, const char *why) override { native::backend().dump_tracker_state(ctx, why); }
+};
+DriveBackend g_drive_backend;
+
+bool native_drives() { return native::mode() == native::Mode::drive; }
+
+// After the application has read NativeMode and installed (or not) the native hooks: which
+// backend the seam hands out, decided from what actually installed rather than from the ini.
+void select_backend()
+{
+	if (native_drives())
+	{
+		icept::set_backend(&g_drive_backend);
+		STRAY_LOG_WARN("seam: backend is %s. The ReShade host still delivers device/list lifetime, "
+			"present, swapchain, the render-target/draw/copy taps and PIXEL pipelines; the native "
+			"hooks deliver compute pipelines, pipeline binds, list resets and dispatches.",
+			icept::backend()->name());
+	}
+	else
+	{
+		icept::set_backend(&rsb::backend());
+	}
+}
+
 // ---- the events, each a translation into the seam ----
 
 void on_init_device(reshade::api::device *device)
@@ -63,6 +108,7 @@ void on_init_device(reshade::api::device *device)
 	// get_native() returns uint64_t and hands back the ORIGINAL vkd3d device, not a ReShade
 	// proxy. That is exactly what NGX must be initialised with. (docs/RESEARCH.md §1.2)
 	app::instance().on_device(reinterpret_cast<ID3D12Device *>(device->get_native()), true);
+	select_backend();
 }
 
 void on_destroy_device(reshade::api::device *device)
@@ -81,7 +127,8 @@ void on_init_command_list(reshade::api::command_list *cmd_list)
 void on_reset_command_list(reshade::api::command_list *cmd_list)
 {
 	rsb::reset_command_list_state(cmd_list);
-	app::instance().on_command_list_reset(rsb::context_for(cmd_list));
+	if (!native_drives()) // the native Reset hook delivers it in drive mode
+		app::instance().on_command_list_reset(rsb::context_for(cmd_list));
 }
 
 void on_push_constants(
@@ -133,6 +180,10 @@ void on_init_pipeline(
 		const auto *shader = static_cast<const reshade::api::shader_desc *>(subobjects[i].data);
 		if (shader == nullptr || shader->code == nullptr || shader->code_size == 0)
 			continue;
+		// In drive mode the native creation hooks deliver COMPUTE pipelines (the ones the TAA
+		// hook identifies); the pixel ones the finders want still come from here.
+		if (is_compute && native_drives())
+			continue;
 
 		app::instance().on_pipeline(pipeline.handle, shader->code, shader->code_size,
 			is_compute ? icept::ShaderKind::compute : icept::ShaderKind::pixel, true);
@@ -154,6 +205,8 @@ void on_bind_pipeline(
 	// the compute stage here would silently miss every event. (docs/RESEARCH.md §2.3)
 	(void)stages;
 	g_saw_bind_pipeline.store(true, std::memory_order_relaxed);
+	if (native_drives()) // the native SetPipelineState hook delivers it in drive mode
+		return;
 	app::instance().on_bind_pipeline(rsb::context_for(cmd_list), pipeline.handle);
 }
 
@@ -170,6 +223,10 @@ void on_push_descriptors(
 
 bool on_dispatch(reshade::api::command_list *cmd_list, uint32_t x, uint32_t y, uint32_t z)
 {
+	// In drive mode the decision is the native Dispatch hook's, which fires inside ReShade's
+	// forward of this very call: let it through here, unconditionally, and never twice.
+	if (native_drives())
+		return false;
 	return app::instance().on_dispatch(rsb::context_for(cmd_list), x, y, z);
 }
 
@@ -809,6 +866,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		// the game's device recreate (measured), and a patched slot pointing into an unmapped
 		// image is the address-0 startup crash.
 		app::instance().shutdown();
+		native::set_sink(nullptr);
 		unregister_events(g_needs);
 		state_tracking::unregister_events();
 		descriptor_tracking::unregister_events();

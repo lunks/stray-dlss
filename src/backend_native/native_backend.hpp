@@ -1,7 +1,10 @@
 // The native backend: our own D3D12 vtable hooks as an icept::Backend. In `observe` mode it
 // runs BESIDE the ReShade backend and diffs every observed dispatch against ReShade's answer
-// (src/app/diff_observer.hpp); it never suppresses and never restores. `drive` is Stage 3
-// and is refused in this version.
+// (src/app/diff_observer.hpp); it never suppresses and never restores. In `drive` mode (plan
+// Stage 3) its hooks DELIVER the seam's events to the installed icept::Sink — pipeline
+// creation, pipeline binds, list resets and, above all, the suppressible dispatch: the
+// Dispatch hook does not forward the game's call when the sink says so — and its resolve,
+// View-CB read, liveness and restore answer the application's questions.
 #pragma once
 
 #include "intercept/backend.hpp"
@@ -16,7 +19,7 @@ enum class Mode
 {
 	off,     // nothing installed
 	observe, // hooks installed, dispatches diffed against the driver's answer, nothing changed
-	drive,   // NOT IMPLEMENTED in this version: refused loudly, falls back to observe
+	drive,   // hooks installed AND delivering the seam's events to the sink; dispatches suppressible
 };
 
 Mode mode_from_string(const char *s);
@@ -44,6 +47,11 @@ void uninstall();
 Mode mode();
 ::ID3D12Device *game_device();
 const char *attach_report();
+
+// The consumer the hooks deliver to in `drive` mode. Set BEFORE install; may be null (then
+// drive is refused and falls back to observe, loudly). The pointer is never owned here.
+void set_sink(icept::Sink *sink);
+icept::Sink *sink();
 
 // While held on this thread, every hook passes straight through: our own recording onto
 // the game's list (resolve, NGX evaluate, codec passes, the restore) must not enter the
@@ -91,7 +99,14 @@ struct Stats
 	std::uint64_t slots = 0;
 	std::uint64_t heaps = 0;
 	unsigned patches = 0;
+	// drive mode: dispatches delivered to the sink through the Dispatch hook, and how many of
+	// those the sink suppressed (the game's call was NOT forwarded).
+	std::uint64_t drive_dispatches = 0;
+	std::uint64_t drive_suppressed = 0;
+	std::uint64_t drive_pipelines = 0; // compute PSOs delivered through the creation hooks
 };
+void count_drive_dispatch(bool suppressed);
+void count_drive_pipeline();
 Stats stats();
 void log_stats(const char *when);
 
