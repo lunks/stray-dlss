@@ -62,6 +62,30 @@ void *patch_slot(void *object, unsigned index, void *replacement, const char *na
 	return original;
 }
 
+void restore_all_patches()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	unsigned restored = 0, skipped = 0;
+	for (auto it = g_patches.rbegin(); it != g_patches.rend(); ++it)
+	{
+		if (*it->slot != it->replacement)
+		{
+			++skipped; // someone patched over us; leave their chain intact
+			continue;
+		}
+		DWORD old = 0;
+		if (::VirtualProtect(it->slot, sizeof(void *), PAGE_READWRITE, &old))
+		{
+			*it->slot = it->original;
+			DWORD ignored = 0;
+			::VirtualProtect(it->slot, sizeof(void *), old, &ignored);
+			++restored;
+		}
+	}
+	STRAY_LOG_INFO("vtable_patch: restored %u slot(s), left %u patched by someone else", restored, skipped);
+	g_patches.clear();
+}
+
 unsigned patch_count()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);

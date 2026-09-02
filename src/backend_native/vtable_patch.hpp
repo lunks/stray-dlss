@@ -14,4 +14,12 @@ void *patch_slot(void *object, unsigned index, void *replacement, const char *na
 
 unsigned patch_count();
 
+// Puts every original back — ONLY where the slot still holds our replacement — and forgets
+// the records. This exists for one reason, MEASURED 2026-09-01: ReShade unloads and reloads
+// the add-on DLL across the game's device recreate, and a process-global patch that outlives
+// its DLL calls a null original (fresh statics) or unmapped code after the reload: the
+// address-0 startup crash. "Never restore" (assessment §1.2) is right for contested slots;
+// a slot whose replacement is about to be unmapped is not that case.
+void restore_all_patches();
+
 } // namespace stray_dlss::native

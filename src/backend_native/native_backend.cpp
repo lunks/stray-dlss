@@ -111,6 +111,17 @@ bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope, bo
 	return complete;
 }
 
+void uninstall()
+{
+	if (g_device == nullptr)
+		return;
+	restore_all_patches();
+	g_device = nullptr;
+	g_mode.store(static_cast<int>(Mode::off), std::memory_order_relaxed);
+	std::snprintf(g_report, sizeof(g_report), "native backend: uninstalled");
+	STRAY_LOG_INFO("%s", g_report);
+}
+
 NativeBackend &backend()
 {
 	static NativeBackend b;

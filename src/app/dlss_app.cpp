@@ -1412,6 +1412,12 @@ void DlssApp::log_final_census(bool saw_bind_pipeline, bool saw_push_descriptors
 // [STRAYDLSS] hash override file: one fnv1a64 per line (0x-prefixed or bare hex, # comments),
 // generated offline by tools/stray_taa_hashes.py after a game update. Read from the game's
 // working directory, the same place ReShade.log lands.
+void DlssApp::shutdown()
+{
+	diff::set_enabled(false);
+	native::uninstall();
+}
+
 void DlssApp::load_hash_override_file()
 {
 	std::FILE *f = nullptr;

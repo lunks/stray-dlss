@@ -805,6 +805,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 		app::instance().log_final_census(
 			g_saw_bind_pipeline.load(std::memory_order_relaxed),
 			g_saw_push_descriptors.load(std::memory_order_relaxed));
+		// The native hooks must not outlive this DLL: ReShade unloads and reloads add-ons across
+		// the game's device recreate (measured), and a patched slot pointing into an unmapped
+		// image is the address-0 startup crash.
+		app::instance().shutdown();
 		unregister_events(g_needs);
 		state_tracking::unregister_events();
 		descriptor_tracking::unregister_events();

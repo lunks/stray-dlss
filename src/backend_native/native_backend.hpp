@@ -38,6 +38,9 @@ bool use_sentinel();
 // `on_proxy`: the device is ReShade's proxy (NativeTarget=proxy), so no QueryInterface is
 // made on it during install (see d3d12_hooks.hpp).
 bool install(::ID3D12Device *real_device, Mode mode, InstallScope scope = InstallScope::all, bool on_proxy = false);
+// On host detach: restores the vtable slots and forgets the device, so a host that unloads
+// and reloads this DLL (ReShade does, across the device recreate) re-installs cleanly.
+void uninstall();
 Mode mode();
 ::ID3D12Device *game_device();
 const char *attach_report();

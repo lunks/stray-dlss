@@ -118,6 +118,8 @@ public:
 	// On detach. The two flags are the ReShade host's capability check (bind_pipeline and
 	// push_descriptors both observed); a native host passes true.
 	void log_final_census(bool saw_bind_pipeline, bool saw_push_descriptors);
+	// On host detach, after the census: undoes the native hooks (the host may reload us).
+	void shutdown();
 };
 
 DlssApp &instance();
