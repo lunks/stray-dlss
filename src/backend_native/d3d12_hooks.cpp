@@ -824,13 +824,31 @@ unsigned install_list_hooks(::ID3D12Device *device)
 	OwnCodeScope own;
 	ComPtr<ID3D12CommandAllocator> alloc;
 	ComPtr<ID3D12GraphicsCommandList> list;
-	if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
-		FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))))
+	HRESULT hr_alloc = S_OK, hr_list = S_OK;
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+	// Device4's CreateCommandList1 makes a CLOSED list with no allocator at all — nothing to
+	// reset, nothing to close, nothing the debug layer can object to. The allocator path is
+	// the fallback for a device without it.
 	{
-		STRAY_LOG_ERROR("native hooks: could not create the throwaway command list; list slots NOT hooked");
+		ComPtr<ID3D12Device4> dev4;
+		if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dev4))) && dev4)
+			hr_list = dev4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&list));
+	}
+#endif
+	if (!list)
+	{
+		hr_alloc = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+		if (SUCCEEDED(hr_alloc))
+			hr_list = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list));
+		if (list)
+			list->Close();
+	}
+	if (!list)
+	{
+		STRAY_LOG_ERROR("native hooks: could not create the throwaway command list (allocator hr=0x%08lx, list hr=0x%08lx); "
+			"list slots NOT hooked", static_cast<unsigned long>(hr_alloc), static_cast<unsigned long>(hr_list));
 		return 0;
 	}
-	list->Close();
 	unsigned n = 0;
 	const auto hook = [&](unsigned index, void *replacement, void **orig, const char *name) {
 		void *o = patch_slot(list.Get(), index, replacement, name);
