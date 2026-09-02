@@ -207,7 +207,6 @@ void write_slot(icept::DescriptorId cpu, std::uint64_t w0, std::uint64_t w1, std
 		if (site == 0) g_orphan_view.fetch_add(1, std::memory_order_relaxed);
 		else g_orphan_copy_dst.fetch_add(1, std::memory_order_relaxed);
 	}
-	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
 }
 // A copy from an unknown source makes the destination unknown again.
 void write_unwritten(icept::DescriptorId cpu)
@@ -249,11 +248,13 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 		gen = registry::generation_of(entry.resource);
 	const std::uint64_t w2 = (entry.buffer_offset & 0xFFFFFFFFull) | ((entry.buffer_size & 0xFFFFFFFFull) << 32);
 	write_slot(cpu, entry.resource, pack_w1(entry.kind, false, entry.dxgi_format, gen), w2, 0);
+	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_null_view(icept::DescriptorId cpu)
 {
 	write_slot(cpu, 0, kWritten | kNull, 0, 0);
+	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc,
@@ -263,12 +264,32 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 	{
 		const icept::DescriptorId s = src + static_cast<std::uint64_t>(i) * inc;
 		const icept::DescriptorId d = dst + static_cast<std::uint64_t>(i) * inc;
-		std::uint64_t w0 = 0, w1 = 0, w2 = 0;
-		bool src_orphan = false;
-		const bool got = read_slot(s, w0, w1, w2, &src_orphan);
-		if (src_orphan)
+		Slot *ds = slot_for(d);
+		Slot *ss = slot_for(s);
+		if (ds != nullptr && ss != nullptr)
+		{
+			// The common case, Config A and the online heap once it is registered: both slots are
+			// flat. Pure lock-free atomics, no counter contention (g_slot_writes is bumped once
+			// per range below, not per descriptor - that per-descriptor atomic across every RHI
+			// thread cost Config A ~15 fps, facts §30).
+			const std::uint64_t sw1 = ss->w1.load(std::memory_order_acquire);
+			if ((sw1 & kWritten) == 0)
+			{
+				ds->w1.store(0, std::memory_order_release);
+				unknown_copies.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			ds->w0.store(ss->w0.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			ds->w2.store(ss->w2.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			ds->w1.store(sw1, std::memory_order_release);
+			continue;
+		}
+		// Orphan path (Config B: the online heap in overflow until the proxy patch). Rare, so a
+		// little redundancy here is fine; Config A never reaches it (orphans=0).
+		if (ss == nullptr)
 			g_orphan_copy_src.fetch_add(1, std::memory_order_relaxed);
-		if (!got)
+		std::uint64_t w0 = 0, w1 = 0, w2 = 0;
+		if (!read_slot(s, w0, w1, w2))
 		{
 			write_unwritten(d);
 			unknown_copies.fetch_add(1, std::memory_order_relaxed);
@@ -276,6 +297,7 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 		}
 		write_slot(d, w0, w1, w2, 1);
 	}
+	g_slot_writes.fetch_add(n, std::memory_order_relaxed);
 }
 
 bool lookup(icept::DescriptorId cpu, ViewEntry &out)
