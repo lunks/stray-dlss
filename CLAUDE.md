@@ -2244,6 +2244,13 @@ real one and reaches the screen through the crop gate. Three things only the box
    and it must remember two looks, because the two alternating output textures of a
    generator that writes nothing read as motion to a one-look memory (caught in CI).
 
+4. **Pacing is a clock, not a delay, and Wine's `wait_for` wakes ~1 ms late** (facts §32.11):
+   the per-present trace (`NgxFGTrace`) showed the real frame at +7.15 ms after every hook
+   for a 6.1 ms hold, a 7.1 / 5.0 rhythm the user felt on the 165 Hz VRR panel. Now the pair
+   is scheduled against the previous REAL present (`core::fg::Schedule`: generated at
+   `last_real + I/2`, real at `last_real + I`, `I` the median of 16 game intervals) and the
+   last 1.5 ms of each hold are spun; the display receives 6.0-6.2 ms every gap.
+
 Steady-state gameplay is 2.00x; the only refusals are NGX's lazy init (~900 frames), ~60
 frames per checkpoint reload (no TAA dispatch, so no guides) and 0-3 per 600 otherwise. Every
 fps and pacing number from these sessions is SUSPECT (host CPU contention) and the pacing

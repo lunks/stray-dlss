@@ -1634,3 +1634,53 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4
   and motion vectors. HARD. The `[fg/ngx]` line and `fg_ngx_refused_*` status keys added in
   the follow-up commit attribute future refusals without this reconstruction.
 ||||||| f600641
+
+### 32.11 The pacing fault, named by the trace, and the phase-locked pacer (2026-09-02 19:59-20:30)
+
+User verdict from the eye test (plugins-only config, 165 Hz VRR panel via gamescope
+`--adaptive-sync`, `bUseVSync=False`, engine steady at 82 fps): "frame pacing is visibly
+wrong with FG on", unchanged with NR off. `NgxFGTrace=200` (a per-present timestamp trace,
+`f901bb8`) on a quiet host (load1 2.4/32), NR off, verbatim (steady-state rows):
+
+```
+[fg-trace]    930 | hook + 11.67 | gen +  0.04 [ 0.01] | real +  7.13 [ 0.01] | delay  6.73 |
+[fg-trace]    945 | hook + 11.78 | gen +  0.04 [ 0.01] | real +  7.15 [ 0.01] | delay  6.17 |
+[fg-trace]    955 | hook + 12.00 | gen +  0.04 [ 0.01] | real +  7.15 [ 0.01] | delay  6.10 |
+[fg-trace] gaps: 7.1 5.0 7.1 5.3 7.1 4.8 7.1 5.1 7.1 5.0 7.1 5.3 7.1 5.0 7.1 5.1 7.1 4.9 7.1 5.1 ...
+```
+
+* **The real frame went out at +7.15 ms after every hook while the pacer asked for 6.1-6.2 ms:
+  `std::condition_variable::wait_for` under Wine wakes ~1 ms LATE.** The generated frame was
+  on time (+0.04 ms, Present blocks 0.01 ms: no vsync, no display back-pressure). So the
+  display received gaps of 7.1 / 5.0 instead of 6.05 / 6.05 — a 2 ms short-long alternation
+  every 12 ms, which a VRR panel shows as-is. HARD.
+* The anchor was also the wrong one in principle: holding a predicted half interval after
+  the game's Present puts every bit of the game's own frame-time jitter on one gap of the pair
+  (gaps `(I_k - d, d)`); the first rows of the trace, with the EMA still settling from
+  20-30 ms warm-up frames, show it (gaps 26.6 / 4.1). The `pacer 16.5 ms` in the user's
+  session was that EMA chasing a hitch.
+
+**The fix (`6d5b38f`), two parts:** the last 1.5 ms of every hold are spun on the dedicated
+worker thread (lands within microseconds); and the pair is scheduled on a clock anchored to
+the previous REAL present — generated at `last_real + I/2`, real at `last_real + I`, `I` the
+median of the last 16 game intervals — with late frames catching up and early ones held at
+most three quarters of an interval so the game is never throttled (`core::fg::Schedule`,
+unit-tested).
+
+**After (`6d5b38f`, same protocol, host load1 0.4/32), verbatim:**
+
+```
+[fg-trace] gaps: 6.1 6.2 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.2 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.2 6.1 6.1 6.1 6.2 6.1 6.2 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.1
+[fg-trace] gaps: 6.0 6.1 6.0 6.1 6.0 6.1 6.0 6.1 6.0 6.1 6.0 6.1 6.0 6.1 6.0 6.1 6.1 6.1 6.1 6.1 6.1 6.1 6.0 6.1 6.1 6.1 6.1 6.1 6.1 6.1 1.2 3.0 6.4 5.6 6.0 5.2 7.4 6.1 6.0 5.4
+[fg] frame 2400: ... pacer median 9.43 ms hitches=4 (schedule: holds=1014 catchups=94 reanchors=9) | issued-interval p50=6 ms p99=16 ms unimodal
+```
+
+* **The steady-state cadence the display receives is 6.0-6.2 ms, every gap, for hundreds of
+  presents** (the 165 Hz panel's period is 6.06 ms) — where it was 7.1 / 5.0 before. The
+  remaining irregular stretches in the 200-present window are the game's own hitches during
+  the post-load settle (23 ms, 18 ms, 15 ms frames: `[perf] worst 265 ms, p99 29 ms` in the
+  same window), which the schedule re-anchors on (`reanchors=9`) and recovers from within a
+  pair. HARD (the issue timestamps); the user's eye is the judge of what the panel shows.
+* `holds=1014 catchups=94`: 91% of pairs went out on the clock, 9% caught up after a late
+  game frame. The 9.43 ms median at frame 2400 is the load-screen cadence still inside the
+  16-sample window; steady gameplay reads 12.1-12.2.
