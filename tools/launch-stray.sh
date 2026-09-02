@@ -222,6 +222,30 @@ crash() {
     verdict "CRASH: game died ${secs}s after start, before the add-on reported in — $1"
     exit 1
 }
+# The newest UE4 crash directory IF it postdates this launch, else empty. UE4 writes
+# CrashContext.runtime-xml BEFORE it shows its modal "Fatal error" dialog, and under that dialog
+# the process STAYS ALIVE with a frozen heartbeat - so a fresh crash dir is the earliest and most
+# reliable signal of the checkpoint-reload fatal (measured 2026-09-02). A pattern the process-gone
+# check would otherwise sit through until timeout.
+newest_crash_dir() {
+    local d
+    d=$(ls -t "$CRASH_DIR" 2>/dev/null | head -n 1)
+    [ -n "$d" ] && newer_than_launch "$CRASH_DIR/$d" && echo "$CRASH_DIR/$d"
+}
+ue4_crash_message() {
+    grep -oE "<ErrorMessage>[^<]*" "$1/CrashContext.runtime-xml" 2>/dev/null | head -n 1 | sed "s/<ErrorMessage>//"
+}
+# A CRASH that happened AFTER the heartbeat (mid-session, e.g. a checkpoint reload). Dismisses the
+# modal dialog by killing the process, clears any reaper, writes the CRASH verdict, and exits.
+session_crash() {
+    log "CRASH mid-session: $1"
+    pkill -x Stray-Win64-Shi 2>/dev/null
+    sleep 2
+    pkill -f "SteamLaunch AppId=$APPID" 2>/dev/null
+    verdict "CRASH (mid-session): $1"
+    exit 1
+}
+
 # True when the game must be treated as dead in a pre-heartbeat phase: the process is gone, OR
 # it is nominally alive but the Proton log recorded an unhandled exception since launch.
 game_dead_before_heartbeat() {
@@ -263,17 +287,24 @@ if ! game_running; then
         >/dev/null 2>&1
 
     log "Waiting for the process"
+    # Proton's first launch (shader precompile + our plugin) can take well over a minute to
+    # spawn the named exe, so wait up to 180 s. The "Steam gave up" short-circuit requires the
+    # chain to be ABSENT for several CONSECUTIVE polls, not one: the AppId chain flickers during
+    # the umu-run -> reaper -> wine transition, and a single missed match here is what made a
+    # previous launcher KILL a game that was actually starting (measured 2026-09-02).
     chain_seen=0
-    for _ in $(seq 1 60); do
+    chain_gone=0
+    for _ in $(seq 1 90); do
         game_running && break
-        # Steam GAVE UP: the launch chain was up and is now gone with no game exe. Do not wait
-        # out the 120 s — nothing is coming. (The chain takes a moment to appear, so only
-        # conclude this once we have actually seen it.)
         if pgrep -f "AppId=$APPID" >/dev/null 2>&1; then
             chain_seen=1
+            chain_gone=0
         elif [ "$chain_seen" = 1 ]; then
-            log "The Steam launch chain (AppId=$APPID) disappeared without a game process — Steam gave up."
-            break
+            chain_gone=$(( chain_gone + 1 ))
+            if [ "$chain_gone" -ge 5 ]; then
+                log "The Steam launch chain (AppId=$APPID) has been gone for ~10s with no game process — Steam gave up."
+                break
+            fi
         fi
         sleep 2
     done
@@ -377,6 +408,13 @@ last_frame=-1; frame_since=$(date +%s)
 census_since=$(date +%s)
 
 while [ "$(date +%s)" -lt "$deadline" ]; do
+    # Checkpoint-reload / any mid-session UE4 fatal: a fresh crash dir appears (dialog pending,
+    # process still alive, heartbeat frozen) — catch it immediately and quote its message.
+    cd_new=$(newest_crash_dir)
+    if [ -n "$cd_new" ]; then
+        cmsg=$(ue4_crash_message "$cd_new")
+        session_crash "UE4 fatal error: ${cmsg:-<no ErrorMessage>} (crash $(basename "$cd_new"))"
+    fi
     if ! game_running; then
         fail "the game exited while driving the menu"
     fi
