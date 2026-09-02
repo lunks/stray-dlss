@@ -147,4 +147,36 @@ LoopAsync(1000, function()
     return false   -- keep looping
 end)
 
+-- BENCH COUNTER, host-independent. While stray-probe-bench exists (stray-traverse.sh
+-- drops it for its window), write stray-frame.txt four times a second with the engine's
+-- own frame counter (UKismetSystemLibrary::GetFrameCount, i.e. GFrameCounter) and the
+-- last frame's delta. That is two cheap static calls per tick, the same in every arm,
+-- so the baseline with no render host gets real fps and the ReShade/plugin arms are
+-- measured by the identical instrument (the user's requirement 2026-09-02: never poison
+-- one arm against another).
+local FRAME = "stray-frame.txt"
+local function benchFlag()
+    local f = io.open("stray-probe-bench", "r")
+    if f then f:close(); return true end
+    return false
+end
+local function writeFrame()
+    local ok, line = pcall(function()
+        local ks = UEHelpers.GetKismetSystemLibrary()
+        local gs = UEHelpers.GetGameplayStatics()
+        local w = world()
+        local frame = ks and ks:GetFrameCount() or -1
+        local dt = (gs and w) and gs:GetWorldDeltaSeconds(w) or -1
+        return string.format("frame=%d\ndt=%.6f\nt=%d\n", tonumber(frame) or -1, tonumber(dt) or -1, os.time())
+    end)
+    local f = io.open(FRAME, "wb")
+    if f then f:write(ok and line or "frame=-1\ndt=-1\n"); f:close() end
+end
+LoopAsync(250, function()
+    if benchFlag() then
+        pcall(function() ExecuteInGameThread(function() pcall(writeFrame) end) end)
+    end
+    return false
+end)
+
 print("[StrayProbe] loaded; writing " .. STATE .. " every second\n")
