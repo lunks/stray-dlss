@@ -34,14 +34,30 @@ PAD_NAME="Microsoft X-Box 360 pad 0"
 
 PRESS_INPUT=1
 TIMEOUT=420
+# The heartbeat (stray-dlss-status.txt) phase caps SEPARATELY from the whole run. Both hosts
+# rewrite that file every 30 frames (dlss_app.cpp:1038 / addon_entry.cpp) and the first write
+# lands within ~3 s of the first presents (measured), so 240 s is ~80x margin on a slow first
+# load and still far short of a caller's own timeout. A hang in start_mod is caught in seconds
+# by the exception/stall checks below, never by this cap.
+HEARTBEAT_TIMEOUT=240
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --no-input) PRESS_INPUT=0; shift ;;
-        --timeout)  TIMEOUT="$2"; shift 2 ;;
+        --no-input)          PRESS_INPUT=0; shift ;;
+        --timeout)           TIMEOUT="$2"; shift 2 ;;
+        --heartbeat-timeout) HEARTBEAT_TIMEOUT="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# Claude's Bash tool kills a call at 600 s, so a --timeout above ~540 means the CALLER sees
+# nothing — the script is killed mid-run before it can print or write the verdict. Honour it
+# (a background invocation reading the verdict file is legitimate), but say so.
+if [ "$TIMEOUT" -gt 540 ]; then
+    echo "WARNING: --timeout $TIMEOUT exceeds the caller's 600 s Bash-tool cap; a foreground caller" >&2
+    echo "         will be killed before this script reports. Use <=540, or run in the background" >&2
+    echo "         and read \$GAME_DIR/stray-launch-verdict.txt." >&2
+fi
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
@@ -128,10 +144,38 @@ status_field() {
 PROTON_LOG="/home/deck/steam-$APPID.log"
 CRASH_DIR="/home/deck/.local/share/Steam/steamapps/compatdata/$APPID/pfx/drive_c/users/steamuser/AppData/Local/Hk_project/Saved/Crashes"
 VERDICT="$GAME_DIR/stray-launch-verdict.txt"
+UE4SS_LOG="$GAME_DIR/ue4ss/UE4SS.log"
 LAUNCH_EPOCH=$(date +%s)
 UP_EPOCH=""
+# Unhandled-exception lines already in the Proton log before we launched. A crash is a COUNT
+# above this, not merely the presence of a line (the log can carry benign .NET exceptions from
+# a previous session, and Proton appends rather than truncates).
+PROTON_EXC_BASELINE=0
+# grep -c prints its count on stdout (0 on no match) but EXITS NON-ZERO on no match, so the
+# `cmd && grep || echo 0` idiom emits "0\n0" for an empty-but-present file and breaks every
+# numeric test (the pgrep -c trap documented elsewhere in this script). Capture and default
+# instead: exactly one number, always.
+exc_count() { local n; n=$(grep -acE "err:seh:NtRaiseException|Unhandled exception|wine: Unhandled" "$PROTON_LOG" 2>/dev/null); echo "${n:-0}"; }
 
 newer_than_launch() { [ -e "$1" ] && [ "$(stat -c %Y "$1" 2>/dev/null || echo 0)" -ge "$LAUNCH_EPOCH" ]; }
+file_age() { [ -e "$1" ] && echo $(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0) )) || echo 999999; }
+
+# A NEW unhandled exception in the Proton log since launch: the count has risen above the
+# pre-launch baseline. This is the fastest crash signal — a c0000005 in start_mod writes it
+# ~11 s in, long before any timeout, and before the engine's own crash handler exists.
+proton_new_exception() { [ "$(exc_count)" -gt "$PROTON_EXC_BASELINE" ]; }
+
+# start_mod() is hung (or crashed inside it before Unreal's handler existed): UE4SS.log's LAST
+# line is still "Starting C++ mod" — it prints the next line only once a mod's start_mod
+# returns — and the file has not advanced for a while. Threshold 60 s: the plugin's own
+# start_mod does no blocking work (it hooks an export and returns; the device work happens
+# later, from the game thread), so a full minute with no further UE4SS line while the process
+# lives means it is wedged, not merely slow.
+start_mod_hung() {
+    newer_than_launch "$UE4SS_LOG" || return 1
+    tail -n 1 "$UE4SS_LOG" 2>/dev/null | grep -q "Starting C++ mod" || return 1
+    [ "$(file_age "$UE4SS_LOG")" -ge 60 ]
+}
 
 # $1 = one-line reason. Prints AND writes the verdict file. Only files touched since this
 # launch are quoted, so a stale log from the previous session cannot pose as evidence
@@ -168,10 +212,20 @@ fail() { log "FAILED: $1"; verdict "FAILED: $1"; exit 1; }
 
 # ---------------------------------------------------------------------------------------
 
-if game_running; then
-    log "Stray is already running; leaving it alone."
+if game_running && [ -f "$STATUS" ] && [ "$(file_age "$STATUS")" -lt 30 ]; then
+    # A LIVE session: the heartbeat moved within the last 30 s. Leave it alone.
+    log "Stray is already running and its heartbeat is fresh ($(file_age "$STATUS")s); leaving it alone."
     UP_EPOCH=$LAUNCH_EPOCH
-else
+    PROTON_EXC_BASELINE=$(exc_count)
+elif game_running; then
+    # The process exists but its heartbeat is stale (or never appeared): a hung or crashed
+    # session from a previous run, not something to inherit. Clear it and launch fresh.
+    log "Stray-Win64-Shipping is running but its heartbeat is stale ($([ -f "$STATUS" ] && file_age "$STATUS" || echo 'no status file')s); treating it as a dead session and clearing it."
+    clear_stale_chain
+    pkill -x Stray-Win64-Shi 2>/dev/null
+    for _ in $(seq 1 10); do game_running || break; sleep 1; done
+fi
+if ! game_running; then
     clear_stale_chain
 
     log "Clearing stale add-on output"
@@ -213,22 +267,28 @@ else
         fail "the game would not start even after a Steam restart"
     fi
     UP_EPOCH=$(date +%s)
-    log "Process up."
+    PROTON_EXC_BASELINE=$(exc_count)
+    log "Process up (proton-log exception baseline=$PROTON_EXC_BASELINE)."
 fi
 
 # The first load after a shader dump is very slow: registering the pipeline events makes
 # ReShade drop the D3D12 PSO cache, so every shader recompiles. Be patient here.
-log "Waiting for the add-on heartbeat (first load recompiles every shader — this is slow)"
-for _ in $(seq 1 "$TIMEOUT"); do
+log "Waiting for the add-on heartbeat (first load recompiles every shader — this is slow), cap ${HEARTBEAT_TIMEOUT}s"
+hb_deadline=$(( $(date +%s) + HEARTBEAT_TIMEOUT ))
+while [ "$(date +%s)" -lt "$hb_deadline" ]; do
     [ -f "$STATUS" ] && break
-    game_running || fail "the game exited before the add-on reported in"
+    game_running || fail "the game exited before the add-on reported in (a crash: the add-on never wrote its status file)"
+    # A crash before the heartbeat is a CRASH, not a slow load — fail the moment the evidence
+    # exists rather than waiting out the cap.
+    proton_new_exception && fail "unhandled exception in the Proton log before the add-on reported in (crashed at load / start_mod)"
+    start_mod_hung && fail "UE4SS is wedged in a mod's start_mod (UE4SS.log stuck at 'Starting C++ mod' for $(file_age "$UE4SS_LOG")s, no heartbeat)"
     sleep 1
 done
 
 if [ ! -f "$STATUS" ]; then
-    log "  no heartbeat after ${TIMEOUT}s. Is the add-on loading? Check:"
-    log "  grep -i stray-dlss '$GAME_DIR/ReShade.log'"
-    fail "no heartbeat after ${TIMEOUT}s while the game kept running"
+    log "  no heartbeat after ${HEARTBEAT_TIMEOUT}s. Is the add-on loading? Check:"
+    log "  grep -i stray-dlss '$GAME_DIR/ReShade.log' and $GAME_DIR/stray-dlss-plugin.log"
+    fail "no heartbeat after ${HEARTBEAT_TIMEOUT}s while the game kept running"
 fi
 log "Add-on is alive (vkd3d=$(status_field vkd3d))"
 
@@ -269,16 +329,35 @@ fi
 log "Pressing $([ "$INPUT_KIND" = pad ] && echo X || echo Enter) every 0.5s until the shader census says we are in game"
 deadline=$(( $(date +%s) + TIMEOUT ))
 last_census=-1
+# Frame-stall: once the heartbeat exists, frame= must keep advancing (both hosts bump it every
+# present). Unchanged for 30 s while the process lives means the game is hung on the GPU or in a
+# wait — 30 s is ~1600 frames at 55 fps, far beyond any legitimate stutter or load hitch.
+last_frame=-1; frame_since=$(date +%s)
+# Census-stall: if the shader census has not moved for 150 s and we are not in game, the button
+# is not reaching the game (the diagnosis this script's old timeout text already gave). 150 s is
+# generous for a first load that recompiles every shader, and still far short of TIMEOUT.
+census_since=$(date +%s)
 
 while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! game_running; then
         fail "the game exited while driving the menu"
     fi
+    proton_new_exception && fail "unhandled exception in the Proton log while driving the menu (crash mid-session)"
+
+    now=$(date +%s)
+    frame=$(status_field frame)
+    if [ "$frame" != "$last_frame" ]; then
+        last_frame=$frame; frame_since=$now
+    elif [ $(( now - frame_since )) -ge 30 ]; then
+        fail "frame= stuck at $frame for 30s while the process lives — the game is hung, not loading"
+    fi
 
     census=$(status_field shader_census)
     if [ "$census" != "$last_census" ]; then
-        log "  census=$census  frame=$(status_field frame)  dispatches=$(status_field dispatches)"
-        last_census=$census
+        log "  census=$census  frame=$frame  dispatches=$(status_field dispatches)"
+        last_census=$census; census_since=$now
+    elif [ "$(status_field in_game)" -ne 1 ] && [ $(( now - census_since )) -ge 150 ]; then
+        fail "shader census stuck at $census for 150s and not in game — the button is not reaching the game (check the input node)"
     fi
 
     if [ "$(status_field in_game)" -eq 1 ]; then
@@ -292,7 +371,5 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 
 log "TIMEOUT after ${TIMEOUT}s at census=$(status_field shader_census)."
-log "  If the census is stuck near the menu value the button is not reaching the game;"
-log "  if it is climbing, just raise --timeout."
 verdict "FAILED: timeout after ${TIMEOUT}s at census=$(status_field shader_census), game still running" >/dev/null
 exit 1
