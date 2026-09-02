@@ -132,19 +132,29 @@ local function collect()
     state.ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
 end
 
+-- ATOMIC writes: write a temp file, then rename over the target. The shell samplers read
+-- these files 4x a second; an in-place truncate-and-write let a reader see an empty or
+-- half-written number (measured 2026-09-02: a bucket of "-27749.5 fps" in the bench CSV).
+-- "wb": the game's C runtime is Windows', and text mode turns "\n" into "\r\n", which the
+-- shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
+local function atomicWrite(path, text)
+    local tmp = path .. ".tmp"
+    local f = io.open(tmp, "wb")
+    if not f then return end
+    f:write(text); f:close()
+    if not os.rename(tmp, path) then
+        os.remove(path); os.rename(tmp, path)   -- Windows rename does not overwrite by itself
+    end
+end
+
 local function flush()
     seq = seq + 1
-    -- "wb": the game's C runtime is Windows', and text mode turns "\n" into "\r\n", which
-    -- the shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
-    local f = io.open(STATE, "wb")
-    if not f then return end
     if quiet() then
-        f:write(string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time()))
+        atomicWrite(STATE, string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time()))
     else
-        f:write(string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
+        atomicWrite(STATE, string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
             seq, os.time(), state.pawn, state.pawnname, state.pc, state.map, state.paused, state.ingame))
     end
-    f:close()
 end
 
 LoopAsync(1000, function()
@@ -177,9 +187,8 @@ local function collectFrame()   -- game thread: two static calls, nothing else
     end)
     if not ok then frameState.frame, frameState.dt = -1, -1 end
 end
-local function flushFrame()     -- async thread: the write
-    local f = io.open(FRAME, "wb")
-    if f then f:write(string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time())); f:close() end
+local function flushFrame()     -- async thread: the write, atomic (see atomicWrite)
+    atomicWrite(FRAME, string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time()))
 end
 LoopAsync(250, function()
     if benchFlag() then

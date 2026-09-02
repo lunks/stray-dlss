@@ -73,6 +73,10 @@ while kill -0 "$INJ" 2>/dev/null; do
     tick_checks "traverse" "$T0"
     if [ "$COUNTER" -eq 1 ]; then
         f_now=$(frame_now); t_now=$(date +%s.%N)
+        # A sample must be a number and monotonic; anything else is a torn read of the
+        # probe file (it produced a "-27749.5 fps" bucket before writes were made atomic).
+        case "$f_now" in ''|*[!0-9]*) continue ;; esac
+        [ "$f_now" -lt "$f_prev" ] && continue
         if [ "$f_now" != "$f_prev" ]; then
             samples+=("$(awk -v a="$f_prev" -v b="$f_now" -v ta="$t_prev" -v tb="$t_now" 'BEGIN { d = tb - ta; if (d > 0) printf "%.1f", (b - a) / d; else print "0" }')")
             dts+=("$(field "$FRAME" dt)")
