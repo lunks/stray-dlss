@@ -996,6 +996,18 @@ Measured working: `depth=…53465B60 live=0` was skipped and the game survived.
 **Together these are a vice.** Copying descriptors is illegal; recreating views needs a resource
 pointer ReShade cannot be trusted for. Only liveness-checked view creation satisfies both.
 
+**3. ReShade's descriptor tracking follows a re-created VIEW, not the copied bytes (measured
+2026-09-02, `docs/STRAY-RENDERING-FACTS.md` §16).** Its per-slot record for an online
+descriptor is the source view HANDLE, resolved to a resource at query time; UE4 recycles its
+offline descriptor slots constantly, so once the game re-creates that offline view for another
+resource, ReShade reports the NEW resource for an online slot whose bytes still hold the copy.
+137 811 slots in one 240 s session, every one convicted with the write sequence on the line.
+D3D12 copies descriptors by value; a shadow that does the same (the native backend's) is right
+and the oracle is wrong. Also measured: ReShade's `init_resource`/`destroy_resource` events
+never carried the swapchain's back buffers, so a liveness set fed by them calls the back buffers
+dead. **The native backend (`[STRAYDLSS] NativeMode=drive`) is the one that survives all three
+hazards; the ReShade backend remains the default only until Stage 4.**
+
 ### ReShade 6.8 add-on API
 
 * **Pin headers to tag `v6.8.0`.** `RESHADE_API_VERSION` is **20**; ReShade rejects anything newer

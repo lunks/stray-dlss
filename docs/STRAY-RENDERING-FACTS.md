@@ -458,3 +458,188 @@ the reload, the runtime calls `Release` on objects allocated by an image that is
 base address, different heap). It did not crash in three sessions, which proves nothing. The
 UE4SS-mod configuration has no reload; in the ReShade-hosted one, either pin the DLL
 (`GET_MODULE_HANDLE_EX_FLAG_PIN`) or keep the sentinel out of the ReShade host.
+
+## 16. The observer gate, closed (runs G-K, 2026-09-01 23:05 - 2026-09-02 00:00, The Slums)
+
+Same box, same save (The Slums, slot 1), the launcher's Enter-driven path to gameplay,
+240 s dwell after `IN GAME`, one build per run. Every number below is the `[frame 15000]`
+report of that run's `stray-dlss.log`, verbatim except where a line is marked cut.
+
+| run | build (CI run) | what changed | DIFF SUMMARY (cut to the counts) | TAA |
+|---|---|---|---|---|
+| F (§15) | e79a4b1 | — | `dispatches=82705 agree=121 mismatch=2200 unknown=82584 … disagreements=82584` | 125, disagree 4 |
+| G | 9b8fa28 / 33581700761 | current-per-parameter oracle CBs, null slots, range VA lookup, same-RS no-op, adjudication | `dispatches=82650 agree=34775 mismatch=10000 unknown=43494 extra=21 heap-identity-only=29666 … disagreements=47875` | 128, disagree 1 |
+| H | fc6b03d / 33582624785 | tombstones, copy provenance | `dispatches=82654 agree=33321 mismatch=2121 unknown=48610 extra=30 … disagreements=49333` | 128, disagree 1 |
+| I | 0f073b6 / 33583278244 | RESHADE-VIEW-RECREATED, per-dispatch gate | `dispatches=86276 agree=45284 mismatch=2615 unknown=39738 extra=212 … disagreements=40992` — `DIFF GATE … oracle-wrong=40780 UNRESOLVED=212` | 124, disagree **0** |
+| J | 45787bb / 33583907692 | the oracle reports the slots it drops | `dispatches=82809 agree=32174 mismatch=3903 unknown=48744 extra=32 … disagreements=50635` — `oracle-wrong=50616 UNRESOLVED=19` | 125, disagree 0 |
+| **K** | 5c2a78e / 33584631939 | RESHADE-LIVENESS-GAP | see below | 126, disagree 0 |
+
+**Run K, the closing run, verbatim:**
+
+```
+DIFF SUMMARY [frame 15000] dispatches=82640 agree=36342 mismatch=9132 unknown=42632 extra=26 heap-identity-only=32682 unconsumed=0 | TAA dispatches=126 disagree=0 | disagreements=46298
+DIFF VERDICTS [frame 15000] slots: RESHADE-STALE=1583 RESHADE-COPY-STALE=0 RESHADE-VIEW-RECREATED=137811 RESHADE-LIVENESS-GAP=21 NATIVE-BLIND=0 LIVENESS-CONFLICT=0 NATIVE-MISSED=0 ORACLE-MISSED=0 BOTH-LIVE=0 unadjudicated=0
+DIFF GATE [frame 15000] disagreeing dispatches: oracle-wrong=46298 (every differing slot convicts ReShade) UNRESOLVED=0 (TAA unresolved=0) - the gate is UNRESOLVED=0
+NATIVE SHADOW [frame 15000] mode=observe patches=28 resolves=82640 (no-layout 0) unknown-lookups=370971 null-lookups=478987 dead-lookups=104792 unknown-copies=0 root-signatures=51 pipelines=671 resources live=3049 (registered 37117, destroyed 34068, sentinel-failures 0, unarmed 0) slots=524555 heaps=2
+```
+
+`disagreements` is not zero and never will be: **every one of the 46 298 disagreeing
+dispatches is adjudicated against ReShade**, slot by slot, from evidence the log carries.
+The gate the plan asked for — `disagreements=0` *or every remaining one explained with
+evidence naming which side is wrong* — is met by the second clause, and the TAA pass agrees
+outright (126/126 in K; 124/124 and 125/125 in I and J).
+
+### 16.1 The adjudication table
+
+Every differing slot gets a verdict from three liveness answers (ReShade's own
+`is_resource_live`, the registry's sentinel liveness, whether the registry ever registered
+the resource) plus the native shadow's provenance for the slot. Classes, with what each
+proves and how many slots of run K fell into it:
+
+| verdict | slots (K) | evidence on the line | which side is wrong |
+|---|---|---|---|
+| `RESHADE-VIEW-RECREATED` | 137 811 | the native online slot was **copied** at seq N from offline view S; the native entry for S was written at seq M > N and names the oracle's resource (or the oracle dropped S as dead/unmapped) | **ReShade.** Its descriptor tracking stores the source *view handle* and resolves it at query time; UE4 recycles offline slots, so a re-created S changes what ReShade reports for an online slot whose bytes still hold the copy. D3D12 copies by value; the native shadow does too. |
+| `RESHADE-STALE` | 1 583 | the native slot is a **tombstone**: the resource it viewed died (sentinel fired) after the write, and the oracle names that very address — reused since | **ReShade.** The §5 never-cleared view→resource map, now with the address-reuse variant both liveness sets are blind to. |
+| `RESHADE-LIVENESS-GAP` | 21 | the native side names a resource whose sentinel is still attached (live, the runtime's word) while ReShade's init/destroy_resource-fed set calls it dead — every instance one of the three swapchain back buffers (`R10G10B10A2_UNORM 3840x2160`) | **ReShade** (its liveness events never carried the back buffers). |
+| `RESHADE-COPY-STALE` | 0 | the copy's source, per ReShade's own map, agrees with native | — (defined, never fired) |
+| `NATIVE-BLIND` | 0 | the oracle names a live resource the registry never saw, or a slot never written since attach | native |
+| `NATIVE-MISSED` | 0 | the oracle names a resource live on both sides; the native walk has no such slot | native |
+| `LIVENESS-CONFLICT` | 0 | the two trackers disagree about a resource in a way neither rule above explains | ambiguous |
+| `BOTH-LIVE` | 0 | both sides name a live resource and differ, no provenance settles it | ambiguous |
+| `ORACLE-MISSED` | 0 | the native side names a live resource and the oracle has nothing, unexplained | ambiguous |
+
+Verbatim lines from run K (the DIFF line and the first two verdicts under it):
+
+```
+DIFF hash=f50e8aa52541b8c2 120x68 dispatch: 8 mismatch, 16 unknown, 0 extra (native unknown-lookups so far 370013) | oracle srvs=64 uavs=16 cbs=2 | native srvs=50 uavs=14 cbs=2 | shadow rs=000000004EB18460 tables=3 root-cbv=2 root-srv=0 root-uav=0 consts=0
+  MISMATCH t12: oracle=(res 4ea0c050 fmt unknown 64x64) native=(res 2a195df0 fmt unknown 0x0) [oracle-res live rs=1 reg=1 seen=1 | native-res live rs=1 reg=1 seen=1] (native slot 2401fe53 copied at seq 4456 from 4ea21bea, which now holds res 4ea0c050 written at seq 336573 - AFTER the copy; ReShade's view map says 4ea0c050) => RESHADE-VIEW-RECREATED
+  UNKNOWN  t10: oracle=(res 80eab9b0 fmt unknown 0x0) native=UNKNOWN [oracle-res live rs=1 reg=1 seen=1 | native-res live rs=-1 reg=-1 seen=-1] (native slot 2401fe13 is a TOMBSTONE: res 4ea45310 died after the slot was written at seq 4454; copied from 23629cca, which now holds res 80eab9b0 at seq 512308 - AFTER the copy) => RESHADE-VIEW-RECREATED
+```
+
+and the liveness gap, from run J (the same 21 slots recur in K):
+
+```
+  EXTRA    t28: oracle=ABSENT native=(res 2a1a77d0 fmt R10G10B10A2_UNORM 3840x2160) [oracle-res live rs=-1 reg=-1 seen=-1 | native-res live rs=0 reg=1 seen=1] => LIVENESS-CONFLICT
+```
+
+(named `LIVENESS-CONFLICT` by J's build; K's build names the same evidence
+`RESHADE-LIVENESS-GAP`).
+
+### 16.2 What the runs taught, in order
+
+* **Run F's "cb: unknown" class was the ORACLE's** (SOFT in §15, now HARD): the ReShade
+  backend's `constant_buffers` was an append-only list of every root CBV pushed since the
+  list's Reset — 31 entries with one offset seven times at a TAA dispatch — not what was
+  bound. Made current-per-root-parameter, the class vanished (run G: `cbs=2 | cbs=2` on both
+  sides of every DIFF line) and the four TAA disagreements with it.
+* **The 3.6M "unknown copies" were null descriptors**: UE4 fills every unbound register of a
+  table from its null views. Recorded as known-null slots and copied as such:
+  `unknown-copies=0` from run G on; `null-lookups` reported apart (478 987 in K).
+* **The per-register disagreements beyond the shader's declarations** (run G's
+  `NATIVE-MISSED`, run H's `BOTH-LIVE`: the ring buffer against some other resource at
+  `t10`, `t14`, `t22`…) all carried one signature once provenance was on the line: the online
+  slot was copied from an offline view the game re-created afterwards. The TAA shader reads
+  `t0`-`t5`; the disputed slots were leftovers in the 64-wide table, and the native side's
+  value — the copy's — is the D3D12 one.
+* **`unknown-lookups` is not a defect counter.** With null slots (`null-lookups`) and
+  tombstones (`dead-lookups`) reported apart, what remains (370 971 in K) is table slots of
+  the online ring never written since attach — UE4's heap is 52 048 descriptors and most of it
+  is stale between frames; the oracle reports nothing for those either.
+* **Cost**: `[perf]` at frames 14400-15000 read 53.3 (G), 53.2 (J), 54.3 (K) fps with the
+  observer on, against 55.1 with it off (run offB) — within the noise of the earlier
+  55.1-55.6 baseline.
+
+## 17. The §15 sentinel hazard, closed (2026-09-01)
+
+The sentinel is now a hand-laid-out COM object whose vtable lives in a `VirtualAlloc`'ed
+page outside the image, with three inert x64 stubs in the same page; `uninstall()` (host
+detach) rewrites the vtable to the stubs, so a first-life sentinel released after ReShade's
+add-on reload lands in mapped code that returns and frees nothing. The sentinel objects are
+process-heap allocations for the same reason. A resource still carrying a first-life sentinel
+gets a fresh one on re-registration (`SetPrivateDataInterface` replaces; the runtime's release
+of the old one hits the stub).
+
+Proven in CI on WARP and under the real ReShade 6.8.0 proxy (`test_registry_sentinel_survives_detach`,
+run 33580516489 and every run since), verbatim:
+
+```
+[test] resource registry: sentinels outlive a detach without reaching this image
+  vtable page 000001D4C2380000 is in module 0000000000000000; this code is in module 00007FF6AD960000
+  ok: the sentinel vtable page is mapped by NO module (VirtualAlloc, not the image)
+    [INFO ] resource_registry: detached - 2 live sentinel(s) made inert on page 000001D4C2380000; the page is leaked on purpose so a later Release cannot reach an unmapped image
+  ok: the two sentinels were orphaned
+  ok: an orphaned sentinel's Release reaches NO callback
+    [INFO ] resource_registry: sentinel page 000001D4C2390000 (vtable outside the image; stubs at +0/+24/+40)
+  ok: life 2 has its own vtable page; life 1's is left inert
+  ok: the survivor's death fires life 2's sentinel, exactly once
+```
+
+On the box, every run G-K goes through the game's startup device recreate (the reload §14
+describes) and the drive sessions do too; `sentinel-failures 0, unarmed 0` in every
+`NATIVE SHADOW` line, no crash in eight sessions. What is NOT proven: a resource dying in
+the window between the unload and the reload on the box — the harness proves the mechanism
+(the stub is reached, nothing of the image is), the game merely did not contradict it.
+
+## 18. NativeMode=drive on the box (2026-09-02 00:03-00:23, The Slums)
+
+Build 3e76e9a (CI 33585956202); ReShade 6.8.0 still loaded as `dxgi.dll` and hosting;
+`[STRAYDLSS] NativeMode=drive`; NGX on the native device with `ext_unhook`; the rest of
+`ReShade.ini` the user's (NgxNR=1, NgxNRHook=taa, MvDispatch=2). Three sessions: driveB
+(build 5c2a78e, 00:03), offB (control, `NativeMode=off`, 00:09) and driveC (3e76e9a, 00:17).
+
+**(1) DLSS evaluates with the native side driving.** driveC, verbatim:
+
+```
+NativeMode=drive ([STRAYDLSS] NativeMode, read as "drive"): native backend: mode=drive scope=all sentinel=1 target=real device=000000001FB00080 device-slots=17 list-slots=11 patches=28 increment=32. Grep 'DIFF' and 'NATIVE SHADOW'.
+seam: backend is native(drive)+reshade(present). The ReShade host still delivers device/list lifetime, present, swapchain, the render-target/draw/copy taps and PIXEL pipelines; the native hooks deliver compute pipelines, pipeline binds, list resets and dispatches.
+DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b
+DLSS evaluate OK: 1920x1080 -> 3840x2160 jitter=0.3594,0.3025 reset=0 preExposure=0.454
+NATIVE DRIVE [frame 3600] dispatches delivered=108836 suppressed=3428 compute-pipelines delivered=34
+NATIVE DRIVE [frame 9000] dispatches delivered=368036 suppressed=8828 compute-pipelines delivered=34
+NATIVE DRIVE [frame 15000] dispatches delivered=656036 suppressed=14828 compute-pipelines delivered=34
+[frame 3600] resolve attempts=3949 skipped_stale=0 (0.0%)
+[frame 3600] NR applied=3364 refused=64 validated=1 ...
+```
+
+Same resolution, mode and preset as the ReShade-driven run (offB: `DLSS feature created:
+1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b`). `suppressed` — the engine's TAA
+dispatch NOT forwarded from the native `Dispatch` hook — is 14 828 over frames ~120-15000,
+one per frame at 99.7%; the NR counter (`applied=3364` at frame 3600) rides on the SR
+evaluates and is the evaluate cadence's second witness. The NR runtime, its codec and the
+history round-trip behaved exactly as under ReShade.
+
+**(2) The DLSS indicator** (registry `NGXCore\ShowDlssIndicator=0x400` in the prefix, verified
+in `system.reg`) is on screen in every drive screenshot, bottom-left, and reads:
+`DLSS v310.7.129 (nvapp_override) DX12 cubin: sm89 HDR Mode: Perf(0.5000) (1920x1080 -> 3840x2160) Net: 1920,1080` /
+`Render Preset: M` / `DLSSNR v310.8.0 (default) ON | 3840x2160`. Identical text in the `off`
+control — it says NGX evaluates, the log says who drives.
+
+**(3) Image, by temporal stability.** Camera still at the save's spawn (the cat sits before
+the guitarist), eight ReShade screenshots per session at 0.8 s, 45 s after `IN GAME`; the
+metric is the standard deviation (x1e5) of the grey DIFFERENCE between consecutive shots
+over a crop with no animated content (the shutter posters, `1400x500+1100+300`; the left
+wall, `900x700+0+0`), seven pairs per session:
+
+| session | posters: pairs | median | left wall: pairs | median |
+|---|---|---|---|---|
+| driveB (drive) | 953 1237 928 1437 1209 920 1071 | **1071** | 615 446 430 759 485 484 592 | **485** |
+| offB (off) | 844 1041 746 905 1005 820 936 | **905** | 461 470 450 464 529 448 489 | **464** |
+| driveC (drive) | 1037 888 848 1090 773 847 1012 | **888** | 460 471 441 473 466 460 441 | **460** |
+
+The two drive sessions straddle the control (driveC is 2% below it on the posters, 1% on the
+wall; driveB 18% and 5% above), so the between-session spread of the SAME mode is larger than
+any drive-versus-off difference: **no evidence the native path changes the image**, at this
+instrument's power (n=7 pairs per session). Viewed at 960x540, the drive and off frames are
+the same scene with the same lighting; the visible differences are the cat's and the
+guitarist's idle animation, which is why the crops exclude them.
+
+**(4) Stability and cost.** All three sessions ran 240 s past `IN GAME` (frames ~2100 to
+15 000-15 300) and were alive at collection; `dmesg` carries no Xid and no new NVRM line
+(the one `NV_ERR_NO_MEMORY` from `_kgmmuClientShadowFaultBufferPagesAllocate` is stamped
+79134 s of host uptime, two hours before the first session of this batch). `[perf]` at
+frames 13200-15000: driveB 53.6-54.3 fps, driveC 53.5-54.2, offB 55.0-55.1 — the drive
+sessions sit ~1.5 fps (~3%) under the control, inside the 53.2-55.6 band the observer runs
+occupy. Three `ERROR` lines per session, all the expected `[pre-NGX] vkd3d ID3D12DeviceExt slot 8
+is HOOKED BY RESHADE` trio that `ext_unhook` answers.
+
+`NativeMode=off` was restored in `ReShade.ini` after driveC.
