@@ -77,9 +77,6 @@ namespace stray_dlss::nrhist {
 void set_enabled(bool enabled);
 bool enabled();
 
-// [STRAYDLSS] NgxNRHook, mirrored here so the gate can refuse `site-inert` by itself rather than
-// making every call site re-derive it. Set once at startup, alongside nrhook::set_hook_mode.
-void set_site(nrplan::HookMode site);
 
 // [STRAYDLSS] NgxNRRestoreState — the D3D12_RESOURCE_STATES bitmask `u0` is ASSUMED to be in at
 // present time, when the restore copy is recorded. Default 0xC0

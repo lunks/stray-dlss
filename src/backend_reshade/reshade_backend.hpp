@@ -21,7 +21,6 @@ public:
 	bool read_buffer(const icept::BufferRange &range, std::uint64_t bytes, void *out) override;
 	bool is_resource_live(icept::ResourceId res) override;
 	void restore_game_compute_state(const icept::CommandContext &ctx) override;
-	void restore_viewports_and_scissors(const icept::CommandContext &ctx) override;
 	void present_barrier(const icept::PresentContext &ctx, icept::ResourceId res,
 	                     std::uint32_t before, std::uint32_t after) override;
 	void dump_tracker_state(const icept::CommandContext &ctx, const char *why) override;

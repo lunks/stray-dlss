@@ -20,7 +20,6 @@
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
 #include "nr_history.hpp"
-#include "nr_hook.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
@@ -271,7 +270,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		nrhist::shutdown();
-		nrhook::shutdown();
 		nr::shutdown();
 		if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 			ngx::shutdown(g_state.native_device);
@@ -945,10 +943,9 @@ void DlssApp::on_render_targets(const icept::CommandContext &ctx, std::uint32_t 
 	// The render-target event feeds both finders (when either is on) and, at
 	// NgxNRHook=preui, the NR trigger — which never listened to begin_render_pass, so the
 	// flag keeps that exact split. Each callee is a cheap no-op when its feature is off.
+	(void)via_render_pass;
 	pass_finder::note_render_targets(ctx, count, rtvs, dsv);
 	gbuffer_finder::note_render_targets(ctx, count, rtvs, dsv);
-	if (!via_render_pass)
-		nrhook::on_bind_render_targets(ctx, count, rtvs, dsv);
 }
 
 void DlssApp::on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count)
@@ -969,10 +966,10 @@ void DlssApp::on_execute(const icept::CommandContext &ctx)
 
 void DlssApp::on_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count, bool created)
 {
-	if (created)
-		nrhook::note_swapchain(back_buffers, count);
-	else
-		nrhook::forget_swapchain();
+	// No consumer since the pre-UI NR site was removed (2026-09-02); the event stays on the seam
+	// because a host that owns the swapchain reports it, and the log is where it lands.
+	if (created && count != 0 && back_buffers != nullptr)
+		STRAY_LOG_INFO("swapchain: %u back buffer(s), first %p", count, reinterpret_cast<void *>(back_buffers[0]));
 }
 
 std::uint64_t DlssApp::next_frame()
@@ -989,9 +986,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
 	// Drains the NR validation readback (it gates NR ever touching the screen).
 	nr::on_present();
-	// Per-present boundary for the post-tonemap hook sites: resets the back-buffer bind ordinal
-	// and the once-per-frame latch, retires staging allocations, and emits the periodic report.
-	nrhook::on_present(frame);
 	// END-OF-FRAME HISTORY RESTORE. Puts the pristine, pre-NR image back into the engine's `u0`
 	// so the next frame's screen-space reflections read the history UE 4.27 would have written,
 	// not the one DLSS Neural Rendering left behind. It records onto ReShade's OWN immediate
@@ -1316,49 +1310,13 @@ EventNeeds DlssApp::configure_events()
 		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
 			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
 	}
-	// [STRAYDLSS] NgxNRHook: taa (default) | present | preui. Where DLSS Neural Rendering runs.
-	// The whole argument for moving it — and what each site costs — is in src/nr_hook.hpp.
+	// DLSS Neural Rendering runs at ONE site: inside the intercepted TAA dispatch, writing the
+	// engine's u0. The `present` / `preui` sites and [STRAYDLSS] NgxNRHook were removed on
+	// 2026-09-02 (neither ever produced a correct frame); a leftover key is ignored, loudly.
 	{
-		char nr_hook[16] = "taa";
-		host::cfg::get_string("NgxNRHook", nr_hook, sizeof(nr_hook));
-		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
-		nrhook::set_hook_mode(mode);
-
-		int preui_bind = 2;
-		preui_bind = host::cfg::get_int("NgxNRPreUiBind", preui_bind);
-		nrhook::set_preui_bind_ordinal(preui_bind < 0 ? 0u : static_cast<unsigned int>(preui_bind));
-
-		// Shared with the TAA path; only consulted on `preui`, which records onto the GAME's
-		// command list. Re-read here for the same reason the mode is.
-		bool restore_state = true;
-		restore_state = host::cfg::get_bool("RestoreState", restore_state);
-		nrhook::set_restore_state(restore_state);
-
-		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
-			mode == nrplan::HookMode::taa
-				? "DLSS Neural Rendering runs inside the intercepted TAA dispatch, writing the "
-				  "engine's u0 — which UE 4.27 also extracts as the next frame's temporal "
-				  "history, so NR's answer compounds. This is the shipped default and the "
-				  "fallback."
-			: mode == nrplan::HookMode::present
-				? "DLSS Neural Rendering runs at reshade_begin_effects, on the composited back "
-				  "buffer. No feedback path by construction, and no pass identification — but "
-				  "the UI is already drawn, and ReShade only fires this event when at least one "
-				  "effect file is LOADED."
-				: "DLSS Neural Rendering runs at the pre-UI render-target boundary: after the "
-				  "scene composite, before Slate draws the HUD. No feedback path AND no HUD "
-				  "pixels in the network. Watch the NR hook census lines to confirm "
-				  "NgxNRPreUiBind.");
-
-		if (mode == nrplan::HookMode::preui)
-		{
-			needs.nr_preui_events = true;
-		}
-		else if (mode == nrplan::HookMode::present)
-		{
-			needs.nr_present_events = true;
-		}
-
+		if (host::cfg::has("NgxNRHook"))
+			STRAY_LOG_WARN("[STRAYDLSS] NgxNRHook is no longer read: DLSS Neural Rendering runs inside the "
+				"intercepted TAA dispatch only (the present/preui sites were removed 2026-09-02).");
 		// [STRAYDLSS] NgxNRRestoreHistory, default ON. Keeps NR's residual out of the engine's
 		// temporal history at the `taa` site by snapshotting u0 before the decode and putting it
 		// back at present. Read alongside the hook mode because it is only meaningful for one of
@@ -1366,7 +1324,6 @@ EventNeeds DlssApp::configure_events()
 		bool restore_history = false;
 		restore_history = host::cfg::get_bool("NgxNRRestoreHistory", restore_history);
 		nrhist::set_enabled(restore_history);
-		nrhist::set_site(mode);
 		g_nr_ui.restore_history = restore_history;
 
 		// The one hypothesis in that path: which D3D12_RESOURCE_STATES u0 is in at present time,
@@ -1378,8 +1335,7 @@ EventNeeds DlssApp::configure_events()
 		nrhist::set_image_state_at_present(restore_state_bits <= 0
 			? 0u : static_cast<unsigned int>(restore_state_bits));
 
-		if (mode == nrplan::HookMode::taa)
-			STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
+		STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
 				"the pre-NR image of u0 aside inside the TAA dispatch and copies it back at "
 				"present, so UE 4.27's TemporalAAHistory.RT[0] — which "
 				"ScreenSpaceRayTracing.cpp:596-620 reads on the NEXT frame — never holds the "
@@ -1397,12 +1353,6 @@ EventNeeds DlssApp::configure_events()
 					  "exactly as it did before this feature existed — which is the SHIPPED "
 					  "behaviour, not a fault.",
 				nrhist::image_state_at_present());
-		else
-			STRAY_LOG_INFO("NgxNRRestoreHistory is INERT at NgxNRHook=%s: a post-tonemap site has "
-				"no feedback path to close by construction (every QueueTextureExtraction into "
-				"PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is "
-				"at 777), so nothing is snapshotted and nothing is restored.",
-				nrplan::hook_mode_name(mode));
 	}
 
 	if (pass_finder_enabled)

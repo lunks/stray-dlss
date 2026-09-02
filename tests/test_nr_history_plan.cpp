@@ -14,7 +14,6 @@
 #include <initializer_list>
 
 using namespace stray_dlss::histplan;
-using stray_dlss::nrplan::HookMode;
 
 namespace {
 
@@ -46,11 +45,10 @@ RestoreInputs good_restore()
 // 2026-09-01 and the restore rests on an INFERRED state for u0 at present), so every test of
 // what the gate DOES has to arm it first. Written as a helper rather than a line in each test
 // so that flipping the default again is one edit here plus the one assertion below.
-Config armed(HookMode site = HookMode::taa)
+Config armed()
 {
 	Config c;
 	c.enabled = true;
-	c.site = site;
 	return c;
 }
 
@@ -66,7 +64,6 @@ TEST_CASE("history restore: the SHIPPED DEFAULT IS OFF")
 	// which means changing this assertion too.
 	const Config shipped;
 	CHECK_FALSE(shipped.enabled);
-	CHECK(shipped.site == HookMode::taa);
 	CHECK(plan_snapshot(shipped, good_snapshot()) == Step::disabled);
 	CHECK(plan_restore(shipped, good_restore()) == Step::disabled);
 }
@@ -87,21 +84,6 @@ TEST_CASE("history restore: NgxNRRestoreHistory=0 is the shipped, drifting behav
 	CHECK(plan_restore(cfg, good_restore()) == Step::disabled);
 	// Not "harmful": the user asked for it, so it must not be warned about every session.
 	CHECK_FALSE(restore_miss_is_harmful(cfg, good_restore()));
-}
-
-TEST_CASE("history restore: the post-tonemap sites are INERT, not merely unnecessary")
-{
-	// There is no feedback path to close at `present` or `preui` — on the desktop deferred path
-	// every QueueTextureExtraction into PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643
-	// while AddTonemapPass is at 777 — so the mechanism must refuse with its own named reason
-	// rather than quietly copying 66 MB a frame for nothing.
-	for (const HookMode site : { HookMode::present, HookMode::preui })
-	{
-		Config cfg = armed(site);
-		CHECK(plan_snapshot(cfg, good_snapshot()) == Step::site_inert);
-		CHECK(plan_restore(cfg, good_restore()) == Step::site_inert);
-		CHECK_FALSE(restore_miss_is_harmful(cfg, good_restore()));
-	}
 }
 
 TEST_CASE("history restore: nothing is copied while NR cannot modify the image")
@@ -179,7 +161,7 @@ TEST_CASE("history restore: the refusal order names the real problem, not a symp
 {
 	// Every gate spoiled at once. The verdict must be the FIRST and most fundamental one, so the
 	// counted reason points at what to fix rather than at whatever happened to be checked last.
-	Config cfg = armed(HookMode::preui);
+	Config cfg = armed();
 	cfg.enabled = false;
 	SnapshotInputs in = good_snapshot();
 	in.nr_enabled = false;
@@ -190,9 +172,6 @@ TEST_CASE("history restore: the refusal order names the real problem, not a symp
 	CHECK(plan_snapshot(cfg, in) == Step::disabled);
 
 	cfg.enabled = true;
-	CHECK(plan_snapshot(cfg, in) == Step::site_inert);
-
-	cfg.site = HookMode::taa;
 	CHECK(plan_snapshot(cfg, in) == Step::nr_disabled);
 
 	in.nr_enabled = true;
@@ -251,10 +230,6 @@ TEST_CASE("history restore: NR modified u0 with no pristine copy is the ONE harm
 	Config off = cfg;
 	off.enabled = false;
 	CHECK_FALSE(restore_miss_is_harmful(off, in));
-
-	Config post = cfg;
-	post.site = HookMode::present;
-	CHECK_FALSE(restore_miss_is_harmful(post, in));
 }
 
 TEST_CASE("history restore: every Step has a distinct, non-empty name")

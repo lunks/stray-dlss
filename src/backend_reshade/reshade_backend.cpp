@@ -153,12 +153,6 @@ void ReshadeBackend::restore_game_compute_state(const icept::CommandContext &ctx
 		rsb::restore_game_compute_state(cl);
 }
 
-void ReshadeBackend::restore_viewports_and_scissors(const icept::CommandContext &ctx)
-{
-	if (reshade::api::command_list *cl = list_of(ctx))
-		rsb::restore_viewports_and_scissors(cl);
-}
-
 void ReshadeBackend::present_barrier(const icept::PresentContext &ctx, icept::ResourceId res,
                                      std::uint32_t before, std::uint32_t after)
 {

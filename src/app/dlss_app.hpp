@@ -21,8 +21,6 @@ struct EventNeeds
 	bool pipeline_events = false;    // on_pipeline (init/destroy)
 	bool finder_rt_events = false;   // on_render_targets + on_draw (either finder)
 	bool pass_finder_events = false; // on_copy + on_execute
-	bool nr_preui_events = false;    // on_swapchain + on_render_targets for NgxNRHook=preui
-	bool nr_present_events = false;  // reshade_begin_effects (ReShade-only; the host wires it)
 };
 
 // Live DLSS Neural Rendering tuning (the overlay's state, formerly NrUiState). Every value is

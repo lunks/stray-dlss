@@ -39,8 +39,6 @@ public:
 	// Re-establishes the compute state the game had before our pass ran on `ctx.native`:
 	// heaps, root signature, tables, root arguments and the PSO. (src/d3d12_restore.hpp)
 	virtual void restore_game_compute_state(const CommandContext &ctx) = 0;
-	// Viewports and scissors on top — only the pre-UI NR site needs them.
-	virtual void restore_viewports_and_scissors(const CommandContext &ctx) = 0;
 
 	// A resource barrier recorded onto the present-time list of `ctx` in a way that the
 	// backend GUARANTEES gets flushed (ReShade's immediate list only flushes what its own API

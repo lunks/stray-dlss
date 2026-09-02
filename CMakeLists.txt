@@ -209,8 +209,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/gbuffer_resolve.hpp
         src/nr_codec_pass.cpp
         src/nr_codec_pass.hpp
-        src/nr_hook.cpp
-        src/nr_hook.hpp
         src/nr_history.cpp
         src/nr_history.hpp
         src/ext_unhook.cpp

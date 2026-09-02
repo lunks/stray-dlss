@@ -149,7 +149,8 @@ enum class Site
 	// feature 18 is a display-referred network and this signal is out of its domain (measured:
 	// neural output max luminance 0.0026, red noise on screen).
 	taa_dispatch,
-	// src/nr_hook.cpp, at reshade_begin_effects or at the pre-UI render-target boundary.
+	// A post-tonemap site (REMOVED 2026-09-02 together with src/nr_hook.cpp; kept as the
+	// codec-bypass case the codec tests pin).
 	// `image` is a staging copy of the back buffer: ALREADY TONEMAPPED and display-referred, in
 	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, and left in that state on exit.
 	//

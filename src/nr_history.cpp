@@ -79,7 +79,7 @@ constexpr std::uint32_t kImageStateAtPresent =
 constexpr D3D12_RESOURCE_STATES kScratchRestState = D3D12_RESOURCE_STATE_COPY_SOURCE;
 
 // Presents a retired scratch texture is held for before release, matching the discipline in
-// mv_resolve / gbuffer_resolve / nr_codec_pass / nr_hook: the GPU may still be reading it.
+// mv_resolve / gbuffer_resolve / nr_codec_pass: the GPU may still be reading it.
 constexpr std::uint64_t kRetireLatency = 8;
 
 // How often the periodic diagnostic goes out, in presents. Same cadence as the NR hook's.
@@ -88,7 +88,6 @@ constexpr std::uint64_t kReportInterval = 600;
 // Default OFF — the rationale is on histplan::Config, and it is a risk judgement about an
 // inferred resource state, not a doubt about the mechanism.
 std::atomic<bool> g_enabled{ false };
-std::atomic<int> g_site{ static_cast<int>(nrplan::HookMode::taa) };
 std::atomic<std::uint32_t> g_image_state_at_present{
 	static_cast<std::uint32_t>(kImageStateAtPresent) };
 
@@ -159,7 +158,7 @@ void release(ID3D12Resource *&p)
 }
 
 // Counts a step and logs the first occurrence of each reason exactly once, in the shape the TAA
-// path's log_gate_refusal and the NR hook's refuse() use. `ok`, `disabled`, `site_inert` and
+// path's log_gate_refusal and the NR hook's refuse() use. `ok`, `disabled` and
 // `nr_not_applied` are counted but never warned about: the first two are stated once at startup
 // with their full rationale, and the last is the steady state of a session with NR off.
 void count_step(std::atomic<std::uint32_t> (&bucket)[histplan::kStepCount], histplan::Step step,
@@ -172,7 +171,7 @@ void count_step(std::atomic<std::uint32_t> (&bucket)[histplan::kStepCount], hist
 	if (before != 0)
 		return;
 	if (step == histplan::Step::ok || step == histplan::Step::disabled ||
-		step == histplan::Step::site_inert || step == histplan::Step::nr_not_applied)
+		step == histplan::Step::nr_not_applied)
 		return;
 	STRAY_LOG_WARN("NR history restore [%s]: refused (%s) — %s. First occurrence of this reason "
 		"only; the running total is in the periodic NR HISTORY line.",
@@ -183,7 +182,6 @@ histplan::Config config()
 {
 	histplan::Config c;
 	c.enabled = g_enabled.load(std::memory_order_relaxed);
-	c.site = static_cast<nrplan::HookMode>(g_site.load(std::memory_order_relaxed));
 	return c;
 }
 
@@ -376,11 +374,6 @@ bool enabled()
 	return g_enabled.load(std::memory_order_relaxed);
 }
 
-void set_site(nrplan::HookMode site)
-{
-	g_site.store(static_cast<int>(site), std::memory_order_relaxed);
-}
-
 void set_image_state_at_present(std::uint32_t state)
 {
 	g_image_state_at_present.store(state != 0 ? state
@@ -429,9 +422,9 @@ void snapshot(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resour
 	{
 		char detail[192];
 		std::snprintf(detail, sizeof(detail),
-			"image=%p rect %ux%u mips=%u slices=%u samples=%u site=%s",
+			"image=%p rect %ux%u mips=%u slices=%u samples=%u",
 			static_cast<void *>(image), in.width, in.height, in.mip_levels, in.array_size,
-			in.sample_count, nrplan::hook_mode_name(cfg.site));
+			in.sample_count);
 		count_step(g_snapshot_reasons, step, "snapshot", detail);
 		return;
 	}
@@ -640,8 +633,8 @@ void on_present(const icept::PresentContext &pc)
 	else
 	{
 		char detail[160];
-		std::snprintf(detail, sizeof(detail), "haveSnapshot=%d nrApplied=%d site=%s",
-			ri.have_snapshot ? 1 : 0, ri.nr_applied ? 1 : 0, nrplan::hook_mode_name(cfg.site));
+		std::snprintf(detail, sizeof(detail), "haveSnapshot=%d nrApplied=%d",
+			ri.have_snapshot ? 1 : 0, ri.nr_applied ? 1 : 0);
 		count_step(g_restore_reasons, step, "restore", detail);
 		if (histplan::restore_miss_is_harmful(cfg, ri))
 			g_harmful_misses.fetch_add(1, std::memory_order_relaxed);
@@ -660,7 +653,7 @@ void on_present(const icept::PresentContext &pc)
 	// The periodic diagnostic. Only at the site where this mechanism does anything, and only
 	// once it has done something — a line that says "0 0 0" every 600 frames in every session
 	// that never enabled NR is noise, and noise is what makes a real line easy to miss.
-	if (cfg.site != nrplan::HookMode::taa || frame == 0 || (frame % kReportInterval) != 0)
+	if (frame == 0 || (frame % kReportInterval) != 0)
 		return;
 	const Counters c = counters();
 	if (c.snapshots == 0 && c.restores == 0 && c.harmful_misses == 0)

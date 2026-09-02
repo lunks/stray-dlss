@@ -64,7 +64,6 @@ TEST_CASE("with no backend installed every query is refused, and set_backend(nul
 		bool read_buffer(const icept::BufferRange &, std::uint64_t, void *) override { return true; }
 		bool is_resource_live(icept::ResourceId) override { return true; }
 		void restore_game_compute_state(const icept::CommandContext &) override {}
-		void restore_viewports_and_scissors(const icept::CommandContext &) override {}
 		void present_barrier(const icept::PresentContext &, icept::ResourceId, std::uint32_t, std::uint32_t) override {}
 		void dump_tracker_state(const icept::CommandContext &, const char *) override {}
 	} fake;

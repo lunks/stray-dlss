@@ -378,16 +378,6 @@ void NativeBackend::restore_game_compute_state(const icept::CommandContext &ctx)
 	restore_native_compute_state(ctx.native, s);
 }
 
-void NativeBackend::restore_viewports_and_scissors(const icept::CommandContext &)
-{
-	static bool said = false;
-	if (!said)
-	{
-		said = true;
-		STRAY_LOG_WARN("native backend: viewports/scissors are not shadowed in this version; nothing restored.");
-	}
-}
-
 void NativeBackend::present_barrier(const icept::PresentContext &ctx, icept::ResourceId res,
                                     std::uint32_t before, std::uint32_t after)
 {

@@ -732,27 +732,6 @@ void restore_game_compute_state(reshade::api::command_list *cmd_list)
 	//    are untouched by anything we do.
 }
 
-void restore_viewports_and_scissors(reshade::api::command_list *cmd_list)
-{
-	// NGX clobbers them and restore_game_compute_state deliberately does not touch graphics
-	// dynamic state. UE 4.27's RHI does set a viewport in RHISetRenderTargets — which is the
-	// very command the pre-UI site records in front of — so this is belt and braces rather
-	// than the load-bearing part, and it is six lines.
-	//
-	// Render targets are NOT restored here on purpose: at that site the next command IS the
-	// OMSetRenderTargets we intercepted, so re-binding them would be redundant work whose
-	// only effect would be to make the game's own bind look redundant to ReShade's cache.
-	if (const auto *state = cmd_list->get_private_data<state_tracking>())
-	{
-		if (!state->viewports.empty())
-			cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()),
-				state->viewports.data());
-		if (!state->scissor_rects.empty())
-			cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()),
-				state->scissor_rects.data());
-	}
-}
-
 void reset_command_list_state(reshade::api::command_list *cmd_list)
 {
 	std::lock_guard<std::mutex> lock(g_mutex);

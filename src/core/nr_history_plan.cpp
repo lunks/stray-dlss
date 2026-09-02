@@ -5,7 +5,7 @@ namespace {
 
 // Parallel to Step. NOTE: kStepCount in the header must match.
 const char *const kStepNames[kStepCount] = {
-	"ok", "disabled", "site-inert", "nr-disabled", "nr-cannot-apply",
+	"ok", "disabled", "nr-disabled", "nr-cannot-apply",
 	"no-image", "zero-extent", "unsupported-image", "alloc-failed", "no-snapshot",
 	"nr-not-applied", "no-command-list",
 };
@@ -21,13 +21,9 @@ const char *step_name(Step step)
 Step plan_snapshot(const Config &config, const SnapshotInputs &in)
 {
 	// Order: the CHEAPEST and most fundamental refusals first, so the counted reason names the
-	// real problem rather than a downstream symptom. (nrplan::plan_post_tonemap precedent.)
+	// real problem rather than a downstream symptom.
 	if (!config.enabled)
 		return Step::disabled;
-	// Post-tonemap sites have no feedback path by construction, so there is nothing to undo.
-	// This is inertness, not a failure — the caller says so once and then stays quiet.
-	if (config.site != nrplan::HookMode::taa)
-		return Step::site_inert;
 	if (!in.nr_enabled)
 		return Step::nr_disabled;
 	if (!in.nr_can_apply)
@@ -48,8 +44,6 @@ Step plan_restore(const Config &config, const RestoreInputs &in)
 {
 	if (!config.enabled)
 		return Step::disabled;
-	if (config.site != nrplan::HookMode::taa)
-		return Step::site_inert;
 	// NR REFUSED, SO `u0` IS UNTOUCHED. Checked BEFORE the snapshot test on purpose: a frame
 	// where NR did not apply is the common, benign case, and reporting it as `no-snapshot` would
 	// bury the one instance of that reason that actually matters.
@@ -62,8 +56,7 @@ Step plan_restore(const Config &config, const RestoreInputs &in)
 
 bool restore_miss_is_harmful(const Config &config, const RestoreInputs &in)
 {
-	return config.enabled && config.site == nrplan::HookMode::taa && in.nr_applied &&
-		!in.have_snapshot;
+	return config.enabled && in.nr_applied && !in.have_snapshot;
 }
 
 } // namespace stray_dlss::histplan

@@ -1729,86 +1729,22 @@ OFF so a future session flipping it does so knowingly.
 
 The last four are what a live run would settle, in that order.
 
-### The hook site is now a choice: `[STRAYDLSS] NgxNRHook` = taa | present | preui
+### The NR hook site is ONE site again: `taa` (the `present` / `preui` sites were REMOVED 2026-09-02)
 
-The drift above is a PLACEMENT problem, so the fix is a placement. Three sites, one NR path
-(`nr::apply` parameterised by `nr::Site`; the gate and the boundary rule are pure and tested in
-`src/core/nr_hook_plan.{hpp,cpp}` / `tests/test_nr_hook_plan.cpp`):
+This section used to describe a three-way `[STRAYDLSS] NgxNRHook` choice. **Both post-tonemap
+sites are gone from the code** (`src/nr_hook.{hpp,cpp}`, the `preui` boundary rule, the
+`plan_post_tonemap` gate, `reshade_begin_effects` wiring, `restore_viewports_and_scissors` on
+the seam), by the user's decision: neither ever produced a correct frame on the box — `preui`
+wrecked a frame the night it was tried, `present` depended on a ReShade event that never fires
+with an empty preset — and every measured session, including the native-drive ones (facts §18),
+ran NR inside the intercepted TAA dispatch. A leftover `NgxNRHook` key logs a WARN and is
+ignored. What survives of that work is the guide-extent latch (`src/core/nr_hook_plan.hpp`) and
+the end-of-frame history restore below, which is where the placement argument's remedy lives.
 
-| `NgxNRHook` | Where | Feedback? | UI in the image? | Needs pass identification? |
-|---|---|---|---|---|
-| **`taa`** (default) | inside the intercepted TAA dispatch, writing `u0` | **yes — the bug** | no | yes |
-| `present` | `reshade_begin_effects` | no | **yes** | no |
-| `preui` | the frame's Nth back-buffer render-target bind | no | no | no |
-
-`preui` is the intended end state: it has `present`'s freedom from feedback AND keeps HUD pixels
-out of the network. `taa` stays the default and the fallback until a post-tonemap site is
-confirmed on the machine.
-
-**Why post-tonemap has no feedback path BY CONSTRUCTION**, rather than "we closed the known
-loops": on the desktop deferred path every `QueueTextureExtraction` into `PrevFrameViewInfo` sits
-at `PostProcessing.cpp` 576/599/643 while `AddTonemapPass` is at 777. Nothing after the
-tonemapper is carried into the next frame.
-
-**Two coupled loops, not one.** Feature 18 keeps its OWN temporal accumulator (it consumes motion
-vectors and depth, and `DLSSNR.Reset` is `settings.resetAccumulation` in the reference), so the
-engine's loop was feeding NR's history an input that already contained NR's previous output.
-Breaking the engine half lets NR's accumulator converge against a stable input, so the move should
-help more than a single-loop reading predicts.
-
-**Verified against the ReShade v6.8.0 source, all HARD:**
-
-* `reshade_begin_effects` fires at `runtime.cpp:4020` with the resource behind `rtv` in
-  **`RENDER_TARGET`** (`runtime.cpp:745` barriers `present -> render_target` immediately before;
-  the `_back_buffer_resolved` branch does the same at `:715`/`:721`). `render_effects` issues no
-  barrier and no GPU state setup before the invoke, and `api::capture_state` is a **no-op on
-  D3D12** (`state_block.cpp:53-92` has no d3d12 case).
-* Its `cmd_list` is **ReShade's own immediate command list**, a different
-  `ID3D12GraphicsCommandList` from the game's (`d3d12_impl_command_queue.cpp:22`,
-  `d3d12_impl_command_list_immediate.cpp:34`). So the game's state is untouched and there is
-  nothing of the game's to restore. ReShade's own heap/root-signature caches
-  (`d3d12_impl_command_list.cpp:538/549`) are **nulled at every flush**
-  (`d3d12_impl_command_list_immediate.cpp:127-130`, once per present via
-  `dxgi_swapchain.cpp:1009`), and nothing binds through the proxy between the flush and the event
-  — so a native clobber of ours cannot make the cache agree with reality by accident, and
-  ReShade's first per-pass bind re-issues the real calls. Calling `restore_game_compute_state`
-  there would be worse than doing nothing: that list's `state_tracking` holds ReShade's own
-  bindings. **`preui` is the opposite** — it is the GAME's list, UE4 filters its own redundant
-  binds, so it restores exactly as the TAA path does, plus viewports and scissors.
-* **`reshade_begin_effects` NEVER FIRES WITH AN EMPTY PRESET.** `render_effects` is only called
-  when `!is_loading() && !_techniques.empty()` (`runtime.cpp:737`, again at `:3810`), so
-  `NgxNRHook=present` is silently inert unless at least one effect file is LOADED (it may stay
-  disabled). The add-on logs an ERROR when `beginEffectsSeen` is still 0. `preui` has no such
-  dependency.
-
-**The `preui` boundary signal, and what is UNCONFIRMED about it.** It is a render-target IDENTITY
-test — resolve `rtvs[0]` to a resource and compare it against the swapchain's own back-buffer
-list — which is much cheaper and more robust than pass identification. What is *not* established
-is that UE 4.27 in this title produces exactly two back-buffer render-target binds per frame
-(composite, then Slate). `[STRAYDLSS] NgxNRPreUiBind` (default **2**) selects the ordinal, and the
-add-on logs a per-bind CENSUS for the first two frames so ONE run settles it. **It fails safe: a
-frame that never reaches the ordinal is skipped, counted under `boundary-not-reached`, never
-injected at a guessed point.** Reading a wrong ordinal off a screenshot: too LOW and the HUD looks
-processed (softened, denoised text); too HIGH and the image is unchanged.
-
-**Staging is a plain same-format copy**, not FP16. A copy cannot convert formats, so an FP16
-staging pair would need a conversion compute pass in EACH direction — and the write-back one
-would still need typed UAV store on the back buffer's format, so it would not even avoid the
-probe. The back buffer's own format for both textures makes both transfers plain copies with no
-shader of ours in the path. `nr_codec_pass`'s existing `CheckFeatureSupport` probe is exposed
-per-bit and logged; only VIEW and STORE gate (NGX writes `DLSSNR.Output` through a typed UAV and
-reads `DLSSNR.Color` through its own path).
-
-**The HDR codec is BYPASSED on both post-tonemap sites**, explicitly and logged. The image is
-already display-referred; encoding it again would apply the tone transfer twice.
-`NgxNRPaperWhiteScale`, `NgxNRColorStrength`, `NgxNRTransferStrength` and `NgxNRTrackExposure` all
-do nothing there, and the luminance diagnostic says so rather than printing codec terms that do
-not apply.
-
-**Guide freshness is a consumption SEQUENCE, not a present index.** The TAA capture publishes a
-counter; a trigger consumes it once. That keeps the gate independent of the order in which
-ReShade fires `addon_event::present` and `reshade_begin_effects`, and a frame with no TAA dispatch
-(a loading screen) simply never advances it.
+The measured facts that motivated the sites stand: `u0` is both scene colour and next-frame
+history, feature 18 keeps its own accumulator, and the hook point is a feedback node. What
+changed is the remedy — `NgxNRTrackExposure` and `NgxNRRestoreHistory` at the `taa` site — not
+the diagnosis.
 
 ### Feature 18 has its OWN temporal history, and we were invalidating it silently
 

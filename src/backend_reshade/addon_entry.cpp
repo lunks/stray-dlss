@@ -11,7 +11,6 @@
 
 #include "app/dlss_app.hpp"
 #include "backend_native/native_backend.hpp"
-#include "core/nr_hook_plan.hpp"
 #include "core/nr_history_plan.hpp"
 #include "core/taa_hashes.hpp"
 #include "host/config.hpp"
@@ -19,7 +18,6 @@
 #include "ngx_backend.hpp"
 #include "ngx_nr.hpp"
 #include "nr_history.hpp"
-#include "nr_hook.hpp"
 #include "shader_dump.hpp"
 
 #include <descriptor_tracking.hpp>
@@ -68,7 +66,6 @@ public:
 	bool read_buffer(const icept::BufferRange &range, std::uint64_t bytes, void *out) override { return native::backend().read_buffer(range, bytes, out); }
 	bool is_resource_live(icept::ResourceId res) override { return native::backend().is_resource_live(res); }
 	void restore_game_compute_state(const icept::CommandContext &ctx) override { native::backend().restore_game_compute_state(ctx); }
-	void restore_viewports_and_scissors(const icept::CommandContext &ctx) override { rsb::backend().restore_viewports_and_scissors(ctx); }
 	void present_barrier(const icept::PresentContext &ctx, icept::ResourceId res, std::uint32_t before, std::uint32_t after) override { rsb::backend().present_barrier(ctx, res, before, after); }
 	void dump_tracker_state(const icept::CommandContext &ctx, const char *why) override { native::backend().dump_tracker_state(ctx, why); }
 };
@@ -378,40 +375,6 @@ void on_execute_command_list(reshade::api::command_queue *queue,
 	app::instance().on_execute(rsb::context_for(cmd_list));
 }
 
-// The swapchain's back-buffer identities, for the `preui` NR site's identity test.
-void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
-{
-	(void)resize;
-	if (swapchain == nullptr)
-		return;
-	icept::ResourceId buffers[16] = {};
-	const uint32_t count = swapchain->get_back_buffer_count();
-	const uint32_t n = count < 16 ? count : 16;
-	for (uint32_t i = 0; i < n; ++i)
-		buffers[i] = swapchain->get_back_buffer(i).handle;
-	app::instance().on_swapchain(buffers, n, true);
-}
-
-void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
-{
-	(void)resize;
-	(void)swapchain;
-	app::instance().on_swapchain(nullptr, 0, false);
-}
-
-// RESHADE-ONLY: reshade_begin_effects runs on ReShade's own immediate command list, with the
-// resource behind `rtv` in RENDER_TARGET. Not part of icept::Sink — the native backend has
-// no such site — so it goes straight to the NR hook. (CLAUDE.md §5: never fires with an
-// empty preset.)
-void on_begin_effects(reshade::api::effect_runtime *runtime,
-	reshade::api::command_list *cmd_list, reshade::api::resource_view rtv,
-	reshade::api::resource_view rtv_srgb)
-{
-	(void)runtime;
-	(void)rtv_srgb;
-	nrhook::on_begin_effects(rsb::context_for(cmd_list), rtv.handle);
-}
-
 // Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
 // into the NGX parameter block on EVERY evaluate, and the codec's three are push constants on
 // every dispatch, so an edit lands on the next frame with no feature recreation. The values are
@@ -423,34 +386,6 @@ void draw_nr_controls()
 	app::NrLive &g_nr_ui = app::instance().nr_live();
 	if (!ImGui::CollapsingHeader("DLSS Neural Rendering (feature 18)"))
 		return;
-
-	// WHERE NR runs. Display only, never a control: NgxNRHook decides which ReShade events get
-	// registered, and registration happens once from DllMain — so a live toggle would silently
-	// do nothing. Changing it means editing ReShade.ini and relaunching.
-	const nrplan::HookMode hook = nrhook::hook_mode();
-	const nrhook::Counters hc = nrhook::counters();
-	ImGui::Text("Hook site:  %s  (NgxNRHook, restart to change)", nrplan::hook_mode_name(hook));
-	if (hook != nrplan::HookMode::taa)
-	{
-		ImGui::Text("  post-tonemap: triggered %llu  applied %llu",
-			static_cast<unsigned long long>(hc.triggered),
-			static_cast<unsigned long long>(hc.applied));
-		if (hook == nrplan::HookMode::preui)
-			ImGui::Text("  back buffers known %u | RTV binds: last %u  max %u "
-				"(NgxNRPreUiBind), frames with no boundary %u",
-				hc.back_buffers_known, hc.last_backbuffer_binds, hc.max_backbuffer_binds,
-				hc.frames_without_boundary);
-		else
-			ImGui::Text("  reshade_begin_effects fired %llu times%s",
-				static_cast<unsigned long long>(hc.begin_effects_seen),
-				hc.begin_effects_seen == 0 ? "  <-- NO EFFECTS LOADED: this site does not exist"
-					: "");
-		for (int i = 0; i < nrplan::kPlanResultCount; ++i)
-			if (hc.reasons[i] != 0)
-				ImGui::Text("    %-20s %u",
-					nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)), hc.reasons[i]);
-	}
-	ImGui::Separator();
 
 	std::uint64_t applied = 0, refused = 0;
 	std::uint32_t reasons[nr::kNrRefusalCount] = {};
@@ -477,29 +412,19 @@ void draw_nr_controls()
 	// purpose: turning it off mid-session and watching a wet floor or the menu's light shafts is
 	// the measurement. (src/nr_history.hpp)
 	const nrhist::Counters histc = nrhist::counters();
-	if (hook == nrplan::HookMode::taa)
+	changed |= ImGui::Checkbox("Restore engine history (keeps NR out of TAA history)",
+		&g_nr_ui.restore_history);
+	ImGui::Text("  snapshots %llu  restores %llu  harmful misses %llu%s",
+		static_cast<unsigned long long>(histc.snapshots),
+		static_cast<unsigned long long>(histc.restores),
+		static_cast<unsigned long long>(histc.harmful_misses),
+		histc.harmful_misses != 0 ? "  <-- frames whose residual DID reach the history" : "");
+	for (int i = 0; i < histplan::kStepCount; ++i)
 	{
-		changed |= ImGui::Checkbox("Restore engine history (keeps NR out of TAA history)",
-			&g_nr_ui.restore_history);
-		ImGui::Text("  snapshots %llu  restores %llu  harmful misses %llu%s",
-			static_cast<unsigned long long>(histc.snapshots),
-			static_cast<unsigned long long>(histc.restores),
-			static_cast<unsigned long long>(histc.harmful_misses),
-			histc.harmful_misses != 0 ? "  <-- frames whose residual DID reach the history" : "");
-		for (int i = 0; i < histplan::kStepCount; ++i)
-		{
-			const std::uint32_t total = histc.snapshot_reasons[i] + histc.restore_reasons[i];
-			if (total != 0 && i != static_cast<int>(histplan::Step::ok))
-				ImGui::Text("    %-20s %u",
-					histplan::step_name(static_cast<histplan::Step>(i)), total);
-		}
-	}
-	else
-	{
-		// Not a control here, and saying so beats a greyed-out box nobody can explain: a
-		// post-tonemap site has no feedback path to close by construction.
-		ImGui::TextUnformatted("Restore engine history: INERT at this hook site (no feedback "
-			"path post-tonemap)");
+		const std::uint32_t total = histc.snapshot_reasons[i] + histc.restore_reasons[i];
+		if (total != 0 && i != static_cast<int>(histplan::Step::ok))
+			ImGui::Text("    %-20s %u",
+				histplan::step_name(static_cast<histplan::Step>(i)), total);
 	}
 
 	ImGui::TextUnformatted("HDR colour codec");
@@ -687,11 +612,10 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 	const app::Status st = app::instance().status();
 	// The site is on the OSD because a screenshot is often the only evidence available, and
 	// "which path produced this image" is the first question to ask of one.
-	ImGui::Text("stray-dlss: %s | NGX %s | TAA x%u | NR@%s",
+	ImGui::Text("stray-dlss: %s | NGX %s | TAA x%u | NR@taa",
 		st.is_vkd3d ? "vkd3d" : "d3d12",
 		ngx_status.super_sampling_available ? "ok" : "n/a",
-		st.taa_pipelines,
-		nrplan::hook_mode_name(nrhook::hook_mode()));
+		st.taa_pipelines);
 }
 
 // ---- finder event handlers (pass finder + G-buffer finder) ----
@@ -741,9 +665,7 @@ void register_events(const app::EventNeeds &needs)
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 
-	// bind_render_targets_and_depth_stencil is shared by the finders and the `preui` NR site;
-	// registered once, forwarded by the application to whichever is on.
-	if (needs.finder_rt_events || needs.nr_preui_events)
+	if (needs.finder_rt_events)
 		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
 			on_bind_render_targets);
 	if (needs.finder_rt_events)
@@ -752,13 +674,6 @@ void register_events(const app::EventNeeds &needs)
 		reshade::register_event<reshade::addon_event::draw>(on_draw);
 		reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 	}
-	if (needs.nr_preui_events)
-	{
-		reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
-		reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-	}
-	if (needs.nr_present_events)
-		reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
 	if (needs.pass_finder_events)
 	{
 		reshade::register_event<reshade::addon_event::copy_resource>(on_copy_resource);
@@ -783,20 +698,13 @@ void unregister_events(const app::EventNeeds &needs)
 		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_copy_texture_region);
 		reshade::unregister_event<reshade::addon_event::copy_resource>(on_copy_resource);
 	}
-	if (needs.nr_present_events)
-		reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
-	if (needs.nr_preui_events)
-	{
-		reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-		reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
-	}
 	if (needs.finder_rt_events)
 	{
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 		reshade::unregister_event<reshade::addon_event::draw>(on_draw);
 		reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
 	}
-	if (needs.finder_rt_events || needs.nr_preui_events)
+	if (needs.finder_rt_events)
 		reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
 			on_bind_render_targets);
 

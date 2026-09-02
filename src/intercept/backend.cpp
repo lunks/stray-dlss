@@ -18,7 +18,6 @@ public:
 	bool read_buffer(const BufferRange &, std::uint64_t, void *) override { return refuse(); }
 	bool is_resource_live(ResourceId) override { return refuse(); }
 	void restore_game_compute_state(const CommandContext &) override { refuse(); }
-	void restore_viewports_and_scissors(const CommandContext &) override { refuse(); }
 	void present_barrier(const PresentContext &, ResourceId, std::uint32_t, std::uint32_t) override { refuse(); }
 	void dump_tracker_state(const CommandContext &, const char *) override { refuse(); }
 

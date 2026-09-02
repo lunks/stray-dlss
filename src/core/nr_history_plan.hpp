@@ -37,8 +37,6 @@
 // gather the numbers from D3D12 and act on the verdict.
 #pragma once
 
-#include "core/nr_hook_plan.hpp"
-
 #include <cstdint>
 
 namespace stray_dlss::histplan {
@@ -51,11 +49,6 @@ enum class Step
 	ok = 0,
 	// [STRAYDLSS] NgxNRRestoreHistory=0 — THE DEFAULT. See Config below for why.
 	disabled,
-	// The hook site is post-tonemap (`present` / `preui`). There is NO feedback path to close
-	// there — on the desktop deferred path every QueueTextureExtraction into PrevFrameViewInfo
-	// sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is at 777 — so this whole
-	// mechanism is INERT rather than merely unnecessary, and says so once in the log.
-	site_inert,
 	// NgxNR=0. DLSS SR alone is a like-for-like replacement for what the engine's own TAA would
 	// have produced, so nothing needs undoing; there is no residual in `u0`.
 	nr_disabled,
@@ -93,11 +86,11 @@ enum class Step
 
 // NOTE: the count is duplicated in src/core/nr_history_plan.cpp's kStepNames — change both
 // together. Same discipline as nrplan::kPlanResultCount and nr::kNrRefusalNames.
-constexpr int kStepCount = 12;
+constexpr int kStepCount = 11;
 const char *step_name(Step step);
 
-// The two settings that gate the whole mechanism. `site` is read once at startup from
-// NgxNRHook; `enabled` is the live toggle.
+// The setting that gates the whole mechanism: `enabled` is the live toggle. (NR runs at one
+// site only, inside the TAA dispatch, since 2026-09-02; the post-tonemap sites are gone.)
 //
 // DEFAULT OFF, and that is a deliberate risk judgement rather than caution for its own sake.
 // The restore records a copy at PRESENT TIME, on a command list that is not the game's, into a
@@ -115,8 +108,7 @@ const char *step_name(Step step);
 // so a future session finds it instead of reimplementing it.
 struct Config
 {
-	bool enabled = false;                                       // [STRAYDLSS] NgxNRRestoreHistory
-	nrplan::HookMode site = nrplan::HookMode::taa;              // [STRAYDLSS] NgxNRHook
+	bool enabled = false; // [STRAYDLSS] NgxNRRestoreHistory
 };
 
 // What the TAA hook knows at the moment DLSS SR/RR has written `u0` and NR has not yet run.

@@ -99,9 +99,6 @@ void note_push_constants(
 	uint32_t count,
 	const void *values);
 
-// Viewports and scissors from ReShade's state_tracking, replayed through its API. Only the
-// pre-UI NR site needs these; the TAA path never touches graphics dynamic state.
-void restore_viewports_and_scissors(reshade::api::command_list *cmd_list);
 
 // Re-establishes the compute state the game had before our pass ran.
 //
