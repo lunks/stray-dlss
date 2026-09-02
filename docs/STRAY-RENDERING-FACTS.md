@@ -1096,3 +1096,44 @@ and of the last heap in slot_for so a run of copies into the online heap skips t
 both target the two named buckets with no lock. drive_ratio is 0.999-1.000 and orphans 0 in every
 Config A arm, so correctness is not in question; this is pure CPU shaving. Deferred: it wants a
 stable box and is its own pass with its own table.
+
+
+## 31. The SR-only "regression" was box degradation, not the overflow - bisected (2026-09-02)
+
+§30 blamed the overflow map for arm C falling from ~104 to ~86 fps across a session. Bisected by
+build, same box, back to back, and it is REFUTED. The real cause is the box's own baseline
+dropping system-wide over a long uptime.
+
+The user's control first: rerun arm A (the ReShade ADD-ON, SR only - carries none of our shadow
+code) in the current box state. It read 82.9 / 100.2 / 101.6 (cycle 1 is shader warmup; steady
+~100), down from 113-117 at 13:37 and 110-117 at 14:25 the same session. A restart of Steam did
+not restore it (93.3 / 95.7 / 97.0 after). So a build with zero shadow code lost ~16%, across
+game and Steam restarts - the box changed, not our code.
+
+The bisection, arm C, both builds deployed and measured back to back on that degraded box:
+
+| build | DLL | arm C 3 cycles | drive_ratio |
+|---|---|---|---|
+| clean box, this morning | 06b8ff7f | 104.9 / 104.2 / 102.2 | - |
+| c90be36 (pre-overflow, flat shadow) | 06b8ff7f | 84.5 / 81.0 / 81.8 | 0.999 |
+| bde9184 (overflow + inline-copy fix) | 50aaa509 | 94.9 / 98.8 / 77.8 | 0.999-1.000 |
+
+The SAME 06b8ff7f binary that was 104 in the morning is 82 now, and the overflow build (bde9184)
+is if anything HIGHER (mean ~90 vs ~82) - so the overflow is not a regression, and §30's
+inline-copy "fix" was fixing a phantom (it is still correct and cheaper, just not the cause).
+Both drive_ratio 0.999-1.000; correctness is intact.
+
+**GPU is not the cause:** at rest clocks_event_reasons.active reads 0x1 (idle), and during a run
+the SM boosts to 2775 MHz at 68-71 C with a 600 W board limit and no throttle reason ever
+recorded. Memory 18 GB free. No leftover extra process (one Stray, the expected reaper). The
+degradation is elsewhere in the 27 h-uptime session - the gamescope compositor or the driver
+state - and persists across game and Steam restarts, so only a container/system reboot will
+restore a clean baseline. Within-arm variance is also high on the degraded box (bde9184
+95/99/78), which a clean box should remove.
+
+**Consequence for the perf passes:** absolute A-vs-C numbers from any run after ~15:00 today are
+not comparable to the morning's 104/113 and must not be used to gate pass 1. The passes (the
+thread-local caches of last-list-state and last-heap, §30) are still the right next step, but on
+a REBOOTED box; on the degraded box a small CPU-shaving delta cannot be resolved against ~20 fps
+of box noise. The thermal explanation in §30 is withdrawn: no throttle reason was ever active;
+the loss is a per-session/system accumulation, not temperature.
