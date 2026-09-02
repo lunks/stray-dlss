@@ -199,7 +199,7 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 		static_cast<double>(real.nonzero) < black_fraction * static_cast<double>(real.total);
 	if (generated_black && real_black)
 	{
-		// MEASURED on the box (facts §31.9): a loading screen / fade makes the REAL crop black
+		// MEASURED on the box (facts §32.9): a loading screen / fade makes the REAL crop black
 		// too, and revoking there flickered FG off and on around every dark moment. Nothing
 		// to judge; neutral, and no reference for the next look.
 		verdict = CropVerdict::dark;

@@ -1,16 +1,16 @@
 // DLSS Frame Generation through the NGX core: NVSDK_NGX_Feature_FrameGeneration (11), the
 // `nvngx_dlssg.dll` snippet, driven WITHOUT Streamline. The snippet has no present path, no
-// queue and no pacer (facts §31.1) — EvaluateFeature records interpolation work onto the
+// queue and no pacer (facts §32.1) — EvaluateFeature records interpolation work onto the
 // command list it is handed and presenting is the caller's job, which is the present owner's
 // present-twice path (src/backend_native/fg_present.hpp). This module is the fg::Generator
 // that path calls: it owns the feature, the parameter block and the copies of the per-frame
 // guides the TAA hook publishes.
 //
 // Every DLSSG.* name written here was confirmed by exact null-terminated search over the
-// snippet (facts §31.2, tools/ngx_param_names.py). An unknown name is silently ignored
+// snippet (facts §32.2, tools/ngx_param_names.py). An unknown name is silently ignored
 // (CLAUDE.md §5), so a name NOT in that list must never be added without re-running the search.
 //
-// INPUTS (facts §31.2/31.3): DLSSG.Backbuffer = the game's final frame (the replacement back
+// INPUTS (facts §32.2/31.3): DLSSG.Backbuffer = the game's final frame (the replacement back
 // buffer), DLSSG.Depth and DLSSG.MVecs = the same depth and dense RG16F motion vectors SR
 // consumes, copied into FG-owned textures at the TAA hook because the engine's depth is a
 // pooled target whose content at present time is not guaranteed; jitter, camera-cut reset,

@@ -260,7 +260,7 @@ bool test_fg_present_twice(Gpu &gpu)
 	}
 
 	// UE 4.27's viewport: GetBuffer(i) for every index right after creation / resize, then its
-	// own counter from 0 (facts §31.4). The colours make every frame identifiable.
+	// own counter from 0 (facts §32.4). The colours make every frame identifiable.
 	const float colours[6][4] = {
 		{ 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },
 		{ 1.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.5f, 0.5f, 1.0f },
@@ -362,7 +362,7 @@ bool test_fg_present_twice(Gpu &gpu)
 	const HRESULT rhr = sc->ResizeBuffers(0, 800, 450, DXGI_FORMAT_UNKNOWN, 0);
 	std::printf("  ResizeBuffers(0, 800x450) hr=0x%08lx\n", static_cast<unsigned long>(rhr));
 	check(SUCCEEDED(rhr), "ResizeBuffers succeeded with the game's buffers released (our references do not block it)");
-	game_index = 0; // UE4 resets its counter after ResizeBuffers (facts §31.4)
+	game_index = 0; // UE4 resets its counter after ResizeBuffers (facts §32.4)
 	{
 		// The present owner re-fetches the back buffers right after the resize (report_back_buffers),
 		// which is a GetBuffer through the hook, so the replacements are already re-armed here -

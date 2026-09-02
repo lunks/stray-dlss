@@ -3,7 +3,7 @@
 // Owned by the present owner (present_owner.cpp), which calls in from its swapchain hooks; the
 // arithmetic is core/fg_plan.hpp (tested), this file is the D3D12/DXGI shell around it.
 //
-// WHAT IT DOES (facts §31.4 for the UE4 half):
+// WHAT IT DOES (facts §32.4 for the UE4 half):
 //   * IDXGISwapChain::GetBuffer is hooked: the game receives OUR textures ("replacements",
 //     same desc as the real back buffers) and renders into them, keeping its own index counter
 //     as UE 4.27's D3D12 RHI does. The real swapchain buffers are never touched by the game.

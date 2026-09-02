@@ -7,7 +7,7 @@
 
 using namespace stray_dlss::core::fg;
 
-TEST_CASE("GameIndexMirror: UE 4.27's counter - 0 after reset, +1 mod count per Present, reset on resize (facts §31.4)")
+TEST_CASE("GameIndexMirror: UE 4.27's counter - 0 after reset, +1 mod count per Present, reset on resize (facts §32.4)")
 {
 	GameIndexMirror m;
 	CHECK_FALSE(m.valid());

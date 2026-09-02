@@ -2186,11 +2186,11 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
 * **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
   mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
-### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02; MEASURED on the box the same day, facts §31.7-31.10)
+### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02; MEASURED on the box the same day, facts §32.7-32.10)
 
-Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
+Facts in `docs/STRAY-RENDERING-FACTS.md` §32. The parts that decide everything:
 
-* **`nvngx_dlssg.dll` has no present path, no queue and no pacer** (§31.1, HARD from the
+* **`nvngx_dlssg.dll` has no present path, no queue and no pacer** (§32.1, HARD from the
   strings): `EvaluateFeature` records the interpolation onto the list it is handed. Everything
   Streamline's `sl.dlss_g` did around it — own the swapchain, present twice, pace, hand the
   interpolated frame over — is ours, in `src/backend_native/fg_present.cpp`, and Streamline is
@@ -2198,7 +2198,7 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
 * **The game is handed REPLACEMENT back buffers** from a hooked `IDXGISwapChain::GetBuffer`
   and never touches the real ring. UE 4.27 never calls `GetCurrentBackBufferIndex`; it keeps
   its own counter (+1 per Present, 0 after every Resize, `GetBuffer(i)` for every index after
-  a resize — §31.4, HARD from source), so `core::fg::GameIndexMirror` reproduces it and tells us
+  a resize — §32.4, HARD from source), so `core::fg::GameIndexMirror` reproduces it and tells us
   which replacement holds this frame. A mirror error would be a STALE presented frame — the
   stage-1 screenshot protocol (magenta band on the generated frame) is what would show it.
 * **Two presents per game frame**: copy generated → real[current], Present; wait the pacer's
@@ -2212,7 +2212,7 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
   or stale (real moved, generated did not, 3x) output REVOKES presenting it, loudly. Every
   refusal is counted by reason (`[fg]` line, `fg_*` in the status file).
 * **Every `DLSSG.*` name written is in the snippet's exact null-terminated string set**
-  (§31.2, `tools/ngx_param_names.py`); the SL-only names (`EnableInterp`, `CmdQueue`, the sync
+  (§32.2, `tools/ngx_param_names.py`); the SL-only names (`EnableInterp`, `CmdQueue`, the sync
   callbacks, `IsRecording`) are absent from the snippet and not written. Re-run the tool on the
   box's SL 2.13 copy before trusting the list there.
 * **Stage 1 (`NgxFG=1 NgxFGMode=1`) needs no NGX**: the generated frame is the previous real
@@ -2228,7 +2228,7 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
   box all five entry points exist and `SetSleepMode`/`Sleep`/`SetLatencyMarker` return
   `NVAPI_OK` (HARD); what they do under vkd3d-proton is UNCONFIRMED.
 
-**What the box settled on 2026-09-02 (facts §31.7-31.10), all HARD:** the present-twice path
+**What the box settled on 2026-09-02 (facts §32.7-32.10), all HARD:** the present-twice path
 survives `SetFullscreenState(TRUE)` + `ResizeBuffers` (OptiScaler's wall) and three checkpoint
 reloads at exactly 2.00x presents per game present; the NGX core under Proton routes feature
 11 to the game-directory `nvngx_dlssg.dll` and `CreateFeature`/`EvaluateFeature` succeed with

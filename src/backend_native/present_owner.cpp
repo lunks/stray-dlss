@@ -154,7 +154,7 @@ void note_swapchain_lazy(IDXGISwapChain *sc, IUnknown *device_arg, const char *h
 		"QI/queue/back-buffers deferred to first Present.",
 		static_cast<void *>(sc), how, static_cast<void *>(device_arg), patched);
 	// Frame generation hooks GetBuffer on the same vtable, and must do so NOW: the game asks for
-	// its back buffers right after creation, before the first Present (facts §31.4).
+	// its back buffers right after creation, before the first Present (facts §32.4).
 	fg::on_swapchain_recorded(sc, g_device);
 }
 
@@ -455,7 +455,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT fla
 	before_present(self, flags);
 	HRESULT hr = S_OK;
 	if (fg_present(self, sync, flags, &hr))
-		return hr; // UE 4.27 calls Present, not Present1 (facts §31.4); FG presents through Present either way
+		return hr; // UE 4.27 calls Present, not Present1 (facts §32.4); FG presents through Present either way
 	return orig != nullptr ? orig(self, sync, flags, params) : S_OK;
 }
 

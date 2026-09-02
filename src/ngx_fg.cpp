@@ -207,7 +207,7 @@ int resolve_hdr(unsigned format, unsigned color_space)
 	// SL guide §11.0: HDR means RGB10 + HDR10/BT.2100. R10G10B10A2 with the PQ colour space is
 	// HDR for certain; R10G10B10A2 with no colour space ever set is HDR by this title's
 	// configuration (gamescope --hdr-enabled, CLAUDE.md §1); anything else is SDR.
-	// MEASURED on the box (facts §31.7): Stray never calls SetColorSpace1 - UE 4.27's default
+	// MEASURED on the box (facts §32.7): Stray never calls SetColorSpace1 - UE 4.27's default
 	// back buffer is the 10-bit R10G10B10A2 in SDR (r.DefaultBackBufferPixelFormat), so a
 	// 10-bit format with no colour space ever set is SDR, not HDR10.
 	if (format == DXGI_FORMAT_R10G10B10A2_UNORM && color_space == static_cast<unsigned>(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))
@@ -216,7 +216,7 @@ int resolve_hdr(unsigned format, unsigned color_space)
 }
 
 #if STRAY_DLSS_ENABLE_NGX
-// Every name here is in facts §31.2's PRESENT set. Keep it that way.
+// Every name here is in facts §32.2's PRESENT set. Keep it that way.
 bool create_feature(ID3D12GraphicsCommandList *list, ID3D12CommandQueue *queue, ID3D12Device *device,
                     std::uint32_t w, std::uint32_t h, unsigned format, const FrameConstants &c)
 {
@@ -466,7 +466,7 @@ public:
 		p->Set("DLSSG.CameraFwdZ", basis.fwd[2]);
 		p->Set("DLSSG.MinRelativeLinearDepthObjectSeparation", 40.0f); // sl_consts.h default
 		p->Set("DLSSG.NotRenderingGameFrames", 0u);
-		// MEASURED on the box (facts §31.7): the index is 1-BASED. With index 0 the snippet
+		// MEASURED on the box (facts §32.7): the index is 1-BASED. With index 0 the snippet
 		// refuses every evaluate with FAIL_InvalidParameter and logs "Multi frame is not
 		// supported on this device. Found index (0) but expected (1)"
 		// (EndpointCoreInputs::ComputeAndValidateTimeFactor:418). One generated frame per real

@@ -38,7 +38,7 @@ are compiled under mingw by CI as the fast proxy for the MSVC build.
 
 ## Frame generation (`NgxFG`, default 0)
 
-DLSS Frame Generation through the NGX core, **without Streamline** (facts §31). The plugin's
+DLSS Frame Generation through the NGX core, **without Streamline** (facts §32). The plugin's
 present owner hands the game replacement back buffers, presents twice per game frame and paces
 the pair on a worker thread; `nvngx_dlssg.dll` (beside the game executable, like `nvngx_dlss.dll`)
 is driven exactly as SR is. Keys, all `[STRAYDLSS]` in `StrayDLSS.ini`:

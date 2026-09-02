@@ -1080,12 +1080,14 @@ gap (52 -> ~104) and eliminated the hitches; ~9% remains. With SR+NR (arms B/D/E
    descriptor through read_slot/write_slot and bumped one global atomic per descriptor (7 000x a
    frame across every RHI thread). Fixed by inlining the both-slots-flat case and batching the
    counter (bde9184); Config A's orphan count is 0 so it never touches the overflow.
-2. **The box drifts within a long session.** After hours of launches the same arm C read
-   100/86/84 across its three cycles where a cooler session read 104/104/102 flat - a decline too
-   large to attribute to our code alone (heap-table growth across reloads is a suspect worth
-   ruling out: fast::g_owned never shrinks, so a heap recreated on reload accumulates and widens
-   the slot_for search; measured create=29 stayed constant across cycles, so if it grows it does
-   so slowly). A tight A-vs-C parity number needs a thermally-settled box and a fixed cycle count.
+2. **SUSPECT - host CPU contention, not our code (see §31).** Every bench row in this section
+   taken after ~16:30 today is INVALID: the Proxmox host running the SteamOS LXC was CPU-starved
+   by a neighbour tenant (load 50 on 32 cores), which inflates the plugin's CPU-side cost
+   specifically. The "100/86/84" decline, the overflow "regression", and the "noregress"/"final"
+   rows are all suspect and must not be used to gate anything. The thermal wording here is
+   WITHDRAWN (no GPU throttle reason was ever active). The only trustworthy rows above are the
+   morning ones (52-60 -> ~104 progression, and add-on ~113) taken before the contention; the
+   real A-vs-C comparison must be re-run on a quiet host, guarded by the load check (§31).
 
 **The remaining ~9% and the next levers (per the buckets, Config A fast):** native hooks total
 3.5-5.5 ms/frame summed over threads - shadow-copy ~3 ms (7 000 flat atomic copies a frame, each
@@ -1097,7 +1099,89 @@ both target the two named buckets with no lock. drive_ratio is 0.999-1.000 and o
 Config A arm, so correctness is not in question; this is pure CPU shaving. Deferred: it wants a
 stable box and is its own pass with its own table.
 
-## 31. The DLSS-G (NGX feature 11) parameter contract, read out of `nvngx_dlssg.dll` (2026-09-02, offline)
+
+## 31. The SR-only "regression" was box degradation, not the overflow - bisected (2026-09-02)
+
+§30 blamed the overflow map for arm C falling from ~104 to ~86 fps across a session. Bisected by
+build, same box, back to back, and it is REFUTED. The real cause is the box's own baseline
+dropping system-wide over a long uptime.
+
+The user's control first: rerun arm A (the ReShade ADD-ON, SR only - carries none of our shadow
+code) in the current box state. It read 82.9 / 100.2 / 101.6 (cycle 1 is shader warmup; steady
+~100), down from 113-117 at 13:37 and 110-117 at 14:25 the same session. A restart of Steam did
+not restore it (93.3 / 95.7 / 97.0 after). So a build with zero shadow code lost ~16%, across
+game and Steam restarts - the box changed, not our code.
+
+The bisection, arm C, both builds deployed and measured back to back on that degraded box:
+
+| build | DLL | arm C 3 cycles | drive_ratio |
+|---|---|---|---|
+| clean box, this morning | 06b8ff7f | 104.9 / 104.2 / 102.2 | - |
+| c90be36 (pre-overflow, flat shadow) | 06b8ff7f | 84.5 / 81.0 / 81.8 | 0.999 |
+| bde9184 (overflow + inline-copy fix) | 50aaa509 | 94.9 / 98.8 / 77.8 | 0.999-1.000 |
+
+The SAME 06b8ff7f binary that was 104 in the morning is 82 now, and the overflow build (bde9184)
+is if anything HIGHER (mean ~90 vs ~82) - so the overflow is not a regression, and §30's
+inline-copy "fix" was fixing a phantom (it is still correct and cheaper, just not the cause).
+Both drive_ratio 0.999-1.000; correctness is intact.
+
+**GPU is not the cause:** at rest clocks_event_reasons.active reads 0x1 (idle), and during a run
+the SM boosts to 2775 MHz at 68-71 C with a 600 W board limit and no throttle reason ever
+recorded. Memory 18 GB free. No leftover extra process (one Stray, the expected reaper). The
+degradation is elsewhere in the 27 h-uptime session - the gamescope compositor or the driver
+state - and persists across game and Steam restarts, so only a container/system reboot will
+restore a clean baseline. Within-arm variance is also high on the degraded box (bde9184
+95/99/78), which a clean box should remove.
+
+**Consequence for the perf passes:** absolute A-vs-C numbers from any run after ~15:00 today are
+not comparable to the morning's 104/113 and must not be used to gate pass 1. The passes (the
+thread-local caches of last-list-state and last-heap, §30) are still the right next step, but on
+a REBOOTED box; on the degraded box a small CPU-shaving delta cannot be resolved against ~20 fps
+of box noise. The thermal explanation in §30 is withdrawn: no throttle reason was ever active;
+the loss is a per-session/system accumulation, not temperature.
+
+
+### 31.1 The cause was the Proxmox HOST, and the bench now guards against it (2026-09-02 ~18:00)
+
+The "box degraded" reading above is right about the symptom and now has its cause: the **Proxmox
+host** carrying the SteamOS LXC was under **CPU contention from another tenant** at the time - four
+java processes at 856% / 656% / 337% / 262% CPU pushed the 32-core host to a 1-minute load average
+of **50** (5-minute 61.6), ~1.6x oversubscribed, while the game wanted ~3.5 cores. The plugin's
+added cost is CPU-side (the native hooks, the resolve), which is exactly what a starved host
+inflates - so this is very likely the whole of the "drift" as well.
+
+**The container's loadavg IS the host's.** An LXC shares the host kernel, so `/proc/loadavg`
+inside container 113 reads the host's load (50.2 on 32 CPUs), which is precisely why the bench can
+detect a neighbour's burst at all. And `/proc/stat` steal is always 0 in an LXC (it is not a VM),
+so steal is not a usable signal here - loadavg is.
+
+**SUSPECT rows.** Every stray-bench.csv row after ~16:30 today - the "drift" C rows (100/86/84),
+the bisect rows (c90be36 84/81/82 and bde9184 95/99/78), the A rechecks (82/100/101 and post-Steam
+93/96/97), and every "final"/"noregress"/"overflow" row - is INVALID and draws no conclusion. The
+bisection §31 ran DURING the contention, which is why the same 06b8ff7f binary read 82 vs its
+morning 104; it does still show the overflow build is not slower than the pre-overflow one (both
+were equally starved), so the overflow is not exonerated OR convicted by it - re-run on a quiet
+host.
+
+**The guard.** stray-bench.sh now reads `/proc/loadavg` at the start of every cycle and REFUSES to
+run when load1/nproc exceeds STRAY_LOAD_MAX (default 0.5; the game alone is well under 0.3), naming
+the host contention. load1, load5 and nproc are written into every CSV row (gpu_sm@tempC too), so a
+starved run can never again be mistaken for a code regression. Pass 1 (the thread-local caches) and
+the build bisection (c90be36 vs bde9184 artifacts staged, accumulation counters at cycle
+boundaries) are ready to run in one go the moment the host is quiet (load1/nproc < 0.3).
+
+**Host scheduling change (2026-09-02, coordinator).** The Proxmox host now sets the SteamOS
+container (113) to `cpu.weight 1000` and the work container (105) to 50 (live + persisted via
+`pct set --cpuunits`), so under contention the game wins ~20:1 rather than splitting evenly. It
+does NOT lift the pause: a loaded host still perturbs timing even when the game wins the
+scheduler, so the load guard stays and benches wait for a quiet host. On release, the arm-A
+add-on control is the first run - it also tells whether the weight alone restored the add-on's
+morning 113-117. stray-bench.sh writes a per-cycle accumulation snapshot (NATIVE SHADOW GROWTH,
+native-hooks buckets, NATIVE DRIVE, live-resource/root-signature counts) to stray-bench-accum.log
+so the bisection can see whether any counter climbs monotonically while fps falls (a leak) versus
+moves with the host load (contention).
+
+## 32. The DLSS-G (NGX feature 11) parameter contract, read out of `nvngx_dlssg.dll` (2026-09-02, offline)
 
 Frame generation, stage 2 of the FG plan. CLAUDE.md §5 rule: an NGX parameter block is an
 untyped string->value map with no validation, so **a name the snippet does not implement is
@@ -1119,7 +1203,7 @@ The contract was read from the newest public Streamline SDK release on GitHub,
 carries the same name set. Run `python3 tools/ngx_param_names.py <box copy> --check <the
 list below>` first thing; a name that flips to ABSENT retires the corresponding write.
 
-### 31.1 Verdicts, verbatim from the tool (release 2.12.0 snippet)
+### 32.1 Verdicts, verbatim from the tool (release 2.12.0 snippet)
 
 94 of the 106 names checked are PRESENT (exact `\0NAME\0`). Every one the plugin writes is in
 the PRESENT set. The 12 ABSENT ones, and why each was checked:
@@ -1150,7 +1234,7 @@ interpolation work onto the command list it is handed, and presenting the result
 caller's job.** HARD (from the strings; the OptiScaler session in CLAUDE.md §5 measured the
 snippet's `Dispatch Result: Ok` through SL, which is the same call).
 
-### 31.2 The full `DLSSG.*` name set of the 2.12.0 snippet (135 names), classified
+### 32.2 The full `DLSSG.*` name set of the 2.12.0 snippet (135 names), classified
 
 Classification is from three sources: present in the snippet (S), present in `sl.dlss_g.dll`
 (C, i.e. the reference caller sets it), read by Nukem's dlssg-to-fsr3 (N, i.e. a caller-set
@@ -1204,7 +1288,7 @@ internal). `DLSSG.UserDebugText` is in the development snippet and `sl.dlss_g` o
 `DLSSG.SyncWaitCallback[Data]` `DLSSG.SyncWaitOnlyCallback[Data]` `DLSSG.VkOFAModeRequest`
 `DLSSG.run_lowres_mvec_pass`.
 
-### 31.3 Other facts read from the same binaries and the SDK
+### 32.3 Other facts read from the same binaries and the SDK
 
 * **Snippet-side exports** (the API `nvngx.dll` calls; the same shape as `nvngx_dlssnr.dll`,
   CLAUDE.md §5): `NVSDK_NGX_D3D12_Init`, `_Init_Ext`, `_CreateFeature`, `_EvaluateFeature`,
@@ -1240,12 +1324,12 @@ internal). `DLSSG.UserDebugText` is in the development snippet and `sl.dlss_g` o
 * **What DLSS-G under Streamline requires that the snippet does NOT:** the SL guide's "DLSS-G
   takes over frame presenting" (§12.0), the Reflex requirement (§8.0), and
   `eFailGetCurrentBackBufferIndexNotCalled` are all properties of `sl.dlss_g`'s swapchain
-  proxy and pacer. None of those names or mechanisms exist in the snippet (31.1). Driving the
+  proxy and pacer. None of those names or mechanisms exist in the snippet (32.1). Driving the
   snippet through the NGX core makes presenting, pacing and the back-buffer index OUR job — the
   present-twice design below — and removes the Streamline-only failure modes. HARD for the
   absence; the consequence is the design bet of this branch.
 
-### 31.4 UE 4.27.2's back-buffer indexing, from the source (`D3D12Viewport.cpp`, `WindowsD3D12Viewport.cpp`, mirror @ `306a7e9`)
+### 32.4 UE 4.27.2's back-buffer indexing, from the source (`D3D12Viewport.cpp`, `WindowsD3D12Viewport.cpp`, mirror @ `306a7e9`)
 
 The present-twice design hands the game REPLACEMENT back buffers (our textures returned from a
 hooked `IDXGISwapChain::GetBuffer`) and copies the presented image into the real swapchain
@@ -1280,24 +1364,24 @@ mirror error would show as a STALE presented frame; that is what the stage-1 scr
 protocol looks for.
 ||||||| df1b48d
 
-### 31.5 No Streamline, by construction — what the snippet reads that only Streamline used to supply
+### 32.5 No Streamline, by construction — what the snippet reads that only Streamline used to supply
 
 Hard constraint from the user (2026-09-02): Streamline's interposer/swapchain layer is where
 OptiScaler's FG died on this box (CLAUDE.md §5), so `sl.interposer.dll`, `sl.dlss_g.dll`,
 `sl.common.dll` and the SDK are off the table in any form, including loading them ourselves.
 The snippet is driven through the NGX core exactly like SR, and OUR present owner does what
 Streamline's swapchain layer did. The question that constraint raises — does the snippet read
-anything only Streamline can supply? — was answered from the strings (31.1/31.2) and from
+anything only Streamline can supply? — was answered from the strings (32.1/32.2) and from
 Nukem's shim, which sits between `sl.dlss_g` and the snippet and so shows both sides:
 
 | what Streamline supplies | in the snippet's strings? | verdict |
 |---|---|---|
-| the pacer / present thread / `DLSSG.CmdQueue` `CmdAlloc` `FenceEvent` `Sync*Callback` `QueueSubmitCallback` | **no** (31.1: 0 exact, 0 fragment) | SL-internal; the snippet records onto the list it is handed and returns. Ours: the present owner (fg_present). HARD |
+| the pacer / present thread / `DLSSG.CmdQueue` `CmdAlloc` `FenceEvent` `Sync*Callback` `QueueSubmitCallback` | **no** (32.1: 0 exact, 0 fragment) | SL-internal; the snippet records onto the list it is handed and returns. Ours: the present owner (fg_present). HARD |
 | `DLSSG.EnableInterp` / `IsRecording` | **no** | SL-internal gating; Nukem reads them off SL's shared block, the snippet cannot. HARD |
 | Reflex (`eFailReflexNotDetectedAtRuntime`) | no `Reflex` marker name; only `DLSSG.ReflexWarp.Available` (a snippet OUTPUT) and `DLSSG.UseReflexMatrices` (S-only) | the snippet has no Reflex dependency; Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` (`src/backend_native/fg_reflex.cpp`), status-logged, never gating. HARD for the absence |
-| `GetCurrentBackBufferIndex` (`eFailGetCurrentBackBufferIndexNotCalled`) | no (`Present`, `Flip`: 0) | a property of SL's swapchain proxy; ours mirrors UE4's counter (31.4). HARD |
+| `GetCurrentBackBufferIndex` (`eFailGetCurrentBackBufferIndexNotCalled`) | no (`Present`, `Flip`: 0) | a property of SL's swapchain proxy; ours mirrors UE4's counter (32.4). HARD |
 | `DLSSG.GetCurrentSettingsCallback` `EstimateVRAMCallback` `MustCallEval` `MultiFrameCountMax` `ReflexWarp.Available` | yes, and Nukem's `PopulateParameters_Impl` SETS them | snippet OUTPUTS the core populates for the caller; we read `MultiFrameCountMax`/`MustCallEval` back after CreateFeature and log them. HARD |
-| every other `DLSSG.*` name `sl.dlss_g` sets (31.2, S+C) | yes | provided by `src/ngx_fg.cpp` per evaluate, values from the TAA hook's View CB and our resolve. HARD that the names are read; the VALUES' conventions (MvecScale, matrices' handedness, CameraFar=0) are UNCONFIRMED until an interpolated frame is judged on the box |
+| every other `DLSSG.*` name `sl.dlss_g` sets (32.2, S+C) | yes | provided by `src/ngx_fg.cpp` per evaluate, values from the TAA hook's View CB and our resolve. HARD that the names are read; the VALUES' conventions (MvecScale, matrices' handedness, CameraFar=0) are UNCONFIRMED until an interpolated frame is judged on the box |
 
 So nothing the snippet reads is Streamline-only. What remains UNCONFIRMED is behavioural:
 whether the core under Proton routes feature 11 to a game-directory `nvngx_dlssg.dll` at all
@@ -1305,12 +1389,12 @@ whether the core under Proton routes feature 11 to a game-directory `nvngx_dlssg
 SOFT that our direct call is treated identically), and whether the snippet evaluates
 correctly with `DLSSG.OutputReal` provided by us rather than by SL (a knob, `NgxFGOutputReal`).
 
-### 31.6 The present-twice path on WARP under the debug layer (CI, 2026-09-02) — stage 1's offline half
+### 32.6 The present-twice path on WARP under the debug layer (CI, 2026-09-02) — stage 1's offline half
 
 `tests/warp/warp_fg_present.inc`, run by every CI push on Windows Server's WARP adapter with the
 D3D12 debug layer and GPU-based validation on, over a REAL flip-model DXGI swapchain
 (`CreateSwapChainForHwnd`, hidden window, `R10G10B10A2_UNORM`, 3 buffers, `FLIP_DISCARD` — the
-game's own configuration, CLAUDE.md §2.1). The harness plays UE 4.27's part exactly (§31.4):
+game's own configuration, CLAUDE.md §2.1). The harness plays UE 4.27's part exactly (§32.4):
 `GetBuffer(i)` for every index after creation and after every `ResizeBuffers`, one `Present`
 per frame, its own counter reset only by `ResizeBuffers`. Verbatim from CI run 33683363510; the NGX=ON leg is green end to end from run 33684873745 on
 (the intervening failures were the test's own model of UE4's counter, and a silent fail-fast
@@ -1360,7 +1444,7 @@ UE4 follows with a `ResizeBuffers`) survives with the worker drained, and whethe
 matches the game's counter in the live process (a mismatch shows as a stale frame in the
 gamescope screenshot). Those are the stage-1 box measurements.
 
-### 31.7 Stage 1 on the box: present-twice through our own present owner SURVIVES (2026-09-02 18:46-18:56)
+### 32.7 Stage 1 on the box: present-twice through our own present owner SURVIVES (2026-09-02 18:46-18:56)
 
 Config A (ReShade `dxgi.dll` renamed aside, plugin `main.dll` = CI run 33686313374 of `ea784ee`,
 `StrayDLSS : 1`, `StrayTriggers : 0`, `NgxNR=0`), `NgxFG=1 NgxFGMode=1 NgxFGPacing=1`
@@ -1417,7 +1501,7 @@ fg: ARMED ... 3840x2160 fmt 24 ...
   with a 6 ms delay that is a false positive of the two-non-adjacent-buckets rule (5 and 7
   ms), not back-to-back presents; do not act on it until the host is quiet.
 
-### 31.8 Stage 2 on the box, first session: the core ROUTES feature 11, CreateFeature SUCCEEDS, evaluate refused for a 1-based index (2026-09-02 18:56)
+### 32.8 Stage 2 on the box, first session: the core ROUTES feature 11, CreateFeature SUCCEEDS, evaluate refused for a 1-based index (2026-09-02 18:56)
 
 Same build, `NgxFGMode=2 NgxFGHDR=0`. Verbatim:
 
@@ -1438,7 +1522,7 @@ fg/ngx: EvaluateFeature(FrameGeneration): 0xbad00005 (FAIL_InvalidParameter)
 * **The NGX core under Proton routes `NVSDK_NGX_Feature_FrameGeneration` (11) to the
   game-directory `nvngx_dlssg.dll` (SL 2.13's copy, md5 `c9bd8831…`) and `CreateFeature`
   succeeds on our own parameter block — no Streamline anywhere in the process.** HARD. This
-  retires the SOFT "does the core route feature 11 for a direct caller" question of §31.5.
+  retires the SOFT "does the core route feature 11 for a direct caller" question of §32.5.
 * **`DLSSG.MultiFrameIndex` is 1-BASED.** With `MultiFrameCount=1, MultiFrameIndex=0` every
   evaluate returns `FAIL_InvalidParameter` and the snippet says why on the LoggingCallback.
   Fixed in `ba6ab94` (index 1). HARD. Nukem's shim tolerates both (it only refuses `> 1`),
@@ -1456,9 +1540,9 @@ fg/ngx: EvaluateFeature(FrameGeneration): 0xbad00005 (FAIL_InvalidParameter)
   feature's creation, as in facts §26 (Config A, ext_unhook inert) — not FG's, and SR
   evaluated fine after.
 
-### 31.9 Stage 2 on the box: DLSS-G evaluates and its frames reach the screen — no Streamline (2026-09-02 19:05-19:10)
+### 32.9 Stage 2 on the box: DLSS-G evaluates and its frames reach the screen — no Streamline (2026-09-02 19:05-19:10)
 
-Plugin = CI run 33688046770 of `ba6ab94` (index 1-based, HDR auto = SDR), Config A as in §31.7,
+Plugin = CI run 33688046770 of `ba6ab94` (index 1-based, HDR auto = SDR), Config A as in §32.7,
 `NgxFGMode=2 NgxFGHDR=-1`. Verbatim:
 
 ```
@@ -1501,9 +1585,9 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 4096/4
   ViewToClipNoAA[1][1]), the camera basis from TranslatedWorldToView. UNCONFIRMED until the
   user reports the interpolation looks right while moving; each is a knob.
 * The snippet does not populate `DLSSG.MultiFrameCountMax` / `MustCallEval` through this
-  core, and the box's registry preset selects "Preset B" with UI recomposition (§31.8). HARD.
+  core, and the box's registry preset selects "Preset B" with UI recomposition (§32.8). HARD.
 
-### 31.10 Stage 2, final session of the day: the gate no longer flickers, 1.91x and climbing (2026-09-02 19:14-19:18)
+### 32.10 Stage 2, final session of the day: the gate no longer flickers, 1.91x and climbing (2026-09-02 19:14-19:18)
 
 Plugin = CI run 33688856852 of `3fcc52a` (both-black looks are neutral). Same protocol.
 `stray-bench.sh --runs 3 --label fg3-dlssg-dark`: bench exit 0, three reloads + traverses,
@@ -1517,7 +1601,7 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4
 ```
 
 * `not-validated` stays at the 5 frames of the one initial validation for the whole session
-  (it was 3 325 in §31.9's run): no revoke through three reloads' black screens. HARD.
+  (it was 3 325 in §32.9's run): no revoke through three reloads' black screens. HARD.
 * `source-missing=1150` of 12 601 is the load/reload frames with no TAA dispatch — the
   remaining gap to 2.0x, and correct (no guides, no generated frame). The ratio climbs
   towards 2.0x as gameplay frames accumulate (1.24x at 1200, 1.91x at 12 600). HARD.
@@ -1549,3 +1633,4 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4
   without the pass). Legitimately not generatable: a generated frame needs this frame's depth
   and motion vectors. HARD. The `[fg/ngx]` line and `fg_ngx_refused_*` status keys added in
   the follow-up commit attribute future refusals without this reconstruction.
+||||||| f600641

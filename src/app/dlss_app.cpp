@@ -1055,7 +1055,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		// DLSS-G's own accounting, so a source-missing refusal in the [fg] line can be
 		// attributed: no fresh guides (no TAA dispatch this frame: loads, menus, cuts), NGX not
 		// initialised yet, or the warm-up. Measured 2026-09-02: steady gameplay is 2.00x and
-		// every gap was one of those three (facts §31.10).
+		// every gap was one of those three (facts §32.10).
 		if (native::fg::enabled() && native::fg::config().mode == native::fg::Mode::ngx)
 		{
 			const ngxfg::Stats gs = ngxfg::stats();

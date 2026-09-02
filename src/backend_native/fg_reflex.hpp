@@ -2,7 +2,7 @@
 // v0.9.2 on the target (CLAUDE.md §1), which implements the low-latency entry points over
 // VK_NV_low_latency2 when vkd3d-proton exposes it — SOFT until the box says so. Streamline's
 // DLSS-G REQUIRES its own Reflex (migration doc §7.4); the snippet driven directly needs none
-// (facts §31.1), so this is a measurement plus a latency aid, never a gate: every call's NvAPI
+// (facts §32.1), so this is a measurement plus a latency aid, never a gate: every call's NvAPI
 // status is logged once and the presents proceed whatever it says.
 //
 // Function ids and struct layouts are NVIDIA's public NVAPI headers (github.com/NVIDIA/nvapi,
