@@ -67,6 +67,23 @@ local DISTANCE_SCALARS = {
     ["Camera Distance Blend"] = 150.0,  -- shipped 75
 }
 
+-- THE BACKPACK CLIP (user screenshot 2026-09-02: shells poking through the harness at the
+-- shoulders/neck). How the shipped fur stays short there: the material samples a painted
+-- per-vertex length map, Cat_furmesh_FurGrowth (read out of the decoded pak assets; both
+-- backpackON and backpackOff share it), and the component's FurLength multiplies the WHOLE
+-- map. Doubling FurLength therefore doubles the short harness fur too, and it grows through
+-- the mesh. The material also ships "Fur Length Power", a power curve on that map: raising
+-- it pushes the map's low (short) values toward zero while values near 1 (the long body
+-- fur) barely move. So a higher power keeps the body length and shortens the harness
+-- region, with no new textures. 1.0 is neutral; the shipped value is read by the material
+-- dump (stray-fur-materials.txt) on the next launch. UNCONFIRMED until seen on screen:
+-- start at 2.0 and dial by eye; "Avoid Short - Offset/Power" are the other two shipped
+-- knobs that act on short fur only, if the power alone is not enough.
+local BACKPACK_SCALARS = {
+    ["Fur Length Power"] = 2.0,     -- shipped: see the dump; 1.0 = no curve
+}
+local DUMP_MATERIALS = true     -- write stray-fur-materials.txt once per pawn (read-only)
+
 ------------------------------------------------------------------ plumbing
 local function log(s) print("[StrayFur] " .. tostring(s) .. "\n") end
 
@@ -115,6 +132,7 @@ local function applyMaterial(gfur)
             applyTable(HD_SCALARS,       "HD",       9)
             applyTable(PLUSH_SCALARS,    "plush",    2)
             applyTable(DISTANCE_SCALARS, "distance", 3)
+            applyTable(BACKPACK_SCALARS, "backpack", 1)
         end
     end
 end
@@ -179,6 +197,10 @@ local function applyTo(pawn)
     log("applying to " .. key)
     if TIER1 then applyMaterial(gfur) end
     if TIER2 then applyDensity(gfur) end
+    if DUMP_MATERIALS then
+        local ok, err = pcall(function() require("dump_fur_materials").run(gfur) end)
+        if not ok then log("material dump failed: " .. tostring(err)) end
+    end
 end
 
 ------------------------------------------------------------------ triggers
