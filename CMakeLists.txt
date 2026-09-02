@@ -209,6 +209,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/ngx_backend.hpp
         src/ngx_nr.cpp
         src/ngx_nr.hpp
+        src/ngx_fg.cpp
+        src/ngx_fg.hpp
         src/ngx_snippet.cpp
         src/ngx_snippet.hpp
         src/shader_dump.cpp

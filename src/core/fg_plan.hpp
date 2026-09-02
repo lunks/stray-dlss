@@ -173,3 +173,26 @@ struct CropJudge
 };
 
 } // namespace stray_dlss::core::fg
+
+// ---- the camera constants DLSS-G takes (facts §30.2), from the View CB's matrices ----
+namespace stray_dlss::core::fg {
+
+// Row-major 4x4 inverse by cofactors. False (out untouched) when singular.
+bool invert4x4(const float m[16], float out[16]);
+
+// Vertical field of view in RADIANS from a row-major perspective ViewToClip whose [1][1] is
+// 1/tan(fov/2) (UE4's, jitter-free). 0 when the entry is not positive.
+float vertical_fov_radians(const float view_to_clip[16]);
+
+// The camera's world-space right/up/forward from UE4's TranslatedWorldToView (row-major,
+// row-vector convention: view = world * M, so the COLUMNS of the 3x3 are the view axes in
+// world space). Translated world is centred on the camera, so the position is the origin.
+struct CameraBasis
+{
+	float right[3] = {};
+	float up[3] = {};
+	float fwd[3] = {};
+};
+CameraBasis camera_basis(const float translated_world_to_view[16]);
+
+} // namespace stray_dlss::core::fg

@@ -165,6 +165,14 @@ bool test_fg_present_twice(Gpu &gpu)
 		present::note_queue(real_queue, D3D12_COMMAND_LIST_TYPE_DIRECT);
 	}
 
+	// install() reads the FG knobs from the config source (none here -> NgxFG=0), so the test's
+	// configuration goes in AFTER it; the GetBuffer patch only happens at swapchain creation.
+	if (!present::install(dev))
+	{
+		fail("present::install failed");
+		return false;
+	}
+	std::printf("  %s\n", present::report());
 	fg::Config fc;
 	fc.enabled = true;
 	fc.mode = fg::Mode::experiment;
@@ -172,12 +180,6 @@ bool test_fg_present_twice(Gpu &gpu)
 	fc.wait_ms = 0;
 	fc.band = true;
 	fg::configure(fc);
-	if (!present::install(dev))
-	{
-		fail("present::install failed");
-		return false;
-	}
-	std::printf("  %s\n", present::report());
 
 	// A hidden window and a real flip-model swapchain in the game's format.
 	HWND hwnd = ::CreateWindowExW(0, L"STATIC", L"stray-dlss fg harness", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, nullptr, nullptr, nullptr, nullptr);
@@ -213,6 +215,11 @@ bool test_fg_present_twice(Gpu &gpu)
 	check(present::stats().swapchains >= 1, "the present owner recorded the swapchain at creation");
 	auto orig_get_buffer = reinterpret_cast<PFN_FgGetBuffer>(native::original_for(sc, native::slot::kSwapChain_GetBuffer));
 	check(orig_get_buffer != nullptr, "GetBuffer is hooked on the swapchain's vtable (FG enabled at creation)");
+	if (orig_get_buffer == nullptr)
+	{
+		::DestroyWindow(hwnd);
+		return false; // nothing below can run without the hook; do not call a null original
+	}
 
 	ComPtr<ID3D12DescriptorHeap> rtv_heap;
 	{

@@ -21,6 +21,7 @@
 #include "log.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_backend.hpp"
+#include "ngx_fg.hpp"
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
 #include "nr_history.hpp"
@@ -274,6 +275,7 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		nrhist::shutdown();
+		ngxfg::shutdown();
 		nr::shutdown();
 		if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 			ngx::shutdown(g_state.native_device);
@@ -325,6 +327,20 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool ngx_evaluate = false;
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	// DLSS Frame Generation's NGX half (src/ngx_fg.hpp). The present-twice path itself is the
+	// present owner's ([STRAYDLSS] NgxFG, read there); these are the feature's own knobs. The
+	// generator is installed unconditionally — fg_present only calls it in ngx mode.
+	{
+		ngxfg::Config fc;
+		fc.hdr = host::cfg::get_int("NgxFGHDR", fc.hdr);
+		fc.warmup_presents = host::cfg::get_int("NgxFGWarmupFrames", fc.warmup_presents);
+		fc.camera_far = host::cfg::get_float("NgxFGCameraFar", fc.camera_far);
+		fc.mvec_scale_mode = host::cfg::get_int("NgxFGMvecScale", fc.mvec_scale_mode);
+		fc.provide_output_real = host::cfg::get_bool("NgxFGOutputReal", fc.provide_output_real);
+		ngxfg::configure(fc);
+		native::fg::set_generator(&ngxfg::generator());
+	}
 
 	// [STRAYDLSS] PerfLog, default ON: frame-time + our-CPU-share reports every 600 presents.
 	// Left on by default because the instrumentation is cheap (one clock read per present;

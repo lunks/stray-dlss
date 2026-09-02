@@ -10,6 +10,7 @@
 #include "log.hpp"
 #include "input_dump.hpp"
 #include "mv_resolve.hpp"
+#include "ngx_fg.hpp"
 #include "ngx_backend.hpp"
 
 
@@ -2138,6 +2139,30 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								// The output is in UAV state; NGX has just written it.
 								input_dump::capture(native_device, native, ei.output,
 									D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "output", eval_no);
+							}
+
+							// Frame generation's guides: copies of this frame's depth and dense
+							// motion vectors into FG-owned textures, plus the constants, published
+							// for the present-time DLSS-G evaluate (src/ngx_fg.hpp). Recorded here
+							// because the engine's depth is a pooled target whose content at
+							// present time is not guaranteed, and the MV output is rewritten by
+							// next frame's resolve.
+							if (ok && native::fg::enabled() && native::fg::config().mode == native::fg::Mode::ngx)
+							{
+								ngxfg::FrameConstants fc;
+								fc.jitter_x = ei.jitter_x;
+								fc.jitter_y = ei.jitter_y;
+								fc.reset = ei.reset;
+								fc.render_width = ei.render_width;
+								fc.render_height = ei.render_height;
+								std::memcpy(fc.clip_to_prev_clip, view.clip_to_prev_clip.m, sizeof(fc.clip_to_prev_clip));
+								std::memcpy(fc.view_to_clip_no_aa, view.view_to_clip_no_aa.m, sizeof(fc.view_to_clip_no_aa));
+								std::memcpy(fc.translated_world_to_view, view.translated_world_to_view.m, sizeof(fc.translated_world_to_view));
+								fc.near_plane = view.near_plane;
+								fc.delta_time_s = view.delta_time;
+								fc.pre_exposure = view.pre_exposure;
+								fc.frame = g_present_frame.load(std::memory_order_relaxed);
+								ngxfg::publish(native_device, native, ei.depth, ei.motion_vectors, fc);
 							}
 
 							// Back to UAV for next frame's resolve.

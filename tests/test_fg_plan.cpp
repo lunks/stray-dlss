@@ -178,3 +178,42 @@ TEST_CASE("CropJudge: black is caught on the first look; stale needs the real fr
 	for (int i = 0; i < static_cast<int>(CropVerdict::count); ++i)
 		CHECK(crop_verdict_name(static_cast<CropVerdict>(i))[0] != '?');
 }
+
+TEST_CASE("camera constants: invert4x4 round-trips a projection-like matrix and refuses a singular one; FOV and basis from UE4's matrices")
+{
+	// UE4-shaped reversed-Z infinite projection (row-major, row-vector): [0][0]=a, [1][1]=b,
+	// [2][3]=1, [3][2]=near. Its inverse must satisfy M * inv = I.
+	const float near_plane = 10.0f;
+	const float a = 0.75f, b = 1.3333333f;
+	float m[16] = { a, 0, 0, 0, 0, b, 0, 0, 0, 0, 0, 1, 0, 0, near_plane, 0 };
+	float inv[16];
+	REQUIRE(invert4x4(m, inv));
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c)
+		{
+			double s = 0;
+			for (int k = 0; k < 4; ++k)
+				s += static_cast<double>(m[r * 4 + k]) * inv[k * 4 + c];
+			CHECK(s == doctest::Approx(r == c ? 1.0 : 0.0).epsilon(1e-5));
+		}
+	float singular[16] = {};
+	float out[16] = { 42 };
+	CHECK_FALSE(invert4x4(singular, out));
+	CHECK(out[0] == 42.0f); // untouched
+	// Vertical FOV: b = 1/tan(fov/2) -> fov = 2*atan(1/b); b = 1 is exactly 90 degrees.
+	float ninety[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 10, 0 };
+	CHECK(vertical_fov_radians(ninety) == doctest::Approx(1.5707963).epsilon(1e-5));
+	CHECK(vertical_fov_radians(m) == doctest::Approx(2.0 * 0.6435011).epsilon(1e-4)); // atan(0.75)=0.6435
+	float bad[16] = {};
+	CHECK(vertical_fov_radians(bad) == 0.0f);
+	// Basis: an identity view (world axes = view axes) yields the unit vectors, and a
+	// rotation about Y (camera yawed) moves right/forward together as the columns say.
+	float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	CameraBasis cb = camera_basis(ident);
+	CHECK((cb.right[0] == 1.0f && cb.up[1] == 1.0f && cb.fwd[2] == 1.0f));
+	// A matrix whose columns are known vectors: column 0 = (0,0,1), column 2 = (-1,0,0).
+	float yawed[16] = { 0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1 };
+	cb = camera_basis(yawed);
+	CHECK((cb.right[0] == 0.0f && cb.right[2] == 1.0f));
+	CHECK((cb.fwd[0] == -1.0f && cb.fwd[2] == 0.0f));
+}

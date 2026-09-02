@@ -1,5 +1,7 @@
 #include "core/fg_plan.hpp"
 
+#include <cmath>
+
 namespace stray_dlss::core::fg {
 
 // ---- GameIndexMirror ----
@@ -205,6 +207,60 @@ void CropJudge::reset()
 	stale_run = 0;
 	prev_gen_hash = prev_real_hash = 0;
 	have_prev = false;
+}
+
+} // namespace stray_dlss::core::fg
+
+namespace stray_dlss::core::fg {
+
+bool invert4x4(const float m[16], float out[16])
+{
+	float inv[16];
+	inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+	inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+	inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+	inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+	inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+	inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+	inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+	inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+	inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+	inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+	inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+	inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+	inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+	inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+	inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+	inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+	const double det = static_cast<double>(m[0]) * inv[0] + static_cast<double>(m[1]) * inv[4] + static_cast<double>(m[2]) * inv[8] + static_cast<double>(m[3]) * inv[12];
+	if (det == 0.0 || det != det)
+		return false;
+	const double r = 1.0 / det;
+	for (int i = 0; i < 16; ++i)
+		out[i] = static_cast<float>(inv[i] * r);
+	return true;
+}
+
+float vertical_fov_radians(const float view_to_clip[16])
+{
+	const float m11 = view_to_clip[5];
+	if (!(m11 > 0.0f))
+		return 0.0f;
+	// 2 * atan(1 / m11), without <cmath> dependencies in the header: use a series-free
+	// identity through the standard library here.
+	return 2.0f * static_cast<float>(std::atan(1.0 / static_cast<double>(m11)));
+}
+
+CameraBasis camera_basis(const float m[16])
+{
+	CameraBasis b;
+	for (int r = 0; r < 3; ++r)
+	{
+		b.right[r] = m[r * 4 + 0];
+		b.up[r] = m[r * 4 + 1];
+		b.fwd[r] = m[r * 4 + 2];
+	}
+	return b;
 }
 
 } // namespace stray_dlss::core::fg
