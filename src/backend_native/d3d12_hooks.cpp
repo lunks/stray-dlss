@@ -584,12 +584,22 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 	// u0 and the game's compute state was put back), so the game's dispatch must NOT run —
 	// the one skip-capable event on our path, now ours to skip. Everything the sink records
 	// onto this list in between arrives here under OwnCodeScope and passes straight through.
+	//
+	// THE FORWARD RUNS UNDER OwnCodeScope, in both branches. MEASURED in CI (2026-09-02): with
+	// GPU-based validation on, the debug layer's Dispatch RE-ENTERS the public vtable — it
+	// binds its own validation PSO and dispatches it inside the game's call — so every game
+	// dispatch reached this hook again from inside its own forward, was delivered to the
+	// sink a second time, and left the debug layer's PSO in the root shadow as "the game's"
+	// (the restore then replayed it: D3D12 #953, root signature does not match the PSO).
+	// The game and vkd3d-proton never re-enter, so treating anything nested inside a forward
+	// as not-the-game's costs nothing there and is exactly right here.
 	if (icept::Sink *sk = drive_sink())
 	{
 		const bool suppress = sk->on_dispatch(context_for(self), x, y, z);
 		count_drive_dispatch(suppress);
 		if (suppress)
 			return;
+		OwnCodeScope forward;
 		g_orig_List_Dispatch(self, x, y, z);
 		return;
 	}
@@ -621,6 +631,7 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 		}
 		diff::consume_and_compare(self, actual, shadow::unknown_lookups(), &adj, note);
 	}
+	OwnCodeScope forward;
 	g_orig_List_Dispatch(self, x, y, z);
 }
 
