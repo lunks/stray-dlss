@@ -79,8 +79,14 @@ local DISTANCE_SCALARS = {
 -- dump (stray-fur-materials.txt) on the next launch. UNCONFIRMED until seen on screen:
 -- start at 2.0 and dial by eye; "Avoid Short - Offset/Power" are the other two shipped
 -- knobs that act on short fur only, if the power alone is not enough.
+-- MEASURED 2026-09-02 (stray-fur-materials.txt): the SHIPPED "Fur Length Power" is 4.0, not
+-- 1.0, so the first try at 2.0 flattened the curve and made the harness fur LONGER; the user
+-- saw no change. Above 4 shortens the short regions harder. "Avoid Short" ships neutral
+-- (Offset 0, Power 1); a small positive offset subtracts a constant from the map, which
+-- kills the very short harness fur outright while long fur loses almost nothing.
 local BACKPACK_SCALARS = {
-    ["Fur Length Power"] = 2.0,     -- shipped: see the dump; 1.0 = no curve
+    ["Fur Length Power"]   = 7.0,   -- shipped 4.0
+    ["Avoid Short - Offset"] = 0.05, -- shipped 0.0
 }
 local DUMP_MATERIALS = true     -- write stray-fur-materials.txt once per pawn (read-only)
 
@@ -132,7 +138,7 @@ local function applyMaterial(gfur)
             applyTable(HD_SCALARS,       "HD",       9)
             applyTable(PLUSH_SCALARS,    "plush",    2)
             applyTable(DISTANCE_SCALARS, "distance", 3)
-            applyTable(BACKPACK_SCALARS, "backpack", 1)
+            applyTable(BACKPACK_SCALARS, "backpack", 2)
         end
     end
 end
