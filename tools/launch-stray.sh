@@ -232,6 +232,9 @@ game_dead_before_heartbeat() {
 
 # ---------------------------------------------------------------------------------------
 
+# "Already running" REQUIRES a heartbeat under 30 s old, never the mere presence of the process:
+# a hung/loading exe, or a stale status file from a container that has since restarted, is not a
+# live session. A silent wait is never evidence that anything is running (facts §21).
 if game_running && [ -f "$STATUS" ] && [ "$(file_age "$STATUS")" -lt 30 ]; then
     # A LIVE session: the heartbeat moved within the last 30 s. Leave it alone.
     log "Stray is already running and its heartbeat is fresh ($(file_age "$STATUS")s); leaving it alone."
@@ -249,7 +252,11 @@ if ! game_running; then
     clear_stale_chain
 
     log "Clearing stale add-on output"
-    rm -f "$STATUS" "$GAME_DIR/stray-dlss.log" "$VERDICT"
+    # Clear BOTH logs: the ReShade add-on's (stray-dlss.log) and the UE4SS plugin host's
+    # (stray-dlss-plugin.log, which the host APPENDS to). A stale plugin log from a previous
+    # session otherwise poses as this one under a grep (a real confusion, 2026-09-02: an old
+    # crash session's device/factory lines read as if current).
+    rm -f "$STATUS" "$GAME_DIR/stray-dlss.log" "$GAME_DIR/stray-dlss-plugin.log" "$VERDICT"
 
     log "Asking Steam to launch $APPID"
     su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \

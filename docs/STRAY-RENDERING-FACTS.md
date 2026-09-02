@@ -763,4 +763,51 @@ FIRST `Present`, when the object is fully built. This removes all work against a
 swapchain and the global-collision surface. It does NOT by itself fix the wine-builtin mismatch —
 only the DXGI-provider change does — but it is required for the DXVK path to be robust.
 Tested in the WARP harness (`original_for` resolves per-vtable and returns null for an unpatched
-slot). HARD (code + symbolisation); the DXVK-path behaviour is UNCONFIRMED until the box run.
+slot). HARD (code + symbolisation).
+
+**CONFIRMED LIVE (2026-09-02, build `f97c2f0`, Config A: ReShade `dxgi.dll` renamed `.off`,
+`dxgi=n,b` kept).** The plugin log, verbatim where it matters:
+
+```
+present owner: factory 000000000161E8A0 (class implemented by C:\windows\system32\dxgi.dll) 4 CreateSwapChain* slot(s) patched
+present owner: swapchain 000000000159C860 via CreateSwapChain device-arg=0000000001669DC0 recorded; 2 Present/Resize slot(s) patched. QI/queue/back-buffers deferred to first Present.
+present owner: swapchain 000000000159C860 FINALISED at first Present (SwapChain1=1 SwapChain3=1) device-arg=0000000001669DC0 -> the SAME queue 0000000001669DC0 (ok); 2 extra slot(s) patched
+present owner: FIRST Present delivered on_present (queue=... present_list=... back_buffer=...) - the frame boundary is live
+DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b
+DLSS evaluate OK: 1920x1080 -> 3840x2160 jitter=0.3750,0.0556 reset=0 preExposure=0.360
+```
+
+The DXGI provider is now DXVK's `system32\dxgi.dll` (not wine-builtin, not game-dir ReShade); the
+swapchain is recorded lazily and finalised at first Present; `on_present` fires; DLSS creates and
+evaluates. The game ran **190 s+** with `native_drive_dispatches` climbing past 430 000 — the 61 s
+crash is gone. The session's launcher verdict was nonetheless **FAILED**: the menu-driving input
+(Enter on the sysrq keyboard node) never advanced the game past an early screen (shader census
+stuck at **34**, far below the ~110 interactive main menu), so it never reached gameplay. That is a
+launcher/input problem in the no-ReShade config, NOT the plugin. Config A "the plugin runs DLSS with
+no ReShade" is PROVEN; "drives to gameplay unattended" is still OPEN, and Config B is untested.
+
+## 21. Box operating discipline: the box epoch, and silent waits (2026-09-02)
+
+Two rules earned when a session assumed the box was fine across a container restart. Both are
+operational, not rendering facts, but they belong with the box traps in §2.11 / CLAUDE.md §5.
+
+* **The box epoch. Read it at the START of a session and BEFORE every box action, and compare.**
+  ```
+  ssh -o ConnectTimeout=10 root@192.168.0.210 'pct status 113; pct exec 113 -- cat /proc/sys/kernel/random/boot_id /proc/uptime'
+  ```
+  `boot_id` is a random UUID minted at each container boot; a low `uptime` confirms a recent one.
+  **If `boot_id` differs from the one recorded at session start, EVERY box-state assumption is void**
+  — staged `/tmp` files (`launch-stray.sh`, `inject.py`) are gone, Steam has freshly started, there
+  is no game and no heartbeat — and the state must be re-established from scratch before anything
+  else. A path or a process that was there a minute ago can be absent after a restart nobody told
+  you about.
+* **A silent wait is never evidence that anything is running.** The launch script is the component
+  that waits, and it prints a progress line at least every ~10 s; an `ssh` call of YOURS that
+  produces no output for 60 s is a hung or dead container, not a running game. Give every box `ssh`
+  `-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2`, so a container that
+  restarts mid-call KILLS the call instead of freezing it until the tool cap. Never sit out a
+  multi-minute wait with no re-check; poll the box's own evidence (heartbeat age, plugin log,
+  verdict file) on a short interval and read what it actually says.
+* **"Stray is already running" requires a heartbeat under 30 s old**, never the mere presence of
+  the process (`launch-stray.sh` enforces this; comment added 2026-09-02). Before any box action,
+  check and log: the game process, the heartbeat age, the reaper, and who launched it.
