@@ -6,8 +6,11 @@ design that was measured working on 2026-09-01 as a `libScePad` shim + Lua mod
 (`tools/dualsense/`, `docs/STRAY-DUALSENSE.md` §12–§13), extracted into a plugin with the
 experiments left behind.
 
-**None of this build has been run.** It compiles, its pure logic is unit-tested, and its Win32
-half links under mingw. See [What is unverified](#what-is-unverified) before anything else.
+**None of this build has been run in the game.** As of CI run 33582881130 (`4e8fb0c`,
+2026-09-02) the full plugin DLL now compiles and links under **MSVC** against RE-UE4SS
+`68caddcf`, not just the portable core and the mingw proxy lane — `src/Mod.cpp`, the only file
+that touches a UE4SS header, included. Compiling is not the same as working: nothing below has
+been observed on the box. See [What is unverified](#what-is-unverified) before anything else.
 
 ## What it does
 
@@ -42,7 +45,7 @@ and link-tested without the SDK.
 | `Triggers` | per-side accumulation, transmit on change, optional readback | mingw |
 | `Runtime` | game intent → the engines; component ownership; `PadVibrationEnabled` | mingw |
 | `Config` / `Log` / `Platform` | INI + hot reload; mutex-guarded file log; paths | mingw |
-| `Mod.cpp` | UE4SS: hook registration, reflective parameter reads, the two game-state reads | **CI only, MSVC** |
+| `Mod.cpp` | UE4SS: hook registration, reflective parameter reads, the two game-state reads | **CI only, MSVC — compiles, CI run 33582881130** |
 
 ## Threading
 
@@ -102,11 +105,16 @@ per-component rule working) and `effect=... (game)` versus `(FALLBACK)`.
 Ranked by how likely each is to be the first thing that misbehaves. "UNCONFIRMED" is used in
 the CLAUDE.md sense: plausible from source, not yet compiled by CI or seen on the box.
 
-1. **`src/Mod.cpp` compiles against RE-UE4SS `68caddcf`.** The Unreal headers refuse mingw,
-   so its first compile is in CI. New in this rewrite and UNCONFIRMED: the include
-   `<Unreal/Property/FStructProperty.hpp>` and `FStructProperty::GetStruct()`, the include
-   `<Unreal/UScriptStruct.hpp>`, and passing a `UScriptStruct*` where `UStruct*` is expected.
-   Everything else was read out of the tree and annotated HARD in the file header.
+1. **Hardware behaviour — all of it.** `src/Mod.cpp` now **compiles under MSVC** against
+   RE-UE4SS `68caddcf` (CI run 33582881130, `4e8fb0c`) — see
+   [What has been checked](#what-has-been-checked). Compiling only proves the API calls exist
+   with the signatures this file assumes; nothing about their runtime BEHAVIOUR — whether a
+   hook actually fires, whether a reflected offset is right, whether `GetStruct()` returns the
+   struct this code expects — has been observed. That is what the rest of this list tracks.
+   One real bug surfaced by the MSVC compile and already fixed: `UStruct::ForEachProperty()` is
+   deprecated at this SHA (`[[deprecated]]`, treated as an error under `/WX`) and was replaced
+   with the exact call the header's own deprecation message names,
+   `TFieldRange<FProperty>(owner, EFieldIterationFlags::IncludeDeprecated)`.
 2. **The HID write reaches the pad from inside the game.** The shim did exactly this
    (`open_pad_hid()` / `set_valid_flag0()`, 48-byte `WriteFile`) and it worked; this code is a
    port, plus a caps read (`HidP_GetCaps`) that the shim did not do. If `hidmode: opened` is
@@ -138,6 +146,16 @@ the CLAUDE.md sense: plausible from source, not yet compiled by CI or seen on th
 * All twelve non-UE4SS sources compile under mingw-w64 GCC 12 with `-Wall -Wextra -Werror`
   and link into a DLL against `ole32 oleaut32 uuid setupapi hid`, importing
   `HidD_GetAttributes`, `SetupDiGetClassDevsW` and `CoCreateInstance` as the design requires.
+* **`src/Mod.cpp` compiles and links under MSVC** against RE-UE4SS `68caddcf` (CI run
+  33582881130, commit `4e8fb0c`, first green build of the full plugin DLL). Confirmed by that
+  compile: the includes `<Unreal/Property/FStructProperty.hpp>` and
+  `<Unreal/UScriptStruct.hpp>` (both forwarding headers, silenced via
+  `RC_UNREAL_DISABLE_*_DEPRECATION_WARNINGS`), `FStructProperty::GetStruct()` returning a
+  `TObjectPtr<UScriptStruct>` that converts implicitly to `UScriptStruct*`, and
+  `UScriptStruct : public UStruct` making the upcast in `DescribeFields(type, ...)` legal — all
+  previously UNCONFIRMED. `x86_64-w64-mingw32-objdump -p` on the artifact confirms PE32+,
+  imports `UE4SS.dll` and `MSVCP140.dll` (dynamic CRT, `/MD` as required), and exports both
+  `start_mod` and `uninstall_mod`.
 * `TriggerEffect`, `LoopList`, `Fade` and `AssetName` pass their unit tests (`ctest`, 4/4).
 * `docs/STRAY-DUALSENSE.md` §12/§13 findings this build encodes, each in one place:
   the flag value and its re-assertion (`HidMode`), the enum order (`TriggerEffect`), per-side
