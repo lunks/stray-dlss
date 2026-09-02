@@ -83,8 +83,38 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Measured 2026-09-02: a plain `apt-get update && apt-get install` here is USUALLY
+      # 15-25s, but run 33660808807 sat on "Install mingw-w64" for 27m45s before the user
+      # canceled it — apt's network fetch (the Ubuntu archive mirror `apt-get update` hits,
+      # then the .deb downloads) is occasionally catastrophically slow on shared runners, not
+      # just averagely slow. Caching the resolved .deb files removes the network dependency on
+      # every run after the first: on a cache hit we skip `apt-get update` and `dpkg -i`
+      # straight from the cache dir, so a warm run touches no mirror at all. Only two packages
+      # were ever requested (not the `mingw-w64` metapackage, which also pulls i686 and
+      # Fortran), so --no-install-recommends is the only extra trim available.
+      - name: Determine Ubuntu release
+        id: os
+        run: echo "codename=$(. /etc/os-release && echo "$VERSION_CODENAME")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache mingw-w64 .deb packages
+        id: mingw-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/apt-cache/archives/*.deb
+          key: mingw-w64-debs-${{ steps.os.outputs.codename }}-gcc-mingw-w64-x86-64-g++-mingw-w64-x86-64-v1
+
       - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+        run: |
+          set -euo pipefail
+          APT_CACHE_DIR="${{ runner.temp }}/apt-cache/archives"
+          mkdir -p "$APT_CACHE_DIR"
+          if [ "${{ steps.mingw-cache.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get -o Dir::Cache::Archives="$APT_CACHE_DIR" install -y \
+              --no-install-recommends --download-only \
+              gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          fi
+          sudo dpkg -i "$APT_CACHE_DIR"/*.deb || sudo apt-get install -f -y --no-install-recommends
 
       # Every source EXCEPT src/Mod.cpp, which is the only file that includes a UE4SS header.
       # That split is why this lane is possible at all, and it is worth preserving. The host
