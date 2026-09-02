@@ -70,6 +70,18 @@ struct DispatchBindings
 	bool view_cb_valid = false;
 	std::uint32_t view_cb_register = 0;
 
+	// Table slots the backend could NOT resolve, with why — the native backend fills this so
+	// a disagreement can be adjudicated slot by slot (the ReShade backend leaves it empty).
+	struct Unresolved
+	{
+		char kind = 't';           // 't' srv, 'u' uav, 'b' cbv
+		std::uint32_t reg = 0;
+		DescriptorId descriptor = 0; // the ONLINE slot's CPU handle (0 if the heap span was unknown)
+		std::uint8_t reason = 0;     // 0 no heap span, 1 no entry (never written since attach), 2 dead (resource died after the write)
+		ResourceId dead_resource = 0; // reason 2: the resource that died
+	};
+	std::vector<Unresolved> unresolved;
+
 	// The descriptor heaps that owned THIS dispatch's descriptors — i.e. exactly what the game
 	// had bound at this moment. Restoring these is precise, where picking the first heap found
 	// across every tracked table is a guess that can restore the wrong one.

@@ -21,18 +21,23 @@ namespace stray_dlss::diff {
 // view->resource map is never cleared on D3D12). Everything else stays ambiguous and is said so.
 enum class Verdict : std::uint8_t
 {
-	reshade_stale,     // the oracle named a resource ITS OWN liveness (destroy_resource) says is dead
-	native_blind,      // the oracle names a live resource the registry has NEVER SEEN (attach gap)
-	liveness_conflict, // the two liveness trackers disagree about the same resource
-	native_missed,     // the oracle names a resource live on both sides; the native side has nothing there
-	oracle_missed,     // the native side names a live resource; the oracle has nothing there
-	both_live,         // both sides name a resource live on both sides and they differ: ambiguous
-	unadjudicated,     // no liveness available (the pure comparison alone)
+	reshade_stale,      // the oracle named a resource its own liveness says is dead, OR one the native
+	                    // shadow saw DIE after that very slot was written (tombstone; address reused)
+	reshade_copy_stale, // the slot was COPIED; ReShade's own view map for the copy's SOURCE agrees
+	                    // with the native answer, its online tracking does not: its copy bookkeeping
+	native_blind,       // the oracle names a live resource the registry never saw, or a slot the
+	                    // shadow never saw written since attach (no entry / no heap span)
+	liveness_conflict,  // the two liveness trackers disagree about the same resource
+	native_missed,      // the oracle names a resource live on both sides; the native walk has no such slot
+	oracle_missed,      // the native side names a live resource; the oracle has nothing there
+	both_live,          // both sides name a resource live on both sides and they differ: ambiguous
+	unadjudicated,      // no liveness available (the pure comparison alone)
 };
-constexpr int kVerdictCount = 7;
+constexpr int kVerdictCount = 8;
 const char *verdict_name(Verdict v);
 
-// Liveness oracles for compare(). Any null makes every slot `unadjudicated`.
+// The evidence compare() may ask for. Any of the first three null makes every slot
+// `unadjudicated`; the last two refine mismatches and unknowns when present.
 struct Adjudicator
 {
 	bool (*oracle_live)(icept::ResourceId) = nullptr; // ReShade's own is_resource_live
@@ -40,6 +45,11 @@ struct Adjudicator
 	// Whether the registry EVER registered it this life: tells "died, per the sentinel" apart
 	// from "never seen" (created before attach or through an unhooked entry point).
 	bool (*native_seen)(icept::ResourceId) = nullptr;
+	// ReShade's OWN view->resource map for a view handle (0 if unknown) — asked about the
+	// SOURCE slot of a copy the native shadow recorded, so ReShade can be checked against itself.
+	icept::ResourceId (*oracle_view_resource)(icept::DescriptorId view) = nullptr;
+	// The native shadow's provenance for an online slot: was it written by a copy, from where.
+	bool (*native_provenance)(icept::DescriptorId slot, bool &via_copy, icept::DescriptorId &src) = nullptr;
 };
 
 struct Result

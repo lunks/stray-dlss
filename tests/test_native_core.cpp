@@ -265,6 +265,56 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::oracle_missed)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 0);
+	// The refinements. A tombstone naming the oracle's resource convicts the oracle: the
+	// resource died after the descriptor was written and its address was reused (both
+	// liveness trackers say "live" — of the NEW resource). A slot never written since attach
+	// is our blind spot. A copied slot whose SOURCE ReShade itself maps to the native answer
+	// convicts ReShade's copy bookkeeping.
+	static const auto all_live = [](icept::ResourceId) { return true; };
+	static const auto view_map = [](icept::DescriptorId v) -> icept::ResourceId { return v == 0xa000 ? 0x3333 : v == 0xa001 ? 0x2222 : 0; };
+	static const auto provenance = [](icept::DescriptorId slot, bool &copy, icept::DescriptorId &src) {
+		if (slot == 0xb800) { copy = true; src = 0xa000; return true; }  // source agrees with native
+		if (slot == 0xb801) { copy = true; src = 0xa001; return true; }  // source agrees with the oracle
+		if (slot == 0xb802) { copy = false; src = 0; return true; }
+		return false;
+	};
+	diff::Adjudicator full;
+	full.oracle_live = all_live; full.native_live = all_live; full.native_seen = all_live;
+	full.oracle_view_resource = view_map; full.native_provenance = provenance;
+	icept::DispatchBindings o2, n2;
+	o2.srvs.push_back(BoundTexture{ 1, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
+	n2.srvs.push_back(BoundTexture{ 1, 0x3333, TexFormat::unknown, 0, 0, 0xb800 }); // copied from a slot ReShade maps to 0x3333
+	o2.srvs.push_back(BoundTexture{ 2, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
+	n2.srvs.push_back(BoundTexture{ 2, 0x3333, TexFormat::unknown, 0, 0, 0xb801 }); // copied from a slot ReShade maps to 0x2222
+	o2.srvs.push_back(BoundTexture{ 3, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
+	n2.srvs.push_back(BoundTexture{ 3, 0x3333, TexFormat::unknown, 0, 0, 0xb802 }); // written by a view creation
+	o2.srvs.push_back(BoundTexture{ 10, 0x8144, TexFormat::unknown, 0, 0, 0xa002 }); // native: tombstone naming 0x8144
+	o2.srvs.push_back(BoundTexture{ 11, 0x8145, TexFormat::unknown, 0, 0, 0xa003 }); // native: tombstone naming another
+	o2.srvs.push_back(BoundTexture{ 12, 0x8146, TexFormat::unknown, 0, 0, 0xa004 }); // native: never written
+	o2.srvs.push_back(BoundTexture{ 13, 0x8147, TexFormat::unknown, 0, 0, 0xa005 }); // native: not in the walk at all
+	n2.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 10, 0xc010, 2, 0x8144 });
+	n2.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 11, 0xc011, 2, 0x9999 });
+	n2.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 12, 0xc012, 1, 0 });
+	const diff::Result r2 = diff::compare(o2, n2, &full);
+	REQUIRE(r2.mismatches.size() == 3);
+	REQUIRE(r2.unknown.size() == 4);
+	CHECK(r2.mismatches[0].find("=> RESHADE-COPY-STALE") != std::string::npos);
+	CHECK(r2.mismatches[0].find("copied from a000, which ReShade's own view map says is res 3333") != std::string::npos);
+	CHECK(r2.mismatches[1].find("=> BOTH-LIVE") != std::string::npos);
+	CHECK(r2.mismatches[2].find("=> BOTH-LIVE") != std::string::npos);
+	CHECK(r2.mismatches[2].find("written by a view creation") != std::string::npos);
+	CHECK(r2.unknown[0].find("TOMBSTONE: res 8144 died after the slot was written; the oracle names that address") != std::string::npos);
+	CHECK(r2.unknown[0].find("=> RESHADE-STALE") != std::string::npos);
+	CHECK(r2.unknown[1].find("=> NATIVE-MISSED") != std::string::npos); // a tombstone of some OTHER resource proves nothing
+	CHECK(r2.unknown[2].find("never written since attach") != std::string::npos);
+	CHECK(r2.unknown[2].find("=> NATIVE-BLIND") != std::string::npos);
+	CHECK(r2.unknown[3].find("no such register") != std::string::npos);
+	CHECK(r2.unknown[3].find("=> NATIVE-MISSED") != std::string::npos);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::reshade_copy_stale)] == 1);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] == 1);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::native_blind)] == 1);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 2);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::both_live)] == 2);
 	// Without an adjudicator every differing slot is unadjudicated and the lines are bare.
 	const diff::Result bare = diff::compare(oracle, native);
 	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 7);

@@ -39,6 +39,11 @@ struct ViewEntry
 	// slot was last written, and whether that write was a copy rather than a view creation.
 	std::uint64_t seq = 0;
 	bool via_copy = false;
+	icept::DescriptorId src_slot = 0; // via_copy: the slot it was copied from
+	// A TOMBSTONE: the resource this slot referenced has died since the slot was written
+	// (registry sentinel). Kept rather than erased, so a later claim that this slot holds
+	// that resource is provably a stale map — the address may since have been reused.
+	bool dead = false;
 };
 
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry);
@@ -50,11 +55,12 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src);
 // SetDescriptorHeaps: records the heap's CPU/GPU spans. Cheap; re-read on every bind.
 void note_heap_bound(::ID3D12DescriptorHeap *heap);
 
+// True for any recorded slot, tombstones included (check ViewEntry::dead).
 bool lookup(icept::DescriptorId cpu, ViewEntry &out);
 // Via the bound heaps' spans. False when no bound heap contains the GPU handle.
 bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu);
 
-// From registry::on_destroyed: every slot referencing the resource is erased.
+// From registry::on_destroyed: every slot referencing the resource becomes a tombstone.
 void forget_resource(icept::ResourceId res);
 
 // The §6.2 counter: lookups (by CPU or GPU handle) that found nothing. Incremented by the
@@ -66,6 +72,9 @@ std::uint64_t unknown_copies();
 // A lookup that found a known-null slot. Not a defect; counted so the ratio is visible.
 std::uint64_t null_lookups();
 void count_null_lookup();
+// A lookup that found a tombstone (the slot's resource died after the write). Not a defect.
+std::uint64_t dead_lookups();
+void count_dead_lookup();
 // The current write sequence (every note_view / note_null_view / note_copy advances it).
 std::uint64_t write_sequence();
 

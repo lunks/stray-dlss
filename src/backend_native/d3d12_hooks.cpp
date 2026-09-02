@@ -655,6 +655,18 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 		adj.oracle_live = [](icept::ResourceId r) { return icept::backend()->is_resource_live(r); };
 		adj.native_live = [](icept::ResourceId r) { return registry::is_live(r); };
 		adj.native_seen = [](icept::ResourceId r) { return registry::ever_seen(r); };
+		adj.oracle_view_resource = [](icept::DescriptorId v) {
+			icept::ResourceId r = 0;
+			return icept::backend()->resource_from_view(v, r) ? r : 0;
+		};
+		adj.native_provenance = [](icept::DescriptorId slot, bool &via_copy, icept::DescriptorId &src) {
+			shadow::ViewEntry e;
+			if (!shadow::lookup(slot, e))
+				return false;
+			via_copy = e.via_copy;
+			src = e.src_slot;
+			return true;
+		};
 		char note[160];
 		{
 			root::ListState st;

@@ -29,6 +29,7 @@ std::vector<HeapRecord> g_heaps;
 
 std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
 std::atomic<std::uint64_t> g_null_lookups{ 0 };
+std::atomic<std::uint64_t> g_dead_lookups{ 0 };
 std::atomic<std::uint64_t> g_unknown_copies{ 0 };
 std::atomic<std::uint64_t> g_seq{ 0 };
 std::uint64_t g_views = 0;
@@ -80,6 +81,7 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src)
 	ViewEntry copy = it->second;
 	copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	copy.via_copy = true;
+	copy.src_slot = src;
 	g_slots[dst] = copy;
 	if (copy.resource != 0)
 		g_by_resource[copy.resource].push_back(dst);
@@ -165,7 +167,7 @@ void forget_resource(icept::ResourceId res)
 	{
 		const auto s = g_slots.find(slot);
 		if (s != g_slots.end() && s->second.resource == res)
-			g_slots.erase(s);
+			s->second.dead = true; // a tombstone, overwritten by the next write to the slot
 	}
 	g_by_resource.erase(it);
 }
@@ -175,6 +177,8 @@ void count_unknown_lookup() { g_unknown_lookups.fetch_add(1, std::memory_order_r
 std::uint64_t unknown_copies() { return g_unknown_copies.load(std::memory_order_relaxed); }
 std::uint64_t null_lookups() { return g_null_lookups.load(std::memory_order_relaxed); }
 void count_null_lookup() { g_null_lookups.fetch_add(1, std::memory_order_relaxed); }
+std::uint64_t dead_lookups() { return g_dead_lookups.load(std::memory_order_relaxed); }
+void count_dead_lookup() { g_dead_lookups.fetch_add(1, std::memory_order_relaxed); }
 std::uint64_t write_sequence() { return g_seq.load(std::memory_order_relaxed); }
 
 Stats stats()
@@ -196,6 +200,7 @@ void clear_for_test()
 	g_heaps.clear();
 	g_unknown_lookups.store(0);
 	g_null_lookups.store(0);
+	g_dead_lookups.store(0);
 	g_unknown_copies.store(0);
 	g_views = g_copies = 0;
 }

@@ -48,7 +48,17 @@ struct Judged
 	Verdict verdict = Verdict::unadjudicated;
 	int o_rs = -1, o_reg = -1, o_seen = -1; // the oracle's resource: live per ReShade / live per the registry / ever registered
 	int n_rs = -1, n_reg = -1, n_seen = -1; // the native side's resource, same three answers
+	std::string detail;                     // the refining evidence, when any
 };
+
+// The native resolver's account of a slot it could not resolve, by kind and register.
+const icept::DispatchBindings::Unresolved *find_unresolved(const icept::DispatchBindings &native, char kind, std::uint32_t reg)
+{
+	for (const auto &u : native.unresolved)
+		if (u.kind == kind && u.reg == reg)
+			return &u;
+	return nullptr;
+}
 
 Judged judge(icept::ResourceId oracle_res, icept::ResourceId native_res, const Adjudicator *adj)
 {
@@ -87,19 +97,89 @@ Judged judge(icept::ResourceId oracle_res, icept::ResourceId native_res, const A
 	return j;
 }
 
+// Refines a MISMATCH (both sides named a live resource) with the slot's provenance: if the
+// native shadow says the online slot was COPIED from source S, ReShade's own map for S is a
+// second answer from the oracle itself — and when it agrees with the native side, ReShade's
+// online copy bookkeeping is what disagrees.
+void refine_mismatch(Judged &j, icept::ResourceId oracle_res, icept::ResourceId native_res,
+                     icept::DescriptorId native_slot, const Adjudicator *adj)
+{
+	if (j.verdict != Verdict::both_live || adj == nullptr || adj->native_provenance == nullptr ||
+		adj->oracle_view_resource == nullptr || native_slot == 0)
+		return;
+	bool via_copy = false;
+	icept::DescriptorId src = 0;
+	if (!adj->native_provenance(native_slot, via_copy, src))
+		return;
+	char buf[200];
+	if (!via_copy)
+	{
+		std::snprintf(buf, sizeof(buf), " (native slot %llx written by a view creation)", static_cast<unsigned long long>(native_slot));
+		j.detail = buf;
+		return;
+	}
+	const icept::ResourceId src_res = adj->oracle_view_resource(src);
+	std::snprintf(buf, sizeof(buf), " (native slot %llx copied from %llx, which ReShade's own view map says is res %llx)",
+		static_cast<unsigned long long>(native_slot), static_cast<unsigned long long>(src), static_cast<unsigned long long>(src_res));
+	j.detail = buf;
+	if (src_res != 0 && src_res == native_res && src_res != oracle_res)
+		j.verdict = Verdict::reshade_copy_stale;
+}
+
+// Refines an UNKNOWN (the native side had nothing) with the native resolver's own account of
+// the slot: a tombstone naming the oracle's resource convicts the oracle (the resource died
+// after the descriptor was written and its address was reused); a slot never written since
+// attach, or a heap span unknown, is the native side's blind spot.
+void refine_unknown(Judged &j, icept::ResourceId oracle_res, const icept::DispatchBindings *native, char kind, std::uint32_t reg)
+{
+	if (native == nullptr || (j.verdict != Verdict::native_missed && j.verdict != Verdict::both_live))
+		return;
+	const auto *u = find_unresolved(*native, kind, reg);
+	char buf[200];
+	if (u == nullptr)
+	{
+		j.detail = " (the native table walk produced no such register)";
+		return;
+	}
+	switch (u->reason)
+	{
+	case 2:
+		std::snprintf(buf, sizeof(buf), " (native slot %llx is a TOMBSTONE: res %llx died after the slot was written%s)",
+			static_cast<unsigned long long>(u->descriptor), static_cast<unsigned long long>(u->dead_resource),
+			u->dead_resource == oracle_res ? "; the oracle names that address" : "");
+		j.detail = buf;
+		if (u->dead_resource == oracle_res)
+			j.verdict = Verdict::reshade_stale;
+		break;
+	case 1:
+		std::snprintf(buf, sizeof(buf), " (native slot %llx never written since attach)", static_cast<unsigned long long>(u->descriptor));
+		j.detail = buf;
+		j.verdict = Verdict::native_blind;
+		break;
+	default:
+		j.detail = " (no bound heap span holds the table's GPU handle)";
+		j.verdict = Verdict::native_blind;
+		break;
+	}
+}
+
 void append_judgement(std::string &line, const Judged &j, Result &out)
 {
 	++out.verdicts[static_cast<int>(j.verdict)];
 	if (j.verdict == Verdict::unadjudicated)
 		return;
-	char buf[160];
-	std::snprintf(buf, sizeof(buf), " [oracle-res live rs=%d reg=%d seen=%d | native-res live rs=%d reg=%d seen=%d] => %s",
-		j.o_rs, j.o_reg, j.o_seen, j.n_rs, j.n_reg, j.n_seen, verdict_name(j.verdict));
+	char buf[128];
+	std::snprintf(buf, sizeof(buf), " [oracle-res live rs=%d reg=%d seen=%d | native-res live rs=%d reg=%d seen=%d]",
+		j.o_rs, j.o_reg, j.o_seen, j.n_rs, j.n_reg, j.n_seen);
 	line += buf;
+	line += j.detail;
+	line += " => ";
+	line += verdict_name(j.verdict);
 }
 
 void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
-                   const std::vector<BoundTexture> &actual, Result &out, const Adjudicator *adj)
+                   const std::vector<BoundTexture> &actual, Result &out, const Adjudicator *adj,
+                   const icept::DispatchBindings *native)
 {
 	for (const BoundTexture &e : expected)
 	{
@@ -110,7 +190,9 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 		{
 			std::snprintf(buf, sizeof(buf), "%c%u: oracle=(%s) native=UNKNOWN", prefix, e.slot, describe(e).c_str());
 			std::string line = buf;
-			append_judgement(line, judge(e.resource, 0, adj), out);
+			Judged j = judge(e.resource, 0, adj);
+			refine_unknown(j, e.resource, native, prefix, e.slot);
+			append_judgement(line, j, out);
 			out.unknown.push_back(line);
 			continue;
 		}
@@ -120,7 +202,9 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 			std::snprintf(buf, sizeof(buf), "%c%u: oracle=(%s) native=(%s)", prefix, e.slot,
 				describe(e).c_str(), describe(*a).c_str());
 			std::string line = buf;
-			append_judgement(line, judge(e.resource, a->resource, adj), out);
+			Judged j = judge(e.resource, a->resource, adj);
+			refine_mismatch(j, e.resource, a->resource, a->descriptor, adj);
+			append_judgement(line, j, out);
 			out.mismatches.push_back(line);
 		}
 	}
@@ -146,6 +230,7 @@ const char *verdict_name(Verdict v)
 	switch (v)
 	{
 	case Verdict::reshade_stale: return "RESHADE-STALE";
+	case Verdict::reshade_copy_stale: return "RESHADE-COPY-STALE";
 	case Verdict::native_blind: return "NATIVE-BLIND";
 	case Verdict::liveness_conflict: return "LIVENESS-CONFLICT";
 	case Verdict::native_missed: return "NATIVE-MISSED";
@@ -160,8 +245,8 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
                const Adjudicator *adj)
 {
 	Result r;
-	compare_slots('t', expected.srvs, actual.srvs, r, adj);
-	compare_slots('u', expected.uavs, actual.uavs, r, adj);
+	compare_slots('t', expected.srvs, actual.srvs, r, adj, &actual);
+	compare_slots('u', expected.uavs, actual.uavs, r, adj, &actual);
 
 	// Constant buffers as a multiset of (buffer, offset): the oracle keys root CBVs by root
 	// PARAMETER index and table CBVs by register, so `first` is not comparable across
@@ -373,7 +458,7 @@ void log_summary(const char *when)
 		static_cast<unsigned long long>(s.taa_dispatches), static_cast<unsigned long long>(s.taa_disagree),
 		static_cast<unsigned long long>(s.dispatches - s.agree));
 	// The adjudication, by differing SLOT: which side each convicts.
-	char verdicts[320];
+	char verdicts[400];
 	int n = 0;
 	for (int i = 0; i < kVerdictCount && n < static_cast<int>(sizeof(verdicts)) - 48; ++i)
 		n += std::snprintf(verdicts + n, sizeof(verdicts) - n, "%s%s=%llu", i ? " " : "",

@@ -223,9 +223,26 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 			const std::uint64_t gpu = base + static_cast<std::uint64_t>(s.table_index) * inc;
 			icept::DescriptorId cpu = 0;
 			shadow::ViewEntry e;
-			if (!shadow::gpu_to_cpu(gpu, cpu) || !shadow::lookup(cpu, e))
+			const char kind_char = s.kind == core::RangeKind::srv ? 't' : s.kind == core::RangeKind::uav ? 'u' : 'b';
+			if (!shadow::gpu_to_cpu(gpu, cpu))
 			{
 				shadow::count_unknown_lookup();
+				out.unresolved.push_back(icept::DispatchBindings::Unresolved{ kind_char, s.reg, 0, 0, 0 });
+				continue;
+			}
+			if (!shadow::lookup(cpu, e))
+			{
+				shadow::count_unknown_lookup();
+				out.unresolved.push_back(icept::DispatchBindings::Unresolved{ kind_char, s.reg, cpu, 1, 0 });
+				continue;
+			}
+			if (e.dead)
+			{
+				// The resource this slot views died after the slot was written: nothing valid
+				// is bound. Reported with the dead identity, so a claim that the slot holds
+				// "that" resource (its address possibly reused) is adjudicable.
+				shadow::count_dead_lookup();
+				out.unresolved.push_back(icept::DispatchBindings::Unresolved{ kind_char, s.reg, cpu, 2, e.resource });
 				continue;
 			}
 			if (e.is_null)
@@ -295,7 +312,7 @@ bool NativeBackend::resolve_graphics_srvs(const icept::CommandContext &, std::ve
 void NativeBackend::describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out)
 {
 	shadow::ViewEntry e;
-	if (!shadow::lookup(view, e) || e.resource == 0)
+	if (!shadow::lookup(view, e) || e.resource == 0 || e.dead)
 		return;
 	if (!registry::is_live(e.resource))
 		return;
@@ -311,7 +328,7 @@ bool NativeBackend::resource_from_view(icept::DescriptorId view, icept::Resource
 {
 	shadow::ViewEntry e;
 	out = 0;
-	if (!shadow::lookup(view, e))
+	if (!shadow::lookup(view, e) || e.dead)
 		return false;
 	out = e.resource;
 	return out != 0;
@@ -408,6 +425,7 @@ Stats stats()
 	Stats s;
 	s.unknown_lookups = shadow::unknown_lookups();
 	s.null_lookups = shadow::null_lookups();
+	s.dead_lookups = shadow::dead_lookups();
 	s.unknown_copies = shadow::unknown_copies();
 	s.resolves = g_resolves.load(std::memory_order_relaxed);
 	s.resolves_no_layout = g_resolves_no_layout.load(std::memory_order_relaxed);
@@ -429,12 +447,12 @@ void log_stats(const char *when)
 	const Stats s = stats();
 	const registry::Stats r = registry::stats();
 	STRAY_LOG_INFO("NATIVE SHADOW [%s] mode=%s patches=%u resolves=%llu (no-layout %llu) unknown-lookups=%llu "
-		"null-lookups=%llu unknown-copies=%llu root-signatures=%llu pipelines=%llu resources live=%llu (registered %llu, "
+		"null-lookups=%llu dead-lookups=%llu unknown-copies=%llu root-signatures=%llu pipelines=%llu resources live=%llu (registered %llu, "
 		"destroyed %llu, sentinel-failures %llu, unarmed %llu) slots=%llu heaps=%llu",
 		when, mode_name(mode()), s.patches,
 		static_cast<unsigned long long>(s.resolves), static_cast<unsigned long long>(s.resolves_no_layout),
 		static_cast<unsigned long long>(s.unknown_lookups), static_cast<unsigned long long>(s.null_lookups),
-		static_cast<unsigned long long>(s.unknown_copies),
+		static_cast<unsigned long long>(s.dead_lookups), static_cast<unsigned long long>(s.unknown_copies),
 		static_cast<unsigned long long>(s.root_signatures), static_cast<unsigned long long>(s.pipelines_hashed),
 		static_cast<unsigned long long>(s.resources_live), static_cast<unsigned long long>(r.registered),
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),

@@ -318,8 +318,9 @@ bool test_descriptor_shadow_copy_chain(Gpu &gpu)
 
 	const std::uint64_t unknown_before = sh::unknown_lookups();
 	tex.Reset(); // destroyed -> sentinel -> registry::on_destroyed -> shadow::forget_resource
-	check(!sh::lookup(cpu, got), "after the resource died the slot is forgotten");
-	check(!sh::lookup(off0.ptr, got), "...the offline slot too");
+	check(sh::lookup(cpu, got) && got.dead && got.resource == e.resource, "after the resource died the slot is a TOMBSTONE naming it");
+	check(got.via_copy && got.src_slot == off0.ptr, "the copied slot remembers its source");
+	check(sh::lookup(off0.ptr, got) && got.dead && !got.via_copy, "...the offline slot is a tombstone too, written by a view creation");
 	check(sh::lookup(on6.ptr, null_entry) && null_entry.is_null, "...but the null slot stays known-null");
 	sh::count_unknown_lookup();
 	check(sh::unknown_lookups() == unknown_before + 1, "unknown_lookups counts");
@@ -633,17 +634,29 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	check(drain_validation(gpu, "native-hooks") == 0, "no D3D12 validation errors with the hooks installed");
 
 	// --- the liveness contract through the whole chain ---
+	ID3D12Resource *const depth_ptr_for_test = depth.Get(); // the identity, kept after the object is gone
 	depth.Reset();
 	gpu.list->SetDescriptorHeaps(1, heaps);
 	gpu.list->SetComputeRootSignature(rs.Get());
 	gpu.list->SetComputeRootDescriptorTable(0, gsrv);
 	gpu.list->SetComputeRootConstantBufferView(1, view_cb->GetGPUVirtualAddress());
 	gpu.list->SetComputeRootDescriptorTable(2, gbuf);
+	const std::uint64_t dead_before = sh::dead_lookups();
 	icept::DispatchBindings after;
 	native::backend().resolve_compute_bindings(ctx, after);
 	check(find(after.srvs, 2) == nullptr && find(after.srvs, 4) == nullptr, "after the depth texture died, t2 and t4 are absent");
 	check(find(after.srvs, 1) != nullptr && find(after.uavs, 0) != nullptr, "...and the others are still there");
-	check(sh::unknown_lookups() == unknown_before + 2, "unknown_lookups grew by exactly 2");
+	check(sh::unknown_lookups() == unknown_before, "...as TOMBSTONES, not unknowns: unknown_lookups did not grow");
+	check(sh::dead_lookups() == dead_before + 2, "dead_lookups grew by exactly 2");
+	{
+		int tomb = 0;
+		for (const auto &u : after.unresolved)
+			if (u.kind == 't' && (u.reg == 2 || u.reg == 4) && u.reason == 2 && u.dead_resource == id_of(depth_ptr_for_test))
+				++tomb;
+		check(tomb == 2, "the resolve reports both slots as tombstones naming the dead depth texture");
+	}
+	std::printf("  unknown_lookups=%llu dead_lookups=%llu\n", static_cast<unsigned long long>(sh::unknown_lookups()),
+		static_cast<unsigned long long>(sh::dead_lookups()));
 	// Setting the SAME root signature again changes nothing: the root CBV survives in the
 	// shadow (vkd3d-proton early-outs on the same object; ReShade's tracker keeps its args).
 	gpu.list->SetComputeRootSignature(rs.Get());
