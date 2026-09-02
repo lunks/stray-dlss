@@ -32,8 +32,8 @@ local TIER2 = true          -- raise shell count / length
 -- MEASURED on the first launch (2026-09-02): the PLAYER cat ships LayerCount=16,
 -- FurLength=1.15, ShellBias=1.0, MinScreenSize=0 - twice the companion cats' 8. So 16 was
 -- a no-op; anything that should be felt as "more fur" has to go above it.
-local LAYERS      = 32      -- shells (player ships 16, companions 8)
-local LAYERS_LOD  = 32      -- per-LOD shells; keep >= LAYERS or LODs undo it
+local LAYERS      = 48      -- shells (player ships 16, companions 8); 48 = smoother volume
+local LAYERS_LOD  = 48      -- per-LOD shells; keep >= LAYERS or LODs undo it
 local FUR_LENGTH  = 2.0     -- shipped 1.15; the single most VISIBLE knob. nil = leave alone
 local SHELL_BIAS  = nil     -- nil = leave; 0..1, higher packs shells toward the root
 local MIN_SCREEN  = 0.0     -- never drop the fur for distance
@@ -49,6 +49,22 @@ local HD_SCALARS = {
     ["AO Power"]                          = 0.2,    -- was 0.1
     ["Spec AO mul"]                       = 0.75,   -- was 1.5
     ["Spec AO power"]                     = 2.0,    -- was 1.0
+}
+
+-- User-requested on top of the HD tier (2026-09-02). These are OUR values, not the game's;
+-- the shipped numbers are noted so they can be dialled back.
+--   Plush: thicker strands and a scruffier coat, length untouched.
+--   Distance: the shipped fade thins the shells out well inside third-person gameplay
+--   range, which is why the change was obvious up close and hard to see from behind.
+--   The fade scalars' units are UNCONFIRMED (SOFT: they read as metres-ish); pushed ~2.5x.
+local PLUSH_SCALARS = {
+    ["Fur Root Thickness"]  = 1.5,    -- shipped 1.0
+    ["Height Variation"]    = 0.25,   -- HD 0.1, shipped 0.0
+}
+local DISTANCE_SCALARS = {
+    ["Fade min"]              = 90.0,   -- shipped 35
+    ["Fade max"]              = 110.0,  -- shipped 40
+    ["Camera Distance Blend"] = 150.0,  -- shipped 75
 }
 
 ------------------------------------------------------------------ plumbing
@@ -87,12 +103,18 @@ local function applyMaterial(gfur)
         if not ok or not mid or not mid:IsValid() then
             log(string.format("  material slot %d: could not create a dynamic instance (%s)", i, tostring(mid)))
         else
-            local applied = 0
-            for pname, pval in pairs(HD_SCALARS) do
-                local ok2 = pcall(function() mid:SetScalarParameterValue(FName(pname), pval) end)
-                if ok2 then applied = applied + 1 end
+            -- Three tables, three counts, so a name that stops resolving is visible per group.
+            local function applyTable(tbl, label, want)
+                local applied = 0
+                for pname, pval in pairs(tbl) do
+                    local ok2 = pcall(function() mid:SetScalarParameterValue(FName(pname), pval) end)
+                    if ok2 then applied = applied + 1 end
+                end
+                log(string.format("  material slot %d: applied %d/%d %s scalars", i, applied, want, label))
             end
-            log(string.format("  material slot %d: applied %d/9 HD scalars", i, applied))
+            applyTable(HD_SCALARS,       "HD",       9)
+            applyTable(PLUSH_SCALARS,    "plush",    2)
+            applyTable(DISTANCE_SCALARS, "distance", 3)
         end
     end
 end
