@@ -811,3 +811,26 @@ operational, not rendering facts, but they belong with the box traps in §2.11 /
 * **"Stray is already running" requires a heartbeat under 30 s old**, never the mere presence of
   the process (`launch-stray.sh` enforces this; comment added 2026-09-02). Before any box action,
   check and log: the game process, the heartbeat age, the reaper, and who launched it.
+
+## 22. The native host's shader census is compute-only; the >=300 in_game gate is structurally false (2026-09-02)
+
+Measured live in Config A (build `f97c2f0`), user in gameplay to frame 20700+ with DLSS SR + NR
+running, heartbeat read `shader_census=34 compute_pipelines=34 taa_pipelines=1 in_game=0`.
+
+**The census counts distinct COMPUTE shaders only.** The native backend feeds the application's
+`on_pipeline` from `store_pipeline`, called by `hk_CreateComputePipelineState` and the stream
+`hk_CreatePipelineState` (which extracts only the CS subobject) — there is no graphics-PSO hook.
+So `distinct_shader_hashes` holds ~34 in The Slums, where the ReShade host's `init_pipeline` saw
+ALL pipelines (PS + CS), ~390 in The Slums and ~728 in the apartment. HARD.
+
+**Consequence:** the heartbeat's `in_game = census >= 300` (calibrated for the add-on) can never
+fire under the host, so the launcher's "reached gameplay" gate was structurally false — NOT an
+input failure (the earlier "menu-drive input never advanced" reading in §20 was this gate, not
+the pad). `in_game` is now `taa_pipelines>=1 && dispatches advancing` — "DLSS is live and
+driving", which is what an unattended A/B needs. It is not a strict menu-vs-gameplay classifier:
+the menu also runs the TAA pass (CLAUDE.md §5), and the host does not sample the §2.4 depth-range
+gate that would separate them. Whether to teach the host graphics PSOs (restoring a menu/gameplay
+census step) or add the depth gate is deferred — neither is needed for the perf work.
+
+Dispatch-side visibility is unaffected: the diff observer counted 126/126 TAA dispatches, and
+DLSS drives every frame; only the pipeline-CREATION census is compute-only.

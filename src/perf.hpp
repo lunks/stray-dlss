@@ -51,6 +51,12 @@ enum Bucket
 	kNgxRr,            // ngx::evaluate_rr   (DLSS Ray Reconstruction)
 	kNgxNr,            // nr::apply          (DLSS Neural Rendering, feature 18)
 	kRestore,          // restore_game_compute_state
+	// Present-owner CPU mechanics, NOT nested in kDispatchPath (so the intercept subtraction
+	// is unaffected). The native host runs these every present; the ReShade host has no
+	// equivalent, so this is where the plugin-vs-add-on delta can hide (frame-pacing task,
+	// 2026-09-02).
+	kPresentOwner,     // ring allocator/list Reset + Close + ExecuteCommandLists + queue Signal
+	kPresentWait,      // the fence WaitForSingleObject stall (a GPU-sync wait, a hitch source)
 	kBucketCount,
 };
 

@@ -1045,10 +1045,22 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
 			std::fprintf(f, "ngx_attempted=%d\n",
 				g_state.ngx_attempted.load(std::memory_order_relaxed) ? 1 : 0);
-			// The measured census is ~110-150 in the main menu and 390 (The Slums, slot 1,
-			// measured 2026-09-01) to ~728 (the apartment) in gameplay, so a threshold of 300
-			// separates them with margin either side. 400 was wrong for the Slums save.
-			std::fprintf(f, "in_game=%d\n", census >= 300 ? 1 : 0);
+			// in_game under the NATIVE HOST cannot use the shader census: the host feeds
+			// on_pipeline COMPUTE pipelines only (store_pipeline is called from
+			// CreateComputePipelineState / the stream CreatePipelineState's CS), so the census
+			// counts distinct COMPUTE shaders (~34 in The Slums gameplay) where the ReShade
+			// host's init_pipeline saw ALL pipelines (~390-728). The >=300 gate is therefore
+			// structurally false under the host (facts §20/§22). Use a signal the host
+			// demonstrably has: the TAA pass identified AND DLSS driving frames (dispatches
+			// advancing between writes). This says "DLSS is live and driving", which is what an
+			// unattended A/B needs; it is NOT a strict menu-vs-gameplay classifier (that needs
+			// the §2.4 depth-range gate the host does not sample).
+			static std::atomic<std::uint32_t> s_last_dispatches{ 0 };
+			const std::uint32_t disp_now = g_state.dispatches_seen.load();
+			const std::uint32_t disp_prev = s_last_dispatches.exchange(disp_now);
+			const bool advancing = disp_now > disp_prev;
+			const bool driving = g_state.taa_pipelines_seen.load() >= 1 && advancing;
+			std::fprintf(f, "in_game=%d\n", driving ? 1 : 0);
 			const auto &d = taa_hook::diagnostics();
 			std::fprintf(f, "large_dispatches=%llu\n", (unsigned long long)d.large_dispatches);
 			std::fprintf(f, "no_bound_pipeline=%llu\n", (unsigned long long)d.no_bound_pipeline);

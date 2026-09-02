@@ -4,6 +4,7 @@
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
 #include "core/present_plan.hpp"
+#include "perf.hpp"
 #include "log.hpp"
 
 #include <d3d12.h>
@@ -341,13 +342,17 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 		slot = &g_ring[pc.frame % kRing];
 		if (slot->pending != 0 && g_fence->GetCompletedValue() < slot->pending)
 		{
+			perf::Scope _wait(perf::kPresentWait);
 			g_fence->SetEventOnCompletion(slot->pending, g_fence_event);
 			::WaitForSingleObject(g_fence_event, 2000);
 		}
-		if (SUCCEEDED(slot->allocator->Reset()) && SUCCEEDED(slot->list->Reset(slot->allocator.Get(), nullptr)))
-			pc.present_list = slot->list.Get();
-		else
-			slot = nullptr;
+		{
+			perf::Scope _reset(perf::kPresentOwner);
+			if (SUCCEEDED(slot->allocator->Reset()) && SUCCEEDED(slot->list->Reset(slot->allocator.Get(), nullptr)))
+				pc.present_list = slot->list.Get();
+			else
+				slot = nullptr;
+		}
 	}
 	g_list_used.store(false, std::memory_order_relaxed);
 
@@ -365,6 +370,7 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 	}
 	if (slot != nullptr)
 	{
+		perf::Scope _submit(perf::kPresentOwner);
 		slot->list->Close();
 		if (g_list_used.load(std::memory_order_relaxed))
 		{

@@ -23,6 +23,10 @@ std::atomic<std::uint64_t> g_bucket_ns[kBucketCount] = {};
 // value if presents ever move threads.
 std::atomic<std::uint64_t> g_frames_in_interval{ 0 };
 std::atomic<std::uint64_t> g_worst_frame_ns{ 0 };
+// Frame-time histogram, 1 ms bins 0..127 plus a 128+ overflow bin, so a hitch shows up as a
+// PERCENTILE rather than being hidden by the average. Written only by the present thread.
+constexpr int kHistBins = 129;
+std::uint64_t g_frame_hist[kHistBins] = {};
 std::uint64_t g_interval_start_ns = 0;
 std::uint64_t g_last_present_ns = 0;
 std::uint64_t g_present_count = 0;
@@ -99,6 +103,10 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	g_frames_in_interval.fetch_add(1, std::memory_order_relaxed);
 	if (frame_ns > g_worst_frame_ns.load(std::memory_order_relaxed))
 		g_worst_frame_ns.store(frame_ns, std::memory_order_relaxed);
+	{
+		const std::uint64_t ms = frame_ns / 1000000ull;
+		g_frame_hist[ms < 128 ? static_cast<int>(ms) : 128]++;
+	}
 
 	if (++g_present_count < kReportInterval)
 		return;
@@ -128,10 +136,29 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	const std::uint64_t first_frame = g_total_frames_reported;
 	g_total_frames_reported += frames;
 
-	STRAY_LOG_INFO("[perf] frames %llu-%llu: %.1f fps avg (%.1fms), worst frame %.1fms",
+	// Percentiles from the histogram (1 ms resolution): the p99 and p99.9 are the frame-pacing
+	// numbers the average hides. Then clear the bins for the next interval.
+	std::uint64_t hist_total = 0;
+	for (int i = 0; i < kHistBins; ++i)
+		hist_total += g_frame_hist[i];
+	const auto pctile = [&](double q) -> double {
+		if (hist_total == 0) return 0.0;
+		const std::uint64_t target = static_cast<std::uint64_t>(q * static_cast<double>(hist_total));
+		std::uint64_t cum = 0;
+		for (int i = 0; i < kHistBins; ++i) { cum += g_frame_hist[i]; if (cum >= target) return static_cast<double>(i); }
+		return static_cast<double>(kHistBins - 1);
+	};
+	const double p50 = pctile(0.50), p95 = pctile(0.95), p99 = pctile(0.99), p999 = pctile(0.999);
+	std::uint64_t hitches16 = 0, hitches33 = 0;
+	for (int i = 0; i < kHistBins; ++i) { if (i >= 16) hitches16 += g_frame_hist[i]; if (i >= 33) hitches33 += g_frame_hist[i]; }
+	for (int i = 0; i < kHistBins; ++i) g_frame_hist[i] = 0;
+
+	STRAY_LOG_INFO("[perf] frames %llu-%llu: %.1f fps avg (%.1fms), worst %.1fms | p50 %.0fms p95 %.0fms p99 %.0fms p99.9 %.0fms | frames>16ms %llu >33ms %llu",
 		static_cast<unsigned long long>(first_frame),
 		static_cast<unsigned long long>(g_total_frames_reported),
-		fps, avg_frame_ms, static_cast<double>(worst) / 1e6);
+		fps, avg_frame_ms, static_cast<double>(worst) / 1e6,
+		p50, p95, p99, p999,
+		static_cast<unsigned long long>(hitches16), static_cast<unsigned long long>(hitches33));
 
 	// Non-overlapping attribution: kDispatchPath CONTAINS the nested buckets, so subtract them
 	// to get the intercept-only share, leaving the parts summing to the total instead of
@@ -165,6 +192,12 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 		"outside these buckets.",
 		static_cast<double>(dispatches) / static_cast<double>(frames),
 		static_cast<double>(large) / static_cast<double>(frames));
+
+	const double present_ms = static_cast<double>(bucket_ns[kPresentOwner]) * per_frame_ms;
+	const double wait_ms = static_cast<double>(bucket_ns[kPresentWait]) * per_frame_ms;
+	STRAY_LOG_INFO("[perf] present owner/frame: mechanics %.3fms (%.0f%%), fence-wait %.3fms (%.0f%%) "
+		"- the native host's per-present ring work; nil under the ReShade host.",
+		present_ms, pct(present_ms), wait_ms, pct(wait_ms));
 }
 
 } // namespace stray_dlss::perf
