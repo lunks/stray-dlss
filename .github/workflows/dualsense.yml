@@ -170,8 +170,11 @@ jobs:
           UEPSEUDO_PAT: ${{ secrets.UEPSEUDO_PAT }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # The submodule URLs are git@github.com:..., which has no credentials in CI.
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          # The submodule URLs are git@github.com:..., which has no credentials in CI. The
+          # rewrite for them is set per branch below, because git applies exactly ONE
+          # url.<x>.insteadOf rule to the ORIGINAL url (longest matching prefix) and never
+          # re-matches the rewritten result - two rules do NOT chain. Run 33579551886 proved
+          # it: with the token present, the ssh url became plain https and git tried to prompt.
           git clone --no-checkout https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
           git -C RE-UE4SS fetch --depth 1 origin $env:UE4SS_SHA
           git -C RE-UE4SS checkout --detach FETCH_HEAD
@@ -179,7 +182,9 @@ jobs:
 
           if ($env:UEPSEUDO_PAT) {
             Write-Host "UEPSEUDO_PAT is present: fetching every submodule at its recorded pin."
-            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "https://github.com/"
+            # ONE rule, ssh prefix straight to the token url. A separate ssh->https rule would
+            # win the prefix match and strip the credentials (see the note above).
+            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "git@github.com:"
             git -C RE-UE4SS submodule update --init --recursive
           } else {
             $warn = "UEPSEUDO_PAT is not set. deps/first/Unreal points at the PRIVATE repo " +
@@ -189,6 +194,8 @@ jobs:
                     "recorded submodule pin eb40a05f. If the resulting DLL fails to load, or " +
                     "loads and then misbehaves, SUSPECT THIS FIRST."
             Write-Host "::warning::$warn"
+            # No token: public submodules still need ssh -> https, credential-free.
+            git config --global url."https://github.com/".insteadOf "git@github.com:"
             # Everything except deps/first/Unreal can come from its real remote.
             git -C RE-UE4SS submodule update --init --recursive -- deps/first/patternsleuth
             git clone --no-checkout https://github.com/$env:UEPSEUDO_MIRROR_REPO.git mirror
