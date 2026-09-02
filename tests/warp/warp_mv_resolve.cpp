@@ -1730,6 +1730,10 @@ LONG WINAPI harness_crash_handler(EXCEPTION_POINTERS *ep)
 	// and thread-naming (0x406D1388) are routine and skipped.
 	if ((code & 0xF0000000u) != 0xC0000000u && code != 0x80000003u && code != 0x80000004u)
 		return EXCEPTION_CONTINUE_SEARCH;
+	// Loader first-chance exceptions ReShade's DLL raises and handles while binding imports
+	// (STATUS_DLL_NOT_FOUND, STATUS_ENTRYPOINT_NOT_FOUND, the delay-load pair) are routine.
+	if (code == 0xC0000135u || code == 0xC0000139u || code == 0xC06D007Eu || code == 0xC06D007Fu)
+		return EXCEPTION_CONTINUE_SEARCH;
 	void *addr = ep->ExceptionRecord->ExceptionAddress;
 	HMODULE m = nullptr;
 	char name[MAX_PATH] = "?";
