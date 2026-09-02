@@ -1304,3 +1304,58 @@ whether the core under Proton routes feature 11 to a game-directory `nvngx_dlssg
 (it routed feature 11 for OptiScaler through SL, which uses the same core call, CLAUDE.md §5 —
 SOFT that our direct call is treated identically), and whether the snippet evaluates
 correctly with `DLSSG.OutputReal` provided by us rather than by SL (a knob, `NgxFGOutputReal`).
+
+### 31.6 The present-twice path on WARP under the debug layer (CI, 2026-09-02) — stage 1's offline half
+
+`tests/warp/warp_fg_present.inc`, run by every CI push on Windows Server's WARP adapter with the
+D3D12 debug layer and GPU-based validation on, over a REAL flip-model DXGI swapchain
+(`CreateSwapChainForHwnd`, hidden window, `R10G10B10A2_UNORM`, 3 buffers, `FLIP_DISCARD` — the
+game's own configuration, CLAUDE.md §2.1). The harness plays UE 4.27's part exactly (§31.4):
+`GetBuffer(i)` for every index after creation and after every `ResizeBuffers`, one `Present`
+per frame, its own counter reset only by `ResizeBuffers`. Verbatim from CI run 33683363510; the NGX=ON leg is green end to end from run 33684873745 on
+(the intervening failures were the test's own model of UE4's counter, and a silent fail-fast
+inside the swapchain's final Release caused by the HARNESS's closed command list still
+referencing the real back buffers - a lesson for the plugin too: never release a swapchain
+while any closed, un-reset list of ours names its buffers).
+
+```
+[WARN ] fg: ARMED for swapchain ...: 3 replacement back buffer(s) 640x360 fmt 24 (real flags 0x1), 2 generated, 3 crop readbacks
+  ok: the game's buffer 0 is a replacement, not the swapchain's real buffer 0
+  [creation] frame 0: Present hr=0x00000000 issued=1 generated=0
+  [creation] frame 1: Present hr=0x00000000 issued=2 generated=1
+    real ring: last=(0,1023,0) want (0,1023,0) | generated centre=(1023,0,0) want previous (1023,0,0) | band=(1023,0,1023) want magenta
+  ok: the last presented real buffer holds the frame the game just rendered (mirror + copy correct)
+  ok: the generated frame before it holds the PREVIOUS game frame
+  ok: the generated frame carries the magenta band
+  ok: counters: 4 game presents -> 7 presents issued, 3 generated
+  ok: no validation errors across the present-twice sequence
+[INFO ] fg: ResizeBuffers begins: worker drained, GPU idle on our lists, epoch 0 suspended
+[WARN ] fg: ResizeBuffers done (hr 0x00000000): epoch 1, replacements DROPPED (the next GetBuffer re-arms), mirror count 3
+[WARN ] fg: ARMED for swapchain ...: 3 replacement back buffer(s) 800x450 fmt 24 ...
+  ok: no validation errors across resize, fullscreen-state and the presents after them
+```
+
+* **Every present of the pair lands the right pixels in the right real buffer**, read back
+  through the ORIGINAL `GetBuffer` on the real ring: the buffer presented last holds the colour
+  the "game" cleared its replacement to, the one before it holds the previous frame with the
+  magenta band. That is the mirror, the replacement hand-off, both copies and both presents,
+  end to end, with zero debug-layer errors. HARD on WARP.
+* **`ResizeBuffers` with the game's references released succeeds while we hold ours** (the
+  replacements are not swapchain buffers), the replacements are dropped and re-armed at the
+  new size by the very next `GetBuffer`, and the mirror restarts at 0. HARD on WARP.
+* **`SetFullscreenState` drains the presenter and bumps the epoch without dropping the
+  replacements**; with no `ResizeBuffers` after it (WARP, windowed) the next present already has
+  a previous frame, as UE4's un-reset counter implies. HARD on WARP.
+* **The worker-thread presenter issues exactly 2 presents per game present** (counters read
+  after the drain): 6 game presents -> 12 issued, 6 generated, issued-interval histogram
+  unimodal (p50 1 ms, p99 6 ms at the harness's 1 ms pacing). HARD on WARP.
+* **Under ReShade's D3D12 proxy (the real-ReShade CI lane, not Config A)** every pixel check
+  passes except the band's exact colour, which reads a constant (389,84,389) instead of
+  (1023,0,1023): written, transformed by something on the proxied path. UNCONFIRMED what.
+
+What WARP cannot say (the box's half of stage 1): DXVK's DXGI + vkd3d-proton's swapchain under
+gamescope — whether a second thread's `Present` is tolerated, what `GetCurrentBackBufferIndex`
+returns between our two presents, whether the real `SetFullscreenState(TRUE)` transition (which
+UE4 follows with a `ResizeBuffers`) survives with the worker drained, and whether the mirror
+matches the game's counter in the live process (a mismatch shows as a stale frame in the
+gamescope screenshot). Those are the stage-1 box measurements.
