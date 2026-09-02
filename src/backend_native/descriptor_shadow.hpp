@@ -98,6 +98,10 @@ std::uint64_t dead_lookups();
 void count_dead_lookup();
 // The current write sequence (every note_view / note_null_view / note_copy advances it).
 std::uint64_t write_sequence();
+// FAST-path orphan diagnostics (facts §29): writes/copies whose handle fell in no registered
+// heap, by call site, plus how many heaps were first seen at CREATE vs at BIND. Zero in Config A.
+void fast_orphan_counts(std::uint64_t &view, std::uint64_t &copy_src, std::uint64_t &copy_dst,
+                        std::uint64_t &heaps_created, std::uint64_t &heaps_bound);
 
 struct Stats
 {

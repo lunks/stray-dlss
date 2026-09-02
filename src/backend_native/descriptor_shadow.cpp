@@ -74,6 +74,14 @@ std::vector<std::unique_ptr<Heap>> g_owned;              // guarded by g_reg
 std::vector<Heap *> *g_owned_leaked_snapshots_unused = nullptr; // (documentation)
 std::atomic<const std::vector<Heap *> *> g_table{ nullptr };
 std::atomic<std::uint64_t> g_slot_writes{ 0 };
+// Orphan handles: a write/copy whose CPU handle falls in NO registered heap - a heap created
+// before our device vtable patches went in, or (under ReShade) through the proxy device, or an
+// offline staging heap never bound. Counted by call site so the gap is named (facts §29).
+std::atomic<std::uint64_t> g_orphan_view{ 0 };
+std::atomic<std::uint64_t> g_orphan_copy_src{ 0 };
+std::atomic<std::uint64_t> g_orphan_copy_dst{ 0 };
+std::atomic<std::uint64_t> g_heaps_via_create{ 0 };
+std::atomic<std::uint64_t> g_heaps_via_bind{ 0 };
 
 Slot *slot_for(std::uint64_t cpu)
 {
@@ -120,7 +128,7 @@ bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
 	return false;
 }
 
-void note_heap_created(::ID3D12DescriptorHeap *heap)
+void note_heap_created(::ID3D12DescriptorHeap *heap, bool via_bind)
 {
 	if (heap == nullptr)
 		return;
@@ -161,16 +169,22 @@ void note_heap_created(::ID3D12DescriptorHeap *heap)
 		snapshot->push_back(e.get());
 	std::sort(snapshot->begin(), snapshot->end(), [](Heap *a, Heap *b) { return a->cpu_base < b->cpu_base; });
 	g_table.store(snapshot, std::memory_order_release); // old snapshot leaked on purpose
-	STRAY_LOG_INFO("descriptor_shadow(fast): heap %p registered: %u descriptors, inc %u, cpu %llx gpu %llx (%s), %zu heaps",
-		static_cast<void *>(heap), desc.NumDescriptors, inc, static_cast<unsigned long long>(cpu_base),
-		static_cast<unsigned long long>(gpu_base), gpu_base != 0 ? "shader-visible" : "CPU-only", g_owned.size());
+	if (via_bind) g_heaps_via_bind.fetch_add(1, std::memory_order_relaxed);
+	else g_heaps_via_create.fetch_add(1, std::memory_order_relaxed);
+	const char *tn = desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? "CBV_SRV_UAV" : desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ? "RTV" : "DSV";
+	STRAY_LOG_INFO("descriptor_shadow(fast): heap %p registered via %s: %s %u descriptors, inc %u, cpu %llx gpu %llx (%s), %zu heaps",
+		static_cast<void *>(heap), via_bind ? "BIND" : "CREATE", tn, desc.NumDescriptors, inc, static_cast<unsigned long long>(cpu_base),
+		static_cast<unsigned long long>(gpu_base), gpu_base != 0 ? "shader-visible/ONLINE" : "cpu-only/OFFLINE", g_owned.size());
 }
 
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 {
 	Slot *s = slot_for(cpu);
 	if (s == nullptr)
-		return; // a heap we never saw created (pre-attach); the resolver treats it as unknown
+	{
+		g_orphan_view.fetch_add(1, std::memory_order_relaxed);
+		return; // a heap we never saw created (pre-attach / proxy / offline); resolver: unknown
+	}
 	std::uint64_t gen = entry.resource_gen;
 	if (gen == 0 && entry.resource != 0)
 		gen = registry::generation_of(entry.resource);
@@ -198,8 +212,13 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 	{
 		Slot *d = slot_for(dst + static_cast<std::uint64_t>(i) * inc);
 		if (d == nullptr)
+		{
+			g_orphan_copy_dst.fetch_add(1, std::memory_order_relaxed);
 			continue;
+		}
 		Slot *sp = slot_for(src + static_cast<std::uint64_t>(i) * inc);
+		if (sp == nullptr)
+			g_orphan_copy_src.fetch_add(1, std::memory_order_relaxed);
 		const std::uint64_t sw1 = sp != nullptr ? sp->w1.load(std::memory_order_acquire) : 0;
 		if (sp == nullptr || (sw1 & kWritten) == 0)
 		{
@@ -254,6 +273,8 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 
 std::uint64_t slots_written() { return g_slot_writes.load(std::memory_order_relaxed); }
 std::size_t heap_count() { const auto *t = g_table.load(std::memory_order_acquire); return t ? t->size() : 0; }
+void orphan_counts(std::uint64_t &view, std::uint64_t &csrc, std::uint64_t &cdst, std::uint64_t &via_c, std::uint64_t &via_b)
+{ view=g_orphan_view.load(); csrc=g_orphan_copy_src.load(); cdst=g_orphan_copy_dst.load(); via_c=g_heaps_via_create.load(); via_b=g_heaps_via_bind.load(); }
 
 void clear_for_test()
 {
@@ -261,6 +282,8 @@ void clear_for_test()
 	g_owned.clear();
 	g_table.store(nullptr, std::memory_order_release); // old snapshots leaked; test-only
 	g_slot_writes.store(0);
+	g_orphan_view.store(0); g_orphan_copy_src.store(0); g_orphan_copy_dst.store(0);
+	g_heaps_via_create.store(0); g_heaps_via_bind.store(0);
 }
 
 } // namespace fast
@@ -505,18 +528,13 @@ void note_heap_bound(::ID3D12DescriptorHeap *heap)
 	if (current_mode() == Mode::debug)
 		debug::note_heap_bound(heap);
 	else
-		// Fast registers heaps at CreateDescriptorHeap, but under ReShade-on-top (Config B) some
-		// online heaps are created before our device hook is installed or through the proxy
-		// device, so they are never seen at creation; the game still BINDS them here. Register on
-		// bind too (idempotent) - without it ~19% of frames resolved the pinned TAA inputs as
-		// unknown, the gate refused, the engine's TAA ran, and the image flickered (facts §29).
-		fast::note_heap_created(heap);
+		fast::note_heap_created(heap, /*via_bind=*/true);
 }
 
 void note_heap_created(::ID3D12DescriptorHeap *heap)
 {
 	if (heap != nullptr && current_mode() == Mode::fast)
-		fast::note_heap_created(heap);
+		fast::note_heap_created(heap, /*via_bind=*/false);
 }
 
 bool lookup(icept::DescriptorId cpu, ViewEntry &out)
@@ -546,6 +564,9 @@ void count_null_lookup() { g_null_lookups.fetch_add(1, std::memory_order_relaxed
 std::uint64_t dead_lookups() { return g_dead_lookups.load(std::memory_order_relaxed); }
 void count_dead_lookup() { g_dead_lookups.fetch_add(1, std::memory_order_relaxed); }
 std::uint64_t write_sequence() { return g_seq.load(std::memory_order_relaxed); }
+void fast_orphan_counts(std::uint64_t &view, std::uint64_t &copy_src, std::uint64_t &copy_dst,
+                        std::uint64_t &heaps_created, std::uint64_t &heaps_bound)
+{ fast::orphan_counts(view, copy_src, copy_dst, heaps_created, heaps_bound); }
 
 Stats stats()
 {
