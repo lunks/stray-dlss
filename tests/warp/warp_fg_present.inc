@@ -138,6 +138,12 @@ bool test_fg_present_twice(Gpu &gpu)
 	namespace present = native::present;
 	ID3D12Device *dev = real_device(gpu);
 
+	// The previous test leaves the harness's command list OPEN (its allocator cannot be reset
+	// while a list records on it: D3D12 ERROR #543 on the first render below). Close it once
+	// here; a Close on an already-closed list is only a debug-layer message, drained as expected.
+	gpu.list->Close();
+	drain_validation(gpu, "fg-preclose", /*expected=*/true);
+
 	static DriveTestSink sink;
 	sink = DriveTestSink{};
 	sink.gpu = &gpu;
