@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 
@@ -547,7 +548,24 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 		ctx.device = game_device();
 		icept::DispatchBindings actual;
 		backend().resolve_compute_bindings(ctx, actual);
-		diff::consume_and_compare(self, actual, shadow::unknown_lookups());
+		// The adjudicator: the driver's liveness (ReShade's, through the seam) against the
+		// registry's sentinel. What the root shadow raw held goes on the line, so "the native
+		// side had NO root CBVs" is not confused with "it had different ones".
+		diff::Adjudicator adj;
+		adj.oracle_live = [](icept::ResourceId r) { return icept::backend()->is_resource_live(r); };
+		adj.native_live = [](icept::ResourceId r) { return registry::is_live(r); };
+		adj.native_seen = [](icept::ResourceId r) { return registry::ever_seen(r); };
+		char note[160];
+		{
+			root::ListState st;
+			if (root::snapshot(self, st))
+				std::snprintf(note, sizeof(note), "shadow rs=%p tables=%zu root-cbv=%zu root-srv=%zu root-uav=%zu consts=%zu",
+					static_cast<void *>(st.compute_root_signature), st.compute_tables.size(), st.compute_root_cbv.size(),
+					st.compute_root_srv.size(), st.compute_root_uav.size(), st.compute_constants.size());
+			else
+				std::snprintf(note, sizeof(note), "shadow: list never seen");
+		}
+		diff::consume_and_compare(self, actual, shadow::unknown_lookups(), &adj, note);
 	}
 	g_orig_List_Dispatch(self, x, y, z);
 }

@@ -14,6 +14,34 @@
 
 namespace stray_dlss::diff {
 
+// Which side a differing slot convicts. The two trackers each carry their own liveness —
+// ReShade's from its init/destroy_resource events, the native registry's from a destruction
+// sentinel on the resource itself — and a resource one side names while the OTHER side's
+// liveness says it is dead is that side's stale map, not a real binding (CLAUDE.md §5: ReShade's
+// view->resource map is never cleared on D3D12). Everything else stays ambiguous and is said so.
+enum class Verdict : std::uint8_t
+{
+	reshade_stale,     // the oracle named a resource ITS OWN liveness (destroy_resource) says is dead
+	native_blind,      // the oracle names a live resource the registry has NEVER SEEN (attach gap)
+	liveness_conflict, // the two liveness trackers disagree about the same resource
+	native_missed,     // the oracle names a resource live on both sides; the native side has nothing there
+	oracle_missed,     // the native side names a live resource; the oracle has nothing there
+	both_live,         // both sides name a resource live on both sides and they differ: ambiguous
+	unadjudicated,     // no liveness available (the pure comparison alone)
+};
+constexpr int kVerdictCount = 7;
+const char *verdict_name(Verdict v);
+
+// Liveness oracles for compare(). Any null makes every slot `unadjudicated`.
+struct Adjudicator
+{
+	bool (*oracle_live)(icept::ResourceId) = nullptr; // ReShade's own is_resource_live
+	bool (*native_live)(icept::ResourceId) = nullptr; // the registry's is_live (sentinel-backed)
+	// Whether the registry EVER registered it this life: tells "died, per the sentinel" apart
+	// from "never seen" (created before attach or through an unhooked entry point).
+	bool (*native_seen)(icept::ResourceId) = nullptr;
+};
+
 struct Result
 {
 	// Per-slot verdicts, every one a line for the log on a disagreement.
@@ -25,11 +53,15 @@ struct Result
 	// every TAA dispatch agreed on every register and differed only here). Reported so a
 	// real heap difference is still visible.
 	std::vector<std::string> heap_identity;
+	// Per differing slot (mismatch, unknown, extra), which side it convicts.
+	std::uint32_t verdicts[kVerdictCount] = {};
 	bool agree() const { return mismatches.empty() && unknown.empty() && extra.empty(); }
 };
 
-// Pure. `expected` is the oracle's (ReShade's) resolve, `actual` the native backend's.
-Result compare(const icept::DispatchBindings &expected, const icept::DispatchBindings &actual);
+// Pure. `expected` is the oracle's (ReShade's) resolve, `actual` the native backend's. With an
+// Adjudicator every differing line carries both liveness answers and its verdict.
+Result compare(const icept::DispatchBindings &expected, const icept::DispatchBindings &actual,
+               const Adjudicator *adj = nullptr);
 
 // --- the live machinery (Windows hosts only call these; the functions are still pure C++) ---
 
@@ -45,8 +77,11 @@ void publish_expected(void *native_list, std::uint64_t shader_hash, std::uint32_
 bool has_expected(void *native_list);
 // Called by the native Dispatch hook: compares, counts, logs, and clears the slot. False if
 // nothing was published for this list on this thread (the dispatch was not observed).
+// `native_note` is appended to the DIFF line (the native side's raw counts: what its root
+// shadow held), so a wholesale absence reads differently from a per-slot difference.
 bool consume_and_compare(void *native_list, const icept::DispatchBindings &actual,
-                         std::uint64_t native_unknown_lookups);
+                         std::uint64_t native_unknown_lookups, const Adjudicator *adj = nullptr,
+                         const char *native_note = nullptr);
 
 struct Summary
 {
@@ -59,6 +94,8 @@ struct Summary
 	std::uint64_t unconsumed = 0;  // published but never consumed (the dispatch was suppressed, or the hook never fired)
 	std::uint64_t taa_dispatches = 0;  // of the compared, those whose hash is a known TAA permutation
 	std::uint64_t taa_disagree = 0;
+	// Differing SLOTS by verdict, cumulative (a dispatch with 31 unknown cbs contributes 31).
+	std::uint64_t verdicts[kVerdictCount] = {};
 };
 Summary summary();
 

@@ -76,6 +76,7 @@ bool test_registry_liveness(Gpu &gpu)
 {
 	std::printf("\n[test] resource registry: creation-time facts, GPU VA, and the destruction sentinel\n");
 	namespace reg = stray_dlss::native::registry;
+	check(reg::arm(), "the sentinel page allocates");
 	stray_dlss::icept::ResourceId id = 0;
 	{
 		ComPtr<ID3D12Resource> buf = create_buffer(gpu, 256, D3D12_HEAP_TYPE_UPLOAD);
@@ -101,6 +102,140 @@ bool test_registry_liveness(Gpu &gpu)
 	} // the last reference goes here: the sentinel fires
 	check(!reg::is_live(id), "released buffer is NOT live, with no explicit destroy call");
 	check(reg::stats().sentinel_failures == 0, "the sentinel attached");
+	return true;
+}
+
+// A module handle for an address, or null when no module maps it — how the harness proves the
+// sentinel page is NOT inside this image (the thing an add-on reload unmaps).
+HMODULE module_containing(const void *addr)
+{
+	HMODULE h = nullptr;
+	if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(addr), &h))
+		return nullptr;
+	return h;
+}
+
+// The §15 hazard, closed: a sentinel attached in one life of the DLL must be harmless after
+// that life detaches, because the resource it rides on can die later — after ReShade has
+// unloaded the image (docs/STRAY-RENDERING-FACTS.md §14/§15). The vtable lives outside the
+// image and detach() turns it into inert stubs; the runtime's Release then reaches code that
+// is still mapped and does nothing. A second life re-arms and re-registers cleanly.
+bool test_registry_sentinel_survives_detach(Gpu &gpu)
+{
+	std::printf("\n[test] resource registry: sentinels outlive a detach without reaching this image\n");
+	namespace reg = stray_dlss::native::registry;
+	namespace sh = stray_dlss::native::shadow;
+	check(reg::arm(), "life 1 armed");
+	const void *vtbl = reg::sentinel_vtable_for_test();
+	check(vtbl != nullptr, "the sentinel vtable exists");
+	const HMODULE page_module = module_containing(vtbl);
+	const HMODULE our_module = module_containing(reinterpret_cast<const void *>(&test_registry_sentinel_survives_detach));
+	std::printf("  vtable page %p is in module %p; this code is in module %p\n", vtbl,
+		static_cast<void *>(page_module), static_cast<void *>(our_module));
+	check(page_module == nullptr, "the sentinel vtable page is mapped by NO module (VirtualAlloc, not the image)");
+	// Before detach the table points INTO this image (the real Release runs our code).
+	const void *const *live_entries = static_cast<const void *const *>(vtbl);
+	check(module_containing(live_entries[2]) == our_module, "before detach, Release points into this image");
+
+	// Life 1: a buffer that will outlive the detach, and one registered only to be counted.
+	ComPtr<ID3D12Resource> survivor = create_buffer(gpu, 256, D3D12_HEAP_TYPE_UPLOAD);
+	ComPtr<ID3D12Resource> doomed = create_buffer(gpu, 256, D3D12_HEAP_TYPE_UPLOAD);
+	if (!survivor || !doomed)
+	{
+		fail("could not create buffers");
+		return false;
+	}
+	const auto id_of = [](ID3D12Resource *r) { return reinterpret_cast<stray_dlss::icept::ResourceId>(r); };
+	reg::note_created(survivor.Get());
+	reg::note_created(doomed.Get());
+	check(reg::is_live(id_of(survivor.Get())) && reg::is_live(id_of(doomed.Get())), "both registered live in life 1");
+	const reg::Stats before = reg::stats();
+
+	// The host detaches (ReShade unloading the add-on across the device recreate).
+	reg::detach();
+	check(!reg::is_live(id_of(survivor.Get())), "after detach the registry knows nothing");
+	check(reg::stats().orphaned >= 2, "the two sentinels were orphaned");
+	check(module_containing(live_entries[2]) == nullptr, "after detach, Release points OUTSIDE every module (the inert stub)");
+	check(module_containing(live_entries[1]) == nullptr && module_containing(live_entries[0]) == nullptr,
+		"...and so do AddRef and QueryInterface");
+
+	// The resource dies while the image is "gone": the runtime calls the orphaned sentinel's
+	// Release. If that reached this image's code, on_destroyed would count it.
+	doomed.Reset();
+	check(reg::stats().destroyed == before.destroyed, "an orphaned sentinel's Release reaches NO callback");
+	std::printf("  the doomed buffer died after detach: destroyed=%llu (unchanged), no fault\n",
+		static_cast<unsigned long long>(reg::stats().destroyed));
+
+	// Life 2: re-arm, and re-register the survivor. SetPrivateDataInterface REPLACES life 1's
+	// sentinel (the runtime releases it into the stub) and attaches a live one.
+	reg::set_destroy_listener(&sh::forget_resource);
+	check(reg::arm(), "life 2 armed");
+	check(reg::sentinel_vtable_for_test() != vtbl, "life 2 has its own vtable page; life 1's is left inert");
+	reg::note_created(survivor.Get());
+	check(reg::is_live(id_of(survivor.Get())), "the survivor is live again in life 2");
+	const std::uint64_t destroyed_before = reg::stats().destroyed;
+	survivor.Reset();
+	check(reg::stats().destroyed == destroyed_before + 1, "the survivor's death fires life 2's sentinel, exactly once");
+	check(!reg::is_live(id_of(nullptr)) , "null is never live");
+	std::printf("  registered=%llu destroyed=%llu orphaned=%llu unarmed=%llu\n",
+		static_cast<unsigned long long>(reg::stats().registered), static_cast<unsigned long long>(reg::stats().destroyed),
+		static_cast<unsigned long long>(reg::stats().orphaned), static_cast<unsigned long long>(reg::stats().unarmed));
+	return true;
+}
+
+// The GPU-VA map resolves by RANGE: a root CBV into the interior of UE4's multi-MB upload ring,
+// and placed buffers that ALIAS one another on a heap (a small one inside a big one's span),
+// where a lookup past the inner one's end must still find the outer one.
+bool test_registry_va_ranges_ring_and_placed(Gpu &gpu)
+{
+	std::printf("\n[test] resource registry: GPU VA -> buffer by range (ring interior, aliased placed buffers)\n");
+	namespace reg = stray_dlss::native::registry;
+	reg::arm();
+	const auto id_of = [](ID3D12Resource *r) { return reinterpret_cast<stray_dlss::icept::ResourceId>(r); };
+	// An 8 MB upload "ring", addressed 4.7 MB in — run F's measured offsets.
+	ComPtr<ID3D12Resource> ring = create_buffer(gpu, 8u << 20, D3D12_HEAP_TYPE_UPLOAD);
+	if (!ring)
+	{
+		fail("could not create the ring");
+		return false;
+	}
+	reg::note_created(ring.Get());
+	stray_dlss::icept::BufferRange br;
+	check(reg::buffer_for_va(ring->GetGPUVirtualAddress() + 4706816, br) && br.buffer == id_of(ring.Get()) && br.offset == 4706816,
+		"an interior address of the ring resolves to (ring, 4706816)");
+	check(reg::buffer_for_va(ring->GetGPUVirtualAddress() + (8u << 20) - 1, br) && br.offset == (8u << 20) - 1, "...and its last byte");
+	check(!reg::buffer_for_va(ring->GetGPUVirtualAddress() + (8u << 20), br), "one past the ring's end is nothing");
+
+	// A heap with a big placed buffer and a small one ALIASING its middle.
+	D3D12_HEAP_DESC hd = {};
+	hd.SizeInBytes = 1u << 20;
+	hd.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+	hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+	ComPtr<ID3D12Heap> heap;
+	HR(gpu.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)));
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ComPtr<ID3D12Resource> big, small;
+	bd.Width = 512u << 10;
+	HR(gpu.device->CreatePlacedResource(heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&big)));
+	bd.Width = 4096;
+	HR(gpu.device->CreatePlacedResource(heap.Get(), 65536, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&small)));
+	reg::note_created(big.Get());
+	reg::note_created(small.Get());
+	const std::uint64_t big_va = big->GetGPUVirtualAddress(), small_va = small->GetGPUVirtualAddress();
+	std::printf("  big %llx +%u  small %llx +%u  (small - big = %lld)\n", static_cast<unsigned long long>(big_va), 512u << 10,
+		static_cast<unsigned long long>(small_va), 4096u, static_cast<long long>(small_va - big_va));
+	check(small_va > big_va && small_va < big_va + (512u << 10), "the small placed buffer lies INSIDE the big one's VA range");
+	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(small.Get()) && br.offset == 100, "inside the small one: the small one (innermost)");
+	check(reg::buffer_for_va(big_va + 100, br) && br.buffer == id_of(big.Get()) && br.offset == 100, "before the small one: the big one");
+	check(reg::buffer_for_va(big_va + 200000, br) && br.buffer == id_of(big.Get()) && br.offset == 200000,
+		"PAST the small one's end: still the big one (the range walk, not the nearest start)");
+	small.Reset(); // the sentinel erases its VA range too
+	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(big.Get()) && br.offset == small_va + 100 - big_va,
+		"after the small one dies, its addresses belong to the big one again");
 	return true;
 }
 
@@ -161,10 +296,31 @@ bool test_descriptor_shadow_copy_chain(Gpu &gpu)
 	sh::ViewEntry got;
 	check(sh::lookup(cpu, got) && got.resource == e.resource && got.format == e.format && got.width == 64,
 		"the copied slot holds the SRV entry");
+	check(got.via_copy && !got.is_null, "the copied slot is marked as written by a copy");
+	sh::ViewEntry src_entry;
+	check(sh::lookup(off0.ptr, src_entry) && !src_entry.via_copy && src_entry.seq < got.seq,
+		"the source slot was written by a view creation, earlier in the write sequence");
+
+	// A NULL view is a KNOWN empty slot, and copying it propagates that knowledge: the resolver
+	// must see "nothing bound here" rather than "unknown" (UE4 fills unbound registers from
+	// null descriptors; run F counted 3.6M such copies as unknown).
+	D3D12_CPU_DESCRIPTOR_HANDLE off1 = off0;
+	off1.ptr += inc;
+	const std::uint64_t unknown_copies_before = sh::unknown_copies();
+	sh::note_null_view(off1.ptr);
+	D3D12_CPU_DESCRIPTOR_HANDLE on6 = on5;
+	on6.ptr += inc;
+	sh::note_copy(on6.ptr, off1.ptr);
+	sh::ViewEntry null_entry;
+	check(sh::lookup(on6.ptr, null_entry) && null_entry.is_null && null_entry.resource == 0 && null_entry.via_copy,
+		"a copy of a null view is a known-null slot, not an unknown one");
+	check(sh::unknown_copies() == unknown_copies_before, "copying a null view is not an unknown copy");
+
 	const std::uint64_t unknown_before = sh::unknown_lookups();
 	tex.Reset(); // destroyed -> sentinel -> registry::on_destroyed -> shadow::forget_resource
 	check(!sh::lookup(cpu, got), "after the resource died the slot is forgotten");
 	check(!sh::lookup(off0.ptr, got), "...the offline slot too");
+	check(sh::lookup(on6.ptr, null_entry) && null_entry.is_null, "...but the null slot stays known-null");
 	sh::count_unknown_lookup();
 	check(sh::unknown_lookups() == unknown_before + 1, "unknown_lookups counts");
 	std::printf("  slots=%llu heaps=%llu unknown_copies=%llu\n", static_cast<unsigned long long>(sh::stats().slots),
@@ -488,6 +644,26 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	check(find(after.srvs, 2) == nullptr && find(after.srvs, 4) == nullptr, "after the depth texture died, t2 and t4 are absent");
 	check(find(after.srvs, 1) != nullptr && find(after.uavs, 0) != nullptr, "...and the others are still there");
 	check(sh::unknown_lookups() == unknown_before + 2, "unknown_lookups grew by exactly 2");
+	// Setting the SAME root signature again changes nothing: the root CBV survives in the
+	// shadow (vkd3d-proton early-outs on the same object; ReShade's tracker keeps its args).
+	gpu.list->SetComputeRootSignature(rs.Get());
+	icept::DispatchBindings same_rs;
+	native::backend().resolve_compute_bindings(ctx, same_rs);
+	check(same_rs.constant_buffers.size() == 1 && find(same_rs.srvs, 1) != nullptr,
+		"re-setting the same root signature keeps the root CBV and the tables in the shadow");
+	// A DIFFERENT one does invalidate: this signature is not the same object.
+	{
+		D3D12_ROOT_SIGNATURE_DESC empty = {};
+		ComPtr<ID3DBlob> eb, ee;
+		HR(D3D12SerializeRootSignature(&empty, D3D_ROOT_SIGNATURE_VERSION_1, &eb, &ee));
+		ComPtr<ID3D12RootSignature> other;
+		HR(gpu.device->CreateRootSignature(0, eb->GetBufferPointer(), eb->GetBufferSize(), IID_PPV_ARGS(&other)));
+		gpu.list->SetComputeRootSignature(other.Get());
+		icept::DispatchBindings changed;
+		native::backend().resolve_compute_bindings(ctx, changed);
+		check(changed.constant_buffers.empty() && changed.srvs.empty(), "a different root signature invalidates every root argument");
+		gpu.list->SetComputeRootSignature(rs.Get()); // back, for a clean close
+	}
 	std::printf("  unknown_lookups=%llu\n", static_cast<unsigned long long>(sh::unknown_lookups()));
 	native::log_stats("harness");
 	stray_dlss::diff::log_summary("harness");

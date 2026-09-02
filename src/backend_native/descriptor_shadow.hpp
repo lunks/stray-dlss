@@ -30,10 +30,19 @@ struct ViewEntry
 	bool is_buffer = false;
 	std::uint64_t buffer_offset = 0; // cbv: from the buffer's start
 	std::uint64_t buffer_size = 0;   // cbv: SizeInBytes
+	// A NULL view (Create*View with a null resource, or a CBV with no BufferLocation): the
+	// slot is KNOWN to hold nothing. Distinct from an unknown slot — UE4 fills every unbound
+	// register of a table from its null descriptors, so a lookup here is not a defect and
+	// must not count as one (run F: 3.6M "unknown" copies were exactly this).
+	bool is_null = false;
+	// Provenance, for adjudicating a disagreement: the global write sequence at which this
+	// slot was last written, and whether that write was a copy rather than a view creation.
+	std::uint64_t seq = 0;
+	bool via_copy = false;
 };
 
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry);
-// A null view (Create*View with a null resource): the slot holds nothing.
+// A null view: the slot now holds a known-null entry (see ViewEntry::is_null).
 void note_null_view(icept::DescriptorId cpu);
 // One descriptor of a CopyDescriptors(Simple). An unknown source clears the destination
 // and is counted (see unknown_copies).
@@ -53,6 +62,12 @@ void forget_resource(icept::ResourceId res);
 std::uint64_t unknown_lookups();
 void count_unknown_lookup();
 std::uint64_t unknown_copies();
+
+// A lookup that found a known-null slot. Not a defect; counted so the ratio is visible.
+std::uint64_t null_lookups();
+void count_null_lookup();
+// The current write sequence (every note_view / note_null_view / note_copy advances it).
+std::uint64_t write_sequence();
 
 struct Stats
 {

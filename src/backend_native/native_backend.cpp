@@ -92,6 +92,7 @@ bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope, bo
 	}
 
 	registry::set_destroy_listener(&shadow::forget_resource);
+	registry::arm(); // this life's sentinel page, outside the image (resource_registry.hpp)
 	const unsigned dev = scope != InstallScope::list_only ? hooks::install_device_hooks(real_device, !on_proxy) : 0;
 	const unsigned list = scope != InstallScope::device_only ? hooks::install_list_hooks(real_device) : 0;
 	g_device = real_device;
@@ -116,6 +117,9 @@ void uninstall()
 	if (g_device == nullptr)
 		return;
 	restore_all_patches();
+	// After the hooks, so no hook can register a resource into a registry that is going away;
+	// makes every sentinel of this life inert before the host can unmap us (§15 hazard).
+	registry::detach();
 	g_device = nullptr;
 	g_mode.store(static_cast<int>(Mode::off), std::memory_order_relaxed);
 	std::snprintf(g_report, sizeof(g_report), "native backend: uninstalled");
@@ -208,6 +212,11 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 			if (!shadow::gpu_to_cpu(gpu, cpu) || !shadow::lookup(cpu, e))
 			{
 				shadow::count_unknown_lookup();
+				continue;
+			}
+			if (e.is_null)
+			{
+				shadow::count_null_lookup(); // a known-null slot: nothing bound there, by the game's own hand
 				continue;
 			}
 			switch (s.kind)
@@ -384,6 +393,7 @@ Stats stats()
 {
 	Stats s;
 	s.unknown_lookups = shadow::unknown_lookups();
+	s.null_lookups = shadow::null_lookups();
 	s.unknown_copies = shadow::unknown_copies();
 	s.resolves = g_resolves.load(std::memory_order_relaxed);
 	s.resolves_no_layout = g_resolves_no_layout.load(std::memory_order_relaxed);
@@ -402,14 +412,16 @@ void log_stats(const char *when)
 	const Stats s = stats();
 	const registry::Stats r = registry::stats();
 	STRAY_LOG_INFO("NATIVE SHADOW [%s] mode=%s patches=%u resolves=%llu (no-layout %llu) unknown-lookups=%llu "
-		"unknown-copies=%llu root-signatures=%llu pipelines=%llu resources live=%llu (registered %llu, "
-		"destroyed %llu, sentinel-failures %llu) slots=%llu heaps=%llu",
+		"null-lookups=%llu unknown-copies=%llu root-signatures=%llu pipelines=%llu resources live=%llu (registered %llu, "
+		"destroyed %llu, sentinel-failures %llu, unarmed %llu) slots=%llu heaps=%llu",
 		when, mode_name(mode()), s.patches,
 		static_cast<unsigned long long>(s.resolves), static_cast<unsigned long long>(s.resolves_no_layout),
-		static_cast<unsigned long long>(s.unknown_lookups), static_cast<unsigned long long>(s.unknown_copies),
+		static_cast<unsigned long long>(s.unknown_lookups), static_cast<unsigned long long>(s.null_lookups),
+		static_cast<unsigned long long>(s.unknown_copies),
 		static_cast<unsigned long long>(s.root_signatures), static_cast<unsigned long long>(s.pipelines_hashed),
 		static_cast<unsigned long long>(s.resources_live), static_cast<unsigned long long>(r.registered),
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),
+		static_cast<unsigned long long>(r.unarmed),
 		static_cast<unsigned long long>(s.slots), static_cast<unsigned long long>(s.heaps));
 }
 

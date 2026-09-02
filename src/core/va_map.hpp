@@ -17,13 +17,19 @@ public:
 	void insert(std::uint64_t start, std::uint64_t size, std::uint64_t id);
 	// Removes every range carrying `id`.
 	void erase(std::uint64_t id);
-	// The range containing `va`; end is exclusive. `offset` is va - start.
+	// The range containing `va`; end is exclusive. `offset` is va - start. Ranges may NEST
+	// (a placed buffer inside another buffer's span on one heap): the INNERMOST — the one with
+	// the greatest start — wins, and an outer range is still found past the inner one's end.
+	// ReShade's registry stops at the first range starting at or before `va`, which misses the
+	// outer buffer whenever an inner one starts between them (measured: UE4's upload ring is
+	// addressed at interior offsets in the MB range by root CBVs, run F).
 	bool find(std::uint64_t va, std::uint64_t &id, std::uint64_t &offset) const;
 	std::size_t size() const { return m_ranges.size(); }
 
 private:
 	struct Range { std::uint64_t size; std::uint64_t id; };
 	std::map<std::uint64_t, Range> m_ranges; // keyed by start
+	std::uint64_t m_max_size = 0;            // bounds the backward walk in find()
 };
 
 } // namespace stray_dlss::core

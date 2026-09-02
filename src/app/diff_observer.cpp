@@ -41,25 +41,86 @@ std::string describe(const BoundTexture &t)
 	return buf;
 }
 
+// The verdict for one differing slot, from what each side named and what each liveness
+// tracker says about it. `oracle_res` / `native_res` are 0 where that side had nothing.
+struct Judged
+{
+	Verdict verdict = Verdict::unadjudicated;
+	int o_rs = -1, o_reg = -1, o_seen = -1; // the oracle's resource: live per ReShade / live per the registry / ever registered
+	int n_rs = -1, n_reg = -1, n_seen = -1; // the native side's resource, same three answers
+};
+
+Judged judge(icept::ResourceId oracle_res, icept::ResourceId native_res, const Adjudicator *adj)
+{
+	Judged j;
+	if (adj == nullptr || adj->oracle_live == nullptr || adj->native_live == nullptr || adj->native_seen == nullptr)
+		return j;
+	if (oracle_res != 0)
+	{
+		j.o_rs = adj->oracle_live(oracle_res) ? 1 : 0;
+		j.o_reg = adj->native_live(oracle_res) ? 1 : 0;
+		j.o_seen = adj->native_seen(oracle_res) ? 1 : 0;
+	}
+	if (native_res != 0)
+	{
+		j.n_rs = adj->oracle_live(native_res) ? 1 : 0;
+		j.n_reg = adj->native_live(native_res) ? 1 : 0;
+		j.n_seen = adj->native_seen(native_res) ? 1 : 0;
+	}
+	// In order of how much each answer proves. ReShade contradicting ITSELF — a view that maps
+	// to a resource its own destroy_resource event has retired — is the CLAUDE.md §5 stale map
+	// and needs no second tracker to convict. A resource the registry never registered is a
+	// blind spot of ours, not evidence about the resource. Only then do the two trackers get
+	// compared with each other.
+	if (oracle_res != 0 && j.o_rs == 0)
+		j.verdict = Verdict::reshade_stale;
+	else if (oracle_res != 0 && j.o_seen == 0)
+		j.verdict = Verdict::native_blind;
+	else if ((oracle_res != 0 && j.o_reg == 0) || (native_res != 0 && (j.n_rs == 0 || j.n_reg == 0)))
+		j.verdict = Verdict::liveness_conflict;
+	else if (native_res == 0)
+		j.verdict = Verdict::native_missed;
+	else if (oracle_res == 0)
+		j.verdict = Verdict::oracle_missed;
+	else
+		j.verdict = Verdict::both_live;
+	return j;
+}
+
+void append_judgement(std::string &line, const Judged &j, Result &out)
+{
+	++out.verdicts[static_cast<int>(j.verdict)];
+	if (j.verdict == Verdict::unadjudicated)
+		return;
+	char buf[160];
+	std::snprintf(buf, sizeof(buf), " [oracle-res live rs=%d reg=%d seen=%d | native-res live rs=%d reg=%d seen=%d] => %s",
+		j.o_rs, j.o_reg, j.o_seen, j.n_rs, j.n_reg, j.n_seen, verdict_name(j.verdict));
+	line += buf;
+}
+
 void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
-                   const std::vector<BoundTexture> &actual, Result &out)
+                   const std::vector<BoundTexture> &actual, Result &out, const Adjudicator *adj)
 {
 	for (const BoundTexture &e : expected)
 	{
 		const auto a = std::find_if(actual.begin(), actual.end(),
 			[&](const BoundTexture &t) { return t.slot == e.slot; });
-		char line[256];
+		char buf[256];
 		if (a == actual.end())
 		{
-			std::snprintf(line, sizeof(line), "%c%u: oracle=(%s) native=UNKNOWN", prefix, e.slot, describe(e).c_str());
+			std::snprintf(buf, sizeof(buf), "%c%u: oracle=(%s) native=UNKNOWN", prefix, e.slot, describe(e).c_str());
+			std::string line = buf;
+			append_judgement(line, judge(e.resource, 0, adj), out);
 			out.unknown.push_back(line);
 			continue;
 		}
 		if (a->resource != e.resource || a->format != e.format || a->width != e.width ||
 			a->height != e.height || a->is_3d != e.is_3d)
 		{
-			std::snprintf(line, sizeof(line), "%c%u: oracle=(%s) native=(%s)", prefix, e.slot,
+			std::snprintf(buf, sizeof(buf), "%c%u: oracle=(%s) native=(%s)", prefix, e.slot,
 				describe(e).c_str(), describe(*a).c_str());
+			std::string line = buf;
+			append_judgement(line, judge(e.resource, a->resource, adj), out);
 			out.mismatches.push_back(line);
 		}
 	}
@@ -69,8 +130,10 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 			[&](const BoundTexture &e) { return e.slot == a.slot; });
 		if (!known)
 		{
-			char line[256];
-			std::snprintf(line, sizeof(line), "%c%u: oracle=ABSENT native=(%s)", prefix, a.slot, describe(a).c_str());
+			char buf[256];
+			std::snprintf(buf, sizeof(buf), "%c%u: oracle=ABSENT native=(%s)", prefix, a.slot, describe(a).c_str());
+			std::string line = buf;
+			append_judgement(line, judge(0, a.resource, adj), out);
 			out.extra.push_back(line);
 		}
 	}
@@ -78,11 +141,27 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 
 } // namespace
 
-Result compare(const icept::DispatchBindings &expected, const icept::DispatchBindings &actual)
+const char *verdict_name(Verdict v)
+{
+	switch (v)
+	{
+	case Verdict::reshade_stale: return "RESHADE-STALE";
+	case Verdict::native_blind: return "NATIVE-BLIND";
+	case Verdict::liveness_conflict: return "LIVENESS-CONFLICT";
+	case Verdict::native_missed: return "NATIVE-MISSED";
+	case Verdict::oracle_missed: return "ORACLE-MISSED";
+	case Verdict::both_live: return "BOTH-LIVE";
+	case Verdict::unadjudicated: return "unadjudicated";
+	}
+	return "?";
+}
+
+Result compare(const icept::DispatchBindings &expected, const icept::DispatchBindings &actual,
+               const Adjudicator *adj)
 {
 	Result r;
-	compare_slots('t', expected.srvs, actual.srvs, r);
-	compare_slots('u', expected.uavs, actual.uavs, r);
+	compare_slots('t', expected.srvs, actual.srvs, r, adj);
+	compare_slots('u', expected.uavs, actual.uavs, r, adj);
 
 	// Constant buffers as a multiset of (buffer, offset): the oracle keys root CBVs by root
 	// PARAMETER index and table CBVs by register, so `first` is not comparable across
@@ -101,11 +180,13 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
 	{
 		const auto it = std::find_if(have.begin(), have.end(),
 			[&](const icept::BufferRange &h) { return h.buffer == w.buffer && h.offset == w.offset; });
-		char line[160];
+		char buf[160];
 		if (it == have.end())
 		{
-			std::snprintf(line, sizeof(line), "cb: oracle=(buf %llx +%llu) native=UNKNOWN",
+			std::snprintf(buf, sizeof(buf), "cb: oracle=(buf %llx +%llu) native=UNKNOWN",
 				static_cast<unsigned long long>(w.buffer), static_cast<unsigned long long>(w.offset));
+			std::string line = buf;
+			append_judgement(line, judge(w.buffer, 0, adj), r);
 			r.unknown.push_back(line);
 		}
 		else
@@ -115,9 +196,11 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
 	}
 	for (const auto &h : have)
 	{
-		char line[160];
-		std::snprintf(line, sizeof(line), "cb: oracle=ABSENT native=(buf %llx +%llu)",
+		char buf[160];
+		std::snprintf(buf, sizeof(buf), "cb: oracle=ABSENT native=(buf %llx +%llu)",
 			static_cast<unsigned long long>(h.buffer), static_cast<unsigned long long>(h.offset));
+		std::string line = buf;
+		append_judgement(line, judge(0, h.buffer, adj), r);
 		r.extra.push_back(line);
 	}
 
@@ -128,12 +211,15 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
 			expected.view_cb.offset != actual.view_cb.offset ||
 			expected.view_cb_register != actual.view_cb_register)
 		{
-			char line[200];
-			std::snprintf(line, sizeof(line), "view_cb: oracle=(valid %d buf %llx +%llu b%u) native=(valid %d buf %llx +%llu b%u)",
+			char buf[200];
+			std::snprintf(buf, sizeof(buf), "view_cb: oracle=(valid %d buf %llx +%llu b%u) native=(valid %d buf %llx +%llu b%u)",
 				expected.view_cb_valid ? 1 : 0, static_cast<unsigned long long>(expected.view_cb.buffer),
 				static_cast<unsigned long long>(expected.view_cb.offset), expected.view_cb_register,
 				actual.view_cb_valid ? 1 : 0, static_cast<unsigned long long>(actual.view_cb.buffer),
 				static_cast<unsigned long long>(actual.view_cb.offset), actual.view_cb_register);
+			std::string line = buf;
+			append_judgement(line, judge(expected.view_cb_valid ? expected.view_cb.buffer : 0,
+				actual.view_cb_valid ? actual.view_cb.buffer : 0, adj), r);
 			r.mismatches.push_back(line);
 		}
 	}
@@ -212,7 +298,8 @@ bool has_expected(void *native_list)
 }
 
 bool consume_and_compare(void *native_list, const icept::DispatchBindings &actual,
-                         std::uint64_t native_unknown_lookups)
+                         std::uint64_t native_unknown_lookups, const Adjudicator *adj,
+                         const char *native_note)
 {
 	if (!enabled() || !t_expected.valid || t_expected.list != native_list)
 		return false;
@@ -220,11 +307,13 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 	std::swap(e, t_expected);
 	t_expected.valid = false;
 
-	const Result r = compare(e.bindings, actual);
+	const Result r = compare(e.bindings, actual, adj);
 	const bool taa = is_known_taa_hash(e.hash);
 
 	std::lock_guard<std::mutex> lock(g_mutex);
 	++g_summary.dispatches;
+	for (int i = 0; i < kVerdictCount; ++i)
+		g_summary.verdicts[i] += r.verdicts[i];
 	if (taa)
 		++g_summary.taa_dispatches;
 	if (r.agree())
@@ -248,10 +337,13 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 			++g_logged_disagreements;
 			++per_hash;
 			STRAY_LOG_WARN("DIFF hash=%016llx %ux%u %s: %zu mismatch, %zu unknown, %zu extra "
-				"(native unknown-lookups so far %llu)%s",
+				"(native unknown-lookups so far %llu) | oracle srvs=%zu uavs=%zu cbs=%zu | native srvs=%zu uavs=%zu cbs=%zu%s%s%s",
 				static_cast<unsigned long long>(e.hash), e.x, e.y, taa ? "TAA" : "dispatch",
 				r.mismatches.size(), r.unknown.size(), r.extra.size(),
 				static_cast<unsigned long long>(native_unknown_lookups),
+				e.bindings.srvs.size(), e.bindings.uavs.size(), e.bindings.constant_buffers.size(),
+				actual.srvs.size(), actual.uavs.size(), actual.constant_buffers.size(),
+				native_note != nullptr ? " | " : "", native_note != nullptr ? native_note : "",
 				g_logged_disagreements == kMaxLoggedDisagreements ? " (last one logged; the summary keeps counting)" : "");
 			for (const auto &l : r.mismatches) STRAY_LOG_WARN("  MISMATCH %s", l.c_str());
 			for (const auto &l : r.unknown) STRAY_LOG_WARN("  UNKNOWN  %s", l.c_str());
@@ -280,6 +372,13 @@ void log_summary(const char *when)
 		static_cast<unsigned long long>(s.unconsumed),
 		static_cast<unsigned long long>(s.taa_dispatches), static_cast<unsigned long long>(s.taa_disagree),
 		static_cast<unsigned long long>(s.dispatches - s.agree));
+	// The adjudication, by differing SLOT: which side each convicts.
+	char verdicts[320];
+	int n = 0;
+	for (int i = 0; i < kVerdictCount && n < static_cast<int>(sizeof(verdicts)) - 48; ++i)
+		n += std::snprintf(verdicts + n, sizeof(verdicts) - n, "%s%s=%llu", i ? " " : "",
+			verdict_name(static_cast<Verdict>(i)), static_cast<unsigned long long>(s.verdicts[i]));
+	STRAY_LOG_INFO("DIFF VERDICTS [%s] slots: %s", when, verdicts);
 }
 
 } // namespace stray_dlss::diff

@@ -18,6 +18,12 @@ ListState &state_locked(::ID3D12GraphicsCommandList *list)
 
 void ListState::set_compute_root_signature(::ID3D12RootSignature *rs)
 {
+	// Setting the root signature that is ALREADY set changes nothing: vkd3d-proton's
+	// d3d12_command_list_set_root_signature early-outs on the same object (SOFT, from its
+	// source as remembered; the box run measures it), and ReShade's tracker keeps its root
+	// arguments unless the layout differs. Only a CHANGE invalidates the root arguments.
+	if (rs == compute_root_signature)
+		return;
 	compute_root_signature = rs;
 	compute_tables.clear();
 	compute_root_cbv.clear();

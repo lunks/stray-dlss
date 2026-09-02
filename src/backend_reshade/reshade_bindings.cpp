@@ -9,6 +9,7 @@
 #include <state_tracking.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -25,9 +26,13 @@ struct RootDescriptors
 {
 	std::vector<BoundTexture> srvs;
 	std::vector<BoundTexture> uavs;
-	// Every root constant buffer, not just the last. UE4 binds several, and which one carries
-	// the View uniform buffer is not fixed — keeping only one loses it on most frames.
-	std::vector<std::pair<uint32_t, icept::BufferRange>> constant_buffers;
+	// Every root constant buffer CURRENTLY bound, one per root parameter (last write wins, as
+	// D3D12 has it). UE4 binds several, and which one carries the View uniform buffer is not
+	// fixed — keeping only one lost it on most frames. This used to be an append-only list
+	// for the life of the command list: run F showed 31 entries with the same offset
+	// repeated seven times at one TAA dispatch, i.e. a HISTORY of every push since Reset,
+	// not what was bound — which made the oracle the wrong side of every `cb:` diff.
+	std::unordered_map<uint32_t, icept::BufferRange> root_cbv_range;
 
 	// --- everything needed to REPLAY the game's compute root arguments ---
 	//
@@ -46,6 +51,7 @@ struct RootDescriptors
 	void reset_root_args(std::uint64_t new_layout)
 	{
 		layout = new_layout;
+		root_cbv_range.clear();
 		root_cbv_va.clear();
 		root_srv_va.clear();
 		root_uav_va.clear();
@@ -218,8 +224,8 @@ void note_push_descriptors(
 			if (ranges[i].buffer.handle != 0)
 			{
 				const icept::BufferRange br = to_range(ranges[i]);
-				rd.constant_buffers.emplace_back(layout_param, br);
 				// Last write wins per root parameter, which matches D3D12 semantics.
+				rd.root_cbv_range[layout_param] = br;
 				rd.root_cbv_va[layout_param] = gpu_address(br);
 			}
 			break;
@@ -547,8 +553,11 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 			const RootDescriptors &rd = rit->second;
 			out.srvs.insert(out.srvs.end(), rd.srvs.begin(), rd.srvs.end());
 			out.uavs.insert(out.uavs.end(), rd.uavs.begin(), rd.uavs.end());
-			out.constant_buffers.insert(out.constant_buffers.end(),
-				rd.constant_buffers.begin(), rd.constant_buffers.end());
+			for (const auto &cb : rd.root_cbv_range)
+				out.constant_buffers.emplace_back(cb.first, cb.second);
+			// Deterministic order (by root parameter), so two resolves of one state read alike.
+			std::sort(out.constant_buffers.begin(), out.constant_buffers.end(),
+				[](const auto &a, const auto &b) { return a.first < b.first; });
 		}
 	}
 

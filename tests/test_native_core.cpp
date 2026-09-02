@@ -191,3 +191,91 @@ TEST_CASE("diff live machinery: publish/consume is per thread and per list, and 
 	diff::publish_expected(&list_a, 1, 40, 20, a);
 	CHECK_FALSE(diff::consume_and_compare(&list_a, a, 0)); // disabled: inert
 }
+
+TEST_CASE("VaMap: a placed buffer nested inside a bigger one, and a sub-allocated ring resolve by RANGE")
+{
+	// UE4's constant/upload ring is ONE big buffer that root CBVs address at arbitrary interior
+	// offsets (run F: offsets up to +5505024 into one resource), and placed resources can sit
+	// INSIDE another buffer's VA range on the same heap. A lookup that only inspects the range
+	// starting at or before the address (ReShade's shape) misses the outer buffer whenever an
+	// inner one starts between them.
+	core::VaMap m;
+	m.insert(0x100000, 8u << 20, 1); // an 8 MB ring
+	m.insert(0x102000, 0x100, 2);    // a small placed buffer inside it
+	std::uint64_t id = 0, off = 0;
+	CHECK(m.find(0x102050, id, off)); CHECK(id == 2); CHECK(off == 0x50);  // the innermost wins
+	CHECK(m.find(0x103000, id, off)); CHECK(id == 1); CHECK(off == 0x3000); // past the inner one: the ring
+	CHECK(m.find(0x100000 + 5505024, id, off)); CHECK(id == 1); CHECK(off == 5505024);
+	CHECK(m.find(0x100000 + (8u << 20) - 1, id, off)); CHECK(id == 1);
+	CHECK_FALSE(m.find(0x100000 + (8u << 20), id, off));
+	m.erase(2);
+	CHECK(m.find(0x102050, id, off)); CHECK(id == 1); CHECK(off == 0x2050);
+	// Two rings side by side, the second registered lazily AFTER an interior address was
+	// already being used: only the range matters, never the registration order.
+	m.insert(0x900000, 8u << 20, 3);
+	CHECK(m.find(0x900000 + 4706816, id, off)); CHECK(id == 3); CHECK(off == 4706816);
+	CHECK(m.find(0x100000 + 4706816, id, off)); CHECK(id == 1);
+}
+
+TEST_CASE("diff adjudication: a stale oracle map is convicted by its own liveness, and the classes are named")
+{
+	// Liveness as the two trackers would answer it.
+	//   0xdead: ReShade's destroy_resource fired (live=0) but its view->resource map still names
+	//           it (CLAUDE.md §5); the registry saw it die too.            -> RESHADE-STALE
+	//   0x7777: live per ReShade, NEVER registered by the registry.          -> NATIVE-BLIND
+	//   0xbeef: dead per ReShade, live per the registry.                     -> LIVENESS-CONFLICT
+	//   everything else: live and seen on both sides.
+	static const auto oracle_live = [](icept::ResourceId r) { return r != 0xdead && r != 0xbeef; };
+	static const auto native_live = [](icept::ResourceId r) { return r != 0xdead && r != 0x7777; };
+	static const auto native_seen = [](icept::ResourceId r) { return r != 0x7777; };
+	diff::Adjudicator adj;
+	adj.oracle_live = oracle_live;
+	adj.native_live = native_live;
+	adj.native_seen = native_seen;
+
+	icept::DispatchBindings oracle, native;
+	oracle.srvs.push_back(BoundTexture{ 6, 0xdead, TexFormat::unknown, 0, 0, 0xa6 });  // stale in ReShade
+	native.srvs.push_back(BoundTexture{ 6, 0x1111, TexFormat::unknown, 0, 0, 0xa6 });
+	oracle.srvs.push_back(BoundTexture{ 8, 0x2222, TexFormat::unknown, 0, 0, 0xa8 });  // both live, differ
+	native.srvs.push_back(BoundTexture{ 8, 0x3333, TexFormat::unknown, 0, 0, 0xa8 });
+	oracle.srvs.push_back(BoundTexture{ 9, 0x4444, TexFormat::unknown, 0, 0, 0xa9 });  // native has nothing
+	oracle.srvs.push_back(BoundTexture{ 10, 0x7777, TexFormat::unknown, 0, 0, 0xaa }); // the registry never saw it
+	native.uavs.push_back(BoundTexture{ 2, 0x5555, TexFormat::unknown, 0, 0, 0xb2 });  // oracle has nothing
+	oracle.uavs.push_back(BoundTexture{ 3, 0x6666, TexFormat::unknown, 0, 0, 0xb3 });
+	native.uavs.push_back(BoundTexture{ 3, 0xbeef, TexFormat::unknown, 0, 0, 0xb3 });  // native names a ReShade-dead one
+	oracle.constant_buffers.emplace_back(1u, icept::BufferRange{ 0xdead, 4096, icept::kUnknownSize });
+
+	const diff::Result r = diff::compare(oracle, native, &adj);
+	REQUIRE(r.mismatches.size() == 3);
+	REQUIRE(r.unknown.size() == 3);
+	REQUIRE(r.extra.size() == 1);
+	CHECK(r.mismatches[0].find("=> RESHADE-STALE") != std::string::npos);
+	CHECK(r.mismatches[0].find("oracle-res live rs=0 reg=0 seen=1") != std::string::npos);
+	CHECK(r.mismatches[1].find("=> BOTH-LIVE") != std::string::npos);
+	CHECK(r.mismatches[2].find("=> LIVENESS-CONFLICT") != std::string::npos); // 0xbeef
+	CHECK(r.unknown[0].find("=> NATIVE-MISSED") != std::string::npos);
+	CHECK(r.unknown[1].find("=> NATIVE-BLIND") != std::string::npos);
+	CHECK(r.unknown[2].rfind("cb:", 0) == 0);
+	CHECK(r.unknown[2].find("=> RESHADE-STALE") != std::string::npos); // the cb into a dead buffer
+	CHECK(r.extra[0].find("=> ORACLE-MISSED") != std::string::npos);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] == 2);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::native_blind)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::both_live)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::liveness_conflict)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::oracle_missed)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 0);
+	// Without an adjudicator every differing slot is unadjudicated and the lines are bare.
+	const diff::Result bare = diff::compare(oracle, native);
+	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 7);
+	CHECK(bare.mismatches[0].find("=>") == std::string::npos);
+	// The live machinery accumulates verdicts into the summary.
+	diff::set_enabled(true);
+	const diff::Summary before = diff::summary();
+	int list = 0;
+	diff::publish_expected(&list, 0x1, 40, 20, oracle);
+	CHECK(diff::consume_and_compare(&list, native, 0, &adj, "shadow rs=0 tables=0 root-cbv=0"));
+	const diff::Summary after = diff::summary();
+	CHECK(after.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] - before.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] == 2);
+	diff::set_enabled(false);
+}

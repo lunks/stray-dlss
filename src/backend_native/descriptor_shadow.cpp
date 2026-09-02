@@ -28,7 +28,9 @@ struct HeapRecord
 std::vector<HeapRecord> g_heaps;
 
 std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
+std::atomic<std::uint64_t> g_null_lookups{ 0 };
 std::atomic<std::uint64_t> g_unknown_copies{ 0 };
+std::atomic<std::uint64_t> g_seq{ 0 };
 std::uint64_t g_views = 0;
 std::uint64_t g_copies = 0;
 
@@ -39,7 +41,10 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 	if (cpu == 0)
 		return;
 	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	g_slots[cpu] = entry;
+	ViewEntry &slot = g_slots[cpu];
+	slot = entry;
+	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	slot.via_copy = false;
 	if (entry.resource != 0)
 		g_by_resource[entry.resource].push_back(cpu);
 	++g_views;
@@ -50,7 +55,10 @@ void note_null_view(icept::DescriptorId cpu)
 	if (cpu == 0)
 		return;
 	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	g_slots.erase(cpu);
+	ViewEntry &slot = g_slots[cpu];
+	slot = ViewEntry{};
+	slot.is_null = true;
+	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	++g_views;
 }
 
@@ -69,7 +77,9 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src)
 		g_unknown_copies.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	const ViewEntry copy = it->second;
+	ViewEntry copy = it->second;
+	copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	copy.via_copy = true;
 	g_slots[dst] = copy;
 	if (copy.resource != 0)
 		g_by_resource[copy.resource].push_back(dst);
@@ -163,6 +173,9 @@ void forget_resource(icept::ResourceId res)
 std::uint64_t unknown_lookups() { return g_unknown_lookups.load(std::memory_order_relaxed); }
 void count_unknown_lookup() { g_unknown_lookups.fetch_add(1, std::memory_order_relaxed); }
 std::uint64_t unknown_copies() { return g_unknown_copies.load(std::memory_order_relaxed); }
+std::uint64_t null_lookups() { return g_null_lookups.load(std::memory_order_relaxed); }
+void count_null_lookup() { g_null_lookups.fetch_add(1, std::memory_order_relaxed); }
+std::uint64_t write_sequence() { return g_seq.load(std::memory_order_relaxed); }
 
 Stats stats()
 {
@@ -182,6 +195,7 @@ void clear_for_test()
 	g_by_resource.clear();
 	g_heaps.clear();
 	g_unknown_lookups.store(0);
+	g_null_lookups.store(0);
 	g_unknown_copies.store(0);
 	g_views = g_copies = 0;
 }

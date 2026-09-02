@@ -1744,6 +1744,8 @@ int main(int argc, char **argv)
 	// The native backend last: its hooks are installed on this device and never restored.
 	test_vtable_patch_roundtrip(gpu);
 	test_registry_liveness(gpu);
+	test_registry_sentinel_survives_detach(gpu);
+	test_registry_va_ranges_ring_and_placed(gpu);
 	test_descriptor_shadow_copy_chain(gpu);
 	test_native_stream_walk();
 	test_native_hooks_ue4_shaped_frame(gpu);

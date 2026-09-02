@@ -81,6 +81,7 @@ NativeBackend &backend();
 struct Stats
 {
 	std::uint64_t unknown_lookups = 0;   // the assessment §6.2 counter
+	std::uint64_t null_lookups = 0;      // known-null slots met by the resolver (not defects)
 	std::uint64_t unknown_copies = 0;
 	std::uint64_t resolves = 0;          // native resolve_compute_bindings calls
 	std::uint64_t resolves_no_layout = 0; // list had no root signature we deserialized
