@@ -719,7 +719,8 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 						"installing on the real device instead.");
 				}
 			}
-			const bool ok = native::install(install_on, mode, native::install_scope_from_string(scope));
+			const bool ok = native::install(install_on, mode, native::install_scope_from_string(scope),
+				install_on != native);
 			diff::set_enabled(ok && native::mode() == native::Mode::observe);
 			STRAY_LOG_WARN("NativeMode=%s ([STRAYDLSS] NativeMode, read as \"%s\"): %s. Grep 'DIFF' and "
 				"'NATIVE SHADOW'.", native::mode_name(native::mode()), native_mode, native::attach_report());

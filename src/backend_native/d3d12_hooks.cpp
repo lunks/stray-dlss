@@ -626,7 +626,7 @@ const void *find_cs_in_stream(const void *, std::size_t, std::size_t &length, co
 
 // ---- installation ----
 
-unsigned install_device_hooks(::ID3D12Device *device)
+unsigned install_device_hooks(::ID3D12Device *device, bool query_device2)
 {
 	if (device == nullptr)
 		return 0;
@@ -656,6 +656,11 @@ unsigned install_device_hooks(::ID3D12Device *device)
 	// object covering its newest interface — measured); patch it only if the device is a
 	// Device2 at all.
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
+	if (!query_device2)
+	{
+		hook(slot::kDevice2_CreatePipelineState, reinterpret_cast<void *>(&hk_CreatePipelineState), reinterpret_cast<void **>(&g_orig_CreatePipelineState), "ID3D12Device2::CreatePipelineState (unqueried)");
+		return n;
+	}
 	ID3D12Device2 *dev2 = nullptr;
 	if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dev2))) && dev2 != nullptr)
 	{

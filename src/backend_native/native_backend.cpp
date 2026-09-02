@@ -71,7 +71,7 @@ InstallScope install_scope_from_string(const char *s)
 void set_use_sentinel(bool enabled) { g_use_sentinel.store(enabled, std::memory_order_relaxed); }
 bool use_sentinel() { return g_use_sentinel.load(std::memory_order_relaxed); }
 
-bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope)
+bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope, bool on_proxy)
 {
 	if (real_device == nullptr || requested == Mode::off)
 	{
@@ -92,15 +92,15 @@ bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope)
 	}
 
 	registry::set_destroy_listener(&shadow::forget_resource);
-	const unsigned dev = scope != InstallScope::list_only ? hooks::install_device_hooks(real_device) : 0;
+	const unsigned dev = scope != InstallScope::list_only ? hooks::install_device_hooks(real_device, !on_proxy) : 0;
 	const unsigned list = scope != InstallScope::device_only ? hooks::install_list_hooks(real_device) : 0;
 	g_device = real_device;
 	g_mode.store(static_cast<int>(requested), std::memory_order_relaxed);
 	const char *scope_name = scope == InstallScope::device_only ? "device-only"
 		: scope == InstallScope::list_only ? "list-only" : "all";
 	std::snprintf(g_report, sizeof(g_report),
-		"native backend: mode=%s scope=%s sentinel=%d device=%p device-slots=%u list-slots=%u patches=%u increment=%u",
-		mode_name(requested), scope_name, use_sentinel() ? 1 : 0, static_cast<void *>(real_device), dev, list,
+		"native backend: mode=%s scope=%s sentinel=%d target=%s device=%p device-slots=%u list-slots=%u patches=%u increment=%u",
+		mode_name(requested), scope_name, use_sentinel() ? 1 : 0, on_proxy ? "proxy" : "real", static_cast<void *>(real_device), dev, list,
 		patch_count(), hooks::descriptor_increment());
 	const bool complete = (scope == InstallScope::device_only && dev != 0) ||
 		(scope == InstallScope::list_only && list != 0) || (scope == InstallScope::all && dev != 0 && list != 0);

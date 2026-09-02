@@ -13,7 +13,11 @@ namespace stray_dlss::native::hooks {
 
 // Patches the device slots and, through a throwaway command list of `device`, the
 // command-list slots. Returns how many slots were patched (0 = failure).
-unsigned install_device_hooks(::ID3D12Device *device);
+// `query_device2`: whether to QueryInterface for ID3D12Device2 before patching its slot. On
+// vkd3d's real device that is safe; on ReShade's PROXY, inside ReShade's own init_device
+// callback, a QueryInterface re-enters ReShade and DEADLOCKS (measured 2026-09-01) — and the
+// proxy implements every device version in one vtable anyway, so the slot is patched blind.
+unsigned install_device_hooks(::ID3D12Device *device, bool query_device2 = true);
 unsigned install_list_hooks(::ID3D12Device *device);
 
 // The deserialized layout of a root signature created through the hooks. False if unknown.
