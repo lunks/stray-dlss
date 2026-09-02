@@ -68,9 +68,12 @@ SLOT_IS(IDXGIFactory2Vtbl, CreateSwapChainForCoreWindow, 16);
 SLOT_IS(IDXGIFactory2Vtbl, CreateSwapChainForComposition, 24);
 SLOT_IS(IDXGISwapChainVtbl, Present, 8);
 SLOT_IS(IDXGISwapChainVtbl, GetBuffer, 9);
+SLOT_IS(IDXGISwapChainVtbl, SetFullscreenState, 10);
 SLOT_IS(IDXGISwapChainVtbl, ResizeBuffers, 13);
+SLOT_IS(IDXGISwapChainVtbl, ResizeTarget, 14);
 SLOT_IS(IDXGISwapChain1Vtbl, Present1, 22);
 SLOT_IS(IDXGISwapChain3Vtbl, GetCurrentBackBufferIndex, 36);
+SLOT_IS(IDXGISwapChain3Vtbl, SetColorSpace1, 38);
 SLOT_IS(IDXGISwapChain3Vtbl, ResizeBuffers1, 39);
 
 /* A translation unit needs at least one declaration under strict C. */

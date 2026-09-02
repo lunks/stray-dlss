@@ -67,9 +67,12 @@ constexpr unsigned kFactory2_CreateSwapChainForComposition = 24;
 // IDXGISwapChain1 18-28, IDXGISwapChain2 29-35, IDXGISwapChain3 36-39.
 constexpr unsigned kSwapChain_Present = 8;
 constexpr unsigned kSwapChain_GetBuffer = 9;
+constexpr unsigned kSwapChain_SetFullscreenState = 10;
 constexpr unsigned kSwapChain_ResizeBuffers = 13;
+constexpr unsigned kSwapChain_ResizeTarget = 14;
 constexpr unsigned kSwapChain1_Present1 = 22;
 constexpr unsigned kSwapChain3_GetCurrentBackBufferIndex = 36;
+constexpr unsigned kSwapChain3_SetColorSpace1 = 38;
 constexpr unsigned kSwapChain3_ResizeBuffers1 = 39;
 
 } // namespace stray_dlss::native::slot

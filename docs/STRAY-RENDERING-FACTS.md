@@ -1005,3 +1005,185 @@ the specific mod was StrayFur.
 plugin driving — `present owner: factory ... (class implemented by ...\Win64\dxgi.dll)` (ReShade's
 proxy factory), `DLSS feature created: 1920x1080 -> 3840x2160`, three reload cycles, no crash,
 parity with the other SR+NR arms.
+
+## 30. The DLSS-G (NGX feature 11) parameter contract, read out of `nvngx_dlssg.dll` (2026-09-02, offline)
+
+Frame generation, stage 2 of the FG plan. CLAUDE.md §5 rule: an NGX parameter block is an
+untyped string->value map with no validation, so **a name the snippet does not implement is
+silently ignored** — every `DLSSG.*` name the plugin writes had to be confirmed by exact
+null-terminated string search over the binary that reads it BEFORE any code depends on it.
+The instrument is `tools/ngx_param_names.py` (re-runnable against any copy of the DLL).
+
+**Subject.** The box is offline (2026-09-02), so its staged `SL 2.13` copy could not be read.
+The contract was read from the newest public Streamline SDK release on GitHub,
+`NVIDIA-RTX/Streamline` **v2.12.0** (2026-06-23, `streamline-sdk-v2.12.0.zip`, 231 958 617 B):
+
+| file | size | md5 |
+|---|---|---|
+| `bin/x64/nvngx_dlssg.dll` (release, the one the contract is read from) | 7 519 856 | `9937f1746696ebcad879ef2781343168` |
+| `bin/x64/development/nvngx_dlssg.dll` | 13 959 792 | `66d30d107ca0de33cf75d1f7f329c6c5` |
+| `bin/x64/sl.dlss_g.dll` (the reference CALLER, cross-check) | 612 992 | — |
+
+**UNCONFIRMED until the box is back:** that SL 2.13's `nvngx_dlssg.dll` (7.4 MB on the box)
+carries the same name set. Run `python3 tools/ngx_param_names.py <box copy> --check <the
+list below>` first thing; a name that flips to ABSENT retires the corresponding write.
+
+### 30.1 Verdicts, verbatim from the tool (release 2.12.0 snippet)
+
+94 of the 106 names checked are PRESENT (exact `\0NAME\0`). Every one the plugin writes is in
+the PRESENT set. The 12 ABSENT ones, and why each was checked:
+
+```
+  check DLSSG.EnableInterp        ABSENT   Nukem's dlssg-to-fsr3 reads it; NVIDIA forum 247260 lists it
+  check DLSSG.IsRecording         ABSENT   forum 247260 calls it "really important" (2023, DLSS 3 era)
+  check DLSSG.CmdQueue            ABSENT   forum 247260; sl.dlss_g.dll DOES contain it
+  check DLSSG.CmdAlloc            ABSENT   forum 247260; sl.dlss_g.dll DOES contain it
+  check DLSSG.FenceEvent          ABSENT   forum 247260; sl.dlss_g.dll DOES contain it
+  check DLSSG.NumFrames           ABSENT   forum 247260
+  check DLSSG.CameraForwardX      ABSENT   forum 247260 (the real name is DLSSG.CameraFwdX)
+  check Enable.OFA                ABSENT   forum 247260 (optical flow: DLSS 3 only; DLSS 4 FG has none)
+  check DLSSG.QueueSubmitCallback ABSENT   sl.dlss_g.dll contains it
+  check DLSSG.SyncSignalCallback  ABSENT   sl.dlss_g.dll contains it
+  check FrameInterpolation.Available ABSENT  the SDK header (v310.7.0) has NeedsUpdatedDriver / MinDriverVersionMajor / FeatureInitResult for FrameInterpolation, no Available
+  check FrameGeneration.Available ABSENT   guessed by analogy with SuperSampling.Available
+```
+
+Substring search ("fragment") is also 0 for `EnableInterp`, `CmdQueue`, `CmdAlloc`, `FenceEvent`,
+`Sync`, `QueueSubmit`, `IsRecording`, `NumFrames`, `OFA`, `Present`, `Flip` — the snippet does
+not build those names at run time either. **Reading:** the queue/allocator/fence-event/sync
+callbacks and `EnableInterp` are Streamline-internal keys shared between `sl.dlss_g` and
+`sl.common` (the SL pacer and present thread live there, not in the snippet); Nukem's
+replacement reads `EnableInterp` because SL's parameter object carries every key it ever set.
+**The snippet itself has no present path, no queue and no pacer: `EvaluateFeature` records
+interpolation work onto the command list it is handed, and presenting the result is the
+caller's job.** HARD (from the strings; the OptiScaler session in CLAUDE.md §5 measured the
+snippet's `Dispatch Result: Ok` through SL, which is the same call).
+
+### 30.2 The full `DLSSG.*` name set of the 2.12.0 snippet (135 names), classified
+
+Classification is from three sources: present in the snippet (S), present in `sl.dlss_g.dll`
+(C, i.e. the reference caller sets it), read by Nukem's dlssg-to-fsr3 (N, i.e. a caller-set
+value that a replacement snippet consumes). A name that is S but not C is either an OUTPUT
+of the snippet or a registry/DRS-driven tuning key; a name that is C but not S is SL-internal.
+
+**Creation-time (S+C), and the plain NGX names:** `Width` `Height` `CreationNodeMask`
+`VisibilityNodeMask` (the core's own creation keys; Nukem reads `Width`/`Height` as the
+swapchain size), `DLSSG.Width` `DLSSG.Height` `DLSSG.InternalWidth` `DLSSG.InternalHeight`
+`DLSSG.BackbufferFormat` `DLSSG.ColorBuffersHDR` `DLSSG.DynamicResolution`
+`DLSSG.MultiFrameCount` `DLSSG.MultiFrameIndex` `DLSSG.MultiFrameCountMax`
+`DLSSG.UserInterfaceRecompositionEnabled` `DLSSG.MenuDetectionEnabled` `DLSSG.TargetFrameRate`
+`DLSSG.StreamlineMode` `DLSSG.StreamlineVersionTag` `DLSSG.ModelVersion` `DLSSG.EvalFlags`
+`DLSSG.AutomodeOverrideReset` `DLSSG.NvAppOvrAppliedVal.MultiFrameCount`
+`DLSSG.NvAppOvrAppliedVal.StreamlineMode`.
+
+**Per-evaluate resources (S+C+N), each with `SubrectBaseX/BaseY/Width/Height` siblings:**
+`DLSSG.Backbuffer` (required; the FINAL colour frame, `InputBackbufferSubrect*` also exist, S only)
+`DLSSG.Depth` (required) `DLSSG.MVecs` (required) `DLSSG.HUDLess` (optional, stage 3)
+`DLSSG.UI` + `DLSSG.UIAlpha` (optional) `DLSSG.NoWarp` (optional) `DLSSG.BidirectionalDistortionField`
+(+ `LowPrecision.Bias/Scale/IsLowPrecision`, optional) `DLSSG.OutputInterpolated` (the generated
+frame, UAV; required) `DLSSG.OutputReal` (S+C+N: Nukem COPIES the back buffer into it when
+provided; optional for us). `DLSSG.BackbufferFrameID` (S+C: a per-frame id, SL sets it).
+
+**Per-evaluate constants (S+C, Nukem reads the starred ones):** `DLSSG.JitterOffsetX/Y`*
+`DLSSG.MvecScaleX/Y`* `DLSSG.MvecJittered`* `DLSSG.MvecDilated`* `DLSSG.MvecInvalidValue`
+`DLSSG.CameraMotionIncluded` `DLSSG.DepthInverted`* `DLSSG.OrthoProjection`* `DLSSG.Reset`*
+`DLSSG.ColorBuffersHDR`* `DLSSG.CameraViewToClip`* `DLSSG.ClipToCameraView` `DLSSG.ClipToPrevClip`
+`DLSSG.PrevClipToClip` `DLSSG.ClipToLensClip` `DLSSG.CameraNear`* `DLSSG.CameraFar`*
+`DLSSG.CameraFOV`* `DLSSG.CameraAspectRatio` `DLSSG.CameraPinholeOffsetX/Y`
+`DLSSG.CameraPosX/Y/Z` `DLSSG.CameraUpX/Y/Z` `DLSSG.CameraRightX/Y/Z` `DLSSG.CameraFwdX/Y/Z`
+`DLSSG.MinRelativeLinearDepthObjectSeparation` `DLSSG.NotRenderingGameFrames`
+`DLSSG.FullscreenMode` `DLSSG.OutputDisableInterpolation`. The matrices are `void*` to a
+row-major float[16] (`sl_consts.h`: "All SL matrices are row-major and should not contain
+any jitter offsets"; `clipToPrevClip = clipToView * viewToViewPrev * viewToClipPrev`,
+`prevClipToClip = clipToPrevClip.inverse()`).
+
+**Snippet outputs / self-populated (S only, or S+N where Nukem's replacement SETS them):**
+`DLSSG.MustCallEval` `DLSSG.BurstCaptureRunning` `DLSSG.ReflexWarp.Available`
+`DLSSG.GetCurrentSettingsCallback` `DLSSG.EstimateVRAMCallback` (the four the snippet's
+`PopulateParameters_Impl` writes for SL to read; Nukem's `NVSDK_NGX_D3D12_PopulateParameters_Impl`
+sets exactly these) plus `DLSSG.IndicatorLevel` `DLSSG.UseReflexMatrices` `DLSSG.AsyncCreateEnabled`
+`DLSSG.LinearizedDepth_Scale` `DLSSG.LinearizedDepth_NearFarPartition`
+`DLSSG.ResourceAlwaysProvidedFlags` `DLSSG.ResourceNeverProvidedFlags` `DLSSG.OutputRealSubrect*`
+`DLSSG.OutputInterpolatedSubrect*` `DLSSG.InputBackbufferSubrect*` (S only; DRS/registry or
+internal). `DLSSG.UserDebugText` is in the development snippet and `sl.dlss_g` only.
+
+**SL-internal (C only):** `DLSSG.EnableInterp` `DLSSG.CmdQueue` `DLSSG.CmdAlloc`
+`DLSSG.FenceEvent` `DLSSG.IsRecording` `DLSSG.QueueSubmitCallback[Data]`
+`DLSSG.SyncFlushCallback[Data]` `DLSSG.SyncSignalCallback[Data]` `DLSSG.SyncSignalOnlyCallback[Data]`
+`DLSSG.SyncWaitCallback[Data]` `DLSSG.SyncWaitOnlyCallback[Data]` `DLSSG.VkOFAModeRequest`
+`DLSSG.run_lowres_mvec_pass`.
+
+### 30.3 Other facts read from the same binaries and the SDK
+
+* **Snippet-side exports** (the API `nvngx.dll` calls; the same shape as `nvngx_dlssnr.dll`,
+  CLAUDE.md §5): `NVSDK_NGX_D3D12_Init`, `_Init_Ext`, `_CreateFeature`, `_EvaluateFeature`,
+  `_ReleaseFeature`, `_Shutdown`, `_Shutdown1`, `_GetScratchBufferSize`,
+  `_GetFeatureRequirements`, `_PopulateParameters_Impl`, `_PopulateDeviceParameters_Impl`, and
+  the D3D11/Vulkan/CUDA twins, plus `NVSDK_NGX_GetSnippetVersion`, `NVSDK_NGX_GetGPUArchitecture`,
+  `NVSDK_NGX_GetDriverVersionEx`, `NVSDK_NGX_SetOverrideStatusCallback`,
+  `NVSDK_NGX_SetTelemetryEvaluateCallback`. HARD.
+* **The feature id is `NVSDK_NGX_Feature_FrameGeneration = 11`** (`nvsdk_ngx_defs.h:210`, the
+  vendored v310.7.0 SDK); Nukem's `NGXHandle::Allocate(11)` agrees. HARD.
+* **The snippet's own D3D12 error strings** are only "Invalid D3D12 device" / "Invalid D3D12
+  graphics command list" / "Invalid D3D12 graphics device" — it validates the objects it is
+  handed and nothing about the resources. A missing or wrong resource is therefore the
+  CLAUDE.md §5 "hang or garbage, never a returned error" class, same as feature 18. HARD
+  (string set), consequence SOFT.
+* **The cubin layer's format table** (`NGXCubinFormat_*`) includes `RGB10A2UN`, `RGBA16F`,
+  `RG16F`, `RG32F`, `R32F`, `R16F`, `RGBA8UN`, `BGRA8UN`, `R8UN`, `RGB11F` — so an
+  `R10G10B10A2_UNORM` back buffer is a format the D3D12 cubin path knows. HARD that the name is
+  there; SOFT that it is accepted for `DLSSG.Backbuffer`/`OutputInterpolated` (the SL guide
+  §11.0, HARD: "please make sure to use UINT10/RGB10 pixel format and HDR10/BT.2100 color
+  space ... DLSS-G currently does NOT support FP16 pixel format and scRGB").
+* **Motion-vector scale convention (SL guide §7.0, HARD):** `mvecScale = {1,1}` if the buffer
+  is already in [-1,1]; `{1/renderWidth, 1/renderHeight}` if it is in pixel space. Our resolve
+  emits render-resolution PIXELS (CLAUDE.md §5), so `DLSSG.MvecScaleX/Y = 1/renderW, 1/renderH`,
+  `DLSSG.MvecJittered = 0` (jitter-free by construction), `DLSSG.MvecDilated = 0`,
+  `DLSSG.CameraMotionIncluded = 1` (dense field, camera branch reconstructed). Sign convention
+  is the NGX one we already feed SR. UNCONFIRMED until an interpolated frame is seen.
+* **Depth (guide §5.1, HARD):** "Same depth data used to generate motion vector data ... this is
+  the same set of requirements as DLSS-SR, and the same depth can be used for both" — so the
+  `R32G8X24_TYPELESS` depth-stencil SR consumes today is the right input; `DLSSG.DepthInverted = 1`
+  (reversed-Z, CLAUDE.md §2.4). `sl_consts.h:248-249`: with `depthInverted` true the snippet
+  linearises as `1/depth`, and `cameraNear/cameraFar` default `INVALID_FLOAT` (must be set).
+* **What DLSS-G under Streamline requires that the snippet does NOT:** the SL guide's "DLSS-G
+  takes over frame presenting" (§12.0), the Reflex requirement (§8.0), and
+  `eFailGetCurrentBackBufferIndexNotCalled` are all properties of `sl.dlss_g`'s swapchain
+  proxy and pacer. None of those names or mechanisms exist in the snippet (30.1). Driving the
+  snippet through the NGX core makes presenting, pacing and the back-buffer index OUR job — the
+  present-twice design below — and removes the Streamline-only failure modes. HARD for the
+  absence; the consequence is the design bet of this branch.
+
+### 30.4 UE 4.27.2's back-buffer indexing, from the source (`D3D12Viewport.cpp`, `WindowsD3D12Viewport.cpp`, mirror @ `306a7e9`)
+
+The present-twice design hands the game REPLACEMENT back buffers (our textures returned from a
+hooked `IDXGISwapChain::GetBuffer`) and copies the presented image into the real swapchain
+buffer at each of our presents, so the real ring may advance twice per game frame without the
+game noticing. That requires knowing which replacement the game rendered into, and UE4 never
+asks the swapchain (`GetCurrentBackBufferIndex` has zero call sites, migration doc §7.4):
+
+* `FD3D12Viewport::Present` (`D3D12Viewport.cpp:869-875`): after `PresentChecked` returns true,
+  `CurrentBackBufferIndex_RHIThread++; %= NumBackBuffers`. `PresentChecked` returns true whenever
+  it called `SwapChain->Present` at all — the HRESULT is only inspected for the three fatal
+  device-removed codes. It returns false WITHOUT presenting only on a fullscreen-state
+  mismatch (`GetFullscreenState` disagrees with `bIsFullscreen`), in which case our hook is
+  not called either. **So the game's index advances exactly once per Present that reaches our
+  hook.** HARD.
+* `FD3D12Viewport::Resize` (`WindowsD3D12Viewport.cpp:387`): after `ResizeBuffers`/`ResizeBuffers1`
+  and re-fetching every buffer through `GetBuffer(i)` (`D3D12Viewport.cpp:214`, one call per
+  index, `i < NumBackBuffers`), `CurrentBackBufferIndex_RHIThread = 0`. **So the index resets to
+  0 at every ResizeBuffers, and GetBuffer is called for every index right after it.** HARD.
+* `WindowsDefaultNumBackBuffers = 3` (`:15`), `DXGI_SWAP_EFFECT_FLIP_DISCARD` (`:120/167/207`),
+  and `SetFullscreenState` is followed by a `Resize` (`:279` then `:354/376`). Before the
+  resize UE4 releases its references to every back buffer (`D3D12Viewport.cpp:474-512`) and
+  checks its OWN wrapper refcount is 1 — it never inspects the D3D12 resource's refcount, so
+  a replacement texture we keep a reference to passes. HARD.
+* `Present` transitions the back buffer to `D3D12_RESOURCE_STATE_PRESENT` (= COMMON) before
+  presenting (`:824-828`) — the state our copy-out finds the replacement in. HARD.
+
+Consequence: the mirror is `index = presents_since_last_resize % NumBackBuffers`, advanced on
+every Present/Present1 that reaches the hook (whatever the HRESULT), reset to 0 by
+ResizeBuffers/ResizeBuffers1 — `core::fg_plan::GameIndexMirror`, unit-tested. There is no
+in-process cross-check available today (the native host has no render-target-bind tap), so a
+mirror error would show as a STALE presented frame; that is what the stage-1 screenshot
+protocol looks for.

@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main, dlss-ue4ss ]
+    branches: [ main, dlss-ue4ss, dlss-fg ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ main, dlss-ue4ss ]
+    branches: [ main, dlss-ue4ss, dlss-fg ]
   workflow_dispatch:
 
 env:
