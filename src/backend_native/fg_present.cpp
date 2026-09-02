@@ -209,6 +209,76 @@ struct Chain
 	std::uintptr_t impl_begin = 0, impl_end = 0;
 };
 
+// ---- the pacing trace ([STRAYDLSS] NgxFGTrace) ----
+//
+// One entry per game present: when the game called Present (the hook's entry), when the
+// generated and the real present were issued and how long each orig Present call blocked, the
+// delay the pacer asked for and whether the hold was cut short by the next game present. Dumped
+// once, as the gap sequence the user feels, so a pacing fault names itself in one run.
+struct TraceEntry
+{
+	std::uint64_t frame = 0;
+	std::uint64_t t_hook = 0;      // present() entry on the game thread
+	std::uint64_t t_gen0 = 0, t_gen1 = 0;   // around orig Present of the generated frame (0 = none)
+	std::uint64_t t_real0 = 0, t_real1 = 0; // around orig Present of the real frame
+	std::uint64_t delay_ns = 0;
+	bool hurried = false;
+	unsigned sync = 0, flags = 0;
+};
+constexpr unsigned kTraceMax = 512;
+TraceEntry g_trace[kTraceMax];
+std::atomic<unsigned> g_trace_count{ 0 };
+std::atomic<bool> g_trace_armed{ false }, g_trace_dumped{ false };
+std::uint64_t g_trace_t0 = 0;
+
+void dump_trace()
+{
+	const unsigned n = g_trace_count.load();
+	if (n == 0)
+		return;
+	STRAY_LOG_WARN("[fg-trace] %u presents. Columns: frame | hook +ms since previous hook | gen issued at +ms after hook [blocked ms] | real issued at +ms after hook [blocked ms] | pacer delay ms | hurried",
+		n);
+	std::uint64_t prev_hook = g_trace[0].t_hook;
+	for (unsigned i = 0; i < n; ++i)
+	{
+		const TraceEntry &e = g_trace[i];
+		STRAY_LOG_INFO("[fg-trace] %6llu | hook +%6.2f | gen %s+%6.2f [%5.2f] | real +%6.2f [%5.2f] | delay %5.2f | %s",
+			static_cast<unsigned long long>(e.frame), (e.t_hook - prev_hook) / 1e6,
+			e.t_gen0 != 0 ? "" : "(none) ", e.t_gen0 != 0 ? (e.t_gen0 - e.t_hook) / 1e6 : 0.0, e.t_gen0 != 0 ? (e.t_gen1 - e.t_gen0) / 1e6 : 0.0,
+			e.t_real0 != 0 ? (e.t_real0 - e.t_hook) / 1e6 : 0.0, e.t_real0 != 0 ? (e.t_real1 - e.t_real0) / 1e6 : 0.0,
+			e.delay_ns / 1e6, e.hurried ? "HURRIED" : "");
+		prev_hook = e.t_hook;
+	}
+	// The gap sequence between consecutive ISSUED presents (what the display receives), in
+	// order, 40 per line.
+	char line[512];
+	int pos = 0;
+	std::uint64_t last = 0;
+	unsigned k = 0;
+	for (unsigned i = 0; i < n; ++i)
+	{
+		const std::uint64_t ts[2] = { g_trace[i].t_gen0, g_trace[i].t_real0 };
+		for (std::uint64_t t : ts)
+		{
+			if (t == 0)
+				continue;
+			if (last != 0)
+			{
+				pos += std::snprintf(line + pos, sizeof(line) - static_cast<std::size_t>(pos), "%.1f ", (t - last) / 1e6);
+				if (++k % 40 == 0 || pos > 440)
+				{
+					STRAY_LOG_INFO("[fg-trace] gaps: %s", line);
+					pos = 0;
+					line[0] = 0;
+				}
+			}
+			last = t;
+		}
+	}
+	if (pos > 0)
+		STRAY_LOG_INFO("[fg-trace] gaps: %s", line);
+}
+
 // The work one game Present hands to the presenter.
 struct Pair
 {
@@ -220,6 +290,8 @@ struct Pair
 	unsigned sync = 0, flags = 0;
 	PFN_Present orig_present = nullptr;
 	std::uint64_t frame = 0;
+	std::uint64_t t_hook = 0;
+	int trace_slot = -1;
 };
 
 Config g_cfg;
@@ -630,7 +702,15 @@ HRESULT present_one(Chain &c, const Pair &p, ID3D12Resource *src)
 	const bool generated = src == p.generated;
 	if (g_cfg.reflex != 0)
 		reflex::marker(generated ? reflex::Marker::out_of_band_present_start : reflex::Marker::present_start, p.frame);
+	const std::uint64_t t0 = now_ns();
 	const HRESULT hr = p.orig_present(p.sc, p.sync, p.flags);
+	const std::uint64_t t1 = now_ns();
+	if (p.trace_slot >= 0)
+	{
+		TraceEntry &e = g_trace[static_cast<unsigned>(p.trace_slot)];
+		if (generated) { e.t_gen0 = t0; e.t_gen1 = t1; }
+		else { e.t_real0 = t0; e.t_real1 = t1; }
+	}
 	if (g_cfg.reflex != 0)
 		reflex::marker(generated ? reflex::Marker::out_of_band_present_end : reflex::Marker::present_end, p.frame);
 	note_issued_present();
@@ -638,12 +718,12 @@ HRESULT present_one(Chain &c, const Pair &p, ID3D12Resource *src)
 }
 
 // Waits `delay_ns` unless hurried (a new pair is waiting) or stopped. Worker-only.
-void paced_wait(std::uint64_t delay_ns)
+bool paced_wait(std::uint64_t delay_ns)
 {
 	if (delay_ns == 0)
-		return;
+		return false;
 	std::unique_lock<std::mutex> lock(g_wmutex);
-	g_wcv.wait_for(lock, std::chrono::nanoseconds(delay_ns), [] { return g_hurry || g_stop; });
+	return g_wcv.wait_for(lock, std::chrono::nanoseconds(delay_ns), [] { return g_hurry || g_stop; });
 }
 
 void run_pair(Chain &c, Pair &p, bool on_worker)
@@ -671,12 +751,18 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 				std::lock_guard<std::mutex> lock(g_smutex);
 				++g_stats.generated_presented;
 			}
+			bool hurried = false;
 			if (on_worker)
-				paced_wait(p.delay_ns);
+				hurried = paced_wait(p.delay_ns);
 			else if (p.delay_ns != 0)
 				std::this_thread::sleep_for(std::chrono::nanoseconds(p.delay_ns));
+			if (p.trace_slot >= 0)
+				g_trace[static_cast<unsigned>(p.trace_slot)].hurried = hurried;
 		}
 		g_last_present_hr.store(present_one(c, p, p.real));
+		if (p.trace_slot >= 0 && static_cast<unsigned>(p.trace_slot) + 1 == g_trace_count.load() &&
+			g_trace_count.load() >= static_cast<unsigned>(g_cfg.trace) && !g_trace_dumped.exchange(true))
+			dump_trace();
 	}
 	if (p.generated != nullptr)
 		p.generated->Release();
@@ -1106,6 +1192,28 @@ bool present(const PresentArgs &args, long *hr_out)
 		p.flags = args.flags;
 		p.orig_present = c.orig_present;
 		p.frame = args.frame;
+		p.t_hook = now_ns();
+		if (g_cfg.trace > 0 && !g_trace_dumped.load())
+		{
+			if (p.generated != nullptr)
+				g_trace_armed.store(true);
+			if (g_trace_armed.load())
+			{
+				const unsigned slot = g_trace_count.load();
+				const unsigned want = static_cast<unsigned>(g_cfg.trace) < kTraceMax ? static_cast<unsigned>(g_cfg.trace) : kTraceMax;
+				if (slot < want)
+				{
+					g_trace[slot] = TraceEntry{};
+					g_trace[slot].frame = args.frame;
+					g_trace[slot].t_hook = p.t_hook;
+					g_trace[slot].delay_ns = delay;
+					g_trace[slot].sync = args.sync;
+					g_trace[slot].flags = args.flags;
+					p.trace_slot = static_cast<int>(slot);
+					g_trace_count.store(slot + 1);
+				}
+			}
+		}
 		if (p.generated != nullptr)
 			p.generated->AddRef();
 		p.real->AddRef();
