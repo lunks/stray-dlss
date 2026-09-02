@@ -25,7 +25,7 @@ log "bench: $RUNS x (reload + traverse), label=$LABEL, hosts: $( [ -f "$GAME_DIR
 for i in $(seq 1 "$RUNS"); do
     shot=""; [ -n "$SHOT_DIR" ] && shot="$SHOT_DIR/$LABEL-$i.png"
     bash "$TOOLS_DIR/stray-reload.sh" ${shot:+--shot "$shot"} || { rc=$?; log "bench: reload $i failed (exit $rc)"; exit "$rc"; }
-    sleep 1   # the reload script already held gameplay for 3 s; keep the dead time short
+    sleep 3   # let the load settle before moving (a 1 s settle changed the replayed path, 2026-09-02)
     bash "$TOOLS_DIR/stray-traverse.sh" --label "$LABEL-$i" ${REPLAY:+--replay "$REPLAY"} || { rc=$?; log "bench: traverse $i failed (exit $rc)"; exit "$rc"; }
 done
 log "bench: $RUNS runs completed; rows tagged $LABEL-* in $GAME_DIR/stray-bench.csv"
