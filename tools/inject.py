@@ -9,6 +9,11 @@ sees them — no uinput, ydotool or evemu, and nothing here EVIOCGRAB's the node
     inject.py key  <node> <code> <hold_ms>            tap a key
     inject.py hold <node> <code> <hold_ms>            hold one key/button, then release
     inject.py axis <node> <code> <value> <hold_ms>    hold an absolute axis, then centre it
+    inject.py record <node> <out_file> [seconds]      record every event from the node with
+        timestamps (no grab: the game keeps receiving them) until seconds elapse or Ctrl-C
+    inject.py replay <node> <file> [speed]            replay a recording into the node with
+        the original inter-event timing (speed 1.0); every key still down at the end is
+        released, even on Ctrl-C
     inject.py traverse <node> [total_s] [swap_s]      the perf scenario (user-specified
         2026-09-02): hold KEY_UP for total_s (15) and, while it is held, alternate
         KEY_LEFT / KEY_RIGHT every swap_s (3). Press/release events are explicit so the
@@ -70,11 +75,68 @@ def _traverse(f, total_s, swap_s):
             _emit(f, EV_KEY, code, 0)
 
 
+def _record(node, out_path, seconds):
+    """Recording format: one line per event, "<t_rel_s> <type> <code> <value>", t_rel from the
+    first event. SYN_REPORT events are kept so replay reproduces the exact frames."""
+    deadline = time.monotonic() + seconds if seconds > 0 else None
+    n = 0
+    with open(node, "rb", buffering=0) as f, open(out_path, "w") as out:
+        t0 = None
+        while deadline is None or time.monotonic() < deadline:
+            raw = f.read(_EVENT.size)
+            if len(raw) < _EVENT.size:
+                break
+            sec, usec, ev_type, code, value = _EVENT.unpack(raw)
+            t = sec + usec / 1e6
+            if t0 is None:
+                t0 = t
+            out.write("%.6f %d %d %d\n" % (t - t0, ev_type, code, value))
+            n += 1
+    return n
+
+
+def _replay(f, path, speed):
+    held = set()
+    t_start = time.monotonic()
+    try:
+        with open(path) as rec:
+            for line in rec:
+                parts = line.split()
+                if len(parts) != 4:
+                    continue
+                t_rel, ev_type, code, value = float(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                delay = t_start + t_rel / speed - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                f.write(_EVENT.pack(0, 0, ev_type, code, value))
+                if ev_type == EV_SYN:
+                    f.flush()
+                if ev_type == EV_KEY:
+                    if value:
+                        held.add(code)
+                    else:
+                        held.discard(code)
+    finally:
+        for code in held:
+            _emit(f, EV_KEY, code, 0)
+
+
 def main(argv):
     if len(argv) < 3:
         print(__doc__, file=sys.stderr)
         return 2
     kind, node = argv[1], _node_path(argv[2])
+    if kind == "record":
+        if len(argv) < 4:
+            print(__doc__, file=sys.stderr)
+            return 2
+        seconds = float(argv[4]) if len(argv) > 4 else 0
+        try:
+            n = _record(node, argv[3], seconds)
+        except KeyboardInterrupt:
+            n = -1
+        print("recorded to %s" % argv[3], file=sys.stderr)
+        return 0
     with open(node, "wb", buffering=0) as f:
         if kind in ("pad", "key", "hold"):
             if len(argv) < 4:
@@ -92,6 +154,12 @@ def main(argv):
             _emit(f, EV_ABS, code, value)
             time.sleep(hold_ms / 1000.0)
             _emit(f, EV_ABS, code, 0)
+        elif kind == "replay":
+            if len(argv) < 4:
+                print(__doc__, file=sys.stderr)
+                return 2
+            speed = float(argv[4]) if len(argv) > 4 else 1.0
+            _replay(f, argv[3], speed)
         elif kind == "traverse":
             total_s = float(argv[3]) if len(argv) > 3 else 15.0
             swap_s = float(argv[4]) if len(argv) > 4 else 3.0

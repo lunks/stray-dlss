@@ -9,9 +9,10 @@
 set -u
 . "$(dirname "$0")/stray-lib.sh"
 
-RUNS=3; LABEL="run"; SHOT_DIR=""
+RUNS=3; LABEL="run"; SHOT_DIR=""; REPLAY=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --replay) REPLAY="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
         --label) LABEL="$2"; shift 2 ;;
         --shot-dir) SHOT_DIR="$2"; shift 2 ;;
@@ -25,7 +26,7 @@ for i in $(seq 1 "$RUNS"); do
     shot=""; [ -n "$SHOT_DIR" ] && shot="$SHOT_DIR/$LABEL-$i.png"
     bash "$TOOLS_DIR/stray-reload.sh" ${shot:+--shot "$shot"} || { rc=$?; log "bench: reload $i failed (exit $rc)"; exit "$rc"; }
     sleep 3   # let the load settle before moving
-    bash "$TOOLS_DIR/stray-traverse.sh" --label "$LABEL-$i" || { rc=$?; log "bench: traverse $i failed (exit $rc)"; exit "$rc"; }
+    bash "$TOOLS_DIR/stray-traverse.sh" --label "$LABEL-$i" ${REPLAY:+--replay "$REPLAY"} || { rc=$?; log "bench: traverse $i failed (exit $rc)"; exit "$rc"; }
 done
 log "bench: $RUNS runs completed; rows tagged $LABEL-* in $GAME_DIR/stray-bench.csv"
 tail -n "$RUNS" "$GAME_DIR/stray-bench.csv"
