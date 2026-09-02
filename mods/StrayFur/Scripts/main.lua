@@ -29,8 +29,11 @@
 ------------------------------------------------------------------ configuration
 local TIER1 = true          -- apply the HD-screenshot material scalars
 local TIER2 = true          -- raise shell count / length
-local LAYERS      = 16      -- shells (companion cats ship 8; player value is logged)
-local LAYERS_LOD  = 16      -- per-LOD shells; keep >= LAYERS or LODs undo it
+-- MEASURED on the first launch (2026-09-02): the PLAYER cat ships LayerCount=16,
+-- FurLength=1.15, ShellBias=1.0, MinScreenSize=0 - twice the companion cats' 8. So 16 was
+-- a no-op; anything that should be felt as "more fur" has to go above it.
+local LAYERS      = 32      -- shells (player ships 16, companions 8)
+local LAYERS_LOD  = 32      -- per-LOD shells; keep >= LAYERS or LODs undo it
 local FUR_LENGTH  = nil     -- nil = leave the game's value; e.g. 1.25 = +25%
 local SHELL_BIAS  = nil     -- nil = leave; 0..1, higher packs shells toward the root
 local MIN_SCREEN  = 0.0     -- never drop the fur for distance
@@ -78,7 +81,9 @@ local function applyMaterial(gfur)
     if count == 0 then pcall(function() mats:ForEach(function() count = count + 1 end) end) end
     if count == 0 then log("  FurMaterials is empty"); return end
     for i = 0, count - 1 do
-        local ok, mid = pcall(function() return gfur:CreateDynamicMaterialInstance(i, nil) end)
+        -- MEASURED: the BlueprintCallable takes THREE params (ElementIndex, SourceMaterial,
+        -- OptionalName); two threw "UFunction expected 3 parameters, received 2".
+        local ok, mid = pcall(function() return gfur:CreateDynamicMaterialInstance(i, nil, FName("None")) end)
         if not ok or not mid or not mid:IsValid() then
             log(string.format("  material slot %d: could not create a dynamic instance (%s)", i, tostring(mid)))
         else
