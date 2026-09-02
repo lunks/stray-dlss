@@ -518,12 +518,21 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 
 namespace {
 
+// The padding is the point (it is the stream's layout), so C4324 — "padded due to
+// alignment specifier" — is silenced exactly as d3dx12.h silences it for its own version.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 template <typename T>
 struct alignas(void *) Subobject
 {
 	D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
 	T value;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 // The size of one subobject of payload type T in the stream, and where its payload sits —
 // what CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT lays out (the type, the payload at its own
