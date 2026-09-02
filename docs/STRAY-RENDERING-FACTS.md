@@ -1359,3 +1359,146 @@ returns between our two presents, whether the real `SetFullscreenState(TRUE)` tr
 UE4 follows with a `ResizeBuffers`) survives with the worker drained, and whether the mirror
 matches the game's counter in the live process (a mismatch shows as a stale frame in the
 gamescope screenshot). Those are the stage-1 box measurements.
+
+### 31.7 Stage 1 on the box: present-twice through our own present owner SURVIVES (2026-09-02 18:46-18:56)
+
+Config A (ReShade `dxgi.dll` renamed aside, plugin `main.dll` = CI run 33686313374 of `ea784ee`,
+`StrayDLSS : 1`, `StrayTriggers : 0`, `NgxNR=0`), `NgxFG=1 NgxFGMode=1 NgxFGPacing=1`
+(experiment mode: the generated frame is the previous real frame under a magenta band, no NGX).
+Box epoch `067020b6-…`, host load1 5-10 over 32 CPUs during the session (the neighbour's
+contention was lower than the 0.8-0.96/CPU reported earlier, but **every frame-rate and pacing
+number below is SUSPECT**, per the user's instruction; only correctness and stability count).
+
+**Launch, verbatim from `stray-dlss-plugin.log`:**
+
+```
+fg: swapchain 000000000159C860 recorded; 3 slot(s) patched (GetBuffer/SetFullscreenState/ResizeTarget)
+fg: ResizeBuffers done (hr 0x00000000): epoch 1, replacements DROPPED (the next GetBuffer re-arms), mirror count 3
+fg: ARMED for swapchain 000000000159C860: 3 replacement back buffer(s) 3840x2160 fmt 24 (real flags 0x1), 2 generated, 3 crop readbacks
+fg/reflex: NvAPI_D3D_SetSleepMode(lowLatency=1 boost=0 markers=1) -> 0 (NVAPI_OK) on device 000000001F900080; Sleep=available markers=available async=available
+fg: finalised on queue 0000000001669E00; presenter=worker thread; armed=1 (GetBuffer already seen)
+present owner: FIRST Present delivered on_present (... back_buffer=000000002A5984C0)   <- a REPLACEMENT
+fg/reflex: first NvAPI_D3D_SetLatencyMarker(1, frame 0) -> 0 (NVAPI_OK)
+fg/reflex: first NvAPI_D3D_Sleep -> 0 (NVAPI_OK)
+fg: SetFullscreenState(TRUE) begins: worker drained, GPU idle on our lists, epoch 1 suspended
+fg: SetFullscreenState(TRUE) done (hr 0x00000000): epoch 2, replacements kept, mirror count 3
+fg: ResizeBuffers done (hr 0x00000000): epoch 3, replacements DROPPED (the next GetBuffer re-arms), mirror count 3
+fg: ARMED ... 3840x2160 fmt 24 ...
+[fg] frame 1800: game presents=1801 issued=3598 generated=1798 (2.00x) | refused: no-previous-frame=2 | pacer 12.17 ms hitches=3 | issued-interval p50=5 ms p99=8 ms BIMODAL (back-to-back presents) | worker waits=30 | epoch=3 reconfigures=3 | 3840x2160 fmt 24 colourspace -1
+```
+
+* **The fullscreen transition — where OptiScaler's FG died (CLAUDE.md §5) — is survived.**
+  `SetFullscreenState(TRUE)` then `ResizeBuffers(3, 3840x2160, fmt 24)`, the worker drained
+  before each, the replacements dropped and re-armed by the game's next `GetBuffer`, and the
+  game went on to gameplay. HARD.
+* **Exactly two presents per game present from then on**: `issued = 2 * game_presents - 2`
+  at every `[fg]` line, the only refusals the two `no-previous-frame` frames after the two
+  resizes. HARD. (`fg_presents_issued=89338` over `fg_game_presents=44670` at the end.)
+* **The alternate frame reaches the display.** 12 `gamescopectl` screenshots (type 4, 0.37 s
+  apart): 7 carried the magenta band (top 120 rows mean RGB (255,0,255)), 5 did not
+  (band (115,65,17) = scene content), centre identical (static camera). The user, watching
+  the screen, reported "pink strip on top of the frame, flickering" — the marker. HARD.
+* **Stability:** `stray-bench.sh --runs 3` (three checkpoint reloads + the user's recorded
+  traverse) completed, `bench exit 0`, the game alive at frame 47 400+ (~10 min), zero
+  `[ERROR]` lines in the plugin log, no new crash directory (the newest is 05:23, before the
+  session), `dmesg -T` shows no NVRM/Xid line after 15:17. HARD.
+* **Reflex through DXVK-NVAPI 0.9.2 works at the API level:** `nvapi64.dll` exports all five
+  entry points, `NvAPI_Initialize` and `NvAPI_D3D_SetSleepMode` return `NVAPI_OK` on the real
+  vkd3d device, `Sleep` and `SetLatencyMarker` return `NVAPI_OK` every frame. HARD that the
+  calls succeed; what they DO under vkd3d-proton/gamescope is UNCONFIRMED.
+* **`colourspace -1`: the game never calls `SetColorSpace1`.** UE 4.27's default back buffer is
+  the 10-bit `R10G10B10A2` in SDR, so `DLSSG.ColorBuffersHDR` must be 0 here; the auto rule
+  was corrected (`ba6ab94`). HARD (the observation), the SDR reading [derived] from UE4's
+  `r.DefaultBackBufferPixelFormat` default.
+* **SUSPECT (host contention), recorded for later:** bench rows `fg1-experiment-1..3`: avg
+  83.0 / 84.1 / 83.0 fps (engine frames, i.e. game presents), slowest bucket 60-68, 0 hitch
+  buckets, worst frame 17-33 ms; `[perf]` 77-80 fps; pacer EMA 10-13 ms; the issued-interval
+  histogram p50 6 ms p99 13-14 ms is flagged BIMODAL by the detector — at a 12 ms cadence
+  with a 6 ms delay that is a false positive of the two-non-adjacent-buckets rule (5 and 7
+  ms), not back-to-back presents; do not act on it until the host is quiet.
+
+### 31.8 Stage 2 on the box, first session: the core ROUTES feature 11, CreateFeature SUCCEEDS, evaluate refused for a 1-based index (2026-09-02 18:56)
+
+Same build, `NgxFGMode=2 NgxFGHDR=0`. Verbatim:
+
+```
+NVSDK_NGX_D3D12_Init_with_ProjectID succeeded
+DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b
+fg/ngx: guide copies (re)created: depth 1920x1080 fmt 19 flags 0x2, mvecs 1920x1080 fmt 34
+  ngx: [NGXCubinD3D12::Init:135] Enabling texmode_raw                      <- a THIRD cubin init: the FG snippet's
+  ngx: [EndpointConfiguration::ReadRegkeys:171] INFO: Preset B selected, enabling UIR.
+  ngx: [EndpointConfiguration::ParseNGXParametersCreateTime:50] NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled: (true)
+  ngx: [NGXOverrideStatusCallback:2020] Feature [FrameGeneration] Override Reported: ModelPreset, Value: 2, Requested: Yes, Applied: Yes
+fg/ngx: DLSS-G feature CREATED: 3840x2160 fmt 24 hdr=0 internal 1920x1080 | snippet says MultiFrameCountMax=absent MustCallEval=absent | output-real=provided
+  ngx: [EndpointCoreInputs::ComputeAndValidateTimeFactor:418] Error: Multi frame is not supported on this device. Found index (0) but expected (1)
+fg/ngx: EvaluateFeature(FrameGeneration): 0xbad00005 (FAIL_InvalidParameter)
+[fg] frame 7200: game presents=7201 issued=7200 generated=0 (1.00x) | refused: no-previous-frame=2 source-missing=7199 | ... crops ok=0 ... validated=0
+```
+
+* **The NGX core under Proton routes `NVSDK_NGX_Feature_FrameGeneration` (11) to the
+  game-directory `nvngx_dlssg.dll` (SL 2.13's copy, md5 `c9bd8831…`) and `CreateFeature`
+  succeeds on our own parameter block — no Streamline anywhere in the process.** HARD. This
+  retires the SOFT "does the core route feature 11 for a direct caller" question of §31.5.
+* **`DLSSG.MultiFrameIndex` is 1-BASED.** With `MultiFrameCount=1, MultiFrameIndex=0` every
+  evaluate returns `FAIL_InvalidParameter` and the snippet says why on the LoggingCallback.
+  Fixed in `ba6ab94` (index 1). HARD. Nukem's shim tolerates both (it only refuses `> 1`),
+  which is why the reference did not settle it.
+* **The loud path held:** 11 685 refused evaluates, `generated=0`, every present real, the
+  status file's `fg_generated_presented=0 fg_refused=7590`, no image damage. HARD.
+* **The registry preset on this box selects "Preset B" and turns UI recomposition on**
+  (`EndpointConfiguration::ReadRegkeys`), overriding our `UserInterfaceRecompositionEnabled=0`;
+  the NV-app `ModelPreset` override "Value: 2 ... Applied: Yes". Noted; a knob if it matters.
+* The snippet's `MultiFrameCountMax` and `MustCallEval` outputs are NOT populated into our
+  parameter block by the Proton core (`absent`), unlike what `sl.dlss_g` reads — so the
+  create-time capability read-back is unavailable here. HARD (this core), consequence: the
+  only availability test is CreateFeature itself, as with SR (CLAUDE.md §1).
+* `nvapi status -5` from `GetCudaIndependentDescriptorObject` appeared 5 times at the SR
+  feature's creation, as in facts §26 (Config A, ext_unhook inert) — not FG's, and SR
+  evaluated fine after.
+
+### 31.9 Stage 2 on the box: DLSS-G evaluates and its frames reach the screen — no Streamline (2026-09-02 19:05-19:10)
+
+Plugin = CI run 33688046770 of `ba6ab94` (index 1-based, HDR auto = SDR), Config A as in §31.7,
+`NgxFGMode=2 NgxFGHDR=-1`. Verbatim:
+
+```
+fg/ngx: guide copies (re)created: depth 1920x1080 fmt 19 flags 0x2, mvecs 1920x1080 fmt 34
+fg/ngx: DLSS-G feature CREATED: 3840x2160 fmt 24 hdr=0 internal 1920x1080 | snippet says MultiFrameCountMax=absent MustCallEval=absent | output-real=provided
+fg/ngx: first DLSS-G evaluate OK: backbuffer 3840x2160, guides 1920x1080, jitter=0.3750,0.0556 reset=1 fov=1.2870 rad aspect=1.7778 near=1.000 far=0.000 mvecScale=0.000521,0.000926 hdr=0
+fg: first crop verdict first-look: generated nonzero 3376/4096 hash 64d92a7cc1e09c8b | real nonzero 3376/4096 hash 64d92a7cc1e09c8b
+fg: first crop verdict ok: generated nonzero 3525/4096 hash 487dd8454049e16f | real nonzero 3376/4096 hash 64d92a7cc1e09c8b
+fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4096, real 3376/4096) - generated frames reach the screen from now on
+[fg] frame 1800: game presents=1801 issued=2694 generated=894 (1.50x) | refused: no-previous-frame=2 not-validated=5 source-missing=899 | ...
+fg: generated output REVOKED: crop verdict BLACK (generated nonzero 0/4096 hash 442c96fd51e00383, real nonzero 0/4096 hash 442c96fd51e00383); real frames only until it validates again
+fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 4096/4096, real 4096/4096) - generated frames reach the screen from now on
+[fg] frame 19200: game presents=19201 issued=33938 generated=14738 (1.77x) | refused: no-previous-frame=2 not-validated=3325 source-missing=1135 | pacer 12.08 ms hitches=11 | ...
+```
+
+* **`EvaluateFeature` on `NVSDK_NGX_Feature_FrameGeneration` succeeds with our parameter
+  block** — the snippet driven through the Proton NGX core, presenting through our present
+  owner, Streamline absent from the process. HARD.
+* **The generated frame is an interpolation, not a copy:** the first valid look after the
+  first-look has `generated hash 487dd8… != real hash 64d92a…` with the real frame unchanged
+  from the look before (the `ok` verdict requires the generated crop to differ from both
+  previous looks while the real one is compared against its own previous), and the
+  `identical` verdict never fired. The two screenshots pulled and viewed (s1, s4 of six) are
+  clean frames of The Slums with no corruption; a static camera makes generated and real
+  indistinguishable by eye there, which is the point. HARD that it evaluates and differs;
+  the QUALITY of the interpolation is the user's call (motion, eye test).
+* **Three checkpoint reloads + traverses with DLSS-G active** (`stray-bench.sh --runs 3
+  --label fg2-dlssg`): bench exit 0, game alive past frame 19 200, no crash directory, no new
+  NVRM/Xid line. HARD. Rows (SUSPECT, host contention): avg 82.2 / 82.8 / 82.0 engine fps,
+  slowest bucket 49-64, 0 hitch buckets, worst frame 29-32 ms — the same engine rate as
+  stage 1 and the plugin-SR arms of §26 under the same contention, i.e. the evaluate's cost
+  is inside the noise here; presented frames 1.5-1.8x game presents over the session.
+* **What kept the ratio under 2x, both fixed:** `not-validated=3325` — every loading screen
+  and fade made the REAL crop black too, the judge called it BLACK, revoked, and re-validated
+  three looks later (`3fcc52a`: both-black is a neutral `dark` look); `source-missing=1135` —
+  frames with no TAA dispatch (loads, menus) have no guides and correctly get no generated
+  frame.
+* Conventions passed and NOT yet judged by eye in motion: `MvecScale = 1/1920, 1/1080`,
+  UE4's row-major matrices as SL's, `CameraFar = 0`, FOV 1.2870 rad (73.7 deg vertical from
+  ViewToClipNoAA[1][1]), the camera basis from TranslatedWorldToView. UNCONFIRMED until the
+  user reports the interpolation looks right while moving; each is a knob.
+* The snippet does not populate `DLSSG.MultiFrameCountMax` / `MustCallEval` through this
+  core, and the box's registry preset selects "Preset B" with UI recomposition (§31.8). HARD.
