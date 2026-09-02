@@ -1277,7 +1277,10 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 					"NgxNRTrackExposure is on but the engine's exposure (View row 135.z) has "
 					"never decoded, so the codec's scale — which DEFINES the display-referred "
 					"units the network and its history work in — is unknown. Evaluating on the "
-					"static scale instead would silently move the input domain.");
+					"static scale instead would silently move the input domain. If this never "
+					"clears, the View constant buffer is not being read (check the 'View row 135' "
+					"line); [STRAYDLSS] NgxNRTrackExposure=0 makes the static scale the whole "
+					"answer by design and lifts this gate.");
 			case nrplan::CodecGate::degenerate_scale:
 				return refuse_pre_evaluate(kRefDegenerateScale,
 					"the codec scale is pinned at one of nrc's clamps, so the proxy is flat black "
