@@ -57,6 +57,13 @@ enum Bucket
 	// 2026-09-02).
 	kPresentOwner,     // ring allocator/list Reset + Close + ExecuteCommandLists + queue Signal
 	kPresentWait,      // the fence WaitForSingleObject stall (a GPU-sync wait, a hitch source)
+	// The native hooks' UNTIMED paths, per call site (the SR-only deficit hunt, facts §26/§27).
+	// These run on whatever thread UE4 records on (several RHI threads), so they are summed CPU.
+	kShadowWrite,      // Create*View hooks: entry_for (registry describe) + shadow::note_view
+	kShadowCopy,       // CopyDescriptors(Simple) hooks: shadow::note_copy per descriptor
+	kHeapBind,         // SetDescriptorHeaps hook: root::on_set_heaps + shadow::note_heap_bound (GetDesc)
+	kRootBind,         // SetComputeRoot* / SetPipelineState / Reset hooks: the root shadow (one global mutex)
+	kResolve,          // NativeBackend::resolve_compute_bindings (the per-dispatch table walk)
 	kBucketCount,
 };
 
@@ -65,6 +72,19 @@ bool enabled();
 
 // Adds nanoseconds to a bucket. Lock-free; safe from any recording thread.
 void add(Bucket bucket, std::uint64_t nanos);
+
+// Per-interval event counters, reported per frame beside the buckets they explain.
+enum Counter
+{
+	kCntViews = 0,     // Create*View hook bodies run (non-null)
+	kCntCopyCalls,     // CopyDescriptors(Simple) calls
+	kCntCopyDescs,     // descriptors shadowed by those calls
+	kCntHeapBinds,     // SetDescriptorHeaps calls
+	kCntRootBinds,     // SetComputeRoot* + SetPipelineState + Reset hook bodies
+	kCntResolves,      // resolve_compute_bindings calls
+	kCounterCount,
+};
+void count(Counter c, std::uint64_t n = 1);
 
 // RAII timer. Reads the clock twice only when enabled, so a disabled build pays one atomic
 // load per scope and nothing else.

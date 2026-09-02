@@ -18,6 +18,7 @@ std::atomic<bool> g_enabled{ true };
 
 // Bucket accumulators, nanoseconds, reset each interval.
 std::atomic<std::uint64_t> g_bucket_ns[kBucketCount] = {};
+std::atomic<std::uint64_t> g_counter[kCounterCount] = {};
 
 // Frame timing. Written only by the present thread; atomics so a report can never read a torn
 // value if presents ever move threads.
@@ -54,6 +55,12 @@ void set_enabled(bool enabled)
 }
 
 bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
+
+void count(Counter c, std::uint64_t n)
+{
+	if (c >= 0 && c < kCounterCount)
+		g_counter[c].fetch_add(n, std::memory_order_relaxed);
+}
 
 void add(Bucket bucket, std::uint64_t nanos)
 {
@@ -121,6 +128,9 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	std::uint64_t bucket_ns[kBucketCount];
 	for (int i = 0; i < kBucketCount; ++i)
 		bucket_ns[i] = g_bucket_ns[i].exchange(0, std::memory_order_relaxed);
+	std::uint64_t cnt[kCounterCount];
+	for (int i = 0; i < kCounterCount; ++i)
+		cnt[i] = g_counter[i].exchange(0, std::memory_order_relaxed);
 
 	const std::uint64_t dispatches = dispatches_total - g_last_dispatches;
 	const std::uint64_t large = large_dispatches_total - g_last_large_dispatches;
@@ -198,6 +208,21 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	STRAY_LOG_INFO("[perf] present owner/frame: mechanics %.3fms (%.0f%%), fence-wait %.3fms (%.0f%%) "
 		"- the native host's per-present ring work; nil under the ReShade host.",
 		present_ms, pct(present_ms), wait_ms, pct(wait_ms));
+
+	// The native hooks' per-call-site CPU, summed across every recording thread (UE4's RHI
+	// threads included), so a figure can exceed the single-threaded share of the frame.
+	const double pf = 1.0 / static_cast<double>(frames);
+	const double w_ms = static_cast<double>(bucket_ns[kShadowWrite]) * per_frame_ms;
+	const double c_ms = static_cast<double>(bucket_ns[kShadowCopy]) * per_frame_ms;
+	const double h_ms = static_cast<double>(bucket_ns[kHeapBind]) * per_frame_ms;
+	const double r_ms = static_cast<double>(bucket_ns[kRootBind]) * per_frame_ms;
+	const double v_ms = static_cast<double>(bucket_ns[kResolve]) * per_frame_ms;
+	STRAY_LOG_INFO("[perf] native hooks/frame: shadow-write %.3fms (%.0f views), shadow-copy %.3fms (%.0f calls, %.0f descs), "
+		"heap-bind %.3fms (%.0f), root-bind %.3fms (%.0f), resolve %.3fms (%.1f) - total %.3fms (%.0f%% of %.1fms; summed over threads)",
+		w_ms, static_cast<double>(cnt[kCntViews]) * pf, c_ms, static_cast<double>(cnt[kCntCopyCalls]) * pf,
+		static_cast<double>(cnt[kCntCopyDescs]) * pf, h_ms, static_cast<double>(cnt[kCntHeapBinds]) * pf,
+		r_ms, static_cast<double>(cnt[kCntRootBinds]) * pf, v_ms, static_cast<double>(cnt[kCntResolves]) * pf,
+		w_ms + c_ms + h_ms + r_ms + v_ms, pct(w_ms + c_ms + h_ms + r_ms + v_ms), avg_frame_ms);
 }
 
 } // namespace stray_dlss::perf
