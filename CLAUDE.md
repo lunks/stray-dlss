@@ -846,6 +846,14 @@ Environment facts, independent of any add-on — useful when triaging so we do n
   screenshot channel for visual verification.**
 * gamescope's `SIGUSR2` screenshot produced no file. `ffmpeg`'s `kmsgrab` cannot read its
   framebuffer (`XB30`, 10-bit HDR).
+  **CORRECTED 2026-09-02:** `SIGUSR2` does write a file — an **AVIF** at
+  `/tmp/gamescope_<date>.avif` (`TakeScreenshot(bAVIF=true)`), which is why a PNG search found
+  nothing. The reliable channel that needs **no ReShade** is gamescope's own console command
+  through `gamescopectl screenshot <path.png> <type>` (type 4 = the on-screen buffer 1:1, 1 =
+  the game's base plane at render resolution), run as `deck` with the compositor's
+  `XDG_RUNTIME_DIR` (uid **1001** on this box, socket `gamescope-0`); measured: a 3840x2160
+  PNG within ~3 s. `tools/screenshot-gamescope.sh` wraps it and reads both variables from
+  Steam's live environment.
 
 ---
 
