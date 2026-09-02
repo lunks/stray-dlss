@@ -33,28 +33,61 @@ local function valid(obj)
     return ok and v == true
 end
 
+-- COST DISCIPLINE (user-reported 2026-09-02: "your heartbeat is sync so there is a frame
+-- spike every second"). FindFirstOf walks the whole object array and this runs on the
+-- game thread, so the expensive lookups are CACHED: a tick normally does only IsValid()
+-- checks and a couple of cheap getters. A rescan happens only when a cached object has
+-- gone invalid, and never more than once per RESCAN_S.
+local RESCAN_S = 2
+local cachedPawn, cachedWorld = nil, nil
+local lastPawnScan, lastWorldScan = 0, 0
+
+local function objectName(obj)
+    local full = obj:GetFullName()
+    return (full:match("%.([^%.]+)$")) or full
+end
+
+local function world()
+    if valid(cachedWorld) then return cachedWorld end
+    local now = os.time()
+    if now - lastWorldScan < RESCAN_S then return nil end
+    lastWorldScan = now
+    local ok, w = pcall(UEHelpers.GetWorld)
+    cachedWorld = (ok and valid(w)) and w or nil
+    return cachedWorld
+end
+
 local function mapName()
-    local ok, name = pcall(function()
-        local world = UEHelpers.GetWorld()
-        if world == nil or not world:IsValid() then return "?" end
-        -- GetFullName() is "World /Game/Maps/Foo.Foo"; keep the object name only.
-        local full = world:GetFullName()
-        return (full:match("%.([^%.]+)$")) or full
-    end)
+    local w = world()
+    if w == nil then return "?" end
+    local ok, name = pcall(objectName, w)   -- "World /Game/Maps/Foo.Foo" -> "Foo"
     return ok and name or "?"
 end
 
--- Returns the pawn's instance name (e.g. BP_CatPawn_C_2147480326) or "" when absent. The
--- name changes if a reload recreates the pawn; measured 2026-09-02 a checkpoint reload
--- keeps it, so this is a diagnostic, not a gate.
+-- The pawn's instance name (e.g. BP_CatPawn_C_2147480326) or "" when absent. Measured
+-- 2026-09-02: a checkpoint reload keeps the same pawn, so this is a diagnostic, not a gate.
 local function pawnName()
-    local ok, v = pcall(function()
-        local pawn = FindFirstOf("BP_CatPawn_C")
-        if not valid(pawn) then return "" end
-        local full = pawn:GetFullName()
-        return (full:match("%.([^%.]+)$")) or full
-    end)
-    return ok and v or ""
+    if not valid(cachedPawn) then
+        cachedPawn = nil
+        local now = os.time()
+        if now - lastPawnScan < RESCAN_S then return "" end
+        lastPawnScan = now
+        local ok, p = pcall(FindFirstOf, "BP_CatPawn_C")
+        if not (ok and valid(p)) then return "" end
+        cachedPawn = p
+    end
+    local ok, name = pcall(objectName, cachedPawn)
+    return ok and name or ""
+end
+
+-- Quiet mode: while a measurement window is open, the bench drops the file
+-- stray-probe-quiet in the game dir and the probe stops asking the engine anything; it
+-- keeps writing seq/t so liveness is still visible. Nothing of ours then runs on the
+-- game thread during the window.
+local function quiet()
+    local f = io.open("stray-probe-quiet", "r")
+    if f then f:close(); return true end
+    return false
 end
 
 local function pawnPresent()
@@ -73,16 +106,21 @@ end
 -- mis-keyed sequence without this field.
 local function isPaused()
     local ok, v = pcall(function()
-        local gs = UEHelpers.GetGameplayStatics()
-        local world = UEHelpers.GetWorld()
-        if gs == nil or world == nil or not world:IsValid() then return false end
-        return gs:IsGamePaused(world) == true
+        local gs = UEHelpers.GetGameplayStatics()   -- UEHelpers caches this itself
+        local w = world()
+        if gs == nil or w == nil then return false end
+        return gs:IsGamePaused(w) == true
     end)
     return ok and v == true
 end
 
 local function write()
     seq = seq + 1
+    if quiet() then
+        local f = io.open(STATE, "wb")
+        if f then f:write(string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time())); f:close() end
+        return
+    end
     local pawn = pawnPresent() and 1 or 0
     local pc = controllerPresent() and 1 or 0
     local map = mapName()

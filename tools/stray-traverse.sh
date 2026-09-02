@@ -33,6 +33,12 @@ HB=0; [ -f "$STATUS" ] && [ "$(( T0 - $(mtime "$STATUS") ))" -le 5 ] && HB=1
 [ "$HB" -eq 1 ] || log "no render-host heartbeat: timing only, no fps"
 
 log "traverse: hold UP, alternate LEFT/RIGHT every ${SWAP}s, ${TOTAL}s total (label=$LABEL)"
+# Silence the probe's engine queries for the window (user-reported: a synchronous probe
+# is a frame spike every second and would throw off the numbers). The flag is removed on
+# every exit path; the render host heartbeat is not ours to silence and stays.
+QUIET="$GAME_DIR/stray-probe-quiet"; touch "$QUIET"; chown deck:deck "$QUIET" 2>/dev/null
+trap 'rm -f "$QUIET"' EXIT
+sleep 1.2   # one probe tick, so the last engine query is before the window opens
 # The key script runs in the background so this shell can sample the heartbeat meanwhile.
 python3 "$INJECT" traverse "/dev/input/$KBD" "$TOTAL" "$SWAP" >/dev/null 2>&1 &
 INJ=$!
@@ -49,6 +55,10 @@ while kill -0 "$INJ" 2>/dev/null; do
 done
 wait "$INJ" 2>/dev/null
 T1=$(date +%s.%N); elapsed=$(awk -v a="$T0" -v b="$T1" 'BEGIN { printf "%.1f", b - a }')
+# Lift the quiet flag and wait for one full probe write, so whatever runs next (another
+# reload's require_ingame) reads engine state, not the quiet stub.
+rm -f "$QUIET"; trap - EXIT
+for _ in $(seq 1 8); do [ -n "$(probe ingame)" ] && break; sleep 0.5; done
 
 if [ "$HB" -eq 1 ]; then
     f_end=$(hb_frame)
