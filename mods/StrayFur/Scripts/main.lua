@@ -185,18 +185,36 @@ end
 -- Primary: be told when a cat pawn is constructed.
 -- UNCONFIRMED: whether NotifyOnNewObject resolves a DynamicClass (nativized BP) by this
 -- path. The poll below is the fallback and is what makes this robust either way.
+-- MEASURED 2026-09-02, and it was THIS mod: "reload last checkpoint" crashed the game every
+-- time (EXCEPTION_ACCESS_VIOLATION reading 0x270, through UE4SS's ProcessEvent hook) with
+-- StrayFur enabled and never with it disabled, DLSS and ReShade and the DualSense mod
+-- being present or absent making no difference (tools/stray-bench.sh bisection, 2 cycles
+-- per arm). The mechanism: ExecuteWithDelay and LoopAsync callbacks run on a UE4SS
+-- thread, so FindFirstOf / applyTo touched UObjects while the game thread was tearing
+-- the checkpoint state down. Every engine call now goes through ExecuteInGameThread,
+-- which is what let mods/StrayProbe survive the same reloads.
+local function applyOnGameThread(pawn)
+    pcall(function() ExecuteInGameThread(function() pcall(applyTo, pawn) end) end)
+end
+
 pcall(function()
     NotifyOnNewObject("/Game/Character/Cat/BP_CatPawn.BP_CatPawn_C", function(obj)
-        -- Components may not be registered inside the constructor; defer one tick.
-        ExecuteWithDelay(500, function() applyTo(obj) end)
+        -- Components may not be registered inside the constructor; defer, then hop to
+        -- the game thread.
+        ExecuteWithDelay(500, function() applyOnGameThread(obj) end)
     end)
     log("registered NotifyOnNewObject for BP_CatPawn_C")
 end)
 
--- Fallback: poll for a live pawn. Cheap (one FindFirstOf every 2 s), idempotent via `done`.
+-- Fallback: poll for a live pawn. One FindFirstOf every 2 s ON THE GAME THREAD, idempotent
+-- via `done`.
 LoopAsync(2000, function()
-    local ok, pawn = pcall(function() return FindFirstOf("BP_CatPawn_C") end)
-    if ok and pawn and pawn:IsValid() then applyTo(pawn) end
+    pcall(function()
+        ExecuteInGameThread(function()
+            local ok, pawn = pcall(function() return FindFirstOf("BP_CatPawn_C") end)
+            if ok and pawn and pawn:IsValid() then pcall(applyTo, pawn) end
+        end)
+    end)
     return false   -- keep looping; level loads recreate the pawn
 end)
 
