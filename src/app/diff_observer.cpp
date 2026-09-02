@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <unordered_map>
 
 namespace stray_dlss::diff {
 namespace {
@@ -174,7 +175,12 @@ std::atomic<bool> g_enabled{ false };
 std::mutex g_mutex;
 Summary g_summary;
 unsigned g_logged_disagreements = 0;
-constexpr unsigned kMaxLoggedDisagreements = 40;
+constexpr unsigned kMaxLoggedDisagreements = 400;
+// Per (hash, shape) so a chatty menu pass cannot spend the whole budget before gameplay
+// starts (measured: the first 40 lines were two hashes, and 3000 gameplay mismatches went
+// unlogged). Keyed on the hash XOR the first kind that differed.
+constexpr unsigned kMaxLoggedPerHash = 3;
+std::unordered_map<std::uint64_t, unsigned> g_logged_per_hash;
 std::uint64_t g_last_native_unknown = 0;
 
 } // namespace
@@ -234,9 +240,13 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 		if (!r.extra.empty()) ++g_summary.extra;
 		if (taa)
 			++g_summary.taa_disagree;
-		if (g_logged_disagreements < kMaxLoggedDisagreements)
+		// Which kind led, so one hash with both a mismatch and an unknown gets both logged.
+		const std::uint64_t key = e.hash ^ (!r.mismatches.empty() ? 0x1ull : !r.unknown.empty() ? 0x2ull : 0x3ull);
+		unsigned &per_hash = g_logged_per_hash[key];
+		if (g_logged_disagreements < kMaxLoggedDisagreements && per_hash < kMaxLoggedPerHash)
 		{
 			++g_logged_disagreements;
+			++per_hash;
 			STRAY_LOG_WARN("DIFF hash=%016llx %ux%u %s: %zu mismatch, %zu unknown, %zu extra "
 				"(native unknown-lookups so far %llu)%s",
 				static_cast<unsigned long long>(e.hash), e.x, e.y, taa ? "TAA" : "dispatch",
