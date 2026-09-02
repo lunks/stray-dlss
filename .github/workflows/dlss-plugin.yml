@@ -180,12 +180,14 @@ jobs:
           }
 
           # The public mirror is from 2026-07-01 and RE-UE4SS at UE4SS_SHA (2026-08-31) has
-          # since grown a .jmap reflection dumper (commit 5fe9328d) whose one source needs
-          # deps/first/Unreal/include/Unreal/ScriptContainerLayout.hpp, which the mirror lacks.
-          # MEASURED: the UE4SS target fails on exactly that include and nothing else. The
-          # dumper's whole public API is one function (JMapGenerator.hpp: generate_jmap), so
-          # on the mirror route it is replaced by a stub that refuses loudly. Our mod never
-          # calls it; the DLL we link against is otherwise the pinned tree.
+          # since moved past it. MEASURED 2026-09-01, two failures deep: first the .jmap
+          # reflection dumper (commit 5fe9328d) needs Unreal/ScriptContainerLayout.hpp, which
+          # the mirror lacks — stubbed below, its whole API is generate_jmap(); then
+          # LuaFSoftObjectPath.cpp needs FSoftObjectPath::GetSubPathString, which the mirror's
+          # class does not have. THE MIRROR ROUTE DOES NOT BUILD 68caddcf. It stays here so a
+          # newer mirror can be dropped in; until then a UEPSEUDO_PAT (a GitHub account linked
+          # to Epic Games, RE-UE4SS/README.md:80-82) is REQUIRED for this workflow to produce
+          # a DLL.
           if (-not $env:UEPSEUDO_PAT -and -not (Test-Path 'RE-UE4SS/deps/first/Unreal/include/Unreal/ScriptContainerLayout.hpp')) {
             Write-Host "::warning::deps/first/Unreal from the mirror lacks Unreal/ScriptContainerLayout.hpp; stubbing UE4SS's JMapGenerator (generate_jmap) so UE4SS.dll still links. The .jmap dumper is unavailable in this build."
             Set-Content RE-UE4SS/UE4SS/src/JMapGenerator/JMapGenerator.cpp @(

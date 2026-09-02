@@ -10,6 +10,7 @@
 // What this can prove: that our own D3D12 usage is legal, and that resource allocation stays
 // bounded. What it cannot prove: anything specific to vkd3d-proton, or the game's actual state.
 
+#include "core/fnv1a.hpp"
 #include "core/ring.hpp"
 #include "core/view_params.hpp"
 #include "d3d12_restore.hpp"
@@ -1699,6 +1700,8 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 	return true;
 }
 
+#include "warp_native_backend.inc"
+
 int main(int argc, char **argv)
 {
 	for (int i = 1; i < argc; ++i)
@@ -1738,6 +1741,12 @@ int main(int argc, char **argv)
 	test_copy_from_shader_visible_source(gpu);
 	test_static_vtables(gpu);
 	test_private_data_release_on_destroy(gpu);
+	// The native backend last: its hooks are installed on this device and never restored.
+	test_vtable_patch_roundtrip(gpu);
+	test_registry_liveness(gpu);
+	test_descriptor_shadow_copy_chain(gpu);
+	test_native_stream_walk();
+	test_native_hooks_ue4_shaped_frame(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");
