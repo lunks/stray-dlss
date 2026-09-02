@@ -1465,6 +1465,81 @@ in. The decode now writes in place and carries the original alpha through.
 the same pixels; sr-shaped puts colour at render resolution and output at display resolution.
 Refusing loudly beats silently reverting to the raw-HDR path.
 
+### NOTHING ON THE NR PATH IS DESTROYED ANYWHERE BUT `nr::on_present` (2026-09-02)
+
+`EvaluateFeature` only RECORDS work and NGX holds no references to anything we pass it (§5), so
+"the CPU stopped using this" and "the GPU stopped reading it" are different moments. Under
+vkd3d-proton there is no debug layer to notice the difference: releasing a texture, a readback
+buffer, a descriptor heap or a PSO that an executing command list still references is a wrong
+image or a GPU that leaves the bus, never an error return.
+
+**`src/core/nr_lifetime.hpp` is the rule.** One monotonic fence, signalled on the swapchain's own
+queue once per present; work is tagged with the value that present will signal and freed at the
+first present whose completed value has passed it. With no queue the fallback is the same
+two-frame-cycle present ring `ring::is_safe_to_release` uses everywhere else — never "free now",
+never "never free". `nr::on_present(queue)` is the only place any of it is released, and it runs
+**even while NR is disabled**, because disabling is what queues the teardown.
+
+Consequences worth knowing before touching that path:
+
+* **`NgxNR` 1 -> 0 destroys nothing on the caller's thread.** It queues; flipping back to 1 before
+  the teardown runs cancels it. `ReleaseFeature` additionally requires the present boundary —
+  the feature owns GPU resources we cannot keep alive by refcount — and logs the last evaluate's
+  fence tag beside the queue's completed value so a live run can prove the ordering held.
+* **A resolution change declines NR for a few frames** (`recreating`) rather than releasing the
+  feature from inside the intercepted TAA dispatch.
+* This came from `RemixProjGroup/dxvk-remix` @ **`a69254ab`**, which found two use-after-frees on
+  exactly the enable -> disable transition; the second is ours verbatim — *"Releasing the NGX
+  feature on deactivation did not wait for the device. The feature owns GPU resources DXVK cannot
+  see and therefore cannot keep alive."*
+* **UNCONFIRMED LIVE.** Proven in CI (`tests/test_nr_lifetime.cpp` and the WARP harness's
+  `warp_nr_lifetime.inc`, which asserts by refcount that nothing is freed before its fence);
+  nothing has run against the game.
+
+### THE CODEC *IS* THE INPUT DOMAIN — so no codec means no evaluate
+
+The soft-clip + exact-sRGB proxy is not a tuning stage sitting in front of feature 18. **It is
+what makes the input display-referred**, which is the only domain the network was trained on.
+Our hook point carries raw, unbounded, pre-exposed linear HDR; the encode is the entire
+conversion, and the runtime has no colour-space, HDR or exposure parameter with which to be told
+otherwise.
+
+**A sibling port found the same rule from the opposite direction, which is why it is worth
+recording as a rule rather than as our own bug.** `RemixProjGroup/dxvk-remix` (branch
+`dlss-nr`, commit **`2df9c812`**, "Neural Uplift: anchor the pass after the sRGB encode") moved
+its injection point because both earlier ones were "wrong, and wrong in the same way": in that
+runtime tone mapping leaves the image in *linear LDR* and the sRGB encode is a separate late
+pass, so anchoring before it handed the network a linear image "which it read as though it were
+already gamma-encoded; the runtime then applied the real encode on top. **Effectively two gamma
+curves, which shows up as lifted blacks and washed out greys in dark scenes.**" Its conclusion is
+the general one: the anchor "is a correctness requirement rather than a tuning choice", and the
+frames where that encode does not run "are still linear at this point, so the pass declines them
+and forces a history reset rather than evaluating on an input domain the model was not trained
+on." Its sibling commit **`a69254ab`** is the lifetime half of the same lesson (see the
+deferred-destruction section).
+
+**Two consequences for us, both now enforced in code
+(`src/core/nr_hook_plan.hpp`, `nrplan::codec_gate`):**
+
+1. **Any frame that cannot produce a correct proxy declines.** The encode not recording, a call
+   site that runs no codec at all, a codec scale pinned at one of `nrc`'s clamps (flat black or
+   flat white — the right format carrying no image), or `NgxNRTrackExposure` on with the
+   engine's exposure never decoded. Each has its own refusal counter in the periodic NR line and
+   in `stray-dlss-status.txt`; declining is the correct behaviour, but a rate that never falls
+   is a configuration problem, not a quiet one.
+2. **A declined frame forces one `DLSSNR.Reset` on the next evaluate.** Feature 18 reprojects
+   its own accumulation with motion vectors describing exactly one frame of motion, so
+   reprojecting across a frame it never saw is the same class of error as a wrong `MVecScale` —
+   and it compounds through the accumulation rather than costing one frame.
+
+**And the general trap: every knob that moves the codec's operating point moves the network's
+input domain.** `NgxNRPaperWhiteScale` and `NgxNRTrackExposure` are not brightness controls; they
+decide where the frame lands relative to the 0.75 soft-clip knee, i.e. *what image the network is
+shown*. That is why the scale gets its own history-invalidation latch
+(`nrc::codec_scale_invalidates_history`) alongside the guide-extent one, why the exposure term
+needs a time constant far slower than the loop it sits in, and why "it looked better at 0.1" was
+a bug report about a missing wire rather than a preference.
+
 ### The u0-feedback diagnosis is REFUTED by experiment (measured 2026-09-01)
 
 I argued at length that the SSR artefact was NR's residual re-entering the engine's temporal
