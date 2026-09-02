@@ -31,14 +31,21 @@ using PFN_Present1 = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT,
 using PFN_ResizeBuffers = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using PFN_ResizeBuffers1 = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
-PFN_CreateSwapChain g_orig_CreateSwapChain = nullptr;
-PFN_CreateSwapChainForHwnd g_orig_CreateSwapChainForHwnd = nullptr;
-PFN_CreateSwapChainForCoreWindow g_orig_CreateSwapChainForCoreWindow = nullptr;
-PFN_CreateSwapChainForComposition g_orig_CreateSwapChainForComposition = nullptr;
-PFN_Present g_orig_Present = nullptr;
-PFN_Present1 g_orig_Present1 = nullptr;
-PFN_ResizeBuffers g_orig_ResizeBuffers = nullptr;
-PFN_ResizeBuffers1 g_orig_ResizeBuffers1 = nullptr;
+// No single g_orig_* globals. Two DXGI implementations coexist in one Proton process (DXVK's,
+// which the game uses, and wine's builtin, which our throwaway factory reached), each with its
+// OWN factory/swapchain vtable and its OWN original functions. A global shadow collapses them
+// and forwards one class's re-entrant CreateSwapChain->CreateSwapChainForHwnd into the OTHER
+// class's implementation: wine's d3d12_swapchain_create then calls vkd3d_instance_from_device
+// on a vkd3d-proton device, gets NULL, and vkd3d_instance_get_vk_instance(NULL) faults reading
+// 0x0 (facts §20, the symbolised crash). So every hook resolves its original PER-VTABLE from
+// the `self` it was handed, via vtable_patch::original_for.
+
+// Re-entry depth for the factory creation hooks. DXVK implements the legacy CreateSwapChain by
+// calling CreateSwapChainForHwnd on the SAME factory, which re-enters our patched slot; note
+// the returned swapchain only at the OUTERMOST creation call, so a half-wired inner return is
+// never recorded (belt-and-braces: lazy noting touches only the vtable pointer, set at
+// construction, so even an inner note would be safe).
+thread_local int t_create_depth = 0;
 
 struct RingSlot
 {
@@ -50,9 +57,10 @@ struct RingSlot
 struct Entry
 {
 	IDXGISwapChain *swapchain = nullptr;  // non-owning: the game's object, whichever class
-	IDXGISwapChain3 *swapchain3 = nullptr; // non-owning: the same object when it is a SwapChain3
-	ID3D12CommandQueue *queue = nullptr;   // the REAL queue we execute on (non-owning)
-	std::uint64_t device_arg = 0;          // what the game passed; may be a proxy
+	IDXGISwapChain3 *swapchain3 = nullptr; // non-owning: the same object when it is a SwapChain3, resolved at first Present
+	ID3D12CommandQueue *queue = nullptr;   // the REAL queue we execute on (non-owning), resolved at first Present
+	IUnknown *device_arg_raw = nullptr;    // the swapchain's "device" arg, captured at creation as a bare pointer; QI'd at first Present
+	bool finalized = false;                // the one-time first-Present work (QI, queue pick, back buffers) is done
 };
 
 std::mutex g_mutex;
@@ -107,12 +115,45 @@ bool ensure_ring()
 	return true;
 }
 
-// Hooks the swapchain's own vtable slots (once per class; patch_slot is idempotent) and
-// records which real queue it presents on.
-void note_swapchain(IDXGISwapChain *sc, IUnknown *device_arg, const char *how)
+// LAZY. Records the returned swapchain pointer and its "device" arg, and patches ITS OWN
+// Present/ResizeBuffers vtable slots — nothing else. It does NOT touch the object (no
+// QueryInterface, no GetDesc, no GetBuffer): the swapchain is still inside its own creation
+// call, DXVK/vkd3d have not finished wiring its back-buffer images, and every earlier crash
+// on this path was work done against a half-built swapchain or a mis-resolved original. All of
+// that moves to the first Present, where the object has proven itself. Patching a vtable slot
+// reads only the object's vtable pointer (set at construction) and writes into the shared
+// static vtable, so it is safe even mid-creation. Present1/ResizeBuffers1 are patched at first
+// Present, after a QueryInterface confirms the object really is a SwapChain1/3. (facts §20)
+void note_swapchain_lazy(IDXGISwapChain *sc, IUnknown *device_arg, const char *how)
 {
 	if (sc == nullptr)
 		return;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (find_entry_locked(sc) != nullptr)
+		return; // already known (creation re-entry, or a re-hook); note once
+	g_entries.push_back(Entry{});
+	Entry *e = &g_entries.back();
+	e->swapchain = sc;
+	e->device_arg_raw = device_arg;
+	++g_stats.swapchains;
+
+	unsigned patched = 0;
+	if (patch_slot(sc, slot::kSwapChain_Present, reinterpret_cast<void *>(&hk_Present), "IDXGISwapChain::Present") != nullptr)
+		++patched;
+	if (patch_slot(sc, slot::kSwapChain_ResizeBuffers, reinterpret_cast<void *>(&hk_ResizeBuffers), "IDXGISwapChain::ResizeBuffers") != nullptr)
+		++patched;
+	STRAY_LOG_WARN("present owner: swapchain %p via %s device-arg=%p recorded; %u Present/Resize slot(s) patched. "
+		"QI/queue/back-buffers deferred to first Present.",
+		static_cast<void *>(sc), how, static_cast<void *>(device_arg), patched);
+}
+
+// The one-time work that used to sit in the creation hook, now run at the FIRST Present of a
+// swapchain, when it is fully built: resolve SwapChain3/1, pick the presenting queue from the
+// captured device arg, patch Present1/ResizeBuffers1, and report the back buffers. Caller holds
+// g_mutex. Returns with e->finalized set.
+void finalize_swapchain_locked(Entry *e)
+{
+	IDXGISwapChain *sc = e->swapchain;
 	IDXGISwapChain3 *sc3 = nullptr;
 	if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3 != nullptr)
 		sc3->Release(); // non-owning; the object outlives every use we make of it
@@ -121,42 +162,22 @@ void note_swapchain(IDXGISwapChain *sc, IUnknown *device_arg, const char *how)
 		sc1->Release();
 	const bool same_object3 = sc3 != nullptr && static_cast<void *>(sc3) == static_cast<void *>(sc);
 	const bool same_object1 = sc1 != nullptr && static_cast<void *>(sc1) == static_cast<void *>(sc);
+	e->swapchain3 = same_object3 ? sc3 : nullptr;
 
 	ID3D12CommandQueue *queue_arg = nullptr;
-	if (device_arg != nullptr && SUCCEEDED(device_arg->QueryInterface(IID_PPV_ARGS(&queue_arg))) && queue_arg != nullptr)
+	if (e->device_arg_raw != nullptr && SUCCEEDED(e->device_arg_raw->QueryInterface(IID_PPV_ARGS(&queue_arg))) && queue_arg != nullptr)
 		queue_arg->Release();
-
-	std::lock_guard<std::mutex> lock(g_mutex);
 	const int pick = core::pick_present_queue(g_queues, reinterpret_cast<std::uint64_t>(queue_arg));
-	Entry *e = find_entry_locked(sc);
-	if (e == nullptr)
-	{
-		g_entries.push_back(Entry{});
-		e = &g_entries.back();
-		++g_stats.swapchains;
-	}
-	e->swapchain = sc;
-	e->swapchain3 = same_object3 ? sc3 : nullptr;
-	e->device_arg = reinterpret_cast<std::uint64_t>(queue_arg);
 	e->queue = pick >= 0 ? reinterpret_cast<ID3D12CommandQueue *>(g_queues[static_cast<std::size_t>(pick)].id) : nullptr;
 
 	unsigned patched = 0;
-	void *o = patch_slot(sc, slot::kSwapChain_Present, reinterpret_cast<void *>(&hk_Present), "IDXGISwapChain::Present");
-	if (o != nullptr) { g_orig_Present = reinterpret_cast<PFN_Present>(o); ++patched; }
-	o = patch_slot(sc, slot::kSwapChain_ResizeBuffers, reinterpret_cast<void *>(&hk_ResizeBuffers), "IDXGISwapChain::ResizeBuffers");
-	if (o != nullptr) { g_orig_ResizeBuffers = reinterpret_cast<PFN_ResizeBuffers>(o); ++patched; }
-	if (same_object1)
-	{
-		o = patch_slot(sc, slot::kSwapChain1_Present1, reinterpret_cast<void *>(&hk_Present1), "IDXGISwapChain1::Present1");
-		if (o != nullptr) { g_orig_Present1 = reinterpret_cast<PFN_Present1>(o); ++patched; }
-	}
-	if (same_object3)
-	{
-		o = patch_slot(sc, slot::kSwapChain3_ResizeBuffers1, reinterpret_cast<void *>(&hk_ResizeBuffers1), "IDXGISwapChain3::ResizeBuffers1");
-		if (o != nullptr) { g_orig_ResizeBuffers1 = reinterpret_cast<PFN_ResizeBuffers1>(o); ++patched; }
-	}
-	STRAY_LOG_WARN("present owner: swapchain %p via %s (SwapChain1=%d SwapChain3=%d) device-arg=%p -> %s queue %p (%s); %u slot(s) newly patched",
-		static_cast<void *>(sc), how, same_object1 ? 1 : 0, same_object3 ? 1 : 0, static_cast<void *>(queue_arg),
+	if (same_object1 && patch_slot(sc, slot::kSwapChain1_Present1, reinterpret_cast<void *>(&hk_Present1), "IDXGISwapChain1::Present1") != nullptr)
+		++patched;
+	if (same_object3 && patch_slot(sc, slot::kSwapChain3_ResizeBuffers1, reinterpret_cast<void *>(&hk_ResizeBuffers1), "IDXGISwapChain3::ResizeBuffers1") != nullptr)
+		++patched;
+	e->finalized = true;
+	STRAY_LOG_WARN("present owner: swapchain %p FINALISED at first Present (SwapChain1=%d SwapChain3=%d) device-arg=%p -> %s queue %p (%s); %u extra slot(s) patched",
+		static_cast<void *>(sc), same_object1 ? 1 : 0, same_object3 ? 1 : 0, static_cast<void *>(queue_arg),
 		pick >= 0 && g_queues[static_cast<std::size_t>(pick)].id == reinterpret_cast<std::uint64_t>(queue_arg) ? "the SAME" : "the first DIRECT",
 		static_cast<void *>(e->queue), e->queue == nullptr ? "NONE: no direct queue recorded, present-time work is unavailable" : "ok", patched);
 }
@@ -191,47 +212,73 @@ void report_back_buffers(IDXGISwapChain *sc, bool created)
 
 // ---- factory hooks ----
 
+// A creation hook's shared tail: forward to the PER-VTABLE original for `self` (never a global),
+// then note the returned swapchain lazily, but only at the outermost creation call (DXVK's
+// legacy CreateSwapChain re-enters CreateSwapChainForHwnd on the same factory).
+struct CreateGuard
+{
+	CreateGuard() { ++t_create_depth; }
+	~CreateGuard() { --t_create_depth; }
+	bool outermost() const { return t_create_depth == 1; }
+};
+
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory *self, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **out)
 {
-	const HRESULT hr = g_orig_CreateSwapChain(self, device, desc, out);
-	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+	auto orig = reinterpret_cast<PFN_CreateSwapChain>(original_for(self, slot::kFactory_CreateSwapChain));
+	if (orig == nullptr)
 	{
-		note_swapchain(*out, device, "CreateSwapChain");
-		report_back_buffers(*out, true);
+		STRAY_LOG_ERROR("present owner: CreateSwapChain has no recorded original for factory %p; cannot forward", static_cast<void *>(self));
+		return E_FAIL;
 	}
+	CreateGuard guard;
+	const HRESULT hr = orig(self, device, desc, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
+		note_swapchain_lazy(*out, device, "CreateSwapChain");
 	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2 *self, IUnknown *device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGIOutput *restrict_to, IDXGISwapChain1 **out)
 {
-	const HRESULT hr = g_orig_CreateSwapChainForHwnd(self, device, hwnd, desc, fs, restrict_to, out);
-	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+	auto orig = reinterpret_cast<PFN_CreateSwapChainForHwnd>(original_for(self, slot::kFactory2_CreateSwapChainForHwnd));
+	if (orig == nullptr)
 	{
-		note_swapchain(*out, device, "CreateSwapChainForHwnd");
-		report_back_buffers(*out, true);
+		STRAY_LOG_ERROR("present owner: CreateSwapChainForHwnd has no recorded original for factory %p; cannot forward", static_cast<void *>(self));
+		return E_FAIL;
 	}
+	CreateGuard guard;
+	const HRESULT hr = orig(self, device, hwnd, desc, fs, restrict_to, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
+		note_swapchain_lazy(*out, device, "CreateSwapChainForHwnd");
 	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForCoreWindow(IDXGIFactory2 *self, IUnknown *device, IUnknown *window, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *restrict_to, IDXGISwapChain1 **out)
 {
-	const HRESULT hr = g_orig_CreateSwapChainForCoreWindow(self, device, window, desc, restrict_to, out);
-	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+	auto orig = reinterpret_cast<PFN_CreateSwapChainForCoreWindow>(original_for(self, slot::kFactory2_CreateSwapChainForCoreWindow));
+	if (orig == nullptr)
 	{
-		note_swapchain(*out, device, "CreateSwapChainForCoreWindow");
-		report_back_buffers(*out, true);
+		STRAY_LOG_ERROR("present owner: CreateSwapChainForCoreWindow has no recorded original for factory %p; cannot forward", static_cast<void *>(self));
+		return E_FAIL;
 	}
+	CreateGuard guard;
+	const HRESULT hr = orig(self, device, window, desc, restrict_to, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
+		note_swapchain_lazy(*out, device, "CreateSwapChainForCoreWindow");
 	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2 *self, IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *restrict_to, IDXGISwapChain1 **out)
 {
-	const HRESULT hr = g_orig_CreateSwapChainForComposition(self, device, desc, restrict_to, out);
-	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+	auto orig = reinterpret_cast<PFN_CreateSwapChainForComposition>(original_for(self, slot::kFactory2_CreateSwapChainForComposition));
+	if (orig == nullptr)
 	{
-		note_swapchain(*out, device, "CreateSwapChainForComposition");
-		report_back_buffers(*out, true);
+		STRAY_LOG_ERROR("present owner: CreateSwapChainForComposition has no recorded original for factory %p; cannot forward", static_cast<void *>(self));
+		return E_FAIL;
 	}
+	CreateGuard guard;
+	const HRESULT hr = orig(self, device, desc, restrict_to, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
+		note_swapchain_lazy(*out, device, "CreateSwapChainForComposition");
 	return hr;
 }
 
@@ -249,6 +296,7 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 		return;
 	}
 	Entry entry;
+	bool just_finalized = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		Entry *e = find_entry_locked(sc);
@@ -257,8 +305,18 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 			++g_stats.skipped;
 			return;
 		}
+		// First Present of this swapchain: it is fully built now, so do the deferred work the
+		// creation hook must not (QI, queue pick, Present1/Resize1 patch). (facts §20)
+		if (!e->finalized)
+		{
+			OwnCodeScope own_finalize; // the QIs below must not be treated as the game's calls
+			finalize_swapchain_locked(e);
+			just_finalized = true;
+		}
 		entry = *e;
 	}
+	if (just_finalized)
+		report_back_buffers(sc, true); // outside the lock: it does GetDesc/GetBuffer + sink()
 	OwnCodeScope own; // everything below is ours: the ring's Reset, the sink's recording, our execute
 
 	icept::PresentContext pc;
@@ -322,21 +380,24 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *self, UINT sync, UINT flags)
 {
+	auto orig = reinterpret_cast<PFN_Present>(original_for(self, slot::kSwapChain_Present));
 	before_present(self, flags);
-	return g_orig_Present(self, sync, flags);
+	return orig != nullptr ? orig(self, sync, flags) : S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *params)
 {
+	auto orig = reinterpret_cast<PFN_Present1>(original_for(self, slot::kSwapChain1_Present1));
 	before_present(self, flags);
-	return g_orig_Present1(self, sync, flags, params);
+	return orig != nullptr ? orig(self, sync, flags, params) : S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+	auto orig = reinterpret_cast<PFN_ResizeBuffers>(original_for(self, slot::kSwapChain_ResizeBuffers));
 	if (!in_own_code())
 		report_back_buffers(self, false);
-	const HRESULT hr = g_orig_ResizeBuffers(self, count, w, h, fmt, flags);
+	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags) : E_FAIL;
 	if (!in_own_code())
 	{
 		{
@@ -352,9 +413,10 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UIN
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags, const UINT *node_masks, IUnknown *const *queues)
 {
+	auto orig = reinterpret_cast<PFN_ResizeBuffers1>(original_for(self, slot::kSwapChain3_ResizeBuffers1));
 	if (!in_own_code())
 		report_back_buffers(self, false);
-	const HRESULT hr = g_orig_ResizeBuffers1(self, count, w, h, fmt, flags, node_masks, queues);
+	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags, node_masks, queues) : E_FAIL;
 	if (!in_own_code())
 	{
 		{
@@ -376,9 +438,12 @@ unsigned patch_factory(IDXGIFactory *factory)
 {
 	if (factory == nullptr)
 		return 0;
+	// patch_slot records the original per (vtable slot); the hooks resolve it with original_for,
+	// so no g_orig_* shadow is kept — that shadow is what collapsed two DXGI vtables into one and
+	// crashed (facts §20). A non-null return counts as "newly patched" for the log only.
 	unsigned n = 0;
-	void *o = patch_slot(factory, slot::kFactory_CreateSwapChain, reinterpret_cast<void *>(&hk_CreateSwapChain), "IDXGIFactory::CreateSwapChain");
-	if (o != nullptr) { g_orig_CreateSwapChain = reinterpret_cast<PFN_CreateSwapChain>(o); ++n; }
+	if (patch_slot(factory, slot::kFactory_CreateSwapChain, reinterpret_cast<void *>(&hk_CreateSwapChain), "IDXGIFactory::CreateSwapChain") != nullptr)
+		++n;
 	IDXGIFactory2 *f2 = nullptr;
 	if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&f2))) && f2 != nullptr)
 	{
@@ -386,12 +451,12 @@ unsigned patch_factory(IDXGIFactory *factory)
 		f2->Release();
 		if (same)
 		{
-			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForHwnd, reinterpret_cast<void *>(&hk_CreateSwapChainForHwnd), "IDXGIFactory2::CreateSwapChainForHwnd");
-			if (o != nullptr) { g_orig_CreateSwapChainForHwnd = reinterpret_cast<PFN_CreateSwapChainForHwnd>(o); ++n; }
-			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForCoreWindow, reinterpret_cast<void *>(&hk_CreateSwapChainForCoreWindow), "IDXGIFactory2::CreateSwapChainForCoreWindow");
-			if (o != nullptr) { g_orig_CreateSwapChainForCoreWindow = reinterpret_cast<PFN_CreateSwapChainForCoreWindow>(o); ++n; }
-			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForComposition, reinterpret_cast<void *>(&hk_CreateSwapChainForComposition), "IDXGIFactory2::CreateSwapChainForComposition");
-			if (o != nullptr) { g_orig_CreateSwapChainForComposition = reinterpret_cast<PFN_CreateSwapChainForComposition>(o); ++n; }
+			if (patch_slot(factory, slot::kFactory2_CreateSwapChainForHwnd, reinterpret_cast<void *>(&hk_CreateSwapChainForHwnd), "IDXGIFactory2::CreateSwapChainForHwnd") != nullptr)
+				++n;
+			if (patch_slot(factory, slot::kFactory2_CreateSwapChainForCoreWindow, reinterpret_cast<void *>(&hk_CreateSwapChainForCoreWindow), "IDXGIFactory2::CreateSwapChainForCoreWindow") != nullptr)
+				++n;
+			if (patch_slot(factory, slot::kFactory2_CreateSwapChainForComposition, reinterpret_cast<void *>(&hk_CreateSwapChainForComposition), "IDXGIFactory2::CreateSwapChainForComposition") != nullptr)
+				++n;
 		}
 	}
 	return n;

@@ -69,6 +69,16 @@ bool test_vtable_patch_roundtrip(Gpu &gpu)
 	check(again == reinterpret_cast<void *>(g_orig_getdesc), "a second install returns the stored original");
 	check(da.Width == 256 && db.Width == 256, "the chained original still answers");
 	check(g_getdesc_calls.load() >= 1, "the hook fired");
+
+	// original_for resolves the original PER-VTABLE from the object, exactly what the present
+	// owner's hooks now use instead of a shadow global (facts §20). It must equal what patch_slot
+	// returned for a's slot, and — the whole point — return nullptr for a slot never patched.
+	void *by_lookup = stray_dlss::native::original_for(a.Get(), stray_dlss::native::slot::kResource_GetDesc);
+	void *unpatched = stray_dlss::native::original_for(a.Get(), 11); // ID3D12Resource::GetGPUVirtualAddress, never patched
+	std::printf("  original_for(GetDesc)=%p (want %p) original_for(unpatched)=%p (want null)\n",
+		by_lookup, reinterpret_cast<void *>(g_orig_getdesc), unpatched);
+	check(by_lookup == reinterpret_cast<void *>(g_orig_getdesc), "original_for returns the chained original for a patched slot");
+	check(unpatched == nullptr, "original_for returns null for a slot that was never patched");
 	return true;
 }
 

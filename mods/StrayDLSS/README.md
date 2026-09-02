@@ -26,6 +26,12 @@ are compiled under mingw by CI as the fast proxy for the MSVC build.
 2. Copy `StrayDLSS/` into `<game>/ue4ss/Mods/` (`dlls/main.dll`, `StrayDLSS.ini`); add
    `StrayDLSS : 1` to `ue4ss/Mods/mods.txt` **above** the `Keybinds` line.
 3. `nvngx_dlss.dll` (and `nvngx_dlssnr.dll` for NR) beside the game executable, as for the add-on.
-4. Launch with UE4SS loading (`WINEDLLOVERRIDES="dwmapi=n,b"` on the box) and `-dx12`. ReShade is
-   optional: with ReShade loaded as `dxgi.dll` the plugin unwraps its proxies; **do not** also
-   run the ReShade add-on (`stray-dlss.addon64`) — two drivers of one TAA pass.
+4. Launch with UE4SS loading (`dwmapi=n,b`) and `-dx12`. **DXGI must be DXVK's, never
+   wine-builtin** — the game's D3D12 is vkd3d-proton, and wine-builtin DXGI (`dxgi=b`) cannot
+   create a D3D12 swapchain on a vkd3d-proton device (a NULL-deref in `vkd3d_instance_get_vk_instance`,
+   facts §20). Keep `dxgi=n,b` (native-first) so DXGI resolves to DXVK's `dxgi.dll`.
+   * **Config A (no ReShade):** rename the game-dir ReShade `dxgi.dll` out of the way (e.g.
+     `dxgi.dll.off`); native resolution then falls to the prefix's DXVK `system32\dxgi.dll`.
+   * **Config B (ReShade coexists):** keep ReShade as `dxgi.dll`; the plugin unwraps its proxies.
+   In both cases **do not** also run the ReShade add-on (`stray-dlss.addon64`) — two drivers of
+   one TAA pass.

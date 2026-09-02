@@ -12,6 +12,14 @@ namespace stray_dlss::native {
 // re-writing. Returns nullptr if the page could not be made writable.
 void *patch_slot(void *object, unsigned index, void *replacement, const char *name);
 
+// The original we chained to for THIS object's vtable slot, or nullptr if that slot was never
+// patched. Resolves per-vtable, never through a shadow global: two objects of different classes
+// (e.g. wine-builtin DXGI and DXVK DXGI, both live in one Proton process) have distinct vtables
+// and distinct originals, so a hook MUST look up the original for the `self` it was handed
+// rather than trust a single global — forwarding one class's re-entrant call to the other
+// class's implementation is a NULL-deref inside vkd3d (facts §20). MEASURED-driven.
+void *original_for(void *object, unsigned index);
+
 unsigned patch_count();
 
 // Puts every original back — ONLY where the slot still holds our replacement — and forgets

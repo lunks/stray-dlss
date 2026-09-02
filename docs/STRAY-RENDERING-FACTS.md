@@ -661,15 +661,11 @@ native-first). Six launches, each read from `stray-launch-verdict.txt` (tools/la
    never hit it because it is /MT. Fixed globally for MSVC (`ac7e3f3`). HARD.
    (The d3d12.dll force-load from start_mod, removed in `5c0060c`, was not the cause; the
    removal stands — the probe's poll-for-d3d12 path is the measured-safe one.)
-2. 02:19, 02:42 — `EXCEPTION_ACCESS_VIOLATION reading 0x0`, 61-62 s in, UE4 dump with an empty
-   callstack; the Proton log's backtrace is `main.dll +0x17DDC -> main.dll +0x17EA3 -> fault at
-   0x6FFFFCA0E7B0` (a DXGI/wine builtin). `+0x17DDC/+0x17EA3` sit just past the four
-   `CreateSwapChain*` hooks the log places at `+0x17870..+0x17AB0`: **the present owner's
-   swapchain-creation path** (`hk_CreateSwapChain*` -> `note_swapchain` / `report_back_buffers`).
-   The game's last recorded act is creating a SECOND DXGI factory (`present owner: patched the
-   game's factory 0000000017D10690`), i.e. the swapchain is being created at that moment. No
-   `present owner: swapchain ... via ...` line was ever written, so the fault is INSIDE that
-   hook before it logs. OPEN — see the report for the candidate fix.
+2. 02:19, 02:42 — `EXCEPTION_ACCESS_VIOLATION reading 0x0`, 61-62 s in. **SYMBOLISED AND
+   ROOT-CAUSED in §20: it is a wine-builtin-DXGI-vs-vkd3d-proton mismatch caused by Config A's
+   `dxgi=b`, NOT the present owner's own code.** The `main.dll +0x17DDC/+0x17EA3` frames are our
+   `CreateSwapChain`/`CreateSwapChainForHwnd` hooks forwarding correctly to the original; the
+   fault is INSIDE that original. Superseded by §20.
 
 **Verified working in the plugin host (02:42 log, verbatim where it matters):**
 
@@ -691,9 +687,80 @@ native-first). Six launches, each read from `stray-launch-verdict.txt` (tools/la
   design already reached the game's factory, and the export hooks are redundant (harmless). The
   02:19 run — throwaway patch only — crashed at the same 61 s with the same signature, which is
   the same swapchain-creation hook faulting. SOFT->HARD downgrade of the earlier claim.
+  > **CORRECTED in §20.** The vtable `00006FFFFCC113E0` this line calls "the throwaway's" is
+  > **wine-builtin dxgi.dll's** (module `00006FFFFCBE0000-…FCC1B000` in the crash minidump), not
+  > DXVK's. Under Config A's `dxgi=b` the whole process's DXGI is wine-builtin, and it is
+  > wine-builtin's `d3d12_swapchain_create` that faults. The one-vtable-per-class observation is
+  > unaffected; the DLL it names is wrong.
 
 **Not reached:** the swapchain hook, so no `on_present`, no status heartbeat, no NGX init (frame
 120 is a present count), no DLSS evaluate under the plugin. Config A and Config B verification of
 the plugin remain OPEN. The box was left in the known-good state (plugin `StrayDLSS : 0`, add-on
 `NativeMode=off`, ReShade loaded, original launch options) and a confirming launch reached
 gameplay: `VERDICT: OK: IN GAME census=388 taa_pipelines=1`.
+
+## 20. The 61 s swapchain crash is a wine-builtin-DXGI vs vkd3d-proton mismatch (`dxgi=b`), symbolised from the minidump (2026-09-02)
+
+Stage 4's 61-62 s `EXCEPTION_ACCESS_VIOLATION reading 0x0` (§19 crash 2), symbolised offline from
+the UE4 minidump (`Saved/Crashes/UE4CC-…EA9444C2…`, the 02:41 run) against the plugin build's
+`main.pdb` and the box's own wine DLLs, with `llvm-symbolizer`. No launch was needed to root-cause
+it. HARD unless marked.
+
+**The faulting instruction.** Exception thread context: `Rip = libvkd3d-1.dll+0x3e7b0`,
+`Rcx = 0`, code `c0000005` reading `0x0`. That RVA is `vkd3d_instance_get_vk_instance`, whose
+entire body is `mov rax,[rcx]; ret` — it dereferences its argument. Its caller is **wine-builtin**
+`dxgi.dll` `d3d12_swapchain_create+0x6eaa`, which does:
+
+```
+call vkd3d_instance_from_device   ; rcx = the D3D12 device
+mov  rcx, rax                      ; rax = the vkd3d instance it returned
+call vkd3d_instance_get_vk_instance ; deref rcx  -> reads 0x0, CRASH
+```
+
+`vkd3d_instance_from_device` is `mov rax,[rcx+0xed8]; ret`, and it returned **NULL**. The device
+handed to it is `R14 = 0x1F910080` — our real device, `vtable in d3d12core.dll`, i.e. a
+**vkd3d-proton** device. wine's own libvkd3d does not recognise a vkd3d-proton device object, so
+the field it reads is not a wine-libvkd3d instance, and the next deref faults on 0x0.
+
+**Two vkd3d/DXGI stacks are in the process, and the crash is the wrong pairing.** The three
+`dxgi.dll` images are distinguishable by size and content:
+
+| DXGI image | size | identity | D3D12 backend it bridges to |
+|---|---|---|---|
+| wine-builtin `dxgi.dll` | 727 289 B (`SizeOfImage 0x3b000`) | exports `d3d12_swapchain_create`, imports `vkd3d_instance_from_device` — the **wined3d / wine-libvkd3d** bridge | wine's own libvkd3d (`libvkd3d-1.dll`) |
+| DXVK `dxgi.dll` (prefix `system32`, native) | 4 853 760 B | contains `DxvkContext…` | vkd3d-proton (`d3d12core.dll`) |
+| ReShade `dxgi.dll` (game dir) | 5 592 064 B | "ReShade …" | chains to whichever native dxgi it finds |
+
+In the crash run the DXGI vtable our own present owner patched was `00006FFFFCC113E0`, which lies
+inside the **wine-builtin** dxgi module (`00006FFFFCBE0000-…FCC1B000` in the minidump). So the
+entire process was on wine-builtin DXGI, whose D3D12-swapchain path targets wine-libvkd3d — while
+the D3D12 device is vkd3d-proton. **wine-builtin DXGI cannot create a D3D12 swapchain on a
+vkd3d-proton device; that is the crash, and it is independent of our hooks.** Our
+`hk_CreateSwapChain`/`hk_CreateSwapChainForHwnd` frames on the stack (`main.dll +0x17DDC`,
+`+0x17EA3`, symbolised to `present_owner.cpp:196` and `:207` — the lines right after each
+`g_orig_*` forward) were forwarding to the correct wine original, which then faulted on its own.
+
+**Why wine-builtin DXGI was selected: `dxgi=b`.** §19's Config A recipe launched with
+`WINEDLLOVERRIDES="dxgi=b;…"`. `b` = builtin = wine's own dxgi.dll — the wined3d bridge — NOT
+DXVK. The game's D3D12 is always vkd3d-proton, so forcing wine-builtin DXGI in front of it is the
+mismatch. **The correct Config A keeps `dxgi=n,b` (native-first) and merely renames the game-dir
+ReShade `dxgi.dll` out of the way; native resolution then falls to the prefix's DXVK
+`system32\dxgi.dll`, giving DXVK DXGI + vkd3d-proton, the compatible pairing, with ReShade absent.**
+UNCONFIRMED until a launch shows which module provides dxgi and that the swapchain is created.
+
+**A separate, real latent bug the same investigation found, and FIXED.** The present owner stored
+the four `CreateSwapChain*` originals in single globals. Two distinct DXGI vtables can coexist in
+one Proton process (wine-builtin, and DXVK/ReShade), each with its own originals; a global collapses
+them, and a re-entrant `CreateSwapChain -> CreateSwapChainForHwnd` on one class then forwards into
+the OTHER class's implementation — the same NULL-deref shape. Fixed by resolving every original
+PER-VTABLE from the `self` handed to the hook (`vtable_patch::original_for`), and by restructuring
+the swapchain interception to be **lazy**: the creation hook now only records the returned pointer,
+patches that object's `Present`/`ResizeBuffers` slots, and returns — with a thread-local depth guard
+so DXVK's `CreateSwapChain`→`CreateSwapChainForHwnd` re-entry notes the swapchain once, at the
+outermost call. Every use of the object (`QueryInterface` for SwapChain3/1, the queue pick,
+`GetDesc`/`GetBuffer`, `Present1`/`ResizeBuffers1` patching, `report_back_buffers`) moves to the
+FIRST `Present`, when the object is fully built. This removes all work against a half-constructed
+swapchain and the global-collision surface. It does NOT by itself fix the wine-builtin mismatch —
+only the DXGI-provider change does — but it is required for the DXVK path to be robust.
+Tested in the WARP harness (`original_for` resolves per-vtable and returns null for an unpatched
+slot). HARD (code + symbolisation); the DXVK-path behaviour is UNCONFIRMED until the box run.

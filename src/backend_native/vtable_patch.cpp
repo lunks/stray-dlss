@@ -62,6 +62,19 @@ void *patch_slot(void *object, unsigned index, void *replacement, const char *na
 	return original;
 }
 
+void *original_for(void *object, unsigned index)
+{
+	if (object == nullptr)
+		return nullptr;
+	void **vtable = *static_cast<void ***>(object);
+	void **slot = &vtable[index];
+	std::lock_guard<std::mutex> lock(g_mutex);
+	for (const Patch &p : g_patches)
+		if (p.slot == slot)
+			return p.original;
+	return nullptr;
+}
+
 void restore_all_patches()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
