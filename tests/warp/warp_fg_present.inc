@@ -431,14 +431,14 @@ bool test_fg_present_twice(Gpu &gpu)
 	fg::set_generator(&stale);
 	{
 		const fg::Stats before = fg::stats();
-		if (!play(3, 8, "ngx-black", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
+		if (!play(3, 8, "ngx-stale", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
 			return false;
 		fg_wait_idle(gpu);
 		const fg::Stats st = fg::stats();
-		std::printf("  stale generator: calls=%d issued +%llu generated +%llu crops ok=%llu stale=%llu black=%llu validated=%d not-validated +%llu\n", stale.calls,
+		std::printf("  stale generator: calls=%d issued +%llu generated +%llu crops ok=%llu suspect=%llu stale=%llu black=%llu validated=%d not-validated +%llu\n", stale.calls,
 			static_cast<unsigned long long>(st.presents_issued - before.presents_issued),
 			static_cast<unsigned long long>(st.generated_presented - before.generated_presented),
-			static_cast<unsigned long long>(st.crop_ok), static_cast<unsigned long long>(st.crop_stale), static_cast<unsigned long long>(st.crop_black), st.validated ? 1 : 0,
+			static_cast<unsigned long long>(st.crop_ok), static_cast<unsigned long long>(st.crop_suspect), static_cast<unsigned long long>(st.crop_stale), static_cast<unsigned long long>(st.crop_black), st.validated ? 1 : 0,
 			static_cast<unsigned long long>(st.refused[static_cast<int>(stray_dlss::core::fg::Refusal::not_validated)] - before.refused[static_cast<int>(stray_dlss::core::fg::Refusal::not_validated)]));
 		check(st.generated_presented == before.generated_presented, "a stale generated frame NEVER reached the screen");
 		check(st.presents_issued - before.presents_issued == 8, "the real frame was presented every time instead");

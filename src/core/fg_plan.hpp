@@ -151,12 +151,20 @@ struct CropStats
 
 enum class CropVerdict
 {
-	ok = 0,
+	ok = 0,      // the generated crop moved along with the real one (or neither moved)
 	black,       // (nearly) every pixel is zero: the evaluate wrote nothing
-	stale,       // the real frame changed but the generated one did not, repeatedly
-	identical,   // generated == real byte for byte (a copy, not an interpolation) — informational
+	stale,       // the real frame changed but the generated one did not, `stale_limit` times running
+	identical,   // generated == real byte for byte (a copy, not an interpolation) — informational, counts as ok
+	first,       // the first look: nothing to compare against; neutral
+	suspect,     // the real frame moved and the generated one did not, but not yet `stale_limit` times; neutral
 	count
 };
+// Whether a verdict counts TOWARD validation (ok, identical), AGAINST it (black, stale) or
+// neither (first, suspect). A stale output must never validate on the looks that precede its
+// STALE verdict — CI caught exactly that (a stale generated frame reached the screen after two
+// "ok" looks), hence the neutral class.
+enum class CropWeight { good, neutral, bad };
+CropWeight crop_weight(CropVerdict v);
 const char *crop_verdict_name(CropVerdict v);
 
 struct CropJudge

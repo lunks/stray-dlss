@@ -171,7 +171,21 @@ const char *crop_verdict_name(CropVerdict v)
 	case CropVerdict::black: return "BLACK";
 	case CropVerdict::stale: return "STALE";
 	case CropVerdict::identical: return "identical-to-real";
+	case CropVerdict::first: return "first-look";
+	case CropVerdict::suspect: return "suspect-unchanged";
 	default: return "?";
+	}
+}
+
+CropWeight crop_weight(CropVerdict v)
+{
+	switch (v)
+	{
+	case CropVerdict::ok:
+	case CropVerdict::identical: return CropWeight::good;
+	case CropVerdict::black:
+	case CropVerdict::stale: return CropWeight::bad;
+	default: return CropWeight::neutral;
 	}
 }
 
@@ -183,22 +197,33 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 	{
 		verdict = CropVerdict::black;
 	}
-	else if (have_prev)
+	else if (!have_prev)
+	{
+		verdict = CropVerdict::first;
+	}
+	else
 	{
 		const bool real_moved = real.hash != prev_real_hash;
 		const bool generated_moved = generated.hash != prev_gen_hash;
 		if (real_moved && !generated_moved)
+		{
 			++stale_run;
+			verdict = stale_run >= stale_limit ? CropVerdict::stale : CropVerdict::suspect;
+		}
 		else
+		{
 			stale_run = 0;
-		if (stale_run >= stale_limit)
-			verdict = CropVerdict::stale;
-		else if (generated.hash == real.hash)
-			verdict = CropVerdict::identical;
+			verdict = generated.hash == real.hash ? CropVerdict::identical : CropVerdict::ok;
+		}
 	}
-	prev_gen_hash = generated.hash;
-	prev_real_hash = real.hash;
-	have_prev = true;
+	if (verdict != CropVerdict::black)
+	{
+		// A black look is not a reference for the next one: the first valid look after it is
+		// a first look again.
+		prev_gen_hash = generated.hash;
+		prev_real_hash = real.hash;
+		have_prev = true;
+	}
 	return verdict;
 }
 

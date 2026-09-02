@@ -151,20 +151,26 @@ TEST_CASE("CropJudge: black is caught on the first look; stale needs the real fr
 	gen.nonzero = 20;                                // 0.5% - still black
 	CHECK(j.judge(gen, real) == CropVerdict::black);
 	gen.nonzero = 3000;
-	CHECK(j.judge(gen, real) == CropVerdict::ok);
-	// The real frame changes every look, the generated hash never does: stale after 3.
+	// The first non-black look has nothing to compare against: neutral, never "good" (a stale
+	// output validated on CI on exactly such looks before this class existed).
+	CHECK(j.judge(gen, real) == CropVerdict::first);
+	CHECK(crop_weight(CropVerdict::first) == CropWeight::neutral);
+	// The real frame changes every look, the generated hash never does: suspect, suspect, STALE.
 	for (int i = 0; i < 2; ++i)
 	{
 		real.hash += 1;
-		CHECK(j.judge(gen, real) == CropVerdict::ok);
+		CHECK(j.judge(gen, real) == CropVerdict::suspect);
 	}
+	CHECK(crop_weight(CropVerdict::suspect) == CropWeight::neutral);
 	real.hash += 1;
 	CHECK(j.judge(gen, real) == CropVerdict::stale);
+	CHECK(crop_weight(CropVerdict::stale) == CropWeight::bad);
 	CHECK(j.stale_run == 3);
-	// One frame where the generated hash moves breaks the run.
+	// One frame where the generated hash moves breaks the run and is the first GOOD look.
 	real.hash += 1;
 	gen.hash += 1;
 	CHECK(j.judge(gen, real) == CropVerdict::ok);
+	CHECK(crop_weight(CropVerdict::ok) == CropWeight::good);
 	CHECK(j.stale_run == 0);
 	// A static camera: neither moves - that is not stale (nothing to interpolate).
 	CHECK(j.judge(gen, real) == CropVerdict::ok);
@@ -172,6 +178,8 @@ TEST_CASE("CropJudge: black is caught on the first look; stale needs the real fr
 	// Generated == real byte for byte is reported, not refused.
 	gen.hash = real.hash;
 	CHECK(j.judge(gen, real) == CropVerdict::identical);
+	CHECK(crop_weight(CropVerdict::identical) == CropWeight::good);
+	CHECK(crop_weight(CropVerdict::black) == CropWeight::bad);
 	// An empty crop is black, never a division by zero.
 	CropJudge z;
 	CHECK(z.judge(CropStats{}, CropStats{}) == CropVerdict::black);
