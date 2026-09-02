@@ -368,9 +368,12 @@ jobs:
           foreach ($obj in @('UE4SS.dir\\src\\UE4SSProgram.cpp.obj', 'Unreal.dir\\src\\UObjectGlobals.cpp.obj', 'StrayDLSS.dir\\src\\Mod.cpp.obj')) {
             $i = [array]::FindIndex($ninja, [Predicate[string]]{ param($l) $l -match "^build .*$obj" })
             if ($i -lt 0) { throw "build.ninja has no build edge for $obj" }
-            $f = $ninja[($i + 1)..($i + 12)] | Where-Object { $_ -match '^\s*FLAGS = ' } | Select-Object -First 1
-            Write-Host "$obj`n  $f"
+            $edge = $ninja[($i + 1)..($i + 14)]
+            $f = $edge | Where-Object { $_ -match '^\s*FLAGS = ' } | Select-Object -First 1
+            $l = $edge | Where-Object { $_ -match '^\s*LAUNCHER = ' } | Select-Object -First 1
+            Write-Host "$obj`n  $f`n  $l"
             if ($f -notmatch '/Z7\b') { throw "$obj is not compiled with /Z7: $f" }
+            if ($l -notmatch 'sccache') { throw "$obj is not compiled through sccache: '$l'" }
           }
           if ($z7.Count -eq 0) { throw "no object in build.ninja is compiled with /Z7" }
           if ($zi.Count -gt 0) { $zi | Select-Object -First 3 | ForEach-Object { Write-Host $_ }; throw "$($zi.Count) FLAGS lines still carry /Zi, which sccache cannot cache" }
@@ -380,12 +383,16 @@ jobs:
             Write-Host $launcher
             if ($launcher -notmatch 'sccache') { throw "CMAKE_${lang}_COMPILER_LAUNCHER is not sccache: $launcher" }
           }
-          # The rules live in CMakeFiles/rules.ninja (build.ninja only includes it - MEASURED,
-          # run 33590431194 found 0 there). CMake prefixes the launcher to each compile rule.
-          $rules = @(Get-Content build/CMakeFiles/rules.ninja | Where-Object { $_ -match '^\s*command = .*sccache' })
-          $rules | ForEach-Object { Write-Host ($_.Substring(0, [Math]::Min(160, $_.Length))) }
-          Write-Host "rules.ninja compile rules routed through sccache: $($rules.Count)"
-          if ($rules.Count -eq 0) { throw "no rules.ninja rule invokes sccache: the launcher did not reach the generator" }
+          # CMake's Ninja generator routes the launcher through a per-object "LAUNCHER = sccache "
+          # variable on each build edge, and the compile rule in CMakeFiles/rules.ninja carries
+          # only the "$LAUNCHER" placeholder (cmNinjaTargetGenerator.cxx: vars["LAUNCHER"]).
+          # MEASURED, runs 33590431194 and 33591180067: "sccache" appears in NO "command =" line
+          # of either file, so a rule grep can never see it. Count the edges instead.
+          $launched = @($ninja | Where-Object { $_ -match '^\s*LAUNCHER = .*sccache' })
+          $placeholders = @(Get-Content build/CMakeFiles/rules.ninja | Where-Object { $_ -match '^\s*command = \$LAUNCHER' })
+          Write-Host "build.ninja objects with 'LAUNCHER = sccache': $($launched.Count); rules.ninja compile rules with the `$LAUNCHER placeholder: $($placeholders.Count)"
+          if ($launched.Count -eq 0) { throw "no build.ninja object carries LAUNCHER = sccache: the launcher did not reach the generator" }
+          if ($placeholders.Count -eq 0) { throw "no rules.ninja compile rule expands `$LAUNCHER: this CMake spells the launcher differently, re-derive the check" }
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
