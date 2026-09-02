@@ -380,9 +380,12 @@ jobs:
             Write-Host $launcher
             if ($launcher -notmatch 'sccache') { throw "CMAKE_${lang}_COMPILER_LAUNCHER is not sccache: $launcher" }
           }
-          $rules = @($ninja | Where-Object { $_ -match '^\s*command = .*sccache' })
-          Write-Host "build.ninja compile rules routed through sccache: $($rules.Count)"
-          if ($rules.Count -eq 0) { throw "no build.ninja rule invokes sccache: the launcher did not reach the generator" }
+          # The rules live in CMakeFiles/rules.ninja (build.ninja only includes it - MEASURED,
+          # run 33590431194 found 0 there). CMake prefixes the launcher to each compile rule.
+          $rules = @(Get-Content build/CMakeFiles/rules.ninja | Where-Object { $_ -match '^\s*command = .*sccache' })
+          $rules | ForEach-Object { Write-Host ($_.Substring(0, [Math]::Min(160, $_.Length))) }
+          Write-Host "rules.ninja compile rules routed through sccache: $($rules.Count)"
+          if ($rules.Count -eq 0) { throw "no rules.ninja rule invokes sccache: the launcher did not reach the generator" }
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
