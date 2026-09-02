@@ -927,6 +927,12 @@ The observer needs *some* driver to publish expectations; with ReShade still loa
 
 ### Task 18: `present_owner` — our command list on the presenting queue
 
+> **STATUS 2026-09-02 (facts §19):** built (`c03b71d`, `533bcc4`) and installed on the box under
+> the UE4SS host; the factory side reaches the game's factories via export hooks, the swapchain
+> side faults inside `hk_CreateSwapChain*`/`note_swapchain` (`main.dll +0x17DDC -> +0x17EA3`).
+> OPEN. The host itself (Task 16/17 under UE4SS: device hook, drive mode, ini, NGX on) is
+> verified through the same log.
+
 **Files:**
 - Create: `src/backend_native/present_owner.{hpp,cpp}`
 - Modify: `src/backend_native/dxgi_hooks.cpp` — the `Present`/`Present1` hooks call `present_owner::before_present(swapchain)` then the original; `ResizeBuffers` → `Sink::on_swapchain(created=false/true)` around the original

@@ -643,3 +643,52 @@ occupy. Three `ERROR` lines per session, all the expected `[pre-NGX] vkd3d ID3D1
 is HOOKED BY RESHADE` trio that `ext_unhook` answers.
 
 `NativeMode=off` was restored in `ReShade.ini` after driveC.
+
+## 19. The UE4SS plugin host on the box (2026-09-02 01:16-02:49): what runs, what does not
+
+Stage 4: `mods/StrayDLSS` 0.1.0 as the host, launched WITHOUT ReShade (`WINEDLLOVERRIDES="dxgi=b;dwmapi=n,b"`
+— the `dxgi=b` matters: merely dropping the `dxgi=n,b` override left ReShade's app-local
+`dxgi.dll` loading, measured at 01:20 by a fresh `ReShade.log`; Proton's own default for dxgi is
+native-first). Six launches, each read from `stray-launch-verdict.txt` (tools/launch-stray.sh).
+
+**Two crashes in `start_mod`, both root-caused from the Proton log's `virtual_unwind` backtrace:**
+
+1. 01:20, 01:52 — `c0000005` at `MSVCP140.dll +0x12eb0` (the prefix's **2020-11-11** msvcp140,
+   `native` at 0x6FFFFCE00000) from `main.dll`, before the first plugin log line. The MSVC
+   17.10+ constexpr `std::mutex` constructor against an old msvcp140: `src/log.cpp` (whose
+   `g_mutex` is the first lock the host takes) is compiled into `stray_dlss_core`, and
+   `_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR` was defined only on `stray_dlss_native`. The add-on
+   never hit it because it is /MT. Fixed globally for MSVC (`ac7e3f3`). HARD.
+   (The d3d12.dll force-load from start_mod, removed in `5c0060c`, was not the cause; the
+   removal stands — the probe's poll-for-d3d12 path is the measured-safe one.)
+2. 02:19, 02:42 — `EXCEPTION_ACCESS_VIOLATION reading 0x0`, 61-62 s in, UE4 dump with an empty
+   callstack; the Proton log's backtrace is `main.dll +0x17DDC -> main.dll +0x17EA3 -> fault at
+   0x6FFFFCA0E7B0` (a DXGI/wine builtin). `+0x17DDC/+0x17EA3` sit just past the four
+   `CreateSwapChain*` hooks the log places at `+0x17870..+0x17AB0`: **the present owner's
+   swapchain-creation path** (`hk_CreateSwapChain*` -> `note_swapchain` / `report_back_buffers`).
+   The game's last recorded act is creating a SECOND DXGI factory (`present owner: patched the
+   game's factory 0000000017D10690`), i.e. the swapchain is being created at that moment. No
+   `present owner: swapchain ... via ...` line was ever written, so the fault is INSIDE that
+   hook before it logs. OPEN — see the report for the candidate fix.
+
+**Verified working in the plugin host (02:42 log, verbatim where it matters):**
+
+* `host: d3d12.dll was already loaded ... first bytes 55 41 54 -> pristine (we are the first hook)`
+  — no ReShade in the process; `host: D3D12CreateDevice #1 ... real device 000000001F910080
+  (vtable in d3d12core.dll)`; the startup device recreate (#2, same object, facts §11) handled.
+* `StrayDLSS.ini loaded (50 values)`, `NGX is ENABLED`, `DLSS evaluation is ENABLED` (after
+  `533bcc4`: the ini lives at the mod ROOT, not `dlls/`; the first run looked in `dlls/`, found
+  nothing, and every key silently defaulted — EnableNGX/NgxEvaluate OFF).
+* `native backend: mode=drive ... device-slots=18 list-slots=11 patches=29` on the real device,
+  `ext_unhook: captured 4 pristine vtable slots` (slot 8 unhooked: no ReShade, the repair is inert).
+* `present owner: queue #1 ... DIRECT`, `#2 copy`, `#3 compute` from the CreateCommandQueue hook.
+* The DXGI factory EXPORT hooks (`533bcc4`) reach the game's factories: `patched the game's
+  factory 00000000033945C0` and `...17D10690` — where the throwaway-factory vtable patch of the
+  first design never fired: **DXVK does not share one vtable per DXGI class** (the d3d12
+  static-vtable fact of §11 does not extend to DXGI). HARD.
+
+**Not reached:** the swapchain hook, so no `on_present`, no status heartbeat, no NGX init (frame
+120 is a present count), no DLSS evaluate under the plugin. Config A and Config B verification of
+the plugin remain OPEN. The box was left in the known-good state (plugin `StrayDLSS : 0`, add-on
+`NativeMode=off`, ReShade loaded, original launch options) and a confirming launch reached
+gameplay: `VERDICT: OK: IN GAME census=388 taa_pipelines=1`.
