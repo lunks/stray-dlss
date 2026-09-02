@@ -44,12 +44,21 @@ local function mapName()
     return ok and name or "?"
 end
 
-local function pawnPresent()
+-- Returns the pawn's instance name (e.g. BP_CatPawn_C_2147480326) or "" when absent. The
+-- name changes if a reload recreates the pawn; measured 2026-09-02 a checkpoint reload
+-- keeps it, so this is a diagnostic, not a gate.
+local function pawnName()
     local ok, v = pcall(function()
         local pawn = FindFirstOf("BP_CatPawn_C")
-        return valid(pawn)
+        if not valid(pawn) then return "" end
+        local full = pawn:GetFullName()
+        return (full:match("%.([^%.]+)$")) or full
     end)
-    return ok and v == true
+    return ok and v or ""
+end
+
+local function pawnPresent()
+    return pawnName() ~= ""
 end
 
 local function controllerPresent()
@@ -84,8 +93,8 @@ local function write()
     -- the shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
     local f = io.open(STATE, "wb")
     if not f then return end
-    f:write(string.format("seq=%d\nt=%d\npawn=%d\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
-        seq, os.time(), pawn, pc, map, paused, ingame))
+    f:write(string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
+        seq, os.time(), pawn, pawnName(), pc, map, paused, ingame))
     f:close()
 end
 

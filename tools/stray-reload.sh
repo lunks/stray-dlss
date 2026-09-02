@@ -57,26 +57,28 @@ tap_key $KEY_ENTER; sleep 1.0
 tap_key $KEY_RIGHT; sleep 0.5
 tap_key $KEY_ENTER
 
-# Phase 1: see the reload actually happen. The probe's pawn/ingame drop during the load,
-# and seq keeps climbing (a frozen seq is a hung game). Without this phase a mis-keyed
-# sequence would "succeed" instantly on the uninterrupted session.
-log "waiting for the reload to start (ingame->0 or pawn recreated), up to 30 s"
-saw_reload=0
-for i in $(seq 1 60); do
-    tick_checks "reload start" "$T0"
-    if [ "$(probe ingame)" != "1" ] || [ "$(probe pawn)" != "1" ]; then saw_reload=1; break; fi
+# Phase 1: see the reload get ACCEPTED. Measured 2026-09-02 (user watching the screen):
+# a checkpoint reload keeps the player pawn and the map, so "ingame drops to 0" never
+# happens and is the wrong signal. What does happen is that the game unpauses by itself:
+# paused 1 -> 0 within a few seconds of the confirm. Had RIGHT+ENTER landed on "No", the
+# dialog would close but the pause menu would still be up (paused stays 1).
+log "waiting for the game to unpause (reload accepted), up to 15 s"
+accepted=0
+for i in $(seq 1 30); do
+    tick_checks "reload accept" "$T0"
+    [ "$(probe paused)" = "0" ] && { accepted=1; break; }
     sleep 0.5
 done
-[ "$saw_reload" -eq 1 ] || { log "FAILED: no reload observed within 30 s (probe still ingame=1 pawn=1 map=$(probe map)); the key sequence did not reach the confirm"; exit 1; }
-log "  reload observed at +$(( $(date +%s) - T0 ))s (map=$(probe map))"
+[ "$accepted" -eq 1 ] || { log "FAILED: still paused 15 s after the confirm (pawn=$(probe pawn) map=$(probe map)); the confirm landed on No or never reached the dialog"; tap_key $KEY_ESC; exit 1; }
+log "  unpaused at +$(( $(date +%s) - T0 ))s: reload accepted (pawn=$(probe pawnname))"
 
-# Phase 2: gameplay comes back and holds.
+# Phase 2: gameplay holds after the reload (the reload is fast; this is a settle check).
 deadline=$(( T0 + TIMEOUT )); stable=0; last=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    tick_checks "reload load" "$T0"
-    now="pawn=$(probe pawn) pc=$(probe pc) map=$(probe map) ingame=$(probe ingame) seq=$(probe seq)"
+    tick_checks "reload settle" "$T0"
+    now="pawn=$(probe pawn) pc=$(probe pc) map=$(probe map) paused=$(probe paused) ingame=$(probe ingame) seq=$(probe seq)"
     [ "$now" != "$last" ] && { log "  $now"; last="$now"; }
-    if [ "$(probe ingame)" = "1" ]; then
+    if [ "$(probe ingame)" = "1" ] && [ "$(probe paused)" = "0" ]; then
         stable=$((stable + 1))
         if [ "$stable" -ge 6 ]; then
             log "BACK IN GAME after $(( $(date +%s) - T0 ))s"
