@@ -9,17 +9,18 @@
 # evdev node never reach the game. Pad replay would have to go through the shim.
 set -u
 . "$(dirname "$0")/stray-lib.sh"
-SECONDS_MAX=60; OUT="$GAME_DIR/stray-recording.txt"
+SECONDS_MAX=60; IDLE=6; OUT="$GAME_DIR/stray-recording.txt"
 while [ $# -gt 0 ]; do
     case "$1" in
         --seconds) SECONDS_MAX="$2"; shift 2 ;;
+        --idle) IDLE="$2"; shift 2 ;;        # stop this many seconds after the last key (0 = never)
         --out) OUT="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 KBD=$(find_keyboard); [ -n "$KBD" ] || { log "FAILED: no sysrq-capable keyboard node"; exit 1; }
-log "recording /dev/input/$KBD for up to ${SECONDS_MAX}s into $OUT — play the segment now"
-python3 "$INJECT" record "/dev/input/$KBD" "$OUT" "$SECONDS_MAX"
+log "recording /dev/input/$KBD for up to ${SECONDS_MAX}s (stops ${IDLE}s after the last key) into $OUT — play the segment now"
+python3 "$INJECT" record "/dev/input/$KBD" "$OUT" "$SECONDS_MAX" "$IDLE"
 chown deck:deck "$OUT" 2>/dev/null
 n=$(wc -l < "$OUT"); dur=$(tail -n 1 "$OUT" | cut -d' ' -f1)
 log "recorded $n events over ${dur:-0}s: $OUT"
