@@ -262,15 +262,17 @@ bool install_device_hook()
 {
 	if (g_hook_installed.load())
 		return true;
+	// DO NOT force-load d3d12.dll. The probe measured (facts §12) that at start_mod the game has
+	// NOT loaded it yet, and it poll-installed the hook from on_update once the game did — which
+	// ran without incident. Force-loading it ourselves from start_mod is what the FIRST host
+	// build did, and it crashed the process ~11 s in with c0000005 in a wine builtin, ReShade's
+	// log ending exactly at "d3d12.dll ... Just loaded via LoadLibrary('...main.dll')": loading
+	// it ~970 ms early, and triggering ReShade's delayed d3d12-hook install at that point, is not
+	// survivable here. So wait for the game to load it, exactly as the probe did.
 	HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
-	const bool already_loaded = d3d12 != nullptr;
 	if (d3d12 == nullptr)
-		d3d12 = ::LoadLibraryW(L"d3d12.dll");
-	if (d3d12 == nullptr)
-	{
-		STRAY_LOG_ERROR("host: d3d12.dll could not be loaded (error %lu); nothing can be hooked", ::GetLastError());
-		return false;
-	}
+		return false; // not yet; Tick() polls
+	const bool already_loaded = true;
 	if (!g_minhook_up.load())
 	{
 		const MH_STATUS st = MH_Initialize();
@@ -328,11 +330,17 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 		"resets and dispatches; the finders' render-target/draw/copy taps are NOT delivered by this host)",
 		needs.pipeline_events ? 1 : 0, needs.finder_rt_events ? 1 : 0, needs.pass_finder_events ? 1 : 0);
 
-	install_device_hook();
+	if (install_device_hook())
+		STRAY_LOG_INFO("host: d3d12.dll was already loaded at start_mod; hook installed now");
+	else
+		STRAY_LOG_WARN("host: d3d12.dll is not loaded yet at start_mod (expected, facts §12); polling for it from on_update. "
+			"NOT force-loading it - doing so from start_mod crashed the process in the first host build.");
 }
 
 void Tick()
 {
+	if (!g_hook_installed.load())
+		install_device_hook();
 	if (g_ini.reload_if_changed())
 		STRAY_LOG_INFO("host: %s changed on disk and was re-read (%zu values); keys read at startup keep their old value",
 			g_ini_path.c_str(), g_ini.size());
