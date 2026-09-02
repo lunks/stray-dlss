@@ -1,5 +1,6 @@
 #include "backend_native/fg_present.hpp"
 
+#include "backend_native/fg_reflex.hpp"
 #include "backend_native/native_backend.hpp"
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
@@ -615,7 +616,12 @@ HRESULT present_one(Chain &c, const Pair &p, ID3D12Resource *src)
 	record_copy(list, real, D3D12_RESOURCE_STATE_PRESENT, src, D3D12_RESOURCE_STATE_COMMON);
 	c.ring.submit(list, c.queue);
 	real->Release();
+	const bool generated = src == p.generated;
+	if (g_cfg.reflex != 0)
+		reflex::marker(generated ? reflex::Marker::out_of_band_present_start : reflex::Marker::present_start, p.frame);
 	const HRESULT hr = p.orig_present(p.sc, p.sync, p.flags);
+	if (g_cfg.reflex != 0)
+		reflex::marker(generated ? reflex::Marker::out_of_band_present_end : reflex::Marker::present_end, p.frame);
 	note_issued_present();
 	return hr;
 }
@@ -901,6 +907,8 @@ void on_swapchain_finalised(IDXGISwapChain *sc, IDXGISwapChain3 *sc3, ID3D12Devi
 		return;
 	}
 	c.finalised = true;
+	if (g_cfg.reflex != 0)
+		reflex::initialise(device, /*low_latency=*/true, /*boost=*/g_cfg.reflex >= 2);
 	if (g_cfg.pacing == Pacing::thread)
 		start_worker();
 	STRAY_LOG_WARN("fg: finalised on queue %p; presenter=%s; armed=%d (GetBuffer %s)", static_cast<void *>(queue),
@@ -1021,6 +1029,16 @@ bool present(const PresentArgs &args, long *hr_out)
 {
 	if (!g_cfg.enabled || !g_have_chain.load() || args.sc != g_chain.sc)
 		return false;
+	if (g_cfg.reflex != 0)
+	{
+		// Reflex's Sleep belongs at the start of the game's frame; inside its Present is the
+		// closest point an injector reaches, and it is where Streamline's own DLSS-G puts it
+		// when the host does not call it (the SL pacer). Measured, not assumed: the status of
+		// every call is in the log and the [fg] line.
+		reflex::marker(reflex::Marker::simulation_end, args.frame);
+		reflex::sleep();
+		reflex::marker(reflex::Marker::simulation_start, args.frame + 1);
+	}
 	Pair p;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -1123,6 +1141,7 @@ bool present(const PresentArgs &args, long *hr_out)
 void uninstall()
 {
 	stop_worker();
+	reflex::shutdown();
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_have_chain.load())
 	{
@@ -1157,7 +1176,8 @@ void log_stats(const char *when)
 				core::fg::refusal_name(static_cast<core::fg::Refusal>(i)), static_cast<unsigned long long>(s.refused[i]));
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
-	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer %.2f ms hitches=%llu | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu validated=%d",
+	const reflex::Status rs = reflex::status();
+	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer %.2f ms hitches=%llu | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),
 		s.game_presents != 0 ? static_cast<double>(s.presents_issued) / static_cast<double>(s.game_presents) : 0.0,
@@ -1166,7 +1186,9 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(s.worker_waits), static_cast<unsigned long long>(s.epoch), static_cast<unsigned long long>(s.reconfigures),
 		s.width, s.height, s.format, static_cast<int>(s.color_space),
 		static_cast<unsigned long long>(s.crop_ok), static_cast<unsigned long long>(s.crop_identical),
-		static_cast<unsigned long long>(s.crop_black), static_cast<unsigned long long>(s.crop_stale), s.validated ? 1 : 0);
+		static_cast<unsigned long long>(s.crop_black), static_cast<unsigned long long>(s.crop_stale), s.validated ? 1 : 0,
+		rs.dll_found ? 1 : 0, rs.initialised ? 1 : 0, rs.sleep_mode_set ? 1 : 0, rs.set_sleep_mode_status,
+		static_cast<unsigned long long>(rs.sleeps), rs.last_sleep_status, static_cast<unsigned long long>(rs.markers), rs.last_marker_status);
 }
 
 } // namespace stray_dlss::native::fg

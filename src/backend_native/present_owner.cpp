@@ -549,6 +549,7 @@ bool install(::ID3D12Device *device)
 		fc.wait_ms = host::cfg::get_int("NgxFGWaitMs", -1);
 		fc.band = host::cfg::get_bool("NgxFGBand", true);
 		fc.validate = host::cfg::get_int("NgxFGValidate", 1);
+		fc.reflex = host::cfg::get_int("NgxFGReflex", 1);
 		fg::configure(fc);
 	}
 

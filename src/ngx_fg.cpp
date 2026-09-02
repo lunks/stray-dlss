@@ -293,9 +293,11 @@ bool create_feature(ID3D12GraphicsCommandList *list, ID3D12CommandQueue *queue, 
 		g_stats.hdr = hdr;
 		g_stats.multi_frame_count_max = have_mfc ? mfc : 0;
 	}
+	char mfc_text[24], mce_text[24];
+	std::snprintf(mfc_text, sizeof(mfc_text), have_mfc ? "%u" : "absent", mfc);
+	std::snprintf(mce_text, sizeof(mce_text), have_mce ? "%u" : "absent", must_call_eval);
 	STRAY_LOG_WARN("fg/ngx: DLSS-G feature CREATED: %ux%u fmt %u hdr=%d internal %ux%u | snippet says MultiFrameCountMax=%s MustCallEval=%s | output-real=%s",
-		w, h, format, hdr, c.render_width, c.render_height, have_mfc ? std::to_string(mfc).c_str() : "absent",
-		have_mce ? std::to_string(must_call_eval).c_str() : "absent", g_output_real != nullptr ? "provided" : "none");
+		w, h, format, hdr, c.render_width, c.render_height, mfc_text, mce_text, g_output_real != nullptr ? "provided" : "none");
 	return true;
 }
 #endif

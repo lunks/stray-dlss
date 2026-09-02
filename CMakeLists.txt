@@ -255,6 +255,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/backend_native/present_owner.hpp
         src/backend_native/fg_present.cpp
         src/backend_native/fg_present.hpp
+        src/backend_native/fg_reflex.cpp
+        src/backend_native/fg_reflex.hpp
         src/backend_native/vtable_slots.hpp
         # Compile-time proof of the slot numbers against the SDK's C Vtbl structs; links nothing.
         src/backend_native/vtable_slots_check.c)
@@ -399,6 +401,7 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/backend_native/root_shadow.cpp
         src/backend_native/present_owner.cpp
         src/backend_native/fg_present.cpp
+        src/backend_native/fg_reflex.cpp
         src/backend_native/vtable_patch.cpp
         src/app/diff_observer.cpp)
 

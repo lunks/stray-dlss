@@ -55,6 +55,7 @@ struct Config
 	int wait_ms = -1;          // [STRAYDLSS] NgxFGWaitMs: sync/thread delay override; -1 = the pacer's half interval
 	bool band = true;          // [STRAYDLSS] NgxFGBand: paint the magenta band on the generated frame (experiment mode)
 	int validate = 1;          // [STRAYDLSS] NgxFGValidate: gate ngx-mode output on the crop readback (0 = present unvalidated, logged loudly)
+	int reflex = 1;            // [STRAYDLSS] NgxFGReflex: 0 off, 1 low-latency mode + Sleep per game present + markers (fg_reflex.hpp), 2 = 1 plus boost
 };
 
 // The stage-2 producer of generated frames. Records onto `list` (executes on the presenting
