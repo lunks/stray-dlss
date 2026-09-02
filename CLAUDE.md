@@ -621,6 +621,9 @@ nor kind to a machine someone is playing on.
 
 **Shader census:** 728 distinct PS/CS shaders in gameplay, `not_dxbc=0`, `dxil=0` — every one is
 **DXBC**. ~150 in the main menu, rising to ~728 on entering gameplay.
+> **MEASURED 2026-09-01:** that 728 was the apartment. The main menu reads **110** and gameplay in
+> **The Slums (save slot 1) reads 388-392**; the add-on's `in_game` threshold is now **300**, not
+> 400, which never fired there.
 
 ### 2.4 Depth
 
@@ -838,6 +841,12 @@ Environment facts, independent of any add-on — useful when triaging so we do n
 * The physical DualSense is held by **Steam** via `/dev/hidraw0`. Nothing holds its evdev nodes.
 * Steam Input re-emits it as **"Microsoft X-Box 360 pad 0"** — that node is what the game reads. Its
   `eventN` number is **not stable**; Steam tears it down with the game.
+  > **CORRECTED 2026-09-01.** Steam Input is now OFF for this title (`UseSteamControllerConfig 0`
+  > in `localconfig.vdf`, a consequence of the DualSense work, which needs the game to see the
+  > real pad), so **no X360 node appears at all** and the pad cannot be driven by evdev injection
+  > (the game reads it over hidraw). `tools/launch-stray.sh` drives the menu with **Enter on the
+  > sysrq keyboard node** instead; the game switches its glyphs to keyboard the moment a key
+  > arrives (seen in a ReShade screenshot).
 * Writing `input_event` structs directly to `/dev/input/eventN` reaches `input_inject_event()` and
   is seen by every reader. No `uinput`, `ydotool` or `evemu` needed. Neither the pad nor the
   keyboard node is `EVIOCGRAB`'d.
@@ -2154,6 +2163,28 @@ block-size code in the encoded-entry flags word is 0x3F, the explicit Compressio
 uint32 sits IMMEDIATELY after the flags word, before Offset — decoding it late shifts every
 later field, and only bites on large-block entries (small zlib entries decode fine either
 way, which is why the bug survived).
+
+### The UE4SS migration (2026-09-01): what is measured so far
+
+Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
+`docs/superpowers/plans/2026-09-01-dlss-sr-ue4ss-plugin.md`. The load-bearing ones:
+
+* **vkd3d-proton shares ONE vtable per class** (command list, queue, resource) and
+  **`SetPrivateDataInterface` releases at destruction** — both HARD from the harness on the box.
+* **UE4SS starts its C++ mods ~970 ms before the game's `D3D12CreateDevice`**, with `d3d12.dll`
+  not yet loaded (HARD, from `ReShade.log` and `UE4SS.log` of one session).
+* **The game destroys and recreates its first D3D12 device at startup, and ReShade unloads and
+  reloads the add-on across it.** A process-global vtable patch that outlives the DLL it points
+  into is an address-0 crash after the reload (measured, root-caused, fixed: the native backend
+  restores its slots on detach). Never patch a vtable from a DLL that can be unloaded without
+  undoing it.
+* **`QueryInterface` on ReShade's proxy device from inside its `init_device` callback deadlocks.**
+* **The native backend's resolve agrees with ReShade's on every register of the TAA pass** (§15);
+  the residual disagreements are root CBVs into UE4's constant ring buffer that the native
+  registry misses, and buffer SRV/UAV slots where the two trackers name different buffers —
+  the oracle's known stale view→resource map is the leading (SOFT) explanation for the latter.
+* **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
+  mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
 ## 6. Build, CI and testing
 

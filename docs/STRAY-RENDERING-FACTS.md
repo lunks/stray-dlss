@@ -408,3 +408,53 @@ DIFF hash=901e041a7cadc9db 480x270 TAA: 0 mismatch, 1 unknown, 0 extra
   cadence, not measured).
 
 Run F (per-hash logging, heap identity reclassified) follows in §15.
+
+## 15. The observer's first characterised numbers — run F (2026-09-01 ~22:05, The Slums)
+
+Per-hash disagreement logging, heap identity reported apart. The game reached gameplay and
+held 55-56 fps with the observer on (`[perf] frames 7200-7800: 55.2 fps avg`), against 55.1-55.6
+without it — the observer's cost is inside the noise.
+
+```
+DIFF SUMMARY [frame 7800] dispatches=39505 agree=121 mismatch=1017 unknown=39384 extra=24 heap-identity-only=121 unconsumed=0 | TAA dispatches=125 disagree=4 | disagreements=39384
+NATIVE SHADOW [frame 7800] mode=observe patches=28 resolves=39505 (no-layout 0) unknown-lookups=647232 unknown-copies=1623955 root-signatures=52 pipelines=673 resources live=3049 (registered 22683, destroyed 19634, sentinel-failures 0) slots=472507 heaps=2
+```
+
+The logged lines (3 per hash), classified:
+
+| class | lines | what |
+|---|---|---|
+| `MISMATCH t#/u#` | 128 | **all 128 name the same native buffer `29f55df0`** against an oracle buffer (both sides `fmt unknown 0x0`, i.e. buffer views); 2 of them the oracle calls an `R16G16B16A16_FLOAT` texture |
+| `UNKNOWN cb` | 564 | root CBVs whose GPU VA resolves to no registered buffer: **311 into `29f55df0`, 253 into `50e82f50`** — two buffers |
+| `UNKNOWN t#/u#` | 271 | table slots the shadow has no entry for |
+| `HEAP-ID` | 30 | proxy-vs-real heap identity, expected |
+
+* **The TAA pass (`0x901e041a7cadc9db`, 480x270): 121 of 125 dispatches agree on every register**
+  — depth+stencil over one resource at t2/t4, velocity, colour, history, eye adaptation, u0, and
+  the View constant buffer. The 4 that disagree each carry 31 `cb:` unknowns, all VAs into
+  `29f55df0`, and nothing else.
+* So the residual is ONE bounded defect, not scattered wrongness: the native registry's
+  GPU-VA map does not cover UE4's constant ring buffer(s) `29f55df0`/`50e82f50`, and the shadow
+  attributes a set of buffer SRV/UAV slots to `29f55df0` where ReShade's tracker names others.
+  Leads, in order: (1) a buffer registered lazily from a view carries a `GetDesc().Width` that
+  is not the range the game addresses (placed/sub-allocated), so `buffer_for_va` misses;
+  (2) a resource address REUSED after death, where ReShade's never-cleared view->resource map
+  (CLAUDE.md §5) would name the stale identity — which would make the ORACLE the wrong side
+  for those 128 lines (SOFT); (3) the buffer was created in the detach->reload window and only
+  seen through views. UNCONFIRMED which; the "native resolve: root CBV ... in no registered
+  buffer" line never printed, which itself says the VA lookup did not fail on the native side
+  — pointing at (1)/(2), an offset or identity disagreement rather than an absent buffer.
+* `unknown-copies=1.6M`: UE4 copying from null-descriptor slots; both sides record nothing
+  there, so it never reaches the diff.
+
+**Verdict for the Stage 2 gate: NOT zero, and characterised.** `disagreements=39384` of 39505
+dispatches, but 39 384 - 24 of them are the two-buffer defect above; the TAA registers the
+hook needs are reproduced exactly. Stage 3 (`drive`) must wait for that defect to be closed
+and a run with `disagreements=0` outside the heap-identity class.
+
+**A second hazard found while root-causing the crash, not yet closed:** the sentinels attached
+to resources during the add-on's FIRST life outlive the unload; when those resources die after
+the reload, the runtime calls `Release` on objects allocated by an image that is gone (same
+base address, different heap). It did not crash in three sessions, which proves nothing. The
+UE4SS-mod configuration has no reload; in the ReShade-hosted one, either pin the DLL
+(`GET_MODULE_HANDLE_EX_FLAG_PIN`) or keep the sentinel out of the ReShade host.
