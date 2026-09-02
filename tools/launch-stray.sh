@@ -72,6 +72,22 @@ fi
 # Restarting Steam is cheap here and clears the states that no amount of process killing
 # fixes: a wedged launch chain, a stale app-running flag, or an error dialog left on screen.
 # The gamescope session respawns Steam automatically.
+# Ask Steam to launch the app. MEASURED 2026-09-02 (facts §23): after Steam restarts inside the
+# gamescope session, the CEF SteamClient.Apps.RunGame call returns normally but produces NO
+# state change in content_log.txt (five calls, nothing), while the classic steam.pipe URL launch
+# works first time. So the pipe is the primary channel and CEF the fallback. The FIFO blocks
+# when nothing reads it, hence the timeout.
+ask_steam_to_launch() {
+    if [ -p /home/deck/.steam/steam.pipe ] && \
+       su - deck -c "timeout 5 sh -c 'echo steam://rungameid/$APPID > /home/deck/.steam/steam.pipe'" >/dev/null 2>&1; then
+        log "  (launch asked via steam.pipe)"
+        return 0
+    fi
+    log "  (steam.pipe unavailable; asking via CEF RunGame)"
+    su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
+        >/dev/null 2>&1
+}
+
 restart_steam() {
     log "Restarting Steam"
     su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.User.StartRestart(false)'" \
@@ -283,8 +299,7 @@ if ! game_running; then
     rm -f "$STATUS" "$GAME_DIR/stray-dlss.log" "$GAME_DIR/stray-dlss-plugin.log" "$VERDICT"
 
     log "Asking Steam to launch $APPID"
-    su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
-        >/dev/null 2>&1
+    ask_steam_to_launch
 
     log "Waiting for the process"
     # Proton's first launch (shader precompile + our plugin) can take well over a minute to
@@ -322,8 +337,7 @@ if ! game_running; then
             log "Attempting recovery: teardown + Steam restart + one retry"
             clear_stale_chain
             restart_steam
-            su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" \
-                >/dev/null 2>&1
+            ask_steam_to_launch
             for _ in $(seq 1 60); do
                 game_running && break
                 sleep 2

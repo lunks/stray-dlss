@@ -834,3 +834,88 @@ census step) or add the depth gate is deferred — neither is needed for the per
 
 Dispatch-side visibility is unaffected: the diff observer counted 126/126 TAA dispatches, and
 DLSS drives every frame; only the pipeline-CREATION census is compute-only.
+
+## 23. Launch channel and the reaper wedge (2026-09-02)
+
+Measured while driving Config A unattended. Operational, belongs with §2.10/§21.
+
+* **The reliable launch channel is the steam.pipe URL, not CEF `RunGame`.** After Steam restarts
+  inside the gamescope session, `SteamClient.Apps.RunGame("1332010","",-1,100)` via CEF returns
+  normally but produces NO `content_log.txt` state change (measured: five calls, nothing), while
+  `echo steam://rungameid/1332010 > /home/deck/.steam/steam.pipe` launches first try. The FIFO
+  blocks with no reader, so wrap it in `timeout 5`. `launch-stray.sh` now uses the pipe first and
+  CEF as fallback (`ask_steam_to_launch`).
+* **A hard-killed game (or a dismissed UE4 fatal dialog) leaves a `reaper SteamLaunch
+  AppId=1332010` process, and Steam then silently ignores every launch until it is killed**
+  (§2.10, confirmed again: killing `pgrep -f "reaper SteamLaunch AppId=1332010"` un-wedged a
+  launch that had been refused for minutes). This is the FIRST thing to check when a launch is
+  ignored — before any Steam restart. Restarting Steam to clear it churns the whole session
+  (four restarts in one hour desynchronised the compositor); prefer the reaper kill.
+* **A launcher wait on the plugin heartbeat is doomed if no host is active.** With `StrayDLSS : 0`
+  AND `dxgi.dll` renamed `.off`, there is no plugin and no ReShade, so nothing writes
+  `stray-dlss-status.txt`; a heartbeat wait then always times out. A control arm with the plugin
+  off needs a host-independent readiness signal (the game process, or a UE4SS-side probe), not the
+  plugin's own heartbeat.
+
+## 24. The present owner is NOT the frame-pacing cost — measured, hypothesis refuted (2026-09-02)
+
+The perf instrumentation (`kPresentOwner`, `kPresentWait`, the 1 ms histogram) shipped and ran in
+The Slums gameplay under the plugin host (DLSS SR + NR on, build with §22's gate). Verbatim:
+
+```
+[perf] frames 37200-37800: 52.4 fps avg (19.1ms), worst 40.4ms | p50 18ms p95 24ms p99 26ms p99.9 38ms | frames>16ms 501 >33ms 3
+[perf] our CPU/frame: intercept 1.49ms (8%), mv_resolve 0.02ms, gbuf_resolve 0.00ms, ngx_sr 0.19ms (1%), ngx_rr 0.00ms (0%), ngx_nr 0.43ms (2%), restore 0.01ms - total 2.15ms (11% of 19.1ms)
+[perf] present owner/frame: mechanics 0.012ms (0%), fence-wait 0.000ms (0%)
+```
+
+* **The present owner's per-present ring work is 0.012 ms and the fence never waits (0.000 ms).**
+  The hypothesis that its `allocator/list Reset + queue Signal` every present, or a cross-frame
+  fence stall, caused the plugin-vs-add-on gap is REFUTED. Do NOT remove that work as an
+  optimisation — it costs nothing. (It is still correct to make it lazy for cleanliness, but not
+  for perf.)
+* Our total CPU is 2.15 ms/frame (11% of a 19 ms frame): intercept 1.49, NGX NR 0.43, NGX SR
+  0.19. That is the same order as the add-on's timed buckets (the coordinator's ~2.2 ms), so the
+  remaining plugin-vs-add-on gap (~52 vs ~57 fps in this scene) is NOT in our timed CPU and NOT in
+  the present owner — it is elsewhere (GPU-side, or an untimed native-hook path such as the
+  per-dispatch `SetDescriptorHeaps`/table resolve over UE4's 500k-descriptor heap). The histogram
+  shows the hitches are rare (p99 26 ms, only 3 frames >33 ms per 600), so "lags off" is a
+  tail-latency phenomenon, not a mean regression. Next: an A/B with the traverse, comparing the
+  histogram tails, and GPU timestamps if the CPU stays exonerated.
+* **All menu figures are void** (58-63 fps p99 19 ms were the MAIN MENU, a different TAA
+  permutation and scene-colour format, §5). Every number above is gameplay in The Slums.
+
+## 25. The checkpoint-reload crash is in UE4SS's ProcessEvent path, not the DLSS plugin (2026-09-02)
+
+Reproduced deterministically: in-game pause menu -> RELOAD LAST CHECKPOINT -> confirm YES (the
+confirmation defaults to NO; RIGHT then ENTER selects YES). The frame freezes, a UE4 "Fatal
+error!" dialog appears (process stays alive under it; ENTER dismisses it and the process then
+exits), and a crash dir is written. `EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000270`.
+
+Symbolised from the minidump's portable callstack (UE4 already resolves module+offset):
+
+```
+Stray-Win64-Shipping +0x2b3e0ef   <- FAULT, reads [null + 0x270]
+Stray-Win64-Shipping +0x2fa3da5
+Stray-Win64-Shipping +0x2f48ac2
+UE4SS                +0x4464a5     <- UE4SS ProcessEvent hook (dispatch to mods)
+Stray-Win64-Shipping +0x2f33e66
+Stray-Win64-Shipping +0x2f51c72
+Stray-Win64-Shipping +0x2b2d1b3
+UE4SS                +0x446175     <- UE4SS ProcessEvent hook (outer)
+Stray-Win64-Shipping +0x8322a1
+Stray-Win64-Shipping +0x838c3f
+```
+
+* **`main.dll` (the DLSS plugin) is NOWHERE on the crash stack.** The fault is UE 4.27 engine
+  code dereferencing a null `UObject` at offset 0x270, reached through UE4SS's ProcessEvent hook
+  (`UE4SS+0x446xxx`, the trampoline that dispatches UFunction calls to mods — a Lua mod like
+  StrayTriggers). The plugin only hooks D3D12/DLSS and never touches UObjects or ProcessEvent, so
+  it cannot be on this path. This is the UE4SS mod layer reacting to the level teardown a
+  checkpoint reload performs, not the DLSS work.
+* **CONTROL, stated honestly as UNCONFIRMED.** A first attempt to reload with the plugin off was
+  INVALID — `StrayDLSS : 0` in mods.txt did NOT stop UE4SS loading the C++ mod (a status heartbeat
+  still appeared), so DLSS was still on; the crash there proves nothing. To disable the plugin for
+  real the DLL must be renamed (`dlls/main.dll` -> `main.dll.OFF`), which was done, but the
+  DLSS-off reload run did not complete (the box launch wedged). The callstack is the load-bearing
+  evidence; the control run is still owed. The right control is StrayTriggers on / plugin DLL
+  renamed off, and then StrayTriggers off, to pin whether it is UE4SS itself or a specific Lua mod.
