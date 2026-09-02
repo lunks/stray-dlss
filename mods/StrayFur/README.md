@@ -52,6 +52,27 @@ Verbatim from `ue4ss/UE4SS.log`, launch three:
 overrides or the TArray-of-struct walk does not iterate; with `MinScreenSize=0` nothing
 undoes the change either way, so it has not mattered. UNCONFIRMED which.
 
+## The material tweaks never landed until 2026-09-02 evening — and the backpack clip
+
+The dump the mod now writes (`stray-fur-materials.txt`, from `Scripts/dump_fur_materials.lua`)
+showed the fur's live `MaterialInstanceDynamic` in **`FurMaterials` slot 1** holding exactly one
+override, `FurLength=2.0`, and none of the mod's scalars. `CreateDynamicMaterialInstance(0, …)`
+had been making a fresh instance on slot 0 that the shells never sample, so every
+"applied 9/9" line before that evening was a `pcall` succeeding on the wrong object. Only
+`LayerCount`/`FurLength` (component properties) had ever changed the look. The mod now writes
+onto the dynamic instance each slot already holds and **reads every value back**; the log line
+is `applied N/N … read back N`.
+
+With the values finally landing, the backpack clip (shells through the harness at the
+shoulders, user screenshot) is fixed by the shipped material's own knobs, no new textures:
+the fur length comes from a painted per-vertex map (`Cat_furmesh_FurGrowth`, shared by the
+`backpackON` and `backpackOff` instances, which differ only in `Use Clumping` and values),
+`FurLength` multiplies the whole map, and **`Fur Length Power` (shipped 4.0, now 7.0)** curves it
+so the short harness fur shortens hard while the body's near-1 values barely move, plus
+**`Avoid Short - Offset` 0.05** (shipped 0). The user confirmed the harness clean with the body
+still plush on the same launch. The HD-screenshot material is never loaded by the game; the mod
+only ever copies its nine values onto the shipped instance.
+
 ## Historical: what was UNCONFIRMED before the first launch
 
 1. **Does the hook fire?** Look for `[StrayFur] applying to …BP_CatPawn_C…` in `ue4ss/UE4SS.log`.
