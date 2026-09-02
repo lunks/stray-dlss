@@ -855,6 +855,52 @@ Environment facts, independent of any add-on — useful when triaging so we do n
   PNG within ~3 s. `tools/screenshot-gamescope.sh` wraps it and reads both variables from
   Steam's live environment.
 
+
+### Driving the game unattended, rewritten 2026-09-02: the probe, the safe launcher, the bench
+
+The old launcher's recovery paths (SIGKILL of the launch tree, automatic Steam restarts) wedged
+the box four times in an hour, its gameplay gate was a render census the plugin host cannot
+produce, and an agent then spent an hour blaming the environment. The replacement is four
+small composable scripts sharing `tools/stray-lib.sh`, gated on an IN-ENGINE probe:
+
+* **`mods/StrayProbe`** (UE4SS Lua, loads via dwmapi in every configuration) writes
+  `stray-game-state.txt` once a second: `pawn` (BP_CatPawn_C valid), `pawnname`, `pc`, `map`
+  (`BaseMap` in gameplay, `HK_Project_Intro`/`HK_Project_MainStart` while loading), `paused`
+  (`UGameplayStatics::IsGamePaused`), `ingame`. While `stray-probe-bench` exists it also
+  writes `stray-frame.txt` at 4 Hz with `UKismetSystemLibrary::GetFrameCount` and the last
+  delta. **Threading rules, each measured:** engine reads on the game thread via
+  `ExecuteInGameThread`, file I/O on the async thread, expensive lookups cached (a
+  `FindFirstOf` per second was a visible spike), `stray-probe-quiet` silences engine queries
+  during a window. **The probe is CRLF under Wine** (`io.open` text mode); readers strip `\r`.
+* **`tools/launch-stray-safe.sh [--kill] [--no-drive] [--timeout S] [--shot P]`**: names every
+  precondition before launching (CEF port, cef-eval helper in the stage dir, sysrq keyboard,
+  reaper, which render host is active), shows the launch helper's output, prints progress
+  every 10 s, bails the tick a wait can no longer succeed, never restarts Steam, never kills
+  without `--kill`. Drives the menu with Enter until the probe says `ingame=1` (~30 s). Every
+  exit writes `stray-launch-verdict.txt`.
+* **`tools/stray-reload.sh`**: the user's sequence, START(Esc), DOWN, DOWN, ENTER, RIGHT,
+  ENTER — the confirm dialog defaults to NO. It first waits for `paused=1` (right after a
+  load the intro keeps the menu locked), and the reload is ACCEPTED when the game unpauses by
+  itself: **a checkpoint reload keeps the pawn and the map**, so "ingame drops" never fires.
+* **`tools/stray-traverse.sh`**: hold UP and alternate LEFT/RIGHT every 3 s for 15 s (the
+  user's scenario; `inject.py traverse`), sampling the engine frame counter: avg fps, slowest
+  0.25 s bucket, hitch buckets, worst sampled frame, one CSV row in `stray-bench.csv`. Take
+  the start frame only after the counter has MOVED — the file's first write carries the
+  previous window's value and inflated a run to 277 fps against a true 140.
+* **`tools/stray-bench.sh --runs N --label L`**: N × (reload + traverse) in ONE process. A
+  death anywhere is the stability verdict; the surviving windows are the perf result.
+* **`tools/screenshot-gamescope.sh`**: `gamescopectl screenshot`, no ReShade needed.
+
+**Measured with it, 2026-09-02:** the "reload checkpoint" crash (`EXCEPTION_ACCESS_VIOLATION
+reading 0x270`) was **StrayFur**, not DLSS, ReShade or the DualSense mod — bisected two cycles
+per arm with no render host; fixed by moving its `ExecuteWithDelay`/`LoopAsync` engine calls
+onto the game thread. **Baseline with no render host** (StrayTriggers off, fur on): avg
+137–149 fps, slowest bucket 99–114 fps, 0 hitch buckets, worst sampled frame 11–24 ms. The
+DLSS arms (~53–57 fps) are measured against that by the identical instrument.
+**Traps:** `pgrep -f "AppId=1332010"` self-matches the shell running it (use `13320[1]0`);
+a launch sequence sent 2 s after reaching gameplay does nothing; Config A needs ReShade's
+`dxgi.dll` renamed aside, never `dxgi=b` (wine-builtin dxgi cannot create a swapchain on
+vkd3d-proton); `WINEDLLOVERRIDES` must keep `dwmapi=n,b` or UE4SS never loads.
 ---
 
 ## 3. How the add-on works
