@@ -1,6 +1,7 @@
 #include "backend_native/native_backend.hpp"
 
 #include "backend_native/d3d12_hooks.hpp"
+#include "backend_native/present_owner.hpp"
 #include "backend_native/descriptor_shadow.hpp"
 #include "backend_native/resource_registry.hpp"
 #include "backend_native/root_shadow.hpp"
@@ -390,6 +391,8 @@ void NativeBackend::present_barrier(const icept::PresentContext &ctx, icept::Res
 	b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(before);
 	b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(after);
 	ctx.present_list->ResourceBarrier(1, &b);
+	// The present owner executes its list only when something was recorded on it.
+	present::note_present_list_used();
 }
 
 void NativeBackend::dump_tracker_state(const icept::CommandContext &ctx, const char *why)

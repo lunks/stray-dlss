@@ -1,6 +1,7 @@
 #include "app/diff_observer.hpp"
 #include "core/heap_math.hpp"
 #include "core/root_signature_walk.hpp"
+#include "core/present_plan.hpp"
 #include "core/va_map.hpp"
 
 #include <doctest/doctest.h>
@@ -365,4 +366,20 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	const diff::Summary after = diff::summary();
 	CHECK(after.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] - before.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] == 2);
 	diff::set_enabled(false);
+}
+
+TEST_CASE("present plan: the swapchain's queue by identity, else the first DIRECT queue (a proxy hid it), else none")
+{
+	std::vector<core::QueueRecord> q;
+	CHECK(core::pick_present_queue(q, 0x10) == -1);
+	q.push_back(core::QueueRecord{ 0x30, 3 }); // copy
+	q.push_back(core::QueueRecord{ 0x20, 2 }); // compute
+	CHECK(core::pick_present_queue(q, 0x99) == -1); // no direct queue at all
+	q.push_back(core::QueueRecord{ 0x10, 0 }); // the game's direct queue
+	q.push_back(core::QueueRecord{ 0x11, 0 }); // a second direct queue
+	CHECK(core::pick_present_queue(q, 0x11) == 3); // identity wins
+	CHECK(core::pick_present_queue(q, 0x10) == 2);
+	CHECK(core::pick_present_queue(q, 0x99) == 2); // ReShade's proxy: the first direct one
+	CHECK(core::pick_present_queue(q, 0) == 2);
+	CHECK(core::pick_present_queue(q, 0x20) == 1); // an exact match, even a compute queue, is honoured
 }

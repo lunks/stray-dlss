@@ -8,6 +8,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <stddef.h>
 
 /* A negative array size is a compile error in every C standard MSVC and mingw speak; that
@@ -60,6 +61,17 @@ SLOT_IS(ID3D12GraphicsCommandListVtbl, SetComputeRootUnorderedAccessView, 41);
 
 SLOT_IS(ID3D12CommandQueueVtbl, ExecuteCommandLists, 10);
 SLOT_IS(ID3D12ResourceVtbl, GetDesc, 10);
+
+SLOT_IS(IDXGIFactoryVtbl, CreateSwapChain, 10);
+SLOT_IS(IDXGIFactory2Vtbl, CreateSwapChainForHwnd, 15);
+SLOT_IS(IDXGIFactory2Vtbl, CreateSwapChainForCoreWindow, 16);
+SLOT_IS(IDXGIFactory2Vtbl, CreateSwapChainForComposition, 24);
+SLOT_IS(IDXGISwapChainVtbl, Present, 8);
+SLOT_IS(IDXGISwapChainVtbl, GetBuffer, 9);
+SLOT_IS(IDXGISwapChainVtbl, ResizeBuffers, 13);
+SLOT_IS(IDXGISwapChain1Vtbl, Present1, 22);
+SLOT_IS(IDXGISwapChain3Vtbl, GetCurrentBackBufferIndex, 36);
+SLOT_IS(IDXGISwapChain3Vtbl, ResizeBuffers1, 39);
 
 /* A translation unit needs at least one declaration under strict C. */
 int stray_dlss_vtable_slots_checked = 1;

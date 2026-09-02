@@ -743,6 +743,7 @@ struct DriveTestSink final : stray_dlss::icept::Sink
 	void on_copy(const stray_dlss::icept::CommandContext &, stray_dlss::icept::ResourceId, stray_dlss::icept::ResourceId) override {}
 	void on_execute(const stray_dlss::icept::CommandContext &) override {}
 	void on_swapchain(const stray_dlss::icept::ResourceId *, std::uint32_t, bool) override {}
+	std::uint64_t next_frame() override { return 0; }
 	void on_present(const stray_dlss::icept::PresentContext &) override {}
 };
 

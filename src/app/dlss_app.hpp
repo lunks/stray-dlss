@@ -105,7 +105,7 @@ public:
 
 	// The present index is the app's; the host asks for the next one when it builds the
 	// PresentContext, so on_present and the host's own per-frame work agree on the number.
-	std::uint64_t next_frame();
+	std::uint64_t next_frame() override;
 
 	// --- for hosts ---
 	Status status() const;

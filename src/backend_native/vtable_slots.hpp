@@ -57,4 +57,19 @@ constexpr unsigned kQueue_ExecuteCommandLists = 10;
 // ID3D12Resource: GetDevice 7, Map 8, Unmap 9, GetDesc 10, GetGPUVirtualAddress 11, ...
 constexpr unsigned kResource_GetDesc = 10;
 
+// DXGI, for the native present owner. IUnknown 0-2, IDXGIObject 3-6, IDXGIFactory 7-11,
+// IDXGIFactory1 12-13, IDXGIFactory2 14-24. Checked against dxgi1_4.h's C Vtbl structs.
+constexpr unsigned kFactory_CreateSwapChain = 10;
+constexpr unsigned kFactory2_CreateSwapChainForHwnd = 15;
+constexpr unsigned kFactory2_CreateSwapChainForCoreWindow = 16;
+constexpr unsigned kFactory2_CreateSwapChainForComposition = 24;
+// IUnknown 0-2, IDXGIObject 3-6, IDXGIDeviceSubObject::GetDevice 7, IDXGISwapChain 8-17,
+// IDXGISwapChain1 18-28, IDXGISwapChain2 29-35, IDXGISwapChain3 36-39.
+constexpr unsigned kSwapChain_Present = 8;
+constexpr unsigned kSwapChain_GetBuffer = 9;
+constexpr unsigned kSwapChain_ResizeBuffers = 13;
+constexpr unsigned kSwapChain1_Present1 = 22;
+constexpr unsigned kSwapChain3_GetCurrentBackBufferIndex = 36;
+constexpr unsigned kSwapChain3_ResizeBuffers1 = 39;
+
 } // namespace stray_dlss::native::slot

@@ -67,6 +67,9 @@ struct Sink
 	virtual void on_copy(const CommandContext &ctx, ResourceId src, ResourceId dst) = 0;
 	virtual void on_execute(const CommandContext &ctx) = 0;
 	virtual void on_swapchain(const ResourceId *back_buffers, std::uint32_t count, bool created) = 0;
+	// The host asks for the present index BEFORE it builds the PresentContext, so on_present and
+	// the host's own per-frame work agree on the number.
+	virtual std::uint64_t next_frame() = 0;
 	virtual void on_present(const PresentContext &ctx) = 0;
 };
 
