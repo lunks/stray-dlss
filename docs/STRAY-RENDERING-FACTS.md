@@ -919,3 +919,89 @@ Stray-Win64-Shipping +0x838c3f
   DLSS-off reload run did not complete (the box launch wedged). The callstack is the load-bearing
   evidence; the control run is still owed. The right control is StrayTriggers on / plugin DLL
   renamed off, and then StrayTriggers off, to pin whether it is UE4SS itself or a specific Lua mod.
+
+## 26. The render-host A/B: plugin vs ReShade add-on, checkpoint-reload + traverse, five arms (2026-09-02 13:31-13:54)
+
+The user's protocol, run with the new unattended tooling (`tools/launch-stray-safe.sh`,
+`stray-bench.sh`, the in-engine `StrayProbe`): per arm ONE launch to gameplay in The Slums
+(slot 1), then three cycles of {reload last checkpoint, settle, 15 s traverse: ARROW UP held,
+LEFT/RIGHT alternating every 3 s}. The instrument is the engine's own `GetFrameCount` sampled at
+4 Hz on the game thread by the probe — host-independent and identical in every arm. The mod set
+is identical in every arm (StrayTriggers 0, StrayFur on with the fix below, StrayProbe on);
+only the render host changes. Rows verbatim from `stray-bench.csv`
+(`time,label,avg fps,slowest 0.25 s bucket fps,hitch buckets,buckets,worst sampled frame ms,elapsed s,map`):
+
+```
+13:31:46,baseline-nohost-1,141.3,113.5,0,57,12.4,15.1,BaseMap
+13:32:25,baseline-nohost-2,149.4,113.4,0,57,11.5,15.1,BaseMap
+13:33:04,baseline-nohost-3,136.8,98.6,0,57,24.3,15.1,BaseMap
+13:37:24,reshade-sr-1,116.6,79.2,0,57,11.5,15.1,BaseMap
+13:38:03,reshade-sr-2,117.5,68.0,0,57,11.2,15.1,BaseMap
+13:38:42,reshade-sr-3,117.5,67.8,0,57,14.2,15.1,BaseMap
+13:42:04,reshade-sr-nr-1,54.7,34.1,0,57,30.1,15.0,BaseMap
+13:42:43,reshade-sr-nr-2,54.4,37.9,0,57,27.9,15.0,BaseMap
+13:43:22,reshade-sr-nr-3,55.7,49.2,0,57,26.9,15.0,BaseMap
+13:45:26,plugin-sr-1,95.0,52.8,6,57,28.2,15.1,BaseMap
+13:46:06,plugin-sr-2,96.8,41.5,8,57,20.8,15.1,BaseMap
+13:46:46,plugin-sr-3,97.2,49.1,10,57,17.1,15.1,BaseMap
+13:49:00,plugin-sr-nr-1,53.5,30.1,1,57,30.2,15.1,BaseMap
+13:49:40,plugin-sr-nr-2,54.5,45.4,0,57,24.4,15.0,BaseMap
+13:50:20,plugin-sr-nr-3,54.7,37.7,0,57,22.5,15.0,BaseMap
+13:52:43,plugin-reshade-1,53.6,41.7,0,57,25.6,15.1,BaseMap
+13:53:22,plugin-reshade-2,52.3,34.1,0,57,60.6,15.0,BaseMap
+13:54:02,plugin-reshade-3,54.3,37.9,0,57,39.8,15.0,BaseMap
+```
+
+| arm | host | avg fps (3 runs) | slowest 0.25 s bucket | hitch buckets /57 | worst frame ms |
+|---|---|---|---|---|---|
+| baseline | none (no ReShade, no plugin) | 141.3 / 149.4 / 136.8 | 113.5 / 113.4 / 98.6 | 0 / 0 / 0 | 12.4 / 11.5 / 24.3 |
+| A | ReShade add-on, SR only | 116.6 / 117.5 / 117.5 | 79.2 / 68.0 / 67.8 | 0 / 0 / 0 | 11.5 / 11.2 / 14.2 |
+| B | ReShade add-on, SR + NR | 54.7 / 54.4 / 55.7 | 34.1 / 37.9 / 49.2 | 0 / 0 / 0 | 30.1 / 27.9 / 26.9 |
+| C | plugin alone, SR only | 95.0 / 96.8 / 97.2 | 52.8 / 41.5 / 49.1 | **6 / 8 / 10** | 28.2 / 20.8 / 17.1 |
+| D | plugin alone, SR + NR | 53.5 / 54.5 / 54.7 | 30.1 / 45.4 / 37.7 | 1 / 0 / 0 | 30.2 / 24.4 / 22.5 |
+| E | plugin + ReShade loaded (Config B), SR + NR | 53.6 / 52.3 / 54.3 | 41.7 / 34.1 / 37.9 | 0 / 0 / 0 | 25.6 / 60.6 / 39.8 |
+
+**Readings (HARD, n=3 per arm, one process per arm, 9 reloads survived under the plugin):**
+
+* **What SR and NR cost.** Against the 141 fps no-host baseline, DLSS SR under the add-on costs
+  ~24 fps (141 -> 117, and the game renders at 50% scale so this is the upscaler's own GPU
+  time plus the interception). **NR costs another ~62 fps (117 -> 55): feature 18 halves the
+  frame rate** under EITHER host. NR is the bottleneck of the user's usual configuration, not
+  the host.
+* **With SR + NR (B vs D): parity.** 54.7/54.4/55.7 against 53.5/54.5/54.7 — same avg, same
+  worst frames, hitch buckets 0-1. Config B (E) is the same again. The user's "plugin is
+  slower" is not visible in this scenario with NR on.
+* **With SR only (A vs C): the plugin is ~20 fps (17%) slower AND hitches.** 117 -> 96 avg,
+  slowest bucket 68-79 -> 42-53, and **6-10 hitch buckets out of 57 where the add-on has 0.**
+  This is the one real deficit, and it is masked whenever NR is on because NR's GPU time
+  dominates.
+* **Where the plugin's SR-only deficit is NOT (plugin log, arm C, cross-referenced):**
+  `present owner/frame: mechanics 0.012ms (0%), fence-wait 0.000ms` — the present owner ring
+  is exonerated again (§24). Our timed CPU is `intercept 1.65ms, ngx_sr 0.18ms, total 1.87ms`
+  — 22% of an 8.5 ms frame, but the add-on's timed buckets are the same order and it does not
+  lose 20 fps. So the loss is in the UNTIMED native-hook paths that only the plugin has: the
+  per-call `Create*View` / `CopyDescriptors` shadow (exclusive `shared_mutex` per descriptor
+  write, `g_by_resource` push_back per copy), `note_heap_bound` (`GetDesc` on every
+  `SetDescriptorHeaps`), and the per-dispatch table resolve over UE4's 500k-descriptor heap —
+  the "descriptor_shadow" suspect in the coordinator's list, now the only one left standing.
+  The hitch buckets (6-10/57) fit the same suspect: an unbounded `unordered_map`/`vector`
+  growing under rehash. UNCONFIRMED which of these; a `kDescriptorShadow` bucket was NOT added
+  (the user called a stop after this A/B), and that is the first thing to time next.
+* **The wine `nvapi status -5` lines** (`NvAPI_D3D12_GetCudaIndependentDescriptorObject`) appear
+  under the plugin with `ext_unhook` inert (slot 8 unhooked, no ReShade) at a steady trickle;
+  DLSS creates, evaluates and the indicator is on screen, so they are not the §1 ReShade
+  ext-vtable failure. Their cost and meaning are UNCONFIRMED.
+
+**The checkpoint-reload crash is SOLVED and was never DLSS (coordinator's bisection, same day).**
+With no render host at all: StrayFur on -> `EXCEPTION_ACCESS_VIOLATION reading 0x270` on every
+reload; StrayFur off -> clean, with StrayTriggers on or off. Cause: StrayFur's
+`ExecuteWithDelay`/`LoopAsync` callbacks ran on a UE4SS thread and touched UObjects during the
+level teardown. Fixed on `dualsense` (`8b401b6`: every engine call via `ExecuteInGameThread`),
+verified with fur on across two reload cycles, and confirmed here by nine reloads under the
+plugin without a crash. §25's reading (UE4SS ProcessEvent path, `main.dll` absent) was right;
+the specific mod was StrayFur.
+
+**Config B is CONFIRMED working:** ReShade loaded as `dxgi.dll`, its add-on `.disabled`, the
+plugin driving — `present owner: factory ... (class implemented by ...\Win64\dxgi.dll)` (ReShade's
+proxy factory), `DLSS feature created: 1920x1080 -> 3840x2160`, three reload cycles, no crash,
+parity with the other SR+NR arms.
