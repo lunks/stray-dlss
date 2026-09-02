@@ -668,8 +668,9 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	native::log_stats("harness");
 	stray_dlss::diff::log_summary("harness");
 	std::printf("diff: disagreements=%llu\n", static_cast<unsigned long long>(sum.dispatches - sum.agree));
-	// Leave the list clean for shutdown.
-	if (!flush(gpu))
+	// Leave the list clean — DISCARDED, not executed: it binds a table holding views of the
+	// depth texture destroyed above, and executing that removed the device (see discard()).
+	if (!discard(gpu))
 		return false;
 	drain_validation(gpu, "native-hooks-teardown");
 	stray_dlss::diff::set_enabled(false);
@@ -742,6 +743,11 @@ bool test_drive_mode_restore_is_complete(Gpu &gpu)
 	static DriveTestSink sink;
 	sink = DriveTestSink{};
 	sink.gpu = &gpu;
+	{
+		const HRESULT removed = dev->GetDeviceRemovedReason();
+		std::printf("  device removed reason on entry: 0x%08lx\n", static_cast<unsigned long>(removed));
+		check(removed == S_OK, "the device is still alive on entry (an earlier test did not remove it)");
+	}
 	native::uninstall(); // the observer life ends (hooks restored, sentinels made inert)
 	native::set_sink(&sink);
 	if (!native::install(dev, native::Mode::drive))

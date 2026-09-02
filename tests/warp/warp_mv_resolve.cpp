@@ -212,6 +212,19 @@ bool flush(Gpu &gpu)
 	return true;
 }
 
+// Throws the list's recorded commands away WITHOUT executing them, then reopens it. For a
+// list that binds descriptors of a resource the test has already destroyed: executing that
+// (even with no dispatch) removed WARP's device — DXGI_ERROR_DEVICE_REMOVED 0x887a0005 on the
+// next creation call, measured in CI 2026-09-02 — and the removal only surfaced in a LATER
+// test, because nothing else touched the device before the harness exited.
+bool discard(Gpu &gpu)
+{
+	HR(gpu.list->Close());
+	HR(gpu.allocator->Reset());
+	HR(gpu.list->Reset(gpu.allocator.Get(), nullptr));
+	return true;
+}
+
 // A plain default-heap buffer, for the object-model probes below. Nothing is ever written to
 // it; only its identity and its vtable matter.
 ComPtr<ID3D12Resource> create_buffer(Gpu &gpu, UINT64 size,
