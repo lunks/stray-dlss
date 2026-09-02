@@ -86,3 +86,26 @@ developers' unfinished tuning, not ours. Run T0–T3 only if there is a reason t
 wanting its inputs, or a visual the baked path cannot give). If T3 removes #2 and T5's audit is
 short, an "RT on, foliage and fixtures fixed" ini+Lua profile is a small mod. If not, leave RT
 off and close this file.
+
+---
+
+## Addendum 2026-09-02 evening: the load-time pop-in, bisected live
+
+Not RT. Recorded here because it is the same shape of work (artifacts the developers left,
+plus one of ours) and the tests are the same tools.
+
+**HARD, measured with the live console mod (`mods/StrayConsole`) plus forced checkpoint
+reloads, user watching:**
+
+| Symptom | Mechanism | Fix |
+|---|---|---|
+| Shadows popping at distance | cascade distance / transition | `r.Shadow.DistanceScale=2.0`, `r.Shadow.CSM.TransitionScale=2`, fade/min resolution, whole-scene cache (in the live `Engine.ini`) — **gone** |
+| Distant shapes popping harder afterwards | mesh LOD switching under the now-longer shadow reach | `r.StaticMeshLODDistanceScale=0.25`, `foliage.LODDistanceScale=2.0`, `r.HLOD.DistanceScale=2.0`, `r.Streaming.PoolSize=4096` — **much better** |
+| Objects appearing one after another ~200 ms apart, only on first sight after a load, every session | **OURS**: the native host's `CreatePipelineState` patch leaves vkd3d-proton with no write pipeline cache ("No write cache exists"; `vkd3d-proton.cache` 284 KB after hours), so every material compiles on first draw | A/B: no host at all → instant. Handed to the FG agent: forward the desc/CachedPSO untouched or stop intercepting creation |
+| ONE object, the reflective plate holding the air conditioners, reappearing ~200 ms after its neighbours, consistent across reloads, **with no host loaded** | the game's own asset: a late-arriving streamed actor/level instance, or its reflection capture being (re)rendered on load. SOFT; not a streaming-budget effect (`s.LevelStreamingActorsUpdateTimeLimit 100`, `s.AsyncLoadingTimeLimit 100`, eager texture streaming, pipeline-cache precompile budgets all tried live: no change) | Open. A Lua mod can identify the actor at load (`FindAllOf` near the camera, log class + level + materials) and, if it is a capture, force `UpdateReflectionCaptures` or pre-place; separate small investigation |
+
+Method notes: `Engine.ini` edits only with the game DOWN (it rewrites the file on exit;
+backups `Engine.ini.bak-<stamp>` beside it); cvars are tested live by appending lines to
+`stray-console.cmd` (the mod echoes `ran:` per line in `UE4SS.log`); a reload is Esc, Down,
+Down, Enter, Right, Enter on the sysrq keyboard node; the shipped game does NOT include a
+`.upipelinecache`, so `r.ShaderPipelineCache.*` has nothing to precompile.
