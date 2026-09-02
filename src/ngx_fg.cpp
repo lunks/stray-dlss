@@ -207,14 +207,11 @@ int resolve_hdr(unsigned format, unsigned color_space)
 	// SL guide §11.0: HDR means RGB10 + HDR10/BT.2100. R10G10B10A2 with the PQ colour space is
 	// HDR for certain; R10G10B10A2 with no colour space ever set is HDR by this title's
 	// configuration (gamescope --hdr-enabled, CLAUDE.md §1); anything else is SDR.
-	if (format == DXGI_FORMAT_R10G10B10A2_UNORM)
-	{
-		if (color_space == static_cast<unsigned>(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))
-			return 1;
-		if (color_space == ~0u)
-			return 1;
-		return 0;
-	}
+	// MEASURED on the box (facts §31.7): Stray never calls SetColorSpace1 - UE 4.27's default
+	// back buffer is the 10-bit R10G10B10A2 in SDR (r.DefaultBackBufferPixelFormat), so a
+	// 10-bit format with no colour space ever set is SDR, not HDR10.
+	if (format == DXGI_FORMAT_R10G10B10A2_UNORM && color_space == static_cast<unsigned>(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020))
+		return 1;
 	return 0;
 }
 
@@ -469,8 +466,13 @@ public:
 		p->Set("DLSSG.CameraFwdZ", basis.fwd[2]);
 		p->Set("DLSSG.MinRelativeLinearDepthObjectSeparation", 40.0f); // sl_consts.h default
 		p->Set("DLSSG.NotRenderingGameFrames", 0u);
+		// MEASURED on the box (facts §31.7): the index is 1-BASED. With index 0 the snippet
+		// refuses every evaluate with FAIL_InvalidParameter and logs "Multi frame is not
+		// supported on this device. Found index (0) but expected (1)"
+		// (EndpointCoreInputs::ComputeAndValidateTimeFactor:418). One generated frame per real
+		// frame is count 1, index 1.
 		p->Set("DLSSG.MultiFrameCount", 1u);
-		p->Set("DLSSG.MultiFrameIndex", 0u);
+		p->Set("DLSSG.MultiFrameIndex", 1u);
 
 		// States: inputs NON_PIXEL_SHADER_RESOURCE, outputs UNORDERED_ACCESS (the NGX convention
 		// SR uses, CLAUDE.md §5). Everything is COMMON on entry and left COMMON.
