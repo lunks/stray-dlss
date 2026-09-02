@@ -263,6 +263,11 @@ if(STRAY_DLSS_BUILD_NATIVE)
     target_compile_options(stray_dlss_native PRIVATE
         /W4 /permissive- /Zi
         $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
+    # The SDK's C interface (CINTERFACE) trips /W4 inside d3d12.h itself; the slot check is a
+    # set of negative-array-size typedefs, which are ERRORS at any warning level, so /W3 there
+    # loses nothing. (MSVC takes the last /W on the line.)
+    set_source_files_properties(src/backend_native/vtable_slots_check.c PROPERTIES
+        COMPILE_OPTIONS "/W3")
 
     # Shaders are compiled to DXBC here and embedded, never compiled at runtime.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
@@ -357,7 +362,15 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/d3d12_restore.cpp
         # The real ReShade bindings, so the ReShade-facing half of the restore is the code
         # under test rather than a reimplementation of it.
-        src/backend_reshade/reshade_bindings.cpp)
+        src/backend_reshade/reshade_bindings.cpp
+        # The native backend, hooked onto the harness's own WARP device (warp_native_backend.inc).
+        src/backend_native/native_backend.cpp
+        src/backend_native/d3d12_hooks.cpp
+        src/backend_native/descriptor_shadow.cpp
+        src/backend_native/resource_registry.cpp
+        src/backend_native/root_shadow.cpp
+        src/backend_native/vtable_patch.cpp
+        src/app/diff_observer.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
