@@ -198,6 +198,11 @@ void publish_expected(void *native_list, std::uint64_t shader_hash, std::uint32_
 	t_expected.valid = true;
 }
 
+bool has_expected(void *native_list)
+{
+	return enabled() && t_expected.valid && t_expected.list == native_list;
+}
+
 bool consume_and_compare(void *native_list, const icept::DispatchBindings &actual,
                          std::uint64_t native_unknown_lookups)
 {

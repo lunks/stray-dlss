@@ -4,6 +4,8 @@
 
 #include "app/dlss_app.hpp"
 
+#include "app/diff_observer.hpp"
+#include "backend_native/native_backend.hpp"
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
 #include "ext_unhook.hpp"
@@ -679,6 +681,27 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		"changes the image; EnableNGX alone only brings NGX up.",
 		ngx_evaluate ? "ENABLED" : "disabled");
 
+	// [STRAYDLSS] NativeMode: off (default) | observe. `observe` installs our own D3D12 vtable
+	// hooks on the ORIGINAL device BESIDE the driving backend and diffs every size-gated
+	// dispatch's bindings against the driver's answer (src/app/diff_observer.hpp). It changes
+	// nothing on screen; it is how the native backend earns the right to drive (plan Task 15).
+	{
+		char native_mode[16] = "off";
+		host::cfg::get_string("NativeMode", native_mode, sizeof(native_mode));
+		const native::Mode mode = native::mode_from_string(native_mode);
+		if (mode != native::Mode::off)
+		{
+			const bool ok = native::install(native, mode);
+			diff::set_enabled(ok && native::mode() == native::Mode::observe);
+			STRAY_LOG_WARN("NativeMode=%s ([STRAYDLSS] NativeMode, read as \"%s\"): %s. Grep 'DIFF' and "
+				"'NATIVE SHADOW'.", native::mode_name(native::mode()), native_mode, native::attach_report());
+		}
+		else
+		{
+			STRAY_LOG_INFO("NativeMode=off ([STRAYDLSS] NativeMode): the native D3D12 hooks are not installed.");
+		}
+	}
+
 	load_hash_override_file();
 }
 
@@ -801,8 +824,36 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 
 	g_state.dispatches_seen.fetch_add(1, std::memory_order_relaxed);
 
-	if (taa_hook::intercept_dispatch(ctx, x, y, z))
-		return true;
+	{
+		// Everything we record onto the game's list from here (the resolve, NGX, the codec
+		// passes, the restore) is OUR state, and the native shadow must not mistake it for
+		// the game's (assessment §8.3).
+		native::OwnCodeScope own;
+		if (taa_hook::intercept_dispatch(ctx, x, y, z))
+			return true;
+	}
+
+	// THE DIFFERENTIAL OBSERVER. The driver's resolve of this dispatch, parked for the native
+	// Dispatch hook — which fires inside the driver's forward of this very call, on this
+	// thread — to compare against its own. Only for dispatches the TAA path would look at
+	// (the same size gate), because a resolve per dispatch is the expensive operation.
+	if (diff::enabled() && z == 1 && x >= 32 && y >= 18)
+	{
+		std::uint64_t hash = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			const auto bound = g_state.bound_compute_pipeline.find(ctx.native);
+			if (bound != g_state.bound_compute_pipeline.end())
+			{
+				const auto it = g_state.compute_pipeline_hashes.find(bound->second);
+				if (it != g_state.compute_pipeline_hashes.end())
+					hash = it->second;
+			}
+		}
+		icept::DispatchBindings expected;
+		icept::backend()->resolve_compute_bindings(ctx, expected);
+		diff::publish_expected(ctx.native, hash, x, y, expected);
+	}
 
 	// Strictly AFTER the intercept decision: a suppressed dispatch never executes, and
 	// recording one would enter a phantom writer into the pass finder's last-writer table.
@@ -900,6 +951,16 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
 
+	// The observer's periodic report: the DIFF SUMMARY (disagreements=) and the native
+	// shadow's own counters, every 600 presents while it is on.
+	if (diff::enabled() && frame != 0 && (frame % 600) == 0)
+	{
+		char when[32];
+		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
+		diff::log_summary(when);
+		native::log_stats(when);
+	}
+
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
@@ -946,6 +1007,19 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "no_hash=%llu\n", (unsigned long long)d.no_hash);
 			std::fprintf(f, "resolve_failed=%llu\n", (unsigned long long)d.resolve_failed);
 			std::fprintf(f, "reports=%llu\n", (unsigned long long)d.candidates_reported);
+			if (diff::enabled())
+			{
+				const diff::Summary ds = diff::summary();
+				const native::Stats ns = native::stats();
+				std::fprintf(f, "diff_dispatches=%llu\n", (unsigned long long)ds.dispatches);
+				std::fprintf(f, "diff_disagreements=%llu\n", (unsigned long long)(ds.dispatches - ds.agree));
+				std::fprintf(f, "diff_mismatch=%llu\n", (unsigned long long)ds.mismatch);
+				std::fprintf(f, "diff_unknown=%llu\n", (unsigned long long)ds.unknown);
+				std::fprintf(f, "diff_extra=%llu\n", (unsigned long long)ds.extra);
+				std::fprintf(f, "diff_taa=%llu\n", (unsigned long long)ds.taa_dispatches);
+				std::fprintf(f, "diff_taa_disagree=%llu\n", (unsigned long long)ds.taa_disagree);
+				std::fprintf(f, "native_unknown_lookups=%llu\n", (unsigned long long)ns.unknown_lookups);
+			}
 			std::fclose(f);
 		}
 	}
@@ -1291,6 +1365,11 @@ void DlssApp::log_final_census(bool saw_bind_pipeline, bool saw_push_descriptors
 		STRAY_LOG_INFO("Resolve attempts=%u skipped_stale=%u (%.1f%%) — a skipped frame "
 			"contributes no motion vectors.", attempts, skipped,
 			attempts ? (100.0 * skipped / attempts) : 0.0);
+	}
+	if (diff::enabled())
+	{
+		diff::log_summary("final");
+		native::log_stats("final");
 	}
 	STRAY_LOG_INFO("Final census: compute pipelines=%u, TAA matches=%u, dispatches=%u, "
 		"bind_pipeline=%d, push_descriptors=%d",

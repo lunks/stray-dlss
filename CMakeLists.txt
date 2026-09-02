@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(stray-dlss
     VERSION 0.1.0
     DESCRIPTION "DLSS Super Resolution ReShade add-on for Stray (UE 4.27.2, D3D12)"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 # The add-on itself is Windows/MSVC only and is never built locally — CI is the only build.
 # The pure-logic core and its tests are deliberately platform-independent so they also build
@@ -220,7 +220,24 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/mv_resolve.cpp
         src/mv_resolve.hpp
         src/d3d12_restore.cpp
-        src/d3d12_restore.hpp)
+        src/d3d12_restore.hpp
+        # The native backend: our own D3D12 vtable hooks, the descriptor and root shadows,
+        # the liveness registry. Framework-free by construction.
+        src/backend_native/native_backend.cpp
+        src/backend_native/native_backend.hpp
+        src/backend_native/d3d12_hooks.cpp
+        src/backend_native/d3d12_hooks.hpp
+        src/backend_native/descriptor_shadow.cpp
+        src/backend_native/descriptor_shadow.hpp
+        src/backend_native/resource_registry.cpp
+        src/backend_native/resource_registry.hpp
+        src/backend_native/root_shadow.cpp
+        src/backend_native/root_shadow.hpp
+        src/backend_native/vtable_patch.cpp
+        src/backend_native/vtable_patch.hpp
+        src/backend_native/vtable_slots.hpp
+        # Compile-time proof of the slot numbers against the SDK's C Vtbl structs; links nothing.
+        src/backend_native/vtable_slots_check.c)
 
     target_include_directories(stray_dlss_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

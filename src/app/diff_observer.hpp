@@ -35,6 +35,9 @@ bool enabled();
 // through: parks the oracle's answer for the native hook to consume.
 void publish_expected(void *native_list, std::uint64_t shader_hash, std::uint32_t x, std::uint32_t y,
                       const icept::DispatchBindings &expected);
+// Whether an expectation is parked for this list on this thread — the native Dispatch hook's
+// cheap pre-check before it resolves anything.
+bool has_expected(void *native_list);
 // Called by the native Dispatch hook: compares, counts, logs, and clears the slot. False if
 // nothing was published for this list on this thread (the dispatch was not observed).
 bool consume_and_compare(void *native_list, const icept::DispatchBindings &actual,

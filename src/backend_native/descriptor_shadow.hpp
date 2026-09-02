@@ -1,0 +1,67 @@
+// What every descriptor slot holds, keyed by the REAL D3D12_CPU_DESCRIPTOR_HANDLE.ptr.
+//
+// Fed by the Create*View and CopyDescriptors(Simple) hooks. Keying by the raw handle rather
+// than by (heap, index) means an OFFLINE heap never has to be identified at all: a copy from
+// it is a lookup at src.ptr and a store at dst.ptr (assessment §1.1 decision 1). Only the
+// ONLINE heaps need their spans, and those arrive at SetDescriptorHeaps — which is how the
+// GPU handle in SetComputeRootDescriptorTable turns back into a CPU handle.
+#pragma once
+
+#include "core/heap_math.hpp"
+#include "intercept/types.hpp"
+
+#include <cstdint>
+
+struct ID3D12DescriptorHeap;
+
+namespace stray_dlss::native::shadow {
+
+enum class ViewKind : std::uint8_t { srv, uav, cbv, rtv, dsv };
+
+struct ViewEntry
+{
+	ViewKind kind = ViewKind::srv;
+	icept::ResourceId resource = 0;
+	TexFormat format = TexFormat::unknown; // the VIEW's format (or the resource's when the view is default)
+	std::uint32_t dxgi_format = 0;
+	std::uint32_t width = 0;
+	std::uint32_t height = 0;
+	bool is_3d = false;
+	bool is_buffer = false;
+	std::uint64_t buffer_offset = 0; // cbv: from the buffer's start
+	std::uint64_t buffer_size = 0;   // cbv: SizeInBytes
+};
+
+void note_view(icept::DescriptorId cpu, const ViewEntry &entry);
+// A null view (Create*View with a null resource): the slot holds nothing.
+void note_null_view(icept::DescriptorId cpu);
+// One descriptor of a CopyDescriptors(Simple). An unknown source clears the destination
+// and is counted (see unknown_copies).
+void note_copy(icept::DescriptorId dst, icept::DescriptorId src);
+// SetDescriptorHeaps: records the heap's CPU/GPU spans. Cheap; re-read on every bind.
+void note_heap_bound(::ID3D12DescriptorHeap *heap);
+
+bool lookup(icept::DescriptorId cpu, ViewEntry &out);
+// Via the bound heaps' spans. False when no bound heap contains the GPU handle.
+bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu);
+
+// From registry::on_destroyed: every slot referencing the resource is erased.
+void forget_resource(icept::ResourceId res);
+
+// The §6.2 counter: lookups (by CPU or GPU handle) that found nothing. Incremented by the
+// resolver on every unresolved slot; readable for the DIFF and the status file.
+std::uint64_t unknown_lookups();
+void count_unknown_lookup();
+std::uint64_t unknown_copies();
+
+struct Stats
+{
+	std::uint64_t views = 0;    // note_view calls
+	std::uint64_t copies = 0;   // descriptors copied
+	std::uint64_t slots = 0;    // live entries
+	std::uint64_t heaps = 0;    // known heap spans
+};
+Stats stats();
+void clear_for_test();
+
+} // namespace stray_dlss::native::shadow
