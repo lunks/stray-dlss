@@ -6,6 +6,8 @@
 
 #include "app/diff_observer.hpp"
 #include "backend_native/descriptor_shadow.hpp"
+
+#include <windows.h>
 #include "backend_native/native_backend.hpp"
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
@@ -331,14 +333,31 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	perf_log = host::cfg::get_bool("PerfLog", perf_log);
 	perf::set_enabled(perf_log);
 
-	// [STRAYDLSS] ShadowMode: fast (default, flat lock-free arrays) or debug (sharded map with
-	// provenance for the diff observer). Selected once, before the game creates any descriptor
-	// heap. A perf measurement is fast-mode only; the mode is logged and written to the status
-	// file so a number can never be attributed to the wrong shadow (facts §28).
-	char shadow_mode[16] = "fast";
-	host::cfg::get_string("ShadowMode", shadow_mode, sizeof(shadow_mode));
-	const bool shadow_debug = shadow_mode[0] == 'd' || shadow_mode[0] == 'D';
-	native::shadow::set_mode(shadow_debug ? native::shadow::Mode::debug : native::shadow::Mode::fast);
+	// [STRAYDLSS] ShadowMode: fast (flat lock-free arrays), debug (sharded map with provenance),
+	// or absent = AUTO. Selected once, before the game creates any descriptor heap; logged and
+	// written to the status file so a number is never attributed to the wrong shadow (facts §28).
+	// AUTO picks DEBUG when ReShade is in the process (Config B): the fast path needs every heap
+	// registered before use, and under ReShade some staging heaps are created before our device
+	// hook or through its proxy device, so ~15-19% of frames resolved the pinned TAA to unknown,
+	// the gate refused, and the image flickered (facts §29). Debug keys the shadow by the raw
+	// handle and handles any heap; Config B is NR-bound (~52 fps) so its cost is irrelevant.
+	// Config A (no ReShade) stays fast - the parity win.
+	char shadow_mode[16] = {};
+	native::shadow::Mode sm;
+	if (host::cfg::get_string("ShadowMode", shadow_mode, sizeof(shadow_mode)) && shadow_mode[0] != '\0')
+	{
+		sm = (shadow_mode[0] == 'd' || shadow_mode[0] == 'D') ? native::shadow::Mode::debug : native::shadow::Mode::fast;
+	}
+	else
+	{
+		bool reshade = false;
+		if (HMODULE dxgi = ::GetModuleHandleW(L"dxgi.dll"))
+			reshade = ::GetProcAddress(dxgi, "ReShadeRegisterAddon") != nullptr;
+		sm = reshade ? native::shadow::Mode::debug : native::shadow::Mode::fast;
+		STRAY_LOG_INFO("ShadowMode=auto: ReShade %s in the process -> %s shadow",
+			reshade ? "IS" : "is NOT", reshade ? "debug" : "fast");
+	}
+	native::shadow::set_mode(sm);
 
 	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
 	// stack (one CreateFeature attempt, released; SR keeps running), 2 = full RR-first
