@@ -114,36 +114,42 @@ local function isPaused()
     return ok and v == true
 end
 
-local function write()
-    seq = seq + 1
-    if quiet() then
-        local f = io.open(STATE, "wb")
-        if f then f:write(string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time())); f:close() end
-        return
-    end
+-- THREADING, and why it is shaped like this (user-reported 2026-09-02: "writing sync inside
+-- the game is causing frame spikes"). The game thread only READS a few values into the
+-- `state` table (collect); the file I/O happens on the UE4SS async thread that LoopAsync
+-- ticks on (flush), from whatever collect last stored. No disk write ever runs on the
+-- game thread, and the async thread never touches a UObject.
+local state = { seq = 0, pawn = 0, pawnname = "", pc = 0, map = "?", paused = 0, ingame = 0 }
+
+local function collect()
+    if quiet() then return end
     local pawn = pawnPresent() and 1 or 0
     local pc = controllerPresent() and 1 or 0
     local map = mapName()
     local paused = isPaused() and 1 or 0
     local menu = map:lower():find("menu", 1, true) ~= nil
-    local ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
+    state.pawn, state.pawnname, state.pc, state.map, state.paused = pawn, pawnName(), pc, map, paused
+    state.ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
+end
+
+local function flush()
+    seq = seq + 1
     -- "wb": the game's C runtime is Windows', and text mode turns "\n" into "\r\n", which
     -- the shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
     local f = io.open(STATE, "wb")
     if not f then return end
-    f:write(string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
-        seq, os.time(), pawn, pawnName(), pc, map, paused, ingame))
+    if quiet() then
+        f:write(string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time()))
+    else
+        f:write(string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
+            seq, os.time(), state.pawn, state.pawnname, state.pc, state.map, state.paused, state.ingame))
+    end
     f:close()
 end
 
--- LoopAsync ticks on a UE4SS thread, not the game thread. Touching UObjects from there
--- during a level teardown (a checkpoint reload) is exactly the kind of thing that faults
--- inside ProcessEvent, and the reload crash measured 2026-09-02 sits in the UE4SS mod layer.
--- So the tick only SCHEDULES the work; every engine query runs on the game thread.
 LoopAsync(1000, function()
-    pcall(function()
-        ExecuteInGameThread(function() pcall(write) end)
-    end)
+    pcall(flush)                                                    -- async thread: file I/O
+    pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
     return false   -- keep looping
 end)
 
@@ -160,21 +166,25 @@ local function benchFlag()
     if f then f:close(); return true end
     return false
 end
-local function writeFrame()
-    local ok, line = pcall(function()
+local frameState = { frame = -1, dt = -1 }
+local function collectFrame()   -- game thread: two static calls, nothing else
+    local ok = pcall(function()
         local ks = UEHelpers.GetKismetSystemLibrary()
         local gs = UEHelpers.GetGameplayStatics()
         local w = world()
-        local frame = ks and ks:GetFrameCount() or -1
-        local dt = (gs and w) and gs:GetWorldDeltaSeconds(w) or -1
-        return string.format("frame=%d\ndt=%.6f\nt=%d\n", tonumber(frame) or -1, tonumber(dt) or -1, os.time())
+        frameState.frame = tonumber(ks and ks:GetFrameCount() or -1) or -1
+        frameState.dt = tonumber((gs and w) and gs:GetWorldDeltaSeconds(w) or -1) or -1
     end)
+    if not ok then frameState.frame, frameState.dt = -1, -1 end
+end
+local function flushFrame()     -- async thread: the write
     local f = io.open(FRAME, "wb")
-    if f then f:write(ok and line or "frame=-1\ndt=-1\n"); f:close() end
+    if f then f:write(string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time())); f:close() end
 end
 LoopAsync(250, function()
     if benchFlag() then
-        pcall(function() ExecuteInGameThread(function() pcall(writeFrame) end) end)
+        pcall(flushFrame)
+        pcall(function() ExecuteInGameThread(function() pcall(collectFrame) end) end)
     end
     return false
 end)
