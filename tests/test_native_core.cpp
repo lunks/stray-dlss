@@ -223,10 +223,12 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	//   0xdead: ReShade's destroy_resource fired (live=0) but its view->resource map still names
 	//           it (CLAUDE.md §5); the registry saw it die too.            -> RESHADE-STALE
 	//   0x7777: live per ReShade, NEVER registered by the registry.          -> NATIVE-BLIND
-	//   0xbeef: dead per ReShade, live per the registry.                     -> LIVENESS-CONFLICT
+	//   0xbeef: dead per ReShade, LIVE per the registry's sentinel (the runtime's word):
+	//           ReShade's event-fed liveness never carried it.        -> RESHADE-LIVENESS-GAP
+	//   0xcafe: live per ReShade, seen by the registry but its sentinel FIRED. -> LIVENESS-CONFLICT
 	//   everything else: live and seen on both sides.
 	static const auto oracle_live = [](icept::ResourceId r) { return r != 0xdead && r != 0xbeef; };
-	static const auto native_live = [](icept::ResourceId r) { return r != 0xdead && r != 0x7777; };
+	static const auto native_live = [](icept::ResourceId r) { return r != 0xdead && r != 0x7777 && r != 0xcafe; };
 	static const auto native_seen = [](icept::ResourceId r) { return r != 0x7777; };
 	diff::Adjudicator adj;
 	adj.oracle_live = oracle_live;
@@ -242,17 +244,20 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	oracle.srvs.push_back(BoundTexture{ 10, 0x7777, TexFormat::unknown, 0, 0, 0xaa }); // the registry never saw it
 	native.uavs.push_back(BoundTexture{ 2, 0x5555, TexFormat::unknown, 0, 0, 0xb2 });  // oracle has nothing
 	oracle.uavs.push_back(BoundTexture{ 3, 0x6666, TexFormat::unknown, 0, 0, 0xb3 });
-	native.uavs.push_back(BoundTexture{ 3, 0xbeef, TexFormat::unknown, 0, 0, 0xb3 });  // native names a ReShade-dead one
+	native.uavs.push_back(BoundTexture{ 3, 0xbeef, TexFormat::unknown, 0, 0, 0xb3 });  // native names a ReShade-dead, sentinel-live one
+	oracle.uavs.push_back(BoundTexture{ 4, 0xcafe, TexFormat::unknown, 0, 0, 0xb4 });  // oracle names one the sentinel saw die
+	native.uavs.push_back(BoundTexture{ 4, 0x1234, TexFormat::unknown, 0, 0, 0xb4 });
 	oracle.constant_buffers.emplace_back(1u, icept::BufferRange{ 0xdead, 4096, icept::kUnknownSize });
 
 	const diff::Result r = diff::compare(oracle, native, &adj);
-	REQUIRE(r.mismatches.size() == 3);
+	REQUIRE(r.mismatches.size() == 4);
 	REQUIRE(r.unknown.size() == 3);
 	REQUIRE(r.extra.size() == 1);
 	CHECK(r.mismatches[0].find("=> RESHADE-STALE") != std::string::npos);
 	CHECK(r.mismatches[0].find("oracle-res live rs=0 reg=0 seen=1") != std::string::npos);
 	CHECK(r.mismatches[1].find("=> BOTH-LIVE") != std::string::npos);
-	CHECK(r.mismatches[2].find("=> LIVENESS-CONFLICT") != std::string::npos); // 0xbeef
+	CHECK(r.mismatches[2].find("=> RESHADE-LIVENESS-GAP") != std::string::npos); // 0xbeef
+	CHECK(r.mismatches[3].find("=> LIVENESS-CONFLICT") != std::string::npos);   // 0xcafe
 	CHECK(r.unknown[0].find("=> NATIVE-MISSED") != std::string::npos);
 	CHECK(r.unknown[1].find("=> NATIVE-BLIND") != std::string::npos);
 	CHECK(r.unknown[2].rfind("cb:", 0) == 0);
@@ -262,6 +267,7 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::native_blind)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::both_live)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::liveness_conflict)] == 1);
+	CHECK(r.verdicts[static_cast<int>(diff::Verdict::reshade_liveness_gap)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::oracle_missed)] == 1);
 	CHECK(r.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 0);
@@ -348,7 +354,7 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	CHECK_FALSE(r4.oracle_wrong());
 	// Without an adjudicator every differing slot is unadjudicated and the lines are bare.
 	const diff::Result bare = diff::compare(oracle, native);
-	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 7);
+	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 8);
 	CHECK(bare.mismatches[0].find("=>") == std::string::npos);
 	// The live machinery accumulates verdicts into the summary.
 	diff::set_enabled(true);

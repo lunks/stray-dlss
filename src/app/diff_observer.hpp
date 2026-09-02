@@ -28,6 +28,10 @@ enum class Verdict : std::uint8_t
 	reshade_view_recreated, // the slot was COPIED from an offline view that the game RE-CREATED for
 	                    // another resource AFTER the copy; ReShade reports the re-created view's
 	                    // resource for the online slot, whose descriptor bytes still hold the old one
+	reshade_liveness_gap, // the native side names a resource whose sentinel is LIVE (the runtime
+	                    // would have released it otherwise) but ReShade's event-fed liveness calls
+	                    // dead: its init/destroy_resource events never carried it (measured: the
+	                    // swapchain's own back buffers, run J)
 	native_blind,       // the oracle names a live resource the registry never saw, or a slot the
 	                    // shadow never saw written since attach (no entry / no heap span)
 	liveness_conflict,  // the two liveness trackers disagree about the same resource
@@ -36,7 +40,7 @@ enum class Verdict : std::uint8_t
 	both_live,          // both sides name a resource live on both sides and they differ: ambiguous
 	unadjudicated,      // no liveness available (the pure comparison alone)
 };
-constexpr int kVerdictCount = 9;
+constexpr int kVerdictCount = 10;
 const char *verdict_name(Verdict v);
 
 // The evidence compare() may ask for. Any of the first three null makes every slot

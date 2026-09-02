@@ -86,6 +86,8 @@ Judged judge(icept::ResourceId oracle_res, icept::ResourceId native_res, const A
 		j.verdict = Verdict::reshade_stale;
 	else if (oracle_res != 0 && j.o_seen == 0)
 		j.verdict = Verdict::native_blind;
+	else if (native_res != 0 && j.n_rs == 0 && j.n_reg == 1 && j.n_seen == 1 && (oracle_res == 0 || j.o_reg == 1))
+		j.verdict = Verdict::reshade_liveness_gap; // a live sentinel is the runtime's word; ReShade's set is event-fed
 	else if ((oracle_res != 0 && j.o_reg == 0) || (native_res != 0 && (j.n_rs == 0 || j.n_reg == 0)))
 		j.verdict = Verdict::liveness_conflict;
 	else if (native_res == 0)
@@ -298,6 +300,7 @@ const char *verdict_name(Verdict v)
 	case Verdict::reshade_stale: return "RESHADE-STALE";
 	case Verdict::reshade_copy_stale: return "RESHADE-COPY-STALE";
 	case Verdict::reshade_view_recreated: return "RESHADE-VIEW-RECREATED";
+	case Verdict::reshade_liveness_gap: return "RESHADE-LIVENESS-GAP";
 	case Verdict::native_blind: return "NATIVE-BLIND";
 	case Verdict::liveness_conflict: return "LIVENESS-CONFLICT";
 	case Verdict::native_missed: return "NATIVE-MISSED";
@@ -314,7 +317,8 @@ bool Result::oracle_wrong() const
 		return false;
 	std::uint32_t convicting = verdicts[static_cast<int>(Verdict::reshade_stale)] +
 		verdicts[static_cast<int>(Verdict::reshade_copy_stale)] +
-		verdicts[static_cast<int>(Verdict::reshade_view_recreated)];
+		verdicts[static_cast<int>(Verdict::reshade_view_recreated)] +
+		verdicts[static_cast<int>(Verdict::reshade_liveness_gap)];
 	std::uint32_t total = 0;
 	for (int i = 0; i < kVerdictCount; ++i)
 		total += verdicts[i];
@@ -550,7 +554,7 @@ void log_summary(const char *when)
 		static_cast<unsigned long long>(s.taa_dispatches), static_cast<unsigned long long>(s.taa_disagree),
 		static_cast<unsigned long long>(s.dispatches - s.agree));
 	// The adjudication, by differing SLOT: which side each convicts.
-	char verdicts[400];
+	char verdicts[480];
 	int n = 0;
 	for (int i = 0; i < kVerdictCount && n < static_cast<int>(sizeof(verdicts)) - 48; ++i)
 		n += std::snprintf(verdicts + n, sizeof(verdicts) - n, "%s%s=%llu", i ? " " : "",
