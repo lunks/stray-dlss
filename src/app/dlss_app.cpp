@@ -8,6 +8,7 @@
 #include "backend_native/descriptor_shadow.hpp"
 
 #include <windows.h>
+#include "backend_native/fg_present.hpp"
 #include "backend_native/native_backend.hpp"
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
@@ -1072,6 +1073,28 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "taa_pipelines=%u\n", g_state.taa_pipelines_seen.load());
 			std::fprintf(f, "dispatches=%u\n", g_state.dispatches_seen.load());
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
+			{
+				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame
+				// counter against fg_presents_issued is the "~2x presents per engine frame" check.
+				const native::fg::Stats fs = native::fg::stats();
+				std::fprintf(f, "fg_enabled=%d\n", native::fg::enabled() ? 1 : 0);
+				std::fprintf(f, "fg_game_presents=%llu\n", (unsigned long long)fs.game_presents);
+				std::fprintf(f, "fg_presents_issued=%llu\n", (unsigned long long)fs.presents_issued);
+				std::fprintf(f, "fg_generated_presented=%llu\n", (unsigned long long)fs.generated_presented);
+				std::fprintf(f, "fg_reconfigures=%llu\n", (unsigned long long)fs.reconfigures);
+				std::fprintf(f, "fg_replacements=%u\n", fs.replacement_count);
+				std::fprintf(f, "fg_pacer_ms=%.2f\n", fs.pacer_interval_ms);
+				std::fprintf(f, "fg_issued_p50_ms=%u\n", fs.issued_p50_ms);
+				std::fprintf(f, "fg_issued_p99_ms=%u\n", fs.issued_p99_ms);
+				std::fprintf(f, "fg_issued_bimodal=%d\n", fs.issued_second_peak_ms >= 0 ? 1 : 0);
+				std::fprintf(f, "fg_validated=%d\n", fs.validated ? 1 : 0);
+				std::fprintf(f, "fg_crop_black=%llu\n", (unsigned long long)fs.crop_black);
+				std::fprintf(f, "fg_crop_stale=%llu\n", (unsigned long long)fs.crop_stale);
+				unsigned long long refused = 0;
+				for (int i = 1; i < static_cast<int>(core::fg::Refusal::count); ++i)
+					refused += fs.refused[i];
+				std::fprintf(f, "fg_refused=%llu\n", refused);
+			}
 			std::fprintf(f, "shadow_mode=%s\n", native::shadow::mode() == native::shadow::Mode::fast ? "fast" : "debug");
 			std::fprintf(f, "ngx_attempted=%d\n",
 				g_state.ngx_attempted.load(std::memory_order_relaxed) ? 1 : 0);

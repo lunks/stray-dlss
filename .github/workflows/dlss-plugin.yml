@@ -139,7 +139,7 @@ jobs:
           done
           # And the native backend's own sources the host links, as the root's CI cannot
           # (it is MSVC-only there): a syntax pass under mingw's older d3d12.h.
-          for f in backend_native/present_owner backend_native/native_backend backend_native/d3d12_hooks \
+          for f in backend_native/present_owner backend_native/fg_present backend_native/native_backend backend_native/d3d12_hooks \
                    backend_native/resource_registry backend_native/descriptor_shadow backend_native/root_shadow \
                    backend_native/vtable_patch; do
             echo "--- $f"

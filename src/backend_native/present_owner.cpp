@@ -1,6 +1,8 @@
 #include "backend_native/present_owner.hpp"
 
+#include "backend_native/fg_present.hpp"
 #include "backend_native/native_backend.hpp"
+#include "host/config.hpp"
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
 #include "core/present_plan.hpp"
@@ -74,6 +76,7 @@ std::uint64_t g_fence_value = 0;
 HANDLE g_fence_event = nullptr;
 std::atomic<bool> g_list_used{ false };
 std::atomic<bool> g_installed{ false };
+std::atomic<std::uint64_t> g_stats_last_frame{ 0 }; // pc.frame of the last delivered on_present
 Stats g_stats;
 char g_report[512] = "present owner: not installed";
 
@@ -146,6 +149,9 @@ void note_swapchain_lazy(IDXGISwapChain *sc, IUnknown *device_arg, const char *h
 	STRAY_LOG_WARN("present owner: swapchain %p via %s device-arg=%p recorded; %u Present/Resize slot(s) patched. "
 		"QI/queue/back-buffers deferred to first Present.",
 		static_cast<void *>(sc), how, static_cast<void *>(device_arg), patched);
+	// Frame generation hooks GetBuffer on the same vtable, and must do so NOW: the game asks for
+	// its back buffers right after creation, before the first Present (facts §30.4).
+	fg::on_swapchain_recorded(sc, g_device);
 }
 
 // The one-time work that used to sit in the creation hook, now run at the FIRST Present of a
@@ -177,6 +183,7 @@ void finalize_swapchain_locked(Entry *e)
 	if (same_object3 && patch_slot(sc, slot::kSwapChain3_ResizeBuffers1, reinterpret_cast<void *>(&hk_ResizeBuffers1), "IDXGISwapChain3::ResizeBuffers1") != nullptr)
 		++patched;
 	e->finalized = true;
+	fg::on_swapchain_finalised(sc, e->swapchain3, g_device, e->queue);
 	STRAY_LOG_WARN("present owner: swapchain %p FINALISED at first Present (SwapChain1=%d SwapChain3=%d) device-arg=%p -> %s queue %p (%s); %u extra slot(s) patched",
 		static_cast<void *>(sc), same_object1 ? 1 : 0, same_object3 ? 1 : 0, static_cast<void *>(queue_arg),
 		pick >= 0 && g_queues[static_cast<std::size_t>(pick)].id == reinterpret_cast<std::uint64_t>(queue_arg) ? "the SAME" : "the first DIRECT",
@@ -325,7 +332,15 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 	pc.swapchain = entry.swapchain3;
 	pc.frame = sk->next_frame();
 	pc.backend_cookie = 0;
-	// The current back buffer, non-owning, exactly as the ReShade host reported it.
+	g_stats_last_frame.store(pc.frame, std::memory_order_relaxed);
+	// The current back buffer, non-owning, exactly as the ReShade host reported it — or, with
+	// frame generation armed, the REPLACEMENT the game rendered this frame into (the real ring
+	// only ever receives our copies, fg_present.hpp).
+	if (ID3D12Resource *replacement = fg::game_frame(sc))
+	{
+		pc.back_buffer = replacement;
+	}
+	else
 	{
 		const UINT index = entry.swapchain3 != nullptr ? entry.swapchain3->GetCurrentBackBufferIndex() : 0;
 		ID3D12Resource *buf = nullptr;
@@ -363,6 +378,10 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 				static_cast<void *>(pc.queue), static_cast<void *>(pc.present_list), reinterpret_cast<void *>(pc.back_buffer));
 	}
 	sk->on_present(pc);
+	// Frame generation's game-thread half: the generated frame's production (and, in ngx mode,
+	// the validation crop) recorded onto this same list, after everything the sink recorded.
+	if (pc.present_list != nullptr && fg::enabled() && fg::record(sc, pc.present_list, pc.frame))
+		g_list_used.store(true, std::memory_order_relaxed);
 
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -384,10 +403,37 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 	}
 }
 
+// Frame generation owns the present once it is armed: it copies the game's frame (and the
+// generated one) into the real ring and calls the ORIGINAL Present itself, once or twice. The
+// frame index it is handed is the one before_present just consumed.
+bool fg_present(IDXGISwapChain *self, UINT sync, UINT flags, HRESULT *hr)
+{
+	if (!fg::enabled() || (flags & DXGI_PRESENT_TEST) != 0 || in_own_code())
+		return false;
+	fg::PresentArgs args;
+	args.sc = self;
+	args.sync = sync;
+	args.flags = flags;
+	{
+		icept::Sink *sk = sink();
+		args.frame = sk != nullptr ? g_stats_last_frame.load(std::memory_order_relaxed) : 0;
+	}
+	args.orig_present = original_for(self, slot::kSwapChain_Present);
+	long out = S_OK;
+	OwnCodeScope own; // the presents and copies below are ours
+	if (!fg::present(args, &out))
+		return false;
+	*hr = static_cast<HRESULT>(out);
+	return true;
+}
+
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *self, UINT sync, UINT flags)
 {
 	auto orig = reinterpret_cast<PFN_Present>(original_for(self, slot::kSwapChain_Present));
 	before_present(self, flags);
+	HRESULT hr = S_OK;
+	if (fg_present(self, sync, flags, &hr))
+		return hr;
 	return orig != nullptr ? orig(self, sync, flags) : S_OK;
 }
 
@@ -395,16 +441,25 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT fla
 {
 	auto orig = reinterpret_cast<PFN_Present1>(original_for(self, slot::kSwapChain1_Present1));
 	before_present(self, flags);
+	HRESULT hr = S_OK;
+	if (fg_present(self, sync, flags, &hr))
+		return hr; // UE 4.27 calls Present, not Present1 (facts §30.4); FG presents through Present either way
 	return orig != nullptr ? orig(self, sync, flags, params) : S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
 {
 	auto orig = reinterpret_cast<PFN_ResizeBuffers>(original_for(self, slot::kSwapChain_ResizeBuffers));
-	if (!in_own_code())
+	const bool game_call = !in_own_code();
+	if (game_call)
+	{
 		report_back_buffers(self, false);
+		fg::before_reconfigure(self, "ResizeBuffers");
+	}
 	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags) : E_FAIL;
-	if (!in_own_code())
+	if (game_call)
+		fg::after_reconfigure(self, "ResizeBuffers", /*drop_replacements=*/true, count, hr);
+	if (game_call)
 	{
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
@@ -420,10 +475,16 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UIN
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags, const UINT *node_masks, IUnknown *const *queues)
 {
 	auto orig = reinterpret_cast<PFN_ResizeBuffers1>(original_for(self, slot::kSwapChain3_ResizeBuffers1));
-	if (!in_own_code())
+	const bool game_call = !in_own_code();
+	if (game_call)
+	{
 		report_back_buffers(self, false);
+		fg::before_reconfigure(self, "ResizeBuffers1");
+	}
 	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags, node_masks, queues) : E_FAIL;
-	if (!in_own_code())
+	if (game_call)
+		fg::after_reconfigure(self, "ResizeBuffers1", /*drop_replacements=*/true, count, hr);
+	if (game_call)
 	{
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
@@ -476,6 +537,21 @@ bool install(::ID3D12Device *device)
 		return true;
 	g_device = device;
 
+	// [STRAYDLSS] NgxFG and its knobs (fg_present.hpp). Read here, once, before the game can
+	// create a swapchain: the GetBuffer hook has to be in place before the first GetBuffer.
+	{
+		fg::Config fc;
+		fc.enabled = host::cfg::get_bool("NgxFG", false);
+		const int mode = host::cfg::get_int("NgxFGMode", 2);
+		fc.mode = mode == 1 ? fg::Mode::experiment : fg::Mode::ngx;
+		const int pacing = host::cfg::get_int("NgxFGPacing", 1);
+		fc.pacing = pacing == 0 ? fg::Pacing::none : pacing == 2 ? fg::Pacing::sync : fg::Pacing::thread;
+		fc.wait_ms = host::cfg::get_int("NgxFGWaitMs", -1);
+		fc.band = host::cfg::get_bool("NgxFGBand", true);
+		fc.validate = host::cfg::get_int("NgxFGValidate", 1);
+		fg::configure(fc);
+	}
+
 	// A throwaway factory reaches the factory class's vtable. dxgi.dll is whatever the process
 	// has: DXVK's, or ReShade's proxy when it is loaded as dxgi.dll — both one class.
 	HMODULE dxgi = ::GetModuleHandleW(L"dxgi.dll");
@@ -521,6 +597,7 @@ void uninstall()
 {
 	if (!g_installed.load())
 		return;
+	fg::uninstall();
 	if (g_fence && g_fence_value != 0 && g_fence->GetCompletedValue() < g_fence_value && g_fence_event != nullptr)
 	{
 		g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);

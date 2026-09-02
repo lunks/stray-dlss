@@ -1714,6 +1714,7 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 }
 
 #include "warp_native_backend.inc"
+#include "warp_fg_present.inc"
 
 int main(int argc, char **argv)
 {
@@ -1765,6 +1766,8 @@ int main(int argc, char **argv)
 	test_native_stream_walk();
 	test_native_hooks_ue4_shaped_frame(gpu);
 	test_drive_mode_restore_is_complete(gpu);
+	// After drive mode: the frame-generation present path over a real swapchain (needs drive).
+	test_fg_present_twice(gpu);
 
 	stray_dlss::mv::shutdown();
 	drain_validation(gpu, "shutdown");

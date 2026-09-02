@@ -85,6 +85,8 @@ add_library(stray_dlss_core STATIC
     src/core/nr_hook_plan.hpp
     src/core/present_plan.cpp
     src/core/present_plan.hpp
+    src/core/fg_plan.cpp
+    src/core/fg_plan.hpp
     src/core/nr_history_plan.cpp
     src/core/nr_history_plan.hpp
     src/core/ring.hpp
@@ -249,6 +251,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/backend_native/vtable_patch.hpp
         src/backend_native/present_owner.cpp
         src/backend_native/present_owner.hpp
+        src/backend_native/fg_present.cpp
+        src/backend_native/fg_present.hpp
         src/backend_native/vtable_slots.hpp
         # Compile-time proof of the slot numbers against the SDK's C Vtbl structs; links nothing.
         src/backend_native/vtable_slots_check.c)
@@ -392,6 +396,7 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/backend_native/resource_registry.cpp
         src/backend_native/root_shadow.cpp
         src/backend_native/present_owner.cpp
+        src/backend_native/fg_present.cpp
         src/backend_native/vtable_patch.cpp
         src/app/diff_observer.cpp)
 
@@ -444,7 +449,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_ring.cpp
         tests/test_ini.cpp
         tests/test_intercept_types.cpp
-        tests/test_native_core.cpp)
+        tests/test_native_core.cpp
+        tests/test_fg_plan.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)
