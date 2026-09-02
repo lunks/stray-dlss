@@ -210,6 +210,26 @@ verdict() {
 }
 fail() { log "FAILED: $1"; verdict "FAILED: $1"; exit 1; }
 
+# The game NEVER RAN LIKE LAST TIME: the process died (or an unhandled exception was raised)
+# before the add-on wrote its first heartbeat. This is its own verdict so it is never confused
+# with "ran, then no heartbeat" — and it exits within one loop tick, never at a timeout. A
+# crash handler that keeps the exe alive does not save it: a NEW Proton unhandled-exception
+# line since launch counts as death too.
+crash() {
+    local secs="?"
+    [ -n "$UP_EPOCH" ] && secs=$(( $(date +%s) - UP_EPOCH ))
+    log "CRASH: game died ${secs}s after start, before the add-on reported in — $1"
+    verdict "CRASH: game died ${secs}s after start, before the add-on reported in — $1"
+    exit 1
+}
+# True when the game must be treated as dead in a pre-heartbeat phase: the process is gone, OR
+# it is nominally alive but the Proton log recorded an unhandled exception since launch.
+game_dead_before_heartbeat() {
+    game_running || return 0
+    proton_new_exception && return 0
+    return 1
+}
+
 # ---------------------------------------------------------------------------------------
 
 if game_running && [ -f "$STATUS" ] && [ "$(file_age "$STATUS")" -lt 30 ]; then
@@ -236,8 +256,18 @@ if ! game_running; then
         >/dev/null 2>&1
 
     log "Waiting for the process"
+    chain_seen=0
     for _ in $(seq 1 60); do
         game_running && break
+        # Steam GAVE UP: the launch chain was up and is now gone with no game exe. Do not wait
+        # out the 120 s — nothing is coming. (The chain takes a moment to appear, so only
+        # conclude this once we have actually seen it.)
+        if pgrep -f "AppId=$APPID" >/dev/null 2>&1; then
+            chain_seen=1
+        elif [ "$chain_seen" = 1 ]; then
+            log "The Steam launch chain (AppId=$APPID) disappeared without a game process — Steam gave up."
+            break
+        fi
         sleep 2
     done
 
@@ -277,10 +307,11 @@ log "Waiting for the add-on heartbeat (first load recompiles every shader — th
 hb_deadline=$(( $(date +%s) + HEARTBEAT_TIMEOUT ))
 while [ "$(date +%s)" -lt "$hb_deadline" ]; do
     [ -f "$STATUS" ] && break
-    game_running || fail "the game exited before the add-on reported in (a crash: the add-on never wrote its status file)"
-    # A crash before the heartbeat is a CRASH, not a slow load — fail the moment the evidence
-    # exists rather than waiting out the cap.
-    proton_new_exception && fail "unhandled exception in the Proton log before the add-on reported in (crashed at load / start_mod)"
+    # Death or an unhandled exception before the heartbeat is a CRASH — exit THIS tick, with
+    # the crash verdict, never at the cap.
+    game_running || crash "the process is gone; the add-on never wrote its status file"
+    proton_new_exception && crash "unhandled exception in the Proton log (a c0000005 in start_mod writes one here)"
+    # A wedged start_mod with NO exception is a hang, not a crash — its own reason, still no wait.
     start_mod_hung && fail "UE4SS is wedged in a mod's start_mod (UE4SS.log stuck at 'Starting C++ mod' for $(file_age "$UE4SS_LOG")s, no heartbeat)"
     sleep 1
 done
