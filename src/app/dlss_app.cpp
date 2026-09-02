@@ -1005,12 +1005,13 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 
 	// The observer's periodic report: the DIFF SUMMARY (disagreements=) and the native
 	// shadow's own counters, every 600 presents while it is on.
-	if (diff::enabled() && frame != 0 && (frame % 600) == 0)
+	if (native::mode() != native::Mode::off && frame != 0 && (frame % 600) == 0)
 	{
 		char when[32];
 		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
-		diff::log_summary(when);
-		native::log_stats(when);
+		if (diff::enabled())
+			diff::log_summary(when);
+		native::log_stats(when); // in drive mode this carries the NATIVE DRIVE delivered/suppressed counters
 	}
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
@@ -1072,6 +1073,12 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				std::fprintf(f, "diff_taa=%llu\n", (unsigned long long)ds.taa_dispatches);
 				std::fprintf(f, "diff_taa_disagree=%llu\n", (unsigned long long)ds.taa_disagree);
 				std::fprintf(f, "native_unknown_lookups=%llu\n", (unsigned long long)ns.unknown_lookups);
+			}
+			if (native::mode() == native::Mode::drive)
+			{
+				const native::Stats ns = native::stats();
+				std::fprintf(f, "native_drive_dispatches=%llu\n", (unsigned long long)ns.drive_dispatches);
+				std::fprintf(f, "native_drive_suppressed=%llu\n", (unsigned long long)ns.drive_suppressed);
 			}
 			std::fclose(f);
 		}
