@@ -889,6 +889,12 @@ small composable scripts sharing `tools/stray-lib.sh`, gated on an IN-ENGINE pro
   previous window's value and inflated a run to 277 fps against a true 140.
 * **`tools/stray-bench.sh --runs N --label L`**: N × (reload + traverse) in ONE process. A
   death anywhere is the stability verdict; the surviving windows are the perf result.
+  **The scenario is the user's own recording** (`tools/data/stray-recording-user1.txt`,
+  staged into the game dir; `tools/stray-record.sh` made it, `inject.py replay` plays it):
+  301 events, 16.9 s, Up/Left/Right/Shift. Its ~1.6 s lead-in of Left held before Up turns
+  the cat and MUST stay — trimming it changed the path — and so must the 3 s settle after a
+  reload. `--synthetic` restores the Up + Left/Right pattern. The pad is not replayable
+  this way (the game reads the DualSense over hidraw via the shim, not evdev).
 * **`tools/screenshot-gamescope.sh`**: `gamescopectl screenshot`, no ReShade needed.
 
 **Measured with it, 2026-09-02:** the "reload checkpoint" crash (`EXCEPTION_ACCESS_VIOLATION
