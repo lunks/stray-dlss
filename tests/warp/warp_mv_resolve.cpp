@@ -1716,8 +1716,36 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 #include "warp_native_backend.inc"
 #include "warp_fg_present.inc"
 
+// A crash in the harness must leave its trail: stdout is unbuffered (ctest captures a pipe, so
+// a segfault would otherwise swallow every line since the last flush) and a vectored handler
+// prints the faulting address as module+offset before the process dies.
+LONG WINAPI harness_crash_handler(EXCEPTION_POINTERS *ep)
+{
+	if (ep == nullptr || ep->ExceptionRecord == nullptr)
+		return EXCEPTION_CONTINUE_SEARCH;
+	const DWORD code = ep->ExceptionRecord->ExceptionCode;
+	if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+		code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	void *addr = ep->ExceptionRecord->ExceptionAddress;
+	HMODULE m = nullptr;
+	char name[MAX_PATH] = "?";
+	if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(addr), &m) && m != nullptr)
+		::GetModuleFileNameA(m, name, MAX_PATH);
+	std::printf("\n*** HARNESS CRASH: exception 0x%08lx at %p = %s + 0x%llx", static_cast<unsigned long>(code), addr, name,
+		static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(addr) - reinterpret_cast<std::uintptr_t>(m)));
+	if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+		std::printf(" (%s address %p)", ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "reading" : "writing",
+			reinterpret_cast<void *>(ep->ExceptionRecord->ExceptionInformation[1]));
+	std::printf("\n");
+	std::fflush(stdout);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char **argv)
 {
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	::AddVectoredExceptionHandler(1, &harness_crash_handler);
 	for (int i = 1; i < argc; ++i)
 	{
 		const std::string arg = argv[i];
