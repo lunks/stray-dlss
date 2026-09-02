@@ -310,3 +310,73 @@ ReShade.log  18:10:04:414  Redirecting D3D12CreateDevice(...)
   has to load `d3d12.dll` itself or wait for it — and whatever installs a hook on that export
   after ReShade's delayed hooks (04.390) sits ABOVE ReShade's and sees ReShade's proxy, not
   vkd3d's device. The probe build (`mods/StrayDLSS` 0.0.1) measures that directly.
+
+## 13. The interception seam changed nothing (measured 2026-09-01)
+
+Plan Stage 1's acceptance: the add-on rebuilt behind `icept::Backend`/`icept::Sink` (commit
+`3193f46` and fixes, CI run 33572090310) deployed to the box, one session from the main menu
+through the save select into gameplay in The Slums (slot 1), 150 s dwell. `stray-dlss.log`
+diffed against the previous build's, normalised for pointers and counts:
+
+* **The WARN/ERROR sets are identical** — every difference is an address (the four
+  `ext_unhook` restores, the snippet's IAT patch site). No new WARN or ERROR line.
+* Same milestones: `DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13,
+  flags=0x4b`, `DLSS evaluate OK`, `View row 135 ... y*z=1.000000`, `NR VALIDATED`,
+  `Add-on event check OK`, the DLSS indicator on screen in the menu and in gameplay
+  (ReShade screenshots, viewed).
+* Gameplay in The Slums renders correctly at 55 fps (`[perf] frames 27000-27600: 55.6 fps`).
+
+Two box facts learned along the way, both now in the tooling:
+
+* **Steam Input is OFF for this title** (`UseSteamControllerConfig 0` in `localconfig.vdf`,
+  a consequence of the DualSense work, which needs the game to see the real pad), so the
+  "Microsoft X-Box 360 pad 0" node never appears and `launch-stray.sh` drives the menu with
+  Enter on the sysrq keyboard instead. The game switches its glyphs to keyboard the moment a
+  key arrives (seen in the screenshot).
+* **The shader census in gameplay in The Slums is 388-392**, not ~728 (that was the
+  apartment); the main menu is 110. The add-on's `in_game` threshold is now 300.
+
+## 14. The native observer installs cleanly but crashes the live game on vkd3d-proton (measured 2026-09-01)
+
+The differential observer (plan Stage 2): our own D3D12 vtable hooks installed BESIDE ReShade,
+diffing every dispatch's bindings against ReShade's answer. Two things are settled and one is
+open.
+
+**Settled — the resolve is correct.** On WARP and under the real-ReShade CI lane, the hooks
+install on the (unwrapped) device, a UE4-shaped frame — depth+stencil as two views of one
+`R32G8X24_TYPELESS` resource, velocity, colour, history, 1x1 eye adaptation, a root CBV whose
+row 135 validates itself (`PreExposure * OneOverPreExposure == 1`) — resolves through them to
+the exact measured registers, the hooked `Dispatch` consumes the oracle's published answer and
+`disagreements=0`, a deliberately wrong oracle is caught, and after the depth texture is
+released `t2`/`t4` vanish with `unknown_lookups += 2`. The debug layer is clean. (CI 33574…,
+`test_native_hooks_ue4_shaped_frame`.)
+
+**Settled — install itself works on the target.** `NativeMode=observe` on the box, from
+`ReShade.log` (the add-on's own log truncates at the crash, unflushed):
+
+```
+vtable_patch: ID3D12Device::CreateCommittedResource slot 27 …
+… (24 more)
+native backend: mode=observe device=000000001FAF0080 device-slots=13 list-slots=11 patches=24 increment=32
+```
+
+All 24 patches applied; vkd3d-proton shares one static vtable per class (§11), so this reaches
+every device and command list process-wide.
+
+**Open — installing the hooks crashes the live game before a single dispatch is observed.**
+Immediately after the install line the add-on unloads (the game destroys that first device and
+recreates it — ReShade re-registers the add-on) and the process dies:
+`EXCEPTION_ACCESS_VIOLATION 0x0000000000000000`, `SecondsSinceStart=0`, empty UE4 callstack.
+`DIFF SUMMARY dispatches=0 disagreements=0` — the observer never ran a frame, so **there is no
+measured disagreement count yet**. The control is decisive: the byte-identical add-on with
+`NativeMode=off` reaches gameplay (`in_game=1`, 8 dispatch reports, clean close). So the fault
+is the install on vkd3d-proton 3.1.0, in a path both CI lanes (WARP, real-ReShade-on-WARP)
+exercise and pass — i.e. a vkd3d-proton-specific or device-recreate-timing interaction, not a
+logic error the debug layer can see.
+
+**Next step, instrumented but not yet run:** `[STRAYDLSS] NativeInstall=device|list` installs
+only the device-view hooks or only the command-list hooks, and `NativeSentinel=0` drops the
+`SetPrivateDataInterface` sentinel (the highest-suspicion call — it mutates every resource the
+game creates). One launch per combination localises the faulting hook set. A
+`VKD3D_DEBUG=warn PROTON_LOG=1` launch would also catch a vkd3d validation assert the release
+path swallows.
