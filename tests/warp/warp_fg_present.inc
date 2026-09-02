@@ -241,7 +241,8 @@ bool test_fg_present_twice(Gpu &gpu)
 		{ 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },
 		{ 1.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.5f, 0.5f, 1.0f },
 	};
-	auto play = [&](UINT buffer_count, int frames, const char *phase, bool verify) -> bool {
+	UINT game_index = 0; // UE4's CurrentBackBufferIndex_RHIThread: persists across SetFullscreenState, 0 after ResizeBuffers
+	auto play = [&](UINT buffer_count, int frames, const char *phase, bool verify, bool expect_reset, bool per_frame_counts) -> bool {
 		std::vector<ComPtr<ID3D12Resource>> game_buffers(buffer_count);
 		for (UINT i = 0; i < buffer_count; ++i)
 		{
@@ -262,7 +263,6 @@ bool test_fg_present_twice(Gpu &gpu)
 			const D3D12_RESOURCE_DESC rd = game_buffers[0]->GetDesc();
 			check((rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 && rd.Format == DXGI_FORMAT_R10G10B10A2_UNORM, "the replacement is render-target capable in the swapchain's format");
 		}
-		UINT game_index = 0;
 		for (int k = 0; k < frames; ++k)
 		{
 			const fg::Stats before = fg::stats();
@@ -278,10 +278,13 @@ bool test_fg_present_twice(Gpu &gpu)
 			const bool generated = after.generated_presented > before.generated_presented;
 			std::printf("  [%s] frame %d: Present hr=0x%08lx issued=%llu generated=%d\n", phase, k, static_cast<unsigned long>(hr),
 				static_cast<unsigned long long>(issued), generated ? 1 : 0);
-			if (k == 0)
-				check(issued == 1 && !generated, "the first frame after (re)creation presents the real frame only (no previous frame)");
-			else
-				check(issued == 2 && generated, "every later game present issues TWO presents: generated, then real");
+			if (per_frame_counts)
+			{
+				if (k == 0 && expect_reset)
+					check(issued == 1 && !generated, "the first frame after (re)creation presents the real frame only (no previous frame)");
+				else
+					check(issued == 2 && generated, "every later game present issues TWO presents: generated, then real");
+			}
 			if (verify && k >= 1 && sc3)
 			{
 				fg_wait_idle(gpu);
@@ -293,7 +296,7 @@ bool test_fg_present_twice(Gpu &gpu)
 				const FgPixel pr = fg_read_pixel(gpu, real_last.Get(), W / 2, H / 2);
 				const FgPixel pg = fg_read_pixel(gpu, real_generated.Get(), W / 2, H / 2);
 				const FgPixel pb = fg_read_pixel(gpu, real_generated.Get(), W / 2, 8);
-				const float *c = colours[k % 6], *p = colours[(k - 1) % 6];
+				const float *c = colours[k % 6], *p = colours[(k + 5) % 6];
 				std::printf("    real ring: last=(%u,%u,%u) want (%.0f,%.0f,%.0f) | generated centre=(%u,%u,%u) want previous (%.0f,%.0f,%.0f) | band=(%u,%u,%u) want magenta\n",
 					pr.r, pr.g, pr.b, c[0] * 1023, c[1] * 1023, c[2] * 1023, pg.r, pg.g, pg.b, p[0] * 1023, p[1] * 1023, p[2] * 1023, pb.r, pb.g, pb.b);
 				check(pr.ok && fg_near(pr.r, c[0]) && fg_near(pr.g, c[1]) && fg_near(pr.b, c[2]), "the last presented real buffer holds the frame the game just rendered (mirror + copy correct)");
@@ -306,7 +309,7 @@ bool test_fg_present_twice(Gpu &gpu)
 		return true;
 	};
 
-	if (!play(3, 4, "creation", true))
+	if (!play(3, 4, "creation", true, /*expect_reset=*/true, /*per_frame_counts=*/true))
 		return false;
 	{
 		const fg::Stats st = fg::stats();
@@ -320,11 +323,15 @@ bool test_fg_present_twice(Gpu &gpu)
 	const HRESULT rhr = sc->ResizeBuffers(0, 800, 450, DXGI_FORMAT_UNKNOWN, 0);
 	std::printf("  ResizeBuffers(0, 800x450) hr=0x%08lx\n", static_cast<unsigned long>(rhr));
 	check(SUCCEEDED(rhr), "ResizeBuffers succeeded with the game's buffers released (our references do not block it)");
+	game_index = 0; // UE4 resets its counter after ResizeBuffers (facts §31.4)
 	{
+		// The present owner re-fetches the back buffers right after the resize (report_back_buffers),
+		// which is a GetBuffer through the hook, so the replacements are already re-armed here -
+		// exactly what UE4's own GetBuffer(i) loop does.
 		const fg::Stats st = fg::stats();
-		check(st.reconfigures == 1 && st.replacement_count == 0, "the resize dropped the replacements and bumped the epoch");
+		check(st.reconfigures == 1 && st.epoch == 1 && st.width == 800 && st.height == 450, "the resize bumped the epoch and re-armed the replacements at the new size");
 	}
-	if (!play(3, 3, "after-resize", true))
+	if (!play(3, 3, "after-resize", true, /*expect_reset=*/true, /*per_frame_counts=*/true))
 		return false;
 	{
 		const fg::Stats st = fg::stats();
@@ -336,7 +343,9 @@ bool test_fg_present_twice(Gpu &gpu)
 	const HRESULT fhr = sc->SetFullscreenState(FALSE, nullptr);
 	std::printf("  SetFullscreenState(FALSE) hr=0x%08lx reconfigures=%llu\n", static_cast<unsigned long>(fhr), static_cast<unsigned long long>(fg::stats().reconfigures));
 	check(fg::stats().reconfigures == 2, "SetFullscreenState went through the reconfigure path");
-	if (!play(3, 3, "after-fullscreen-state", false))
+	// No ResizeBuffers followed, so neither UE4's counter nor the mirror reset: the generated
+	// frame is available from the first present of this phase.
+	if (!play(3, 3, "after-fullscreen-state", true, /*expect_reset=*/false, /*per_frame_counts=*/true))
 		return false;
 	check(drain_validation(gpu, "fg-resize") == 0, "no validation errors across resize, fullscreen-state and the presents after them");
 
@@ -346,7 +355,7 @@ bool test_fg_present_twice(Gpu &gpu)
 	fc.wait_ms = 1;
 	fg::configure(fc);
 	const fg::Stats before_thread = fg::stats();
-	if (!play(3, 6, "worker", false))
+	if (!play(3, 6, "worker", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
 		return false;
 	present::uninstall(); // drains the worker, releases the replacements and the ring
 	{
@@ -358,8 +367,8 @@ bool test_fg_present_twice(Gpu &gpu)
 			static_cast<unsigned long long>(st.worker_waits), st.issued_p50_ms, st.issued_p99_ms,
 			st.issued_second_peak_ms >= 0 ? "bimodal" : "unimodal");
 		check(st.game_presents - before_thread.game_presents == 6, "the worker phase saw 6 game presents");
-		check(st.presents_issued - before_thread.presents_issued == 11, "the worker issued 11 presents for them (2 per frame, 1 for the first)");
-		check(st.generated_presented - before_thread.generated_presented == 5, "5 generated frames were presented by the worker");
+		check(st.presents_issued - before_thread.presents_issued == 12, "the worker issued 12 presents for them (2 per frame: no reset happened)");
+		check(st.generated_presented - before_thread.generated_presented == 6, "6 generated frames were presented by the worker");
 	}
 	fg::log_stats("harness");
 	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
