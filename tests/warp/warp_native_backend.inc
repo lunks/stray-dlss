@@ -207,7 +207,7 @@ bool test_registry_va_ranges_ring_and_placed(Gpu &gpu)
 	check(reg::buffer_for_va(ring->GetGPUVirtualAddress() + (8u << 20) - 1, br) && br.offset == (8u << 20) - 1, "...and its last byte");
 	check(!reg::buffer_for_va(ring->GetGPUVirtualAddress() + (8u << 20), br), "one past the ring's end is nothing");
 
-	// A heap with a big placed buffer and a small one ALIASING its middle.
+	// A heap with an outer placed buffer and an inner one ALIASING its middle. (Not `big`/`small`: rpcndr.h defines `small` as a macro.)
 	D3D12_HEAP_DESC hd = {};
 	hd.SizeInBytes = 1u << 20;
 	hd.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -218,24 +218,24 @@ bool test_registry_va_ranges_ring_and_placed(Gpu &gpu)
 	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
 	bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
 	bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	ComPtr<ID3D12Resource> big, small;
+	ComPtr<ID3D12Resource> outer, inner;
 	bd.Width = 512u << 10;
-	HR(gpu.device->CreatePlacedResource(heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&big)));
+	HR(gpu.device->CreatePlacedResource(heap.Get(), 0, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&outer)));
 	bd.Width = 4096;
-	HR(gpu.device->CreatePlacedResource(heap.Get(), 65536, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&small)));
-	reg::note_created(big.Get());
-	reg::note_created(small.Get());
-	const std::uint64_t big_va = big->GetGPUVirtualAddress(), small_va = small->GetGPUVirtualAddress();
-	std::printf("  big %llx +%u  small %llx +%u  (small - big = %lld)\n", static_cast<unsigned long long>(big_va), 512u << 10,
+	HR(gpu.device->CreatePlacedResource(heap.Get(), 65536, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&inner)));
+	reg::note_created(outer.Get());
+	reg::note_created(inner.Get());
+	const std::uint64_t big_va = outer->GetGPUVirtualAddress(), small_va = inner->GetGPUVirtualAddress();
+	std::printf("  outer %llx +%u  inner %llx +%u  (inner - outer = %lld)\n", static_cast<unsigned long long>(big_va), 512u << 10,
 		static_cast<unsigned long long>(small_va), 4096u, static_cast<long long>(small_va - big_va));
-	check(small_va > big_va && small_va < big_va + (512u << 10), "the small placed buffer lies INSIDE the big one's VA range");
-	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(small.Get()) && br.offset == 100, "inside the small one: the small one (innermost)");
-	check(reg::buffer_for_va(big_va + 100, br) && br.buffer == id_of(big.Get()) && br.offset == 100, "before the small one: the big one");
-	check(reg::buffer_for_va(big_va + 200000, br) && br.buffer == id_of(big.Get()) && br.offset == 200000,
-		"PAST the small one's end: still the big one (the range walk, not the nearest start)");
-	small.Reset(); // the sentinel erases its VA range too
-	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(big.Get()) && br.offset == small_va + 100 - big_va,
-		"after the small one dies, its addresses belong to the big one again");
+	check(small_va > big_va && small_va < big_va + (512u << 10), "the inner placed buffer lies INSIDE the outer one's VA range");
+	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(inner.Get()) && br.offset == 100, "inside the inner one: the inner one (innermost)");
+	check(reg::buffer_for_va(big_va + 100, br) && br.buffer == id_of(outer.Get()) && br.offset == 100, "before the inner one: the outer one");
+	check(reg::buffer_for_va(big_va + 200000, br) && br.buffer == id_of(outer.Get()) && br.offset == 200000,
+		"PAST the inner one's end: still the outer one (the range walk, not the nearest start)");
+	inner.Reset(); // the sentinel erases its VA range too
+	check(reg::buffer_for_va(small_va + 100, br) && br.buffer == id_of(outer.Get()) && br.offset == small_va + 100 - big_va,
+		"after the inner one dies, its addresses belong to the outer one again");
 	return true;
 }
 
