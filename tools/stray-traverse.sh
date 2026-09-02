@@ -15,9 +15,10 @@
 set -u
 . "$(dirname "$0")/stray-lib.sh"
 
-TOTAL=15; SWAP=3; LABEL="run"; CSV="$GAME_DIR/stray-bench.csv"; SHOT=""
+TOTAL=15; SWAP=3; LABEL="run"; CSV="$GAME_DIR/stray-bench.csv"; SHOT=""; REPLAY=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --replay) REPLAY="$2"; shift 2 ;;    # a stray-record.sh file: the user's own input, replayed
         --total) TOTAL="$2"; shift 2 ;;
         --swap) SWAP="$2"; shift 2 ;;
         --label) LABEL="$2"; shift 2 ;;
@@ -32,7 +33,12 @@ T0=$(date +%s)
 FRAME="$GAME_DIR/stray-frame.txt"
 frame_now() { field "$FRAME" frame; }
 
-log "traverse: hold UP, alternate LEFT/RIGHT every ${SWAP}s, ${TOTAL}s total (label=$LABEL)"
+if [ -n "$REPLAY" ]; then
+    [ -s "$REPLAY" ] || { log "FAILED: recording $REPLAY is missing or empty"; exit 1; }
+    log "traverse: replaying the recorded input $REPLAY ($(wc -l < "$REPLAY") events, $(tail -n 1 "$REPLAY" | cut -d' ' -f1)s) (label=$LABEL)"
+else
+    log "traverse: hold UP, alternate LEFT/RIGHT every ${SWAP}s, ${TOTAL}s total (label=$LABEL)"
+fi
 # The measurement instrument is the probe's engine frame counter (GFrameCounter via
 # UKismetSystemLibrary), written at 4 Hz only while stray-probe-bench exists. It is the
 # same two static calls in every arm, so no arm is measured differently from the
@@ -54,7 +60,11 @@ if [ "$COUNTER" -eq 1 ]; then
 fi
 
 # The key script runs in the background so this shell can sample the counter meanwhile.
-python3 "$INJECT" traverse "/dev/input/$KBD" "$TOTAL" "$SWAP" >/dev/null 2>&1 &
+if [ -n "$REPLAY" ]; then
+    python3 "$INJECT" replay "/dev/input/$KBD" "$REPLAY" >/dev/null 2>&1 &
+else
+    python3 "$INJECT" traverse "/dev/input/$KBD" "$TOTAL" "$SWAP" >/dev/null 2>&1 &
+fi
 INJ=$!
 TW0=$(date +%s.%N)
 samples=(); dts=(); f_prev=$(frame_now); t_prev=$TW0; f_start=$f_prev; t_first=$TW0; t_last=$TW0; f_end=$f_prev
