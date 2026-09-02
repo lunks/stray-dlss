@@ -21,6 +21,7 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include <atomic>
 #include <cstring>
@@ -167,6 +168,70 @@ struct DeviceSentinel final : IUnknown
 	}
 };
 
+// The DXGI factory the game uses to create its swapchain. present::install patches a THROWAWAY
+// factory, which only reaches the game's swapchain if DXVK shares one vtable per factory class
+// (measured FALSE on the first box run: our throwaway patch never fired for the game's
+// swapchain). So hook the CreateDXGIFactory* EXPORTS and patch the REAL factory the game
+// receives - the same export-detour trick used for D3D12CreateDevice.
+using PFN_CreateDXGIFactory = HRESULT(WINAPI *)(REFIID, void **);
+using PFN_CreateDXGIFactory2 = HRESULT(WINAPI *)(UINT, REFIID, void **);
+PFN_CreateDXGIFactory g_orig_CreateDXGIFactory = nullptr;
+PFN_CreateDXGIFactory g_orig_CreateDXGIFactory1 = nullptr;
+PFN_CreateDXGIFactory2 g_orig_CreateDXGIFactory2 = nullptr;
+std::atomic<bool> g_dxgi_hooks_installed{ false };
+
+void note_factory_out(void **out)
+{
+	if (out != nullptr && *out != nullptr && !native::in_own_code())
+		native::present::note_factory(reinterpret_cast<IUnknown *>(*out));
+}
+HRESULT WINAPI hk_CreateDXGIFactory(REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateDXGIFactory(riid, out);
+	if (SUCCEEDED(hr)) note_factory_out(out);
+	return hr;
+}
+HRESULT WINAPI hk_CreateDXGIFactory1(REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateDXGIFactory1(riid, out);
+	if (SUCCEEDED(hr)) note_factory_out(out);
+	return hr;
+}
+HRESULT WINAPI hk_CreateDXGIFactory2(UINT flags, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateDXGIFactory2(flags, riid, out);
+	if (SUCCEEDED(hr)) note_factory_out(out);
+	return hr;
+}
+
+void install_dxgi_factory_hooks()
+{
+	if (g_dxgi_hooks_installed.exchange(true))
+		return;
+	HMODULE dxgi = ::GetModuleHandleW(L"dxgi.dll");
+	if (dxgi == nullptr)
+	{
+		STRAY_LOG_WARN("host: dxgi.dll not loaded at device attach; the game's factory cannot be export-hooked (present owner relies on the throwaway-factory patch only)");
+		return;
+	}
+	const auto hook = [&](const char *name, void *replacement, void **orig) {
+		void *target = reinterpret_cast<void *>(::GetProcAddress(dxgi, name));
+		if (target == nullptr)
+			return;
+		if (MH_CreateHook(target, replacement, orig) == MH_OK && MH_EnableHook(target) == MH_OK)
+			STRAY_LOG_INFO("host: hooked %s for the present owner", name);
+		else
+			STRAY_LOG_WARN("host: could not hook %s", name);
+	};
+	hook("CreateDXGIFactory", reinterpret_cast<void *>(&hk_CreateDXGIFactory), reinterpret_cast<void **>(&g_orig_CreateDXGIFactory));
+	hook("CreateDXGIFactory1", reinterpret_cast<void *>(&hk_CreateDXGIFactory1), reinterpret_cast<void **>(&g_orig_CreateDXGIFactory1));
+	hook("CreateDXGIFactory2", reinterpret_cast<void *>(&hk_CreateDXGIFactory2), reinterpret_cast<void **>(&g_orig_CreateDXGIFactory2));
+	// The game very likely already created its factory before our device hook fired (it makes
+	// the swapchain right after the device). Patch every EXISTING factory we can reach: the one
+	// behind the swapchain does not exist yet, but a factory the game keeps will be reused.
+	STRAY_LOG_INFO("host: DXGI factory export hooks installed; new factories will be patched as the game creates them");
+}
+
 void attach_to(ID3D12Device *real, ID3D12Device *as_returned)
 {
 	app::DlssApp &a = app::instance();
@@ -215,6 +280,7 @@ void attach_to(ID3D12Device *real, ID3D12Device *as_returned)
 			native::mode_name(native::mode()));
 		return;
 	}
+	install_dxgi_factory_hooks();
 	if (!native::present::install(real))
 		STRAY_LOG_ERROR("host: the present owner did not install - no frame boundary, so NGX will never initialise and nothing at present time runs");
 	STRAY_LOG_WARN("host: attached. real device %p%s; seam backend=%s; %s", static_cast<void *>(real),
@@ -316,11 +382,34 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 	STRAY_LOG_INFO("StrayDLSS %s attaching (UE4SS C++ mod, the HOST): mod dir %s, game dir %s",
 		STRAY_DLSS_PLUGIN_VERSION_STRING, sds::Narrow(mod_dir).c_str(), sds::Narrow(game_dir).c_str());
 
-	g_ini_path = sds::Narrow(mod_dir + L"StrayDLSS.ini");
-	if (!g_ini.load(g_ini_path))
-		STRAY_LOG_ERROR("host: %s could not be opened; every [STRAYDLSS] key reads its default", g_ini_path.c_str());
-	else
-		STRAY_LOG_INFO("host: %s loaded (%zu values), hot-reloaded from on_update", g_ini_path.c_str(), g_ini.size());
+	// The DLL lives at <Mod>/dlls/main.dll but StrayDLSS.ini sits at the mod ROOT (<Mod>/), the
+	// UE4SS convention. mod_dir is the dll's directory, so try the parent first, then the dll
+	// dir as a fallback. (Measured 2026-09-02: the first host run looked only in dlls/, found
+	// nothing, and every key silently took its default - which left EnableNGX and NgxEvaluate
+	// OFF, so DLSS never ran.)
+	std::wstring root = mod_dir; // ".../StrayDLSS/dlls/"
+	if (root.size() >= 2)
+	{
+		root.pop_back(); // trailing separator
+		const size_t slash = root.find_last_of(L"\\/");
+		if (slash != std::wstring::npos)
+			root = root.substr(0, slash + 1); // ".../StrayDLSS/"
+	}
+	const std::wstring candidates[] = { root + L"StrayDLSS.ini", mod_dir + L"StrayDLSS.ini" };
+	bool loaded = false;
+	for (const std::wstring &c : candidates)
+	{
+		g_ini_path = sds::Narrow(c);
+		if (g_ini.load(g_ini_path))
+		{
+			STRAY_LOG_INFO("host: %s loaded (%zu values), hot-reloaded from on_update", g_ini_path.c_str(), g_ini.size());
+			loaded = true;
+			break;
+		}
+	}
+	if (!loaded)
+		STRAY_LOG_ERROR("host: StrayDLSS.ini not found (tried %s and the dll dir); every [STRAYDLSS] key reads its "
+			"default, which leaves EnableNGX/NgxEvaluate OFF and DLSS inert.", sds::Narrow(candidates[0]).c_str());
 	host::cfg::set_source(&g_source);
 
 	// The application's one-time configuration (which events a host must deliver; here the

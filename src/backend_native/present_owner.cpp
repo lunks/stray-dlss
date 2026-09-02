@@ -293,6 +293,12 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 	}
 	g_list_used.store(false, std::memory_order_relaxed);
 
+	{
+		static std::atomic<bool> s_said{ false };
+		if (!s_said.exchange(true))
+			STRAY_LOG_WARN("present owner: FIRST Present delivered on_present (queue=%p present_list=%p back_buffer=%p) - the frame boundary is live",
+				static_cast<void *>(pc.queue), static_cast<void *>(pc.present_list), reinterpret_cast<void *>(pc.back_buffer));
+	}
 	sk->on_present(pc);
 
 	{
@@ -364,6 +370,33 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, U
 
 } // namespace
 
+// Patches one factory's CreateSwapChain* slots (idempotent per slot). Returns how many were
+// newly patched.
+unsigned patch_factory(IDXGIFactory *factory)
+{
+	if (factory == nullptr)
+		return 0;
+	unsigned n = 0;
+	void *o = patch_slot(factory, slot::kFactory_CreateSwapChain, reinterpret_cast<void *>(&hk_CreateSwapChain), "IDXGIFactory::CreateSwapChain");
+	if (o != nullptr) { g_orig_CreateSwapChain = reinterpret_cast<PFN_CreateSwapChain>(o); ++n; }
+	IDXGIFactory2 *f2 = nullptr;
+	if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&f2))) && f2 != nullptr)
+	{
+		const bool same = static_cast<void *>(f2) == static_cast<void *>(factory);
+		f2->Release();
+		if (same)
+		{
+			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForHwnd, reinterpret_cast<void *>(&hk_CreateSwapChainForHwnd), "IDXGIFactory2::CreateSwapChainForHwnd");
+			if (o != nullptr) { g_orig_CreateSwapChainForHwnd = reinterpret_cast<PFN_CreateSwapChainForHwnd>(o); ++n; }
+			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForCoreWindow, reinterpret_cast<void *>(&hk_CreateSwapChainForCoreWindow), "IDXGIFactory2::CreateSwapChainForCoreWindow");
+			if (o != nullptr) { g_orig_CreateSwapChainForCoreWindow = reinterpret_cast<PFN_CreateSwapChainForCoreWindow>(o); ++n; }
+			o = patch_slot(factory, slot::kFactory2_CreateSwapChainForComposition, reinterpret_cast<void *>(&hk_CreateSwapChainForComposition), "IDXGIFactory2::CreateSwapChainForComposition");
+			if (o != nullptr) { g_orig_CreateSwapChainForComposition = reinterpret_cast<PFN_CreateSwapChainForComposition>(o); ++n; }
+		}
+	}
+	return n;
+}
+
 bool install(::ID3D12Device *device)
 {
 	if (device == nullptr)
@@ -395,23 +428,7 @@ bool install(::ID3D12Device *device)
 			return false;
 		}
 	}
-	unsigned n = 0;
-	void *o = patch_slot(factory.Get(), slot::kFactory_CreateSwapChain, reinterpret_cast<void *>(&hk_CreateSwapChain), "IDXGIFactory::CreateSwapChain");
-	if (o != nullptr) { g_orig_CreateSwapChain = reinterpret_cast<PFN_CreateSwapChain>(o); ++n; }
-	ComPtr<IDXGIFactory2> f2;
-	if (SUCCEEDED(factory.As(&f2)) && f2 && static_cast<void *>(f2.Get()) == static_cast<void *>(factory.Get()))
-	{
-		o = patch_slot(factory.Get(), slot::kFactory2_CreateSwapChainForHwnd, reinterpret_cast<void *>(&hk_CreateSwapChainForHwnd), "IDXGIFactory2::CreateSwapChainForHwnd");
-		if (o != nullptr) { g_orig_CreateSwapChainForHwnd = reinterpret_cast<PFN_CreateSwapChainForHwnd>(o); ++n; }
-		o = patch_slot(factory.Get(), slot::kFactory2_CreateSwapChainForCoreWindow, reinterpret_cast<void *>(&hk_CreateSwapChainForCoreWindow), "IDXGIFactory2::CreateSwapChainForCoreWindow");
-		if (o != nullptr) { g_orig_CreateSwapChainForCoreWindow = reinterpret_cast<PFN_CreateSwapChainForCoreWindow>(o); ++n; }
-		o = patch_slot(factory.Get(), slot::kFactory2_CreateSwapChainForComposition, reinterpret_cast<void *>(&hk_CreateSwapChainForComposition), "IDXGIFactory2::CreateSwapChainForComposition");
-		if (o != nullptr) { g_orig_CreateSwapChainForComposition = reinterpret_cast<PFN_CreateSwapChainForComposition>(o); ++n; }
-	}
-	else
-	{
-		STRAY_LOG_WARN("present owner: the factory is not an IDXGIFactory2 (or is a different object as one); only CreateSwapChain is hooked");
-	}
+	const unsigned n = patch_factory(factory.Get());
 	char owner[MAX_PATH] = "?";
 	{
 		HMODULE m = nullptr;
@@ -457,6 +474,20 @@ void uninstall()
 	g_installed.store(false);
 	std::snprintf(g_report, sizeof(g_report), "present owner: uninstalled");
 	STRAY_LOG_INFO("%s", g_report);
+}
+
+void note_factory(::IUnknown *factory)
+{
+	if (factory == nullptr)
+		return;
+	IDXGIFactory *f = nullptr;
+	if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&f))) || f == nullptr)
+		return;
+	const unsigned n = patch_factory(f);
+	f->Release();
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (n != 0)
+		STRAY_LOG_INFO("present owner: patched the game's factory %p (%u CreateSwapChain* slot(s) newly hooked)", static_cast<void *>(factory), n);
 }
 
 void note_queue(::ID3D12CommandQueue *queue, int type)

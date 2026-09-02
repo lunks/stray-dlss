@@ -22,6 +22,7 @@
 
 #include <cstdint>
 
+struct IUnknown;
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 
@@ -36,6 +37,10 @@ void uninstall();
 
 // From the device hook: every ID3D12CommandQueue created, with its D3D12_COMMAND_LIST_TYPE.
 void note_queue(::ID3D12CommandQueue *queue, int type);
+// From the host's CreateDXGIFactory* export hooks: patch this factory's CreateSwapChain* slots,
+// so the game's OWN factory is reached even when DXGI does not share one vtable per class
+// (measured on DXVK: it does not). `factory` is an IUnknown that is really an IDXGIFactory.
+void note_factory(::IUnknown *factory);
 // From NativeBackend::present_barrier: something was recorded on this frame's present list,
 // so it must be executed.
 void note_present_list_used();
