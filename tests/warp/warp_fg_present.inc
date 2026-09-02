@@ -373,10 +373,20 @@ bool test_fg_present_twice(Gpu &gpu)
 	fg::log_stats("harness");
 	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
 
+	// The harness's own command list still holds the readback copies that reference the REAL
+	// back buffers (a closed, un-reset list keeps its references); reset it before the swapchain
+	// goes, and make sure nothing is in flight on the queue.
+	fg_wait_idle(gpu);
+	if (SUCCEEDED(gpu.allocator->Reset()) && SUCCEEDED(gpu.list->Reset(gpu.allocator.Get(), nullptr)))
+		gpu.list->Close();
+	std::printf("  harness list reset; draining validation before the release...\n");
+	drain_validation(gpu, "fg-pre-release");
 	std::printf("  releasing the swapchain (hook trace on)...\n");
 	present::set_hook_trace(true);
 	sc3.Reset();
+	std::printf("  SwapChain3 reference released\n");
 	sc1.Reset();
+	std::printf("  SwapChain1 reference released\n");
 	present::set_hook_trace(false);
 	std::printf("  swapchain released; releasing the factory...\n");
 	factory.Reset();
