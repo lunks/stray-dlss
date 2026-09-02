@@ -111,29 +111,42 @@ end
 local done = {}
 
 local function applyMaterial(gfur)
-    -- GFurComponent keeps its materials in FurMaterials (an array); UMeshComponent's
-    -- CreateDynamicMaterialInstance is BlueprintCallable and gives us a writable instance.
+    -- MEASURED 2026-09-02 (stray-fur-materials.txt): the fur's live dynamic instance sits in
+    -- FurMaterials SLOT 1 (slot 0 is the base material), and the MID our old code made with
+    -- CreateDynamicMaterialInstance(0, ...) was a fresh instance the shells never sampled.
+    -- Every "applied N/N" line before this was a pcall succeeding on a setter that reached
+    -- nothing: no HD, plush, distance or backpack scalar ever touched the fur, which is why
+    -- only LayerCount/FurLength (component properties) ever changed the look. So: walk
+    -- FurMaterials, and for each slot write onto the MaterialInstanceDynamic the component
+    -- already holds; only if a slot is not dynamic yet, create one for THAT slot.
     local mats = get(gfur, "FurMaterials")
     if not mats then log("  no FurMaterials on the component"); return end
-    local count = 0
-    pcall(function() count = #mats end)
-    if count == 0 then pcall(function() mats:ForEach(function() count = count + 1 end) end) end
-    if count == 0 then log("  FurMaterials is empty"); return end
-    for i = 0, count - 1 do
-        -- MEASURED: the BlueprintCallable takes THREE params (ElementIndex, SourceMaterial,
-        -- OptionalName); two threw "UFunction expected 3 parameters, received 2".
-        local ok, mid = pcall(function() return gfur:CreateDynamicMaterialInstance(i, nil, FName("None")) end)
-        if not ok or not mid or not mid:IsValid() then
-            log(string.format("  material slot %d: could not create a dynamic instance (%s)", i, tostring(mid)))
+    local slots = {}
+    pcall(function() mats:ForEach(function(i, elem) slots[#slots + 1] = { index = i, mat = elem:get() } end) end)
+    if #slots == 0 then log("  FurMaterials is empty"); return end
+    for _, s in ipairs(slots) do
+        local mid = s.mat
+        local isDyn = false
+        pcall(function() isDyn = mid ~= nil and mid:IsValid() and mid:GetFullName():find("MaterialInstanceDynamic", 1, true) ~= nil end)
+        if not isDyn then
+            local ok, made = pcall(function() return gfur:CreateDynamicMaterialInstance(s.index, nil, FName("None")) end)
+            if ok and made and made:IsValid() then mid = made else mid = nil end
+        end
+        if mid == nil then
+            log(string.format("  material slot %d: no dynamic instance to write to", s.index))
         else
-            -- Three tables, three counts, so a name that stops resolving is visible per group.
+            -- Read back one value after writing, so "applied" means the instance really took it.
             local function applyTable(tbl, label, want)
-                local applied = 0
+                local applied, verified = 0, 0
                 for pname, pval in pairs(tbl) do
                     local ok2 = pcall(function() mid:SetScalarParameterValue(FName(pname), pval) end)
                     if ok2 then applied = applied + 1 end
+                    pcall(function()
+                        local got = mid:K2_GetScalarParameterValue(FName(pname))
+                        if math.abs(tonumber(got) - pval) < 1e-3 then verified = verified + 1 end
+                    end)
                 end
-                log(string.format("  material slot %d: applied %d/%d %s scalars", i, applied, want, label))
+                log(string.format("  material slot %d: applied %d/%d %s scalars, read back %d", s.index, applied, want, label, verified))
             end
             applyTable(HD_SCALARS,       "HD",       9)
             applyTable(PLUSH_SCALARS,    "plush",    2)
