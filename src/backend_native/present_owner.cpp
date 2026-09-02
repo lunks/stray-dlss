@@ -77,6 +77,10 @@ HANDLE g_fence_event = nullptr;
 std::atomic<bool> g_list_used{ false };
 std::atomic<bool> g_installed{ false };
 std::atomic<std::uint64_t> g_stats_last_frame{ 0 }; // pc.frame of the last delivered on_present
+std::atomic<bool> g_hook_trace{ false };
+#define PRESENT_HOOK_TRACE(name, self) \
+	do { if (g_hook_trace.load(std::memory_order_relaxed)) \
+		STRAY_LOG_INFO("[hook] %s self=%p thread=%lu own=%d", name, static_cast<void *>(self), static_cast<unsigned long>(::GetCurrentThreadId()), in_own_code() ? 1 : 0); } while (0)
 Stats g_stats;
 char g_report[512] = "present owner: not installed";
 
@@ -435,6 +439,7 @@ bool fg_present(IDXGISwapChain *self, UINT sync, UINT flags, HRESULT *hr)
 
 HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *self, UINT sync, UINT flags)
 {
+	PRESENT_HOOK_TRACE("Present", self);
 	auto orig = reinterpret_cast<PFN_Present>(original_for(self, slot::kSwapChain_Present));
 	before_present(self, flags);
 	HRESULT hr = S_OK;
@@ -445,6 +450,7 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *self, UINT sync, UINT flags
 
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *params)
 {
+	PRESENT_HOOK_TRACE("Present1", self);
 	auto orig = reinterpret_cast<PFN_Present1>(original_for(self, slot::kSwapChain1_Present1));
 	before_present(self, flags);
 	HRESULT hr = S_OK;
@@ -455,6 +461,7 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT fla
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
 {
+	PRESENT_HOOK_TRACE("ResizeBuffers", self);
 	auto orig = reinterpret_cast<PFN_ResizeBuffers>(original_for(self, slot::kSwapChain_ResizeBuffers));
 	const bool game_call = !in_own_code();
 	if (game_call)
@@ -480,6 +487,7 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UIN
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags, const UINT *node_masks, IUnknown *const *queues)
 {
+	PRESENT_HOOK_TRACE("ResizeBuffers1", self);
 	auto orig = reinterpret_cast<PFN_ResizeBuffers1>(original_for(self, slot::kSwapChain3_ResizeBuffers1));
 	const bool game_call = !in_own_code();
 	if (game_call)
@@ -660,6 +668,8 @@ void note_queue(::ID3D12CommandQueue *queue, int type)
 }
 
 void note_present_list_used() { g_list_used.store(true, std::memory_order_relaxed); }
+void set_hook_trace(bool on) { g_hook_trace.store(on, std::memory_order_relaxed); }
+bool hook_trace() { return g_hook_trace.load(std::memory_order_relaxed); }
 
 Stats stats()
 {

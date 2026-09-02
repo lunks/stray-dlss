@@ -56,5 +56,9 @@ struct Stats
 };
 Stats stats();
 const char *report();
+// Diagnostics: log every swapchain-hook entry (which slot, which object, which thread). Off by
+// default; the WARP harness turns it on around teardown to see what DXGI calls on its way out.
+void set_hook_trace(bool on);
+bool hook_trace();
 
 } // namespace stray_dlss::native::present

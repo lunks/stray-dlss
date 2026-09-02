@@ -2,6 +2,7 @@
 
 #include "backend_native/fg_reflex.hpp"
 #include "backend_native/native_backend.hpp"
+#include "backend_native/present_owner.hpp"
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
 #include "log.hpp"
@@ -29,6 +30,10 @@ using Microsoft::WRL::ComPtr;
 
 namespace stray_dlss::native::fg {
 namespace {
+
+#define FG_HOOK_TRACE(name, self) \
+	do { if (present::hook_trace()) \
+		STRAY_LOG_INFO("[hook] %s self=%p thread=%lu own=%d", name, static_cast<void *>(self), static_cast<unsigned long>(::GetCurrentThreadId()), in_own_code() ? 1 : 0); } while (0)
 
 struct ModuleRange
 {
@@ -735,6 +740,7 @@ void stop_worker()
 
 HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain *self, UINT index, REFIID riid, void **out)
 {
+	FG_HOOK_TRACE("GetBuffer", self);
 	auto orig = reinterpret_cast<PFN_GetBuffer>(original_for(self, slot::kSwapChain_GetBuffer));
 	if (orig == nullptr)
 		return E_FAIL;
@@ -767,6 +773,7 @@ HRESULT STDMETHODCALLTYPE hk_GetBuffer(IDXGISwapChain *self, UINT index, REFIID 
 
 HRESULT STDMETHODCALLTYPE hk_SetFullscreenState(IDXGISwapChain *self, BOOL fullscreen, IDXGIOutput *target)
 {
+	FG_HOOK_TRACE("SetFullscreenState", self);
 	auto orig = reinterpret_cast<PFN_SetFullscreenState>(original_for(self, slot::kSwapChain_SetFullscreenState));
 	if (orig == nullptr)
 		return E_FAIL;
@@ -781,6 +788,7 @@ HRESULT STDMETHODCALLTYPE hk_SetFullscreenState(IDXGISwapChain *self, BOOL fulls
 
 HRESULT STDMETHODCALLTYPE hk_ResizeTarget(IDXGISwapChain *self, const DXGI_MODE_DESC *mode)
 {
+	FG_HOOK_TRACE("ResizeTarget", self);
 	auto orig = reinterpret_cast<PFN_ResizeTarget>(original_for(self, slot::kSwapChain_ResizeTarget));
 	if (orig == nullptr)
 		return E_FAIL;
@@ -795,6 +803,7 @@ HRESULT STDMETHODCALLTYPE hk_ResizeTarget(IDXGISwapChain *self, const DXGI_MODE_
 
 HRESULT STDMETHODCALLTYPE hk_SetColorSpace1(IDXGISwapChain3 *self, DXGI_COLOR_SPACE_TYPE space)
 {
+	FG_HOOK_TRACE("SetColorSpace1", self);
 	auto orig = reinterpret_cast<PFN_SetColorSpace1>(original_for(self, slot::kSwapChain3_SetColorSpace1));
 	if (orig == nullptr)
 		return E_FAIL;

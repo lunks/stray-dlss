@@ -373,9 +373,11 @@ bool test_fg_present_twice(Gpu &gpu)
 	fg::log_stats("harness");
 	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
 
-	std::printf("  releasing the swapchain...\n");
+	std::printf("  releasing the swapchain (hook trace on)...\n");
+	present::set_hook_trace(true);
 	sc3.Reset();
 	sc1.Reset();
+	present::set_hook_trace(false);
 	std::printf("  swapchain released; releasing the factory...\n");
 	factory.Reset();
 	std::printf("  factory released; destroying the window...\n");
