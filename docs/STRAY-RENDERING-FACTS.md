@@ -1053,3 +1053,46 @@ Interim shipping choice: ShadowMode=auto (dc29457) selects DEBUG under ReShade, 
 1.00 and flat and carries no overflow; the overflow makes FAST correct under ReShade too (drive
 1.0). Both fix the user's flicker. Config A is unaffected: fast, no overflow, no orphans, drive
 100%.
+
+
+## 30. Perf work after the shadow rewrite: where the plugin stands vs the add-on (2026-09-02)
+
+The SR-only deficit (facts §26: plugin ~20 fps under the add-on with 6-10 hitch buckets) was
+hunted with the per-call-site [perf] buckets, on the user's recorded traverse, 3 reload+traverse
+cycles per arm. Changes, each measured, one at a time, CI green before each deploy:
+
+| change | arm C avg (recorded) | hitch buckets | what the buckets named |
+|---|---|---|---|
+| baseline (sharded-only, pre-work) | 52-60 | 4-8 | shadow-copy 6-63 ms/frame - the reverse-index push_back |
+| drop the reverse index (generation liveness) | ~57 | 6-8 | shadow-copy still 6-63 ms - the exclusive lock |
+| shard by address + range copies | ~85 | 0-1 | shadow-copy 5-14 ms - per-call std::vector allocs |
+| allocation-free stack-chunked copy | ~87 | 0 | shadow-copy 3.6-11 ms - the sharded map itself (hash+lock) |
+| root_shadow per-list shared_mutex | ~87 | 0 | root-bind 0.5->0.9 ms (the second, smaller convoy) |
+| **fast flat lock-free shadow** (default) | **~104** | **0** | shadow-copy 1-3 ms, hitches gone - the parity change |
+
+against **add-on SR-only (arm A) ~113 fps / 0 hitches**. So the fast shadow closed most of the
+gap (52 -> ~104) and eliminated the hitches; ~9% remains. With SR+NR (arms B/D/E) everything is
+~52 fps (NR-bound) and at parity already (facts §26).
+
+**Two caveats on the last rows, stated honestly:**
+
+1. **The overflow map (§29) regressed Config A to ~88 fps** because note_copy_range routed every
+   descriptor through read_slot/write_slot and bumped one global atomic per descriptor (7 000x a
+   frame across every RHI thread). Fixed by inlining the both-slots-flat case and batching the
+   counter (bde9184); Config A's orphan count is 0 so it never touches the overflow.
+2. **The box drifts within a long session.** After hours of launches the same arm C read
+   100/86/84 across its three cycles where a cooler session read 104/104/102 flat - a decline too
+   large to attribute to our code alone (heap-table growth across reloads is a suspect worth
+   ruling out: fast::g_owned never shrinks, so a heap recreated on reload accumulates and widens
+   the slot_for search; measured create=29 stayed constant across cycles, so if it grows it does
+   so slowly). A tight A-vs-C parity number needs a thermally-settled box and a fixed cycle count.
+
+**The remaining ~9% and the next levers (per the buckets, Config A fast):** native hooks total
+3.5-5.5 ms/frame summed over threads - shadow-copy ~3 ms (7 000 flat atomic copies a frame, each
+a slot_for binary search + 3 atomic stores), root-bind ~1 ms (a shared_mutex map lookup per
+SetComputeRoot*, 700-860/frame), resolve ~0.6 ms. The obvious next pass is a thread-local cache
+of the last (list -> ListState*) so consecutive SetComputeRoot* on one list skip the map lookup,
+and of the last heap in slot_for so a run of copies into the online heap skips the binary search -
+both target the two named buckets with no lock. drive_ratio is 0.999-1.000 and orphans 0 in every
+Config A arm, so correctness is not in question; this is pure CPU shaving. Deferred: it wants a
+stable box and is its own pass with its own table.
