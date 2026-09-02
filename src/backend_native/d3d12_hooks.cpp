@@ -483,6 +483,11 @@ HRESULT STDMETHODCALLTYPE hk_CreatePipelineState(ID3D12Device2 *self, const D3D1
 #endif
 
 // ---- command-list hooks ----
+//
+// Every forward to the original runs under OwnCodeScope: whatever the runtime does INSIDE
+// our call is not the game's (the debug layer re-enters the public vtable from Dispatch and
+// SetPipelineState with GPU-based validation on — measured in CI; vkd3d-proton never does).
+// The shadow is written and the sink delivered AFTER the forward, outside that scope.
 
 icept::CommandContext context_for(ID3D12GraphicsCommandList *list)
 {
@@ -495,7 +500,11 @@ icept::CommandContext context_for(ID3D12GraphicsCommandList *list)
 
 HRESULT STDMETHODCALLTYPE hk_List_Reset(ID3D12GraphicsCommandList *self, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
-	const HRESULT hr = g_orig_List_Reset(self, alloc, pso);
+	HRESULT hr;
+	{
+		OwnCodeScope forward;
+		hr = g_orig_List_Reset(self, alloc, pso);
+	}
 	if (!in_own_code())
 	{
 		root::on_reset(self, pso);
@@ -507,7 +516,10 @@ HRESULT STDMETHODCALLTYPE hk_List_Reset(ID3D12GraphicsCommandList *self, ID3D12C
 
 void STDMETHODCALLTYPE hk_List_SetDescriptorHeaps(ID3D12GraphicsCommandList *self, UINT n, ID3D12DescriptorHeap *const *heaps)
 {
-	g_orig_List_SetDescriptorHeaps(self, n, heaps);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetDescriptorHeaps(self, n, heaps);
+	}
 	if (in_own_code())
 		return;
 	root::on_set_heaps(self, n, heaps);
@@ -517,7 +529,10 @@ void STDMETHODCALLTYPE hk_List_SetDescriptorHeaps(ID3D12GraphicsCommandList *sel
 
 void STDMETHODCALLTYPE hk_List_SetPipelineState(ID3D12GraphicsCommandList *self, ID3D12PipelineState *pso)
 {
-	g_orig_List_SetPipelineState(self, pso);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetPipelineState(self, pso);
+	}
 	if (!in_own_code())
 	{
 		root::on_set_pso(self, pso);
@@ -531,49 +546,70 @@ void STDMETHODCALLTYPE hk_List_SetPipelineState(ID3D12GraphicsCommandList *self,
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootSignature(ID3D12GraphicsCommandList *self, ID3D12RootSignature *rs)
 {
-	g_orig_List_SetComputeRootSignature(self, rs);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRootSignature(self, rs);
+	}
 	if (!in_own_code())
 		root::on_set_compute_root_signature(self, rs);
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootDescriptorTable(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE handle)
 {
-	g_orig_List_SetComputeRootDescriptorTable(self, param, handle);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRootDescriptorTable(self, param, handle);
+	}
 	if (!in_own_code())
 		root::on_set_compute_table(self, param, handle.ptr);
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList *self, UINT param, UINT value, UINT offset)
 {
-	g_orig_List_SetComputeRoot32BitConstant(self, param, value, offset);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRoot32BitConstant(self, param, value, offset);
+	}
 	if (!in_own_code())
 		root::on_set_compute_constants(self, param, offset, 1, &value);
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstants(ID3D12GraphicsCommandList *self, UINT param, UINT n, const void *data, UINT offset)
 {
-	g_orig_List_SetComputeRoot32BitConstants(self, param, n, data, offset);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRoot32BitConstants(self, param, n, data, offset);
+	}
 	if (!in_own_code())
 		root::on_set_compute_constants(self, param, offset, n, static_cast<const std::uint32_t *>(data));
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
 {
-	g_orig_List_SetComputeRootConstantBufferView(self, param, va);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRootConstantBufferView(self, param, va);
+	}
 	if (!in_own_code())
 		root::on_set_compute_root_cbv(self, param, va);
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
 {
-	g_orig_List_SetComputeRootShaderResourceView(self, param, va);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRootShaderResourceView(self, param, va);
+	}
 	if (!in_own_code())
 		root::on_set_compute_root_srv(self, param, va);
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
 {
-	g_orig_List_SetComputeRootUnorderedAccessView(self, param, va);
+	{
+		OwnCodeScope forward;
+		g_orig_List_SetComputeRootUnorderedAccessView(self, param, va);
+	}
 	if (!in_own_code())
 		root::on_set_compute_root_uav(self, param, va);
 }

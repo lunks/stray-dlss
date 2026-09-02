@@ -651,12 +651,14 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	native::backend().resolve_compute_bindings(ctx, same_rs);
 	check(same_rs.constant_buffers.size() == 1 && find(same_rs.srvs, 1) != nullptr,
 		"re-setting the same root signature keeps the root CBV and the tables in the shadow");
-	// A DIFFERENT one does invalidate: this signature is not the same object.
+	// A DIFFERENT one does invalidate: this signature is not the same object. (Declared at
+	// function scope: the list references it until it is discarded below, and the debug
+	// layer objects to closing a list whose root signature is already gone — #921.)
+	ComPtr<ID3D12RootSignature> other;
 	{
 		D3D12_ROOT_SIGNATURE_DESC empty = {};
 		ComPtr<ID3DBlob> eb, ee;
 		HR(D3D12SerializeRootSignature(&empty, D3D_ROOT_SIGNATURE_VERSION_1, &eb, &ee));
-		ComPtr<ID3D12RootSignature> other;
 		HR(gpu.device->CreateRootSignature(0, eb->GetBufferPointer(), eb->GetBufferSize(), IID_PPV_ARGS(&other)));
 		gpu.list->SetComputeRootSignature(other.Get());
 		icept::DispatchBindings changed;
@@ -781,7 +783,8 @@ bool test_drive_mode_restore_is_complete(Gpu &gpu)
 	UINT golden[4] = {};
 	const int binds_before = sink.binds;
 	bind_probe_state(gpu, p, 0x1111u);
-	check(sink.binds == binds_before + 1, "SetPipelineState delivered on_bind_pipeline");
+	std::printf("  binds before=%d after=%d\n", binds_before, sink.binds);
+	check(sink.binds == binds_before + 1, "SetPipelineState delivered on_bind_pipeline exactly once");
 	gpu.list->Dispatch(1, 1, 1);
 	check(sink.dispatches == 1, "Dispatch delivered on_dispatch");
 	if (!read_probe(gpu, p, golden))
