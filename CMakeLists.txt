@@ -83,6 +83,8 @@ add_library(stray_dlss_core STATIC
     src/core/nr_codec.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
+    src/core/nr_lifetime.cpp
+    src/core/nr_lifetime.hpp
     src/core/present_plan.cpp
     src/core/present_plan.hpp
     src/core/nr_history_plan.cpp
@@ -379,6 +381,9 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         tests/warp/log_stub.cpp
         src/mv_resolve.cpp
         src/d3d12_restore.cpp
+        # The DLSS-NR codec pass, for the deferred-destruction test (warp_nr_lifetime.inc). It is
+        # the only NR code the harness can link: everything else on that path needs NGX.
+        src/nr_codec_pass.cpp
         # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
         # 2026-09-02), so the harness that links present_owner must also link perf.
         src/perf.cpp
@@ -399,6 +404,12 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/warp_probe.hlsl"
                    main cs_5_0 g_warp_probe_dxbc)
+    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
+                   main cs_5_0 g_nr_encode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
+    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
+                   main cs_5_0 g_nr_decode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
 
     target_include_directories(stray_dlss_warp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -440,6 +451,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_envbrdf.cpp
         tests/test_nr_codec.cpp
         tests/test_nr_hook_plan.cpp
+        tests/test_nr_lifetime.cpp
         tests/test_nr_history_plan.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp
