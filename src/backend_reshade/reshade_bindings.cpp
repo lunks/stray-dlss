@@ -70,6 +70,12 @@ struct LayoutParam
 };
 std::unordered_map<uint64_t, std::vector<LayoutParam>> g_layouts;
 
+// What describe() refused, when the caller wants to know (the differential observer does:
+// a slot the oracle drops in silence is otherwise indistinguishable from one it never had).
+// Reason 3: the view maps to no resource; 4: the resource is dead per ReShade's own liveness.
+thread_local std::vector<icept::DispatchBindings::Unresolved> *t_refusals = nullptr;
+thread_local char t_refusal_kind = 't';
+
 void describe(reshade::api::device *device, reshade::api::resource_view view,
               uint32_t reg, std::vector<BoundTexture> &out)
 {
@@ -78,7 +84,11 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 
 	const reshade::api::resource res = device->get_resource_from_view(view);
 	if (res.handle == 0)
+	{
+		if (t_refusals != nullptr)
+			t_refusals->push_back(icept::DispatchBindings::Unresolved{ t_refusal_kind, reg, view.handle, 3, 0 });
 		return;
+	}
 
 	// Liveness FIRST. get_resource_desc dereferences the resource, and ReShade's view->resource
 	// map outlives the resource on D3D12 — so for a descriptor slot UE4 has recycled this is a
@@ -86,7 +96,11 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 	// resolve later was not enough: the access violation happens here, during binding capture,
 	// which is why the game still died on a frame the resolve correctly skipped.
 	if (!is_resource_live(res.handle))
+	{
+		if (t_refusals != nullptr)
+			t_refusals->push_back(icept::DispatchBindings::Unresolved{ t_refusal_kind, reg, view.handle, 4, res.handle });
 		return;
+	}
 
 	const reshade::api::resource_view_desc vd = device->get_resource_view_desc(view);
 	const reshade::api::resource_desc rd = device->get_resource_desc(res);
@@ -520,10 +534,16 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 					switch (range.type)
 					{
 					case reshade::api::descriptor_type::shader_resource_view:
+						t_refusals = &out.unresolved;
+						t_refusal_kind = 't';
 						describe(device, desc->get_resource_view(heap, offset), reg, out.srvs);
+						t_refusals = nullptr;
 						break;
 					case reshade::api::descriptor_type::unordered_access_view:
+						t_refusals = &out.unresolved;
+						t_refusal_kind = 'u';
 						describe(device, desc->get_resource_view(heap, offset), reg, out.uavs);
+						t_refusals = nullptr;
 						break;
 					case reshade::api::descriptor_type::constant_buffer:
 					{

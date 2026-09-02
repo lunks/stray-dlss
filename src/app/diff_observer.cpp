@@ -208,9 +208,42 @@ void append_judgement(std::string &line, const Judged &j, Result &out)
 	line += verdict_name(j.verdict);
 }
 
+// Refines an EXTRA (the native side has a slot the oracle does not): the oracle's own account
+// of what it dropped there, when it reported one. A view that maps to nothing, or to a dead
+// resource, where the native slot was COPIED from that very view — since re-created (or
+// released) by the game after the copy — is the same re-created-view defect as a mismatch:
+// the online descriptor bytes are the copy's, and they are what the native side holds.
+void refine_extra(Judged &j, const BoundTexture &a, const icept::DispatchBindings *oracle, char kind, const Adjudicator *adj)
+{
+	if (j.verdict != Verdict::oracle_missed || oracle == nullptr)
+		return;
+	const auto *u = find_unresolved(*oracle, kind, a.slot);
+	if (u == nullptr)
+	{
+		j.detail = " (the oracle's table walk produced no such register)";
+		return;
+	}
+	icept::ResourceId res = 0;
+	std::uint64_t seq = 0;
+	bool via_copy = false, dead = false;
+	icept::DescriptorId src = 0;
+	const bool have = adj != nullptr && adj->native_slot != nullptr && adj->native_slot(a.descriptor, res, seq, via_copy, src, dead);
+	char buf[280];
+	std::snprintf(buf, sizeof(buf), " (oracle dropped view %llx: %s%llx%s; native slot %llx %s%llx at seq %llu)",
+		static_cast<unsigned long long>(u->descriptor), u->reason == 4 ? "its resource " : "it maps to no resource",
+		static_cast<unsigned long long>(u->reason == 4 ? u->dead_resource : 0), u->reason == 4 ? " is dead per ReShade" : "",
+		static_cast<unsigned long long>(a.descriptor), have && via_copy ? "copied from " : "written by a view creation ",
+		static_cast<unsigned long long>(have && via_copy ? src : 0), static_cast<unsigned long long>(seq));
+	j.detail = buf;
+	// The oracle's dropped view IS the source the native slot was copied from: the game
+	// re-created or released that offline view after the copy. The copy's value stands.
+	if (have && via_copy && src == u->descriptor)
+		j.verdict = Verdict::reshade_view_recreated;
+}
+
 void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
                    const std::vector<BoundTexture> &actual, Result &out, const Adjudicator *adj,
-                   const icept::DispatchBindings *native)
+                   const icept::DispatchBindings *native, const icept::DispatchBindings *oracle)
 {
 	for (const BoundTexture &e : expected)
 	{
@@ -248,7 +281,9 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 			char buf[256];
 			std::snprintf(buf, sizeof(buf), "%c%u: oracle=ABSENT native=(%s)", prefix, a.slot, describe(a).c_str());
 			std::string line = buf;
-			append_judgement(line, judge(0, a.resource, adj), out);
+			Judged j = judge(0, a.resource, adj);
+			refine_extra(j, a, oracle, prefix, adj);
+			append_judgement(line, j, out);
 			out.extra.push_back(line);
 		}
 	}
@@ -290,8 +325,8 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
                const Adjudicator *adj)
 {
 	Result r;
-	compare_slots('t', expected.srvs, actual.srvs, r, adj, &actual);
-	compare_slots('u', expected.uavs, actual.uavs, r, adj, &actual);
+	compare_slots('t', expected.srvs, actual.srvs, r, adj, &actual, &expected);
+	compare_slots('u', expected.uavs, actual.uavs, r, adj, &actual, &expected);
 
 	// Constant buffers as a multiset of (buffer, offset): the oracle keys root CBVs by root
 	// PARAMETER index and table CBVs by register, so `first` is not comparable across
@@ -472,7 +507,9 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 		// Which kind led, so one hash with both a mismatch and an unknown gets both logged.
 		const std::uint64_t key = e.hash ^ (!r.mismatches.empty() ? 0x1ull : !r.unknown.empty() ? 0x2ull : 0x3ull);
 		unsigned &per_hash = g_logged_per_hash[key];
-		if (g_logged_disagreements < kMaxLoggedDisagreements && per_hash < kMaxLoggedPerHash)
+		// An UNRESOLVED disagreement (some slot does not convict ReShade) always earns its
+		// lines within the total budget: those are the ones the gate is waiting on.
+		if (g_logged_disagreements < kMaxLoggedDisagreements && (per_hash < kMaxLoggedPerHash || !r.oracle_wrong()))
 		{
 			++g_logged_disagreements;
 			++per_hash;

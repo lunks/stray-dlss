@@ -77,8 +77,11 @@ struct DispatchBindings
 		char kind = 't';           // 't' srv, 'u' uav, 'b' cbv
 		std::uint32_t reg = 0;
 		DescriptorId descriptor = 0; // the ONLINE slot's CPU handle (0 if the heap span was unknown)
-		std::uint8_t reason = 0;     // 0 no heap span, 1 no entry (never written since attach), 2 dead (resource died after the write)
-		ResourceId dead_resource = 0; // reason 2: the resource that died
+		// native: 0 no heap span, 1 no entry (never written since attach), 2 dead (resource
+		// died after the write). ReShade: 3 the view maps to no resource, 4 the resource is
+		// dead per ReShade's own liveness (dropped in silence before this field existed).
+		std::uint8_t reason = 0;
+		ResourceId dead_resource = 0; // reasons 2 and 4: the resource that died
 	};
 	std::vector<Unresolved> unresolved;
 

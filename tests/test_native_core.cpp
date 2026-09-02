@@ -334,6 +334,18 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	const diff::Result r3 = diff::compare(o3, n3, &full);
 	CHECK(r3.oracle_wrong());
 	CHECK_FALSE(diff::compare(o3, n3).oracle_wrong()); // unadjudicated never convicts
+	// EXTRA: the oracle dropped a view (dead per its liveness) that is exactly the source
+	// the native slot was copied from - the game released/re-created it after the copy.
+	icept::DispatchBindings o4, n4;
+	o4.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 26, 0xa001, 4, 0x7777 });
+	n4.srvs.push_back(BoundTexture{ 26, 0x3333, TexFormat::unknown, 0, 0, 0xb801 }); // copied from a001
+	n4.srvs.push_back(BoundTexture{ 27, 0x3333, TexFormat::unknown, 0, 0, 0xb802 }); // a view creation; the oracle said nothing
+	const diff::Result r4 = diff::compare(o4, n4, &full);
+	REQUIRE(r4.extra.size() == 2);
+	CHECK(r4.extra[0].find("oracle dropped view a001: its resource 7777 is dead per ReShade") != std::string::npos);
+	CHECK(r4.extra[0].find("=> RESHADE-VIEW-RECREATED") != std::string::npos);
+	CHECK(r4.extra[1].find("=> ORACLE-MISSED") != std::string::npos);
+	CHECK_FALSE(r4.oracle_wrong());
 	// Without an adjudicator every differing slot is unadjudicated and the lines are bare.
 	const diff::Result bare = diff::compare(oracle, native);
 	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 7);
