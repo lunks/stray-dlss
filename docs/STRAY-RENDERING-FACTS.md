@@ -682,10 +682,15 @@ native-first). Six launches, each read from `stray-launch-verdict.txt` (tools/la
 * `native backend: mode=drive ... device-slots=18 list-slots=11 patches=29` on the real device,
   `ext_unhook: captured 4 pristine vtable slots` (slot 8 unhooked: no ReShade, the repair is inert).
 * `present owner: queue #1 ... DIRECT`, `#2 copy`, `#3 compute` from the CreateCommandQueue hook.
-* The DXGI factory EXPORT hooks (`533bcc4`) reach the game's factories: `patched the game's
-  factory 00000000033945C0` and `...17D10690` — where the throwaway-factory vtable patch of the
-  first design never fired: **DXVK does not share one vtable per DXGI class** (the d3d12
-  static-vtable fact of §11 does not extend to DXGI). HARD.
+* The DXGI factory EXPORT hooks (`533bcc4`) see the game's factories (`patched the game's
+  factory 00000000033945C0` and `...17D10690`). **Correction, same day:** those lines say
+  "4 slot(s) newly hooked" because `patch_factory` counts a slot patch_slot reports as ALREADY
+  ours (it returns the stored original, non-null) — a counting artefact, not evidence of a second
+  vtable. Both factories share the throwaway's vtable (`00006FFFFCC113E0`), so DXVK's DXGI
+  objects DO share one vtable per class like vkd3d's D3D12 ones, the throwaway patch of the first
+  design already reached the game's factory, and the export hooks are redundant (harmless). The
+  02:19 run — throwaway patch only — crashed at the same 61 s with the same signature, which is
+  the same swapchain-creation hook faulting. SOFT->HARD downgrade of the earlier claim.
 
 **Not reached:** the swapchain hook, so no `on_present`, no status heartbeat, no NGX init (frame
 120 is a present count), no DLSS evaluate under the plugin. Config A and Config B verification of
