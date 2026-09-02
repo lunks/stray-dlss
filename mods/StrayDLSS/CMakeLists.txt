@@ -2,9 +2,9 @@
 #
 # This file plays TWO roles, on purpose (the layout is mods/StrayDualSense/CMakeLists.txt's):
 #
-#   standalone   `cmake -S mods/StrayDLSS -B build` builds only the portable pieces. Today
-#                that is nothing but a configure check; the pure logic lives in the parent
-#                project's stray_dlss_core and is tested there.
+#   standalone   `cmake -S mods/StrayDLSS -B build` is a configure check only; the pure logic
+#                lives in the root's stray_dlss_core and is tested there, and the plain-Win32
+#                host (Host.cpp) is compiled under mingw by the workflow.
 #
 #   sub-project  When added from a parent that has already done `add_subdirectory(RE-UE4SS)`,
 #                the `UE4SS` target exists and the plugin DLL is built too. That is the
@@ -17,7 +17,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(StrayDLSS
-    VERSION 0.0.1
+    VERSION 0.1.0
     DESCRIPTION "DLSS Super Resolution for Stray, loaded by UE4SS"
     LANGUAGES C CXX)
 
@@ -71,14 +71,21 @@ if(NOT WIN32)
         "DLL boundary, so the mod must be built by the same toolchain and CRT as UE4SS itself.")
 endif()
 
+# The shared application + native backend, from the repository root, configured ONCE with the
+# dynamic CRT (the UE4SS ABI contract below) and with nothing else the add-on builds.
+set(STRAY_DLSS_BUILD_ADDON OFF CACHE BOOL "" FORCE)
+set(STRAY_DLSS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(STRAY_DLSS_BUILD_WARP_TESTS OFF CACHE BOOL "" FORCE)
+set(STRAY_DLSS_BUILD_NATIVE ON CACHE BOOL "" FORCE)
+set(STRAY_DLSS_DYNAMIC_CRT ON CACHE BOOL "" FORCE)
+add_subdirectory(${STRAY_DLSS_ROOT} stray_dlss_root)
+
 add_library(StrayDLSS SHARED
-    src/Log.cpp
-    src/Log.hpp
+    src/Host.cpp
+    src/Host.hpp
     src/Mod.cpp
     src/Platform.cpp
     src/Platform.hpp
-    src/Probe.cpp
-    src/Probe.hpp
     src/Version.hpp)
 
 target_include_directories(StrayDLSS PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -90,7 +97,7 @@ target_compile_features(StrayDLSS PRIVATE cxx_std_23)
 
 # Linking the UE4SS target brings the import library, the include directories and the
 # Unreal/File/DynamicOutput/fmt/imgui transitives with it. Never name UE4SS.lib directly.
-target_link_libraries(StrayDLSS PRIVATE UE4SS stray_dlss_minhook d3d12 dxgi)
+target_link_libraries(StrayDLSS PRIVATE UE4SS stray_dlss_native stray_dlss_minhook d3d12 dxgi)
 
 target_compile_options(StrayDLSS PRIVATE ${SDL_WARN})
 target_compile_definitions(StrayDLSS PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN

@@ -1,32 +1,31 @@
-# StrayDLSS — a UE4SS C++ plugin (0.0.1: the attach-timing probe)
+# StrayDLSS — the UE4SS C++ plugin host (0.1.0)
 
-The first step of `docs/superpowers/plans/2026-09-01-dlss-sr-ue4ss-plugin.md`: a UE4SS C++ mod
-that **renders nothing and changes nothing on screen**. It exists to answer, from inside the
-process, the one timing question the whole native-hook design depends on (assessment §6.2):
+DLSS Super Resolution (and DLSS Neural Rendering) for Stray, loaded by UE4SS, **with no
+ReShade in the process**. This is plan Stage 4 (`docs/superpowers/plans/2026-09-01-dlss-sr-ue4ss-plugin.md`):
+the same application and native D3D12 backend the ReShade add-on ships, hosted by a UE4SS mod.
 
-* does `start_mod()` run **before** the game's `D3D12CreateDevice`?
-* what does an export hook installed from a C++ mod actually **see** when ReShade is loaded as
-  `dxgi.dll` in the same process — the real vkd3d device, or ReShade's proxy?
-* from a throwaway device (the late-attach path), is the **real** device reachable through
-  `ID3D12Resource::GetDevice` without any vkd3d interop interface?
+* `start_mod()` runs ~970 ms before the game's `D3D12CreateDevice` (facts §12), so the host
+  detours that export (MinHook, loading `d3d12.dll` itself), sees the game's device as it is
+  created, unwraps a proxy if one sits above it (a throwaway resource's `GetDevice`), and
+  installs the native backend in **drive** mode on the real device.
+* The native present owner (`src/backend_native/present_owner.cpp`) patches the DXGI factory
+  and swapchain vtables, so the frame boundary and a command list of ours on the presenting
+  queue exist without ReShade.
+* NGX runs on the native device; `ext_unhook` stays on and is inert without ReShade.
+* Config: `<mod>/StrayDLSS.ini`, `[STRAYDLSS]`, the same keys as ReShade.ini. Log:
+  `<game>/stray-dlss-plugin.log` (plus `stray-dlss-status.txt` in the game directory).
+* No overlay, no screenshot channel, no UI. Status is the NGX indicator (the registry key
+  `NGXCore\ShowDlssIndicator=0x400` in the prefix) plus the log.
 
-Everything it learns goes to `<game>/stray-dlss-plugin.log`, timestamped in both local time
-and UTC so the lines can be laid against `ReShade.log` (local) and `ue4ss/UE4SS.log` (UTC).
-
-Only `src/Mod.cpp` includes a UE4SS header. `Probe.cpp`, `Log.cpp` and `Platform.cpp` are
-plain Win32 and are compiled and linked under mingw by CI as a proxy for the MSVC build.
+Only `src/Mod.cpp` includes a UE4SS header. `Host.cpp` and `Platform.cpp` are plain Win32 and
+are compiled under mingw by CI as the fast proxy for the MSVC build.
 
 ## Install
 
 1. Build (CI: `.github/workflows/dlss-plugin.yml`, artifact `stray-dlss-plugin`).
-2. `<game>/ue4ss/Mods/StrayDLSS/dlls/main.dll`; add `StrayDLSS : 1` to `ue4ss/Mods/mods.txt`
-   **above** the `Keybinds` line.
-3. UE4SS itself must already be loading (`dwmapi.dll` proxy; the box already has it). With
-   ReShade as `dxgi.dll` the launch options must **merge** both overrides:
-   `WINEDLLOVERRIDES="dwmapi,dxgi=n,b"`.
-
-## What it does NOT do
-
-No hidden window and no dummy swapchain (the plan's Task 2 lists one): the observer build
-that follows needs no `Present` hook while ReShade owns the frame, and a Wine toplevel under
-gamescope has a documented focus-steal freeze (CLAUDE.md §6). It is deferred, not forgotten.
+2. Copy `StrayDLSS/` into `<game>/ue4ss/Mods/` (`dlls/main.dll`, `StrayDLSS.ini`); add
+   `StrayDLSS : 1` to `ue4ss/Mods/mods.txt` **above** the `Keybinds` line.
+3. `nvngx_dlss.dll` (and `nvngx_dlssnr.dll` for NR) beside the game executable, as for the add-on.
+4. Launch with UE4SS loading (`WINEDLLOVERRIDES="dwmapi=n,b"` on the box) and `-dx12`. ReShade is
+   optional: with ReShade loaded as `dxgi.dll` the plugin unwraps its proxies; **do not** also
+   run the ReShade add-on (`stray-dlss.addon64`) — two drivers of one TAA pass.

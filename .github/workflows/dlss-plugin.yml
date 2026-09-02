@@ -36,12 +36,20 @@ on:
     branches: [ main, dlss-ue4ss ]
     paths:
       - 'mods/StrayDLSS/**'
-      - 'third_party/minhook/**'
+      - 'third_party/**'
+      - 'src/**'
+      - 'shaders/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
       - '.github/workflows/dlss-plugin.yml'
   pull_request:
     paths:
       - 'mods/StrayDLSS/**'
-      - 'third_party/minhook/**'
+      - 'third_party/**'
+      - 'src/**'
+      - 'shaders/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
       - '.github/workflows/dlss-plugin.yml'
   workflow_dispatch:
 
@@ -65,6 +73,8 @@ env:
   UEPSEUDO_MIRROR_SUBDIR: RE-UE4SS/deps/first/Unreal
 
   BUILD_CONFIG: Game__Shipping__Win64
+  # The same pin as ci.yml's, for the _d import library.
+  DLSS_SDK_TAG: v310.7.0
 
 jobs:
   mingw:
@@ -77,8 +87,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
       # Every source EXCEPT src/Mod.cpp, which is the only file that includes a UE4SS header.
-      # That split is why this lane is possible at all, and it is worth preserving.
-      - name: Compile and link the Win32 sources and MinHook
+      # That split is why this lane is possible at all, and it is worth preserving. The host
+      # calls into the root's native library (MSVC-only to LINK: NGX, fxc-compiled shaders), so
+      # this lane COMPILES the host against the root's headers and links nothing.
+      - name: Compile the Win32 host and MinHook
         working-directory: mods/StrayDLSS
         run: |
           set -euo pipefail
@@ -88,32 +100,24 @@ jobs:
             echo "--- $f.c"
             x86_64-w64-mingw32-gcc -O2 -Wall -c "$f.c" -o "/tmp/obj/$(basename $f).o"
           done
-          for f in Log Platform Probe; do
+          for f in Platform Host; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
-              -Isrc -I../../third_party/minhook/include -c "src/$f.cpp" -o "/tmp/obj/$f.o"
+              -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
+              -Isrc -I../../src -I../../third_party/minhook/include -I../../third_party/ngx/include \
+              -c "src/$f.cpp" -o "/tmp/obj/$f.o"
           done
-          cat > /tmp/obj/stub.cpp <<'STUB'
-          #include <windows.h>
-          #include "Probe.hpp"
-          // Calls every entry point the UE4SS glue uses, so an unresolved symbol in the Win32
-          // half surfaces here rather than as a DLL that will not load in the game.
-          extern "C" __declspec(dllexport) void stray_dlss_stub_entry()
-          {
-              stray_dlss::probe::Start();
-              stray_dlss::probe::Tick();
-              stray_dlss::probe::Stop();
-          }
-          BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
-          STUB
-          x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror -Isrc -shared \
-            -o /tmp/obj/stub.dll /tmp/obj/stub.cpp /tmp/obj/*.o \
-            -ld3d12 -ldxgi -static-libgcc -static-libstdc++
-          ls -la /tmp/obj/stub.dll
-          x86_64-w64-mingw32-objdump -p /tmp/obj/stub.dll > /tmp/obj/imports.txt
-          for sym in D3D12CreateDevice VirtualProtect; do
-            grep -q "$sym" /tmp/obj/imports.txt || { echo "missing import: $sym"; exit 1; }
+          # And the native backend's own sources the host links, as the root's CI cannot
+          # (it is MSVC-only there): a syntax pass under mingw's older d3d12.h.
+          for f in backend_native/present_owner backend_native/native_backend backend_native/d3d12_hooks \
+                   backend_native/resource_registry backend_native/descriptor_shadow backend_native/root_shadow \
+                   backend_native/vtable_patch; do
+            echo "--- $f"
+            x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror -fsyntax-only \
+              -DWIN32_LEAN_AND_MEAN -DNOMINMAX -I../../src "../../src/$f.cpp"
           done
+          x86_64-w64-mingw32-gcc -c ../../src/backend_native/vtable_slots_check.c -o /tmp/obj/slots.o
+          echo "the Win32 host compiles; the DXGI/D3D12 slot numbers are the SDK's"
 
   plugin:
     name: Plugin DLL (Windows, MSVC)
@@ -139,6 +143,20 @@ jobs:
           cargo --version
           cmake --version
           ninja --version
+
+      # The NGX import library for the DYNAMIC CRT (_d): the plugin is /MD by UE4SS's ABI
+      # contract, unlike the add-on (/MT, nvsdk_ngx_s.lib). Fetched, not committed, as ci.yml
+      # does for the add-on.
+      - name: Fetch the NGX import library (dynamic CRT)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path repo/third_party/ngx/lib | Out-Null
+          $url = "https://github.com/NVIDIA/DLSS/raw/$env:DLSS_SDK_TAG/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile repo/third_party/ngx/lib/nvsdk_ngx_d.lib
+          $size = (Get-Item repo/third_party/ngx/lib/nvsdk_ngx_d.lib).Length
+          Write-Host "nvsdk_ngx_d.lib = $size bytes"
+          if ($size -lt 1000000) { throw "nvsdk_ngx_d.lib looks truncated ($size bytes)" }
 
       - name: Clone RE-UE4SS at the pinned SHA
         shell: pwsh
@@ -261,6 +279,8 @@ jobs:
           # /MD is an ABI contract with UE4SS (see mods/StrayDLSS/CMakeLists.txt). A /MT
           # build would allocate in its own heap and free in UE4SS's, which is silent
           # corruption rather than a load failure — so assert the dependency is THERE.
+          # NGX is linked statically (nvsdk_ngx_d.lib); nvngx_dlss.dll is loaded at run time
+          # from the game directory, so no nvngx import is expected here.
           $deps = & dumpbin /DEPENDENTS $dll.FullName | Out-String
           Write-Host $deps
           if ($deps -notmatch 'MSVCP140') {

@@ -41,6 +41,17 @@ void init_file_sink()
 #endif
 }
 
+#ifdef _WIN32
+void init_file_sink(const wchar_t *path)
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (g_file != nullptr || path == nullptr)
+		return;
+	if (_wfopen_s(&g_file, path, L"w") != 0)
+		g_file = nullptr;
+}
+#endif
+
 void shutdown_file_sink()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);

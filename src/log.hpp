@@ -23,6 +23,11 @@ enum class Level
 
 // Opens the side-channel file next to the add-on. Safe to call before register_addon.
 void init_file_sink();
+#ifdef _WIN32
+// The same sink at an explicit path (the UE4SS host writes <game>/stray-dlss-plugin.log so it
+// never collides with a ReShade add-on's stray-dlss.log in the same directory).
+void init_file_sink(const wchar_t *path);
+#endif
 void shutdown_file_sink();
 
 // An optional second sink, installed by whichever host we run inside: the ReShade backend
