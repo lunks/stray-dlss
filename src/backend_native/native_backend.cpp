@@ -461,10 +461,11 @@ void log_stats(const char *when)
 		const shadow::Stats sh = shadow::stats();
 		std::uint64_t ov=0, ocs=0, ocd=0, hc=0, hb=0;
 		shadow::fast_orphan_counts(ov, ocs, ocd, hc, hb);
-		STRAY_LOG_INFO("NATIVE SHADOW GROWTH [%s] slots=%llu (buckets %llu) | fast heaps: create=%llu bind=%llu | ORPHANS view=%llu copy-src=%llu copy-dst=%llu",
+		STRAY_LOG_INFO("NATIVE SHADOW GROWTH [%s] slots=%llu (buckets %llu) | fast heaps: create=%llu bind=%llu | ORPHANS view=%llu copy-src=%llu copy-dst=%llu overflow-live=%llu",
 			when, static_cast<unsigned long long>(sh.slots), static_cast<unsigned long long>(sh.slots_buckets),
 			static_cast<unsigned long long>(hc), static_cast<unsigned long long>(hb),
-			static_cast<unsigned long long>(ov), static_cast<unsigned long long>(ocs), static_cast<unsigned long long>(ocd));
+			static_cast<unsigned long long>(ov), static_cast<unsigned long long>(ocs), static_cast<unsigned long long>(ocd),
+			static_cast<unsigned long long>(shadow::fast_overflow_size()));
 	}
 	if (mode() == Mode::drive)
 		STRAY_LOG_INFO("NATIVE DRIVE [%s] dispatches delivered=%llu suppressed=%llu compute-pipelines delivered=%llu",
