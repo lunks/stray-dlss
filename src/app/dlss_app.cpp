@@ -691,7 +691,10 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		const native::Mode mode = native::mode_from_string(native_mode);
 		if (mode != native::Mode::off)
 		{
-			const bool ok = native::install(native, mode);
+			char scope[16] = "all";
+			host::cfg::get_string("NativeInstall", scope, sizeof(scope));
+			native::set_use_sentinel(host::cfg::get_bool("NativeSentinel", true));
+			const bool ok = native::install(native, mode, native::install_scope_from_string(scope));
 			diff::set_enabled(ok && native::mode() == native::Mode::observe);
 			STRAY_LOG_WARN("NativeMode=%s ([STRAYDLSS] NativeMode, read as \"%s\"): %s. Grep 'DIFF' and "
 				"'NATIVE SHADOW'.", native::mode_name(native::mode()), native_mode, native::attach_report());

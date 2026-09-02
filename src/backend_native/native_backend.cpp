@@ -22,6 +22,7 @@ namespace {
 thread_local int t_own_code = 0;
 std::atomic<int> g_mode{ static_cast<int>(Mode::off) };
 ::ID3D12Device *g_device = nullptr;
+std::atomic<bool> g_use_sentinel{ true };
 char g_report[512] = "native backend: not installed";
 std::atomic<std::uint64_t> g_resolves{ 0 };
 std::atomic<std::uint64_t> g_resolves_no_layout{ 0 };
@@ -58,7 +59,19 @@ Mode mode() { return static_cast<Mode>(g_mode.load(std::memory_order_relaxed)); 
 ::ID3D12Device *game_device() { return g_device; }
 const char *attach_report() { return g_report; }
 
-bool install(::ID3D12Device *real_device, Mode requested)
+InstallScope install_scope_from_string(const char *s)
+{
+	if (s != nullptr && std::strcmp(s, "device") == 0)
+		return InstallScope::device_only;
+	if (s != nullptr && std::strcmp(s, "list") == 0)
+		return InstallScope::list_only;
+	return InstallScope::all;
+}
+
+void set_use_sentinel(bool enabled) { g_use_sentinel.store(enabled, std::memory_order_relaxed); }
+bool use_sentinel() { return g_use_sentinel.load(std::memory_order_relaxed); }
+
+bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope)
 {
 	if (real_device == nullptr || requested == Mode::off)
 	{
@@ -79,19 +92,23 @@ bool install(::ID3D12Device *real_device, Mode requested)
 	}
 
 	registry::set_destroy_listener(&shadow::forget_resource);
-	const unsigned dev = hooks::install_device_hooks(real_device);
-	const unsigned list = hooks::install_list_hooks(real_device);
+	const unsigned dev = scope != InstallScope::list_only ? hooks::install_device_hooks(real_device) : 0;
+	const unsigned list = scope != InstallScope::device_only ? hooks::install_list_hooks(real_device) : 0;
 	g_device = real_device;
 	g_mode.store(static_cast<int>(requested), std::memory_order_relaxed);
+	const char *scope_name = scope == InstallScope::device_only ? "device-only"
+		: scope == InstallScope::list_only ? "list-only" : "all";
 	std::snprintf(g_report, sizeof(g_report),
-		"native backend: mode=%s device=%p device-slots=%u list-slots=%u patches=%u increment=%u",
-		mode_name(requested), static_cast<void *>(real_device), dev, list, patch_count(),
-		hooks::descriptor_increment());
-	if (dev == 0 || list == 0)
+		"native backend: mode=%s scope=%s sentinel=%d device=%p device-slots=%u list-slots=%u patches=%u increment=%u",
+		mode_name(requested), scope_name, use_sentinel() ? 1 : 0, static_cast<void *>(real_device), dev, list,
+		patch_count(), hooks::descriptor_increment());
+	const bool complete = (scope == InstallScope::device_only && dev != 0) ||
+		(scope == InstallScope::list_only && list != 0) || (scope == InstallScope::all && dev != 0 && list != 0);
+	if (!complete)
 		STRAY_LOG_ERROR("%s - INCOMPLETE, the observer cannot see the game's bindings", g_report);
 	else
 		STRAY_LOG_INFO("%s", g_report);
-	return dev != 0 && list != 0;
+	return complete;
 }
 
 NativeBackend &backend()

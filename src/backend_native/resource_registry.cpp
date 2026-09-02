@@ -1,5 +1,7 @@
 #include "backend_native/resource_registry.hpp"
 
+#include "backend_native/native_backend.hpp"
+
 #include "core/dxgi_format.hpp"
 #include "core/va_map.hpp"
 #include "log.hpp"
@@ -108,6 +110,15 @@ void note_created(::ID3D12Resource *res)
 	}
 
 	// The destruction callback. The resource holds the only reference after our Release.
+	// [STRAYDLSS] NativeSentinel=0 skips this, to isolate SetPrivateDataInterface as a crash
+	// suspect on the box; then a resource stays live until forget_resource is never called,
+	// which over-reports liveness but cannot fault.
+	if (!use_sentinel())
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_stats.sentinel_failures;
+		return;
+	}
 	Sentinel *s = new Sentinel(id);
 	if (FAILED(res->SetPrivateDataInterface(kSentinelGuid, s)))
 	{

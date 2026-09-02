@@ -22,10 +22,20 @@ enum class Mode
 Mode mode_from_string(const char *s);
 const char *mode_name(Mode m);
 
+// Which hook sets to install — a bisection knob for the box, because a crash the CI lanes
+// pass has to be narrowed there. `all` is the shipping value.
+enum class InstallScope { all, device_only, list_only };
+InstallScope install_scope_from_string(const char *s);
+// Whether note_created attaches its SetPrivateDataInterface sentinel. Off means liveness is
+// tracked only by what the view hooks re-register (a resource never seen again reads live);
+// the box uses it to isolate the sentinel as a crash suspect.
+void set_use_sentinel(bool enabled);
+bool use_sentinel();
+
 // Installs the hooks on `real_device` (the ORIGINAL vkd3d/WARP device, never a proxy) and
 // on the command-list vtable reached through a throwaway list of that device. Idempotent.
 // Returns false if nothing could be installed; the report says what was and was not.
-bool install(::ID3D12Device *real_device, Mode mode);
+bool install(::ID3D12Device *real_device, Mode mode, InstallScope scope = InstallScope::all);
 Mode mode();
 ::ID3D12Device *game_device();
 const char *attach_report();
