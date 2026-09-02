@@ -1013,8 +1013,12 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 
 	// Frame-time sampling and the periodic CPU-share report. Fed the cumulative counters we
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
-	// Drains the NR validation readback (it gates NR ever touching the screen).
-	nr::on_present();
+	// The NR path's present boundary: signals its lifetime fence on the swapchain's own queue,
+	// performs every deferred free the fence has cleared (a queued NgxNR=0 teardown, a resolution
+	// change's ReleaseFeature), and drains the validation readback that gates NR ever touching
+	// the screen. The queue is what makes "the GPU is done with this" answerable at all
+	// (src/core/nr_lifetime.hpp); with none, NR falls back to a conservative present ring.
+	nr::on_present(pc.queue);
 	// END-OF-FRAME HISTORY RESTORE. Puts the pristine, pre-NR image back into the engine's `u0`
 	// so the next frame's screen-space reflections read the history UE 4.27 would have written,
 	// not the one DLSS Neural Rendering left behind. It records onto ReShade's OWN immediate
@@ -1269,7 +1273,11 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::uint64_t nr_applied = 0, nr_refused = 0;
 			std::uint32_t nr_reasons[nr::kNrRefusalCount] = {};
 			nr::counters(nr_applied, nr_refused, nr_reasons);
-			char nr_line[256];
+			// Sized for EVERY reason name plus its count. This was 256, which the list has
+			// outgrown — and a truncated diagnostic drops the reasons at the end of the array,
+			// which are the newest ones and therefore the ones a session is most likely asking
+			// about.
+			char nr_line[640];
 			int off = std::snprintf(nr_line, sizeof(nr_line),
 				"[%s] NR applied=%llu refused=%llu validated=%d reasons:", when,
 				static_cast<unsigned long long>(nr_applied),

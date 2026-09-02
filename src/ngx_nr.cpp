@@ -8,6 +8,7 @@
 
 #include "core/nr_codec.hpp"
 #include "core/nr_hook_plan.hpp"
+#include "core/nr_lifetime.hpp"
 
 #include <d3d12.h>
 
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #if !defined(STRAY_DLSS_ENABLE_NGX)
 #define STRAY_DLSS_ENABLE_NGX 1
@@ -28,6 +30,9 @@ const char *const kNrRefusalNames[kNrRefusalCount] = {
 	// The HDR colour codec. It is mandatory (ngx_nr.hpp): refusing loudly is strictly better
 	// than silently reverting to the raw-HDR path that produced the near-black neural output.
 	"codec-failed", "codec-topology",
+	// A teardown or a resolution change is waiting on the GPU. Frames in this state are normal
+	// and brief; a rate that never falls means a fence that never advances.
+	"recreating",
 };
 
 } // namespace stray_dlss::nr
@@ -51,7 +56,7 @@ void set_exposure_smoothing(float) {}
 void set_scale_reset_tolerance(float) {}
 void set_track_exposure(bool) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
-void on_present() {}
+void on_present(ID3D12CommandQueue *) {}
 void shutdown() {}
 const char *last_error() { return g_err; }
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
@@ -133,6 +138,7 @@ enum
 	kRefMippedInput,
 	kRefCodecFailed,
 	kRefCodecTopology,
+	kRefRecreating,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -269,17 +275,48 @@ std::atomic<std::uint64_t> g_refused{ 0 };
 std::atomic<std::uint32_t> g_refusals[kNrRefusalCount] = {};
 bool g_refusal_logged[kNrRefusalCount] = {};
 
+// --- THE GPU TIMELINE (src/core/nr_lifetime.hpp) ---
+//
+// Everything NR owns is bound into command lists the GPU executes later, so nothing may be
+// destroyed on the thread that decided to stop using it. One fence on the swapchain's queue,
+// signalled once per present, is what separates "the CPU is done with this" from "the GPU is done
+// with this". Every deferred free and ReleaseFeature itself is decided against it.
+nrlife::Timeline g_timeline;
+ID3D12Fence *g_fence = nullptr;
+// A fence that could not be created is a diagnosis, not a retry loop: fall back to the
+// conservative present ring for the rest of the session and say so once.
+bool g_fence_failed = false;
+// The signal value covering the last evaluate that referenced the feature and its resources.
+nrlife::Tag g_last_eval_tag;
+
+// Objects retired but not yet freed. IUnknown is enough: everything in here is released, never
+// used, and the type only matters for the log line.
+struct Grave
+{
+	IUnknown *obj = nullptr;
+	nrlife::Tag tag;
+	const char *what = "";
+};
+std::vector<Grave> g_graves;
+
+// A resolution change or an NgxNR 1->0. Both mean "stop using feature 18", and both are answered
+// at the present boundary rather than where they were noticed.
+bool g_release_feature_requested = false; // recreate: the feature goes, everything else stays
+bool g_teardown_requested = false;        // NgxNR 1->0: give the whole working set back
+
 // Keep NR's inputs and output alive past GPU execution, exactly as the SR/RR paths do: NGX
 // holds no references and EvaluateFeature only RECORDS work. (CLAUDE.md §5)
-constexpr std::size_t kKeepAliveFrames = 6;
+//
+// Tagged against the fence rather than counted in frames. The old six-evaluate rule was a guess
+// at how far behind the GPU can be; the fence is the answer.
+constexpr std::size_t kKeepAliveSlots = 16;
 struct KeepAlive
 {
 	ID3D12Resource *resources[4] = {};
-	std::uint64_t frame = 0;
+	nrlife::Tag tag;
 };
-KeepAlive g_keep_alive[kKeepAliveFrames * 2];
+KeepAlive g_keep_alive[kKeepAliveSlots];
 std::size_t g_keep_alive_count = 0;
-std::uint64_t g_eval_frame = 0;
 
 template <typename T>
 void release(T *&p)
@@ -315,13 +352,44 @@ void set_error(const char *what, NVSDK_NGX_Result result)
 	STRAY_LOG_ERROR("NR %s", g_last_error);
 }
 
+// Hands `obj` to the graveyard, tagged against the current timeline. DESTROYS NOTHING — that is
+// the entire point. Takes ownership of the caller's reference and nulls it.
+template <typename T>
+void bury(T *&obj, const char *what)
+{
+	if (obj == nullptr)
+		return;
+	Grave g;
+	g.obj = static_cast<IUnknown *>(obj);
+	g.tag = nrlife::tag_now(g_timeline);
+	g.what = what;
+	g_graves.push_back(g);
+	obj = nullptr;
+}
+
+// Frees whatever the timeline says the GPU has passed. PRESENT BOUNDARY ONLY.
+void collect_graves()
+{
+	std::size_t kept = 0;
+	for (std::size_t i = 0; i < g_graves.size(); ++i)
+	{
+		if (nrlife::safe_to_free(g_timeline, g_graves[i].tag))
+		{
+			g_graves[i].obj->Release();
+			continue;
+		}
+		g_graves[kept++] = g_graves[i];
+	}
+	g_graves.resize(kept);
+}
+
 void retire_keep_alive(bool all)
 {
 	std::size_t kept = 0;
 	for (std::size_t i = 0; i < g_keep_alive_count; ++i)
 	{
 		KeepAlive &ka = g_keep_alive[i];
-		if (all || ka.frame + kKeepAliveFrames <= g_eval_frame)
+		if (all || nrlife::safe_to_free(g_timeline, ka.tag))
 		{
 			for (ID3D12Resource *r : ka.resources)
 				if (r != nullptr)
@@ -391,8 +459,27 @@ NVSDK_NGX_Result nr_release_feature(NVSDK_NGX_Handle *h)
 	return NVSDK_NGX_D3D12_ReleaseFeature(h);
 }
 
-void release_feature()
+// RELEASES FEATURE 18 NOW. Only legal once the queue has completed the last evaluate that used
+// it, and only at the present boundary — nrlife::feature_release_ready is the gate, and every
+// caller below goes through it. The reason is the sibling port's second defect verbatim: "the
+// feature owns GPU resources DXVK cannot see and therefore cannot keep alive". Neither can we:
+// our AddRefs cover the textures we pass in, not whatever the snippet allocated inside itself.
+//
+// `why` is logged with the fence values, so a live run can prove the ordering held rather than
+// asking anyone to take it on trust.
+void release_feature_now(const char *why)
 {
+	if (g_feature != nullptr || g_params != nullptr)
+		STRAY_LOG_WARN("NR: releasing feature 18 (%s) at the PRESENT boundary. Last evaluate was "
+			"tagged fence=%llu/present=%llu; the queue has completed %llu and presented %llu, so "
+			"nothing that referenced the feature can still be executing. (If the completed value "
+			"is below the tag in this line, the ordering gate is broken — that is the whole thing "
+			"it exists to guarantee.)",
+			why, static_cast<unsigned long long>(g_last_eval_tag.fence),
+			static_cast<unsigned long long>(g_last_eval_tag.present),
+			static_cast<unsigned long long>(g_timeline.completed),
+			static_cast<unsigned long long>(g_timeline.present));
+
 	retire_keep_alive(/*all=*/true);
 	if (g_feature != nullptr)
 	{
@@ -405,6 +492,7 @@ void release_feature()
 		g_params = nullptr;
 	}
 	g_feature_render_w = g_feature_render_h = g_feature_out_w = g_feature_out_h = 0;
+	g_release_feature_requested = false;
 }
 
 // Creates (or recreates on a size change) feature 18. Availability is deliberately NOT gated on
@@ -423,7 +511,23 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	if (g_create_latched)
 		return false;
 
-	release_feature();
+	// A LIVE FEATURE FOR A DIFFERENT SIZE IS NOT OURS TO DESTROY HERE. This runs on the recording
+	// thread, inside the intercepted TAA dispatch, with the previous frames' evaluates very
+	// possibly still executing. Ask for the release, decline this frame, and create the new
+	// feature once the present boundary has actually done it. A resolution change costs a handful
+	// of NR-less frames; releasing a feature under the GPU costs the session.
+	if (g_feature != nullptr || g_params != nullptr)
+	{
+		if (!g_release_feature_requested)
+		{
+			g_release_feature_requested = true;
+			STRAY_LOG_WARN("NR: the feature's rects moved (%ux%u -> %ux%u in, %ux%u -> %ux%u "
+				"out). Release is DEFERRED to the present boundary and NR declines until then.",
+				g_feature_render_w, g_feature_render_h, render_w, render_h,
+				g_feature_out_w, g_feature_out_h, out_w, out_h);
+		}
+		return false;
+	}
 
 	NVSDK_NGX_Result result = nr_alloc_params(&g_params);
 	if (NVSDK_NGX_FAILED(result) || g_params == nullptr)
@@ -471,7 +575,10 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 			"FAIL_FeatureNotFound/NotSupported here means the loaded nvngx_dlssnr.dll does not "
 			"provide the reserved slot (wrong build, or the Ada patch this 4090 needs is "
 			"missing); the SR/RR image is unaffected.");
-		release_feature();
+		// Immediate, and safe precisely because there is no feature: CreateFeature returned
+		// nothing, so nothing was ever evaluated against this parameter block and no command
+		// list holds a handle to it.
+		release_feature_now("create failed");
 		g_create_latched = true;
 		return false;
 	}
@@ -500,10 +607,14 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 		g_nr_height == h)
 		return true;
 
-	release(g_nr_output);
-	release(g_crop_input.buffer);
-	release(g_crop_proxy.buffer);
-	release(g_crop_neural.buffer);
+	// NEVER a straight Release here. This runs on the recording thread, and the outgoing texture
+	// is DLSSNR.Output for every evaluate still in flight while the readback buffers are the
+	// destinations of CopyTextureRegions that may not have executed yet. Both go to the
+	// graveyard and are freed at a present the fence has passed.
+	bury(g_nr_output, "neural output texture (resolution change)");
+	bury(g_crop_input.buffer, "validation crop: colour input");
+	bury(g_crop_proxy.buffer, "validation crop: proxy");
+	bury(g_crop_neural.buffer, "validation crop: neural output");
 	g_validation.store(Validation::pending, std::memory_order_release);
 
 	D3D12_HEAP_PROPERTIES heap = {};
@@ -766,6 +877,24 @@ std::uint32_t format_bytes(DXGI_FORMAT fmt)
 
 void set_enabled(bool value)
 {
+	// THIS RUNS ON WHATEVER THREAD FLIPPED THE KEY — the overlay checkbox, an ini reload — and it
+	// must therefore free nothing. 1 -> 0 QUEUES a teardown that on_present() performs once the
+	// fence has passed the last evaluate; 0 -> 1 before that teardown has run simply cancels it,
+	// so a toggle loop keeps the working set it already has. The sibling port crashed on exactly
+	// this transition by releasing on the spot (dxvk-remix @ a69254ab).
+	if (g_enabled && !value)
+	{
+		g_teardown_requested = true;
+		STRAY_LOG_WARN("NR DISABLED ([STRAYDLSS] NgxNR=0): teardown QUEUED. Nothing is destroyed "
+			"on this thread; feature 18, the neural output texture and the codec's proxy are "
+			"released at a present whose fence has passed the last evaluate.");
+	}
+	else if (!g_enabled && value && g_teardown_requested)
+	{
+		g_teardown_requested = false;
+		STRAY_LOG_WARN("NR RE-ENABLED before its queued teardown ran; the teardown is cancelled "
+			"and the existing feature and textures are kept.");
+	}
 	g_enabled = value;
 	if (value)
 		STRAY_LOG_WARN("NR ENABLED ([STRAYDLSS] NgxNR=1): DLSS Neural Rendering (NGX feature "
@@ -942,6 +1071,16 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		in.motion_vectors == nullptr || in.render_width == 0 || in.output_width == 0)
 		return refuse(kRefBadInputs, "a required resource or dimension was missing.");
 
+	// A queued teardown or feature release owns the working set until the present boundary has
+	// carried it out. Evaluating into resources that are on their way to the graveyard is exactly
+	// the use-after-free this whole path exists to prevent, so decline and count it.
+	if (g_teardown_requested || g_release_feature_requested)
+		return refuse(kRefRecreating,
+			"a teardown or a feature release is queued and is waiting on the GPU fence.");
+
+	// The pass's deferred frees are decided against the same timeline this module owns.
+	nrp::set_timeline(g_timeline);
+
 	// WHICH COLOUR PIPELINE. One NR path, two call sites, and this is the only place they differ.
 	//
 	//  taa_dispatch  — `image` is raw unbounded pre-exposed linear HDR, which is out of a
@@ -994,7 +1133,12 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		return refuse(kRefAllocFailed, g_last_error);
 	if (!ensure_feature(cmd, in.render_width, in.render_height, in.output_width,
 			in.output_height))
+	{
+		if (g_release_feature_requested)
+			return refuse(kRefRecreating,
+				"the feature's rects moved; its release is deferred to the present boundary.");
 		return refuse(kRefCreateFailed, "feature 18 could not be created.");
+	}
 
 	ext_unhook::repair();
 
@@ -1202,6 +1346,12 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 				in.output_height, reset ? 1 : 0, g_intensity, g_ui_correction);
 	}
 
+	// Tagged BEFORE the call, not after: EvaluateFeature records work whether or not it returns
+	// success, so a failed evaluate can still have left references on the command list. The
+	// feature-release gate reads this tag, and it must never name a moment earlier than the last
+	// thing that touched the feature.
+	g_last_eval_tag = nrlife::tag_now(g_timeline);
+
 	const NVSDK_NGX_Result result =
 		nr_evaluate_feature(cmd, g_feature, g_params);
 
@@ -1219,11 +1369,27 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		return refuse(kRefEvaluateFailed, g_last_error);
 	}
 
-	// Hold everything NGX touched alive past GPU execution.
-	if (g_keep_alive_count < sizeof(g_keep_alive) / sizeof(g_keep_alive[0]))
+	// Hold everything NGX touched alive past GPU execution, under the tag taken above.
+	if (g_keep_alive_count >= sizeof(g_keep_alive) / sizeof(g_keep_alive[0]))
+	{
+		// Not a leak — a stall. The slots only fill when the fence stops advancing, which means
+		// presents have stopped reaching us, and the frames that overflow hold NO reference at
+		// all. Say so once rather than silently skipping the AddRef, which is what this did
+		// before it was tagged against a timeline.
+		static bool s_warned = false;
+		if (!s_warned)
+		{
+			s_warned = true;
+			STRAY_LOG_ERROR("NR: the keep-alive ring is full (%u slots) — the GPU fence is not "
+				"advancing, so nothing can be retired and this frame's inputs are NOT held. "
+				"Check that nr::on_present is being called with the swapchain's queue.",
+				static_cast<unsigned int>(kKeepAliveSlots));
+		}
+	}
+	else
 	{
 		KeepAlive &ka = g_keep_alive[g_keep_alive_count++];
-		ka.frame = g_eval_frame;
+		ka.tag = g_last_eval_tag;
 		ka.resources[0] = colour;
 		ka.resources[1] = in.depth;
 		ka.resources[2] = in.motion_vectors;
@@ -1232,8 +1398,9 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 			if (r != nullptr)
 				r->AddRef();
 	}
-	++g_eval_frame;
-	retire_keep_alive(/*all=*/false);
+	// The retirement itself happens at the present boundary, with everything else. Dropping the
+	// last reference to a texture is a destruction like any other, and this is the recording
+	// thread.
 
 	// Until validation passes, NR must not reach the screen.
 	if (g_validation.load(std::memory_order_acquire) != Validation::ok)
@@ -1392,8 +1559,93 @@ CropLuma drain_crop(CropReadback &crop)
 
 } // namespace
 
-void on_present()
+namespace {
+
+// Advances the GPU timeline: signal our own fence on the swapchain's queue and read back how far
+// the GPU has actually got. Everything freed this present is decided from the result.
+//
+// The fence is ours, monotonic and used for nothing else, so signalling a queue we do not own is
+// both legal and side-effect free. Signalling HERE means the value covers every command list the
+// game submitted this frame, which is exactly the set that can reference what we are about to
+// free.
+void advance_timeline(ID3D12CommandQueue *queue)
 {
+	if (queue == nullptr || g_fence_failed)
+	{
+		nrlife::on_present_unfenced(g_timeline);
+		return;
+	}
+
+	if (g_fence == nullptr)
+	{
+		ID3D12Device *device = nullptr;
+		if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr ||
+			FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
+		{
+			g_fence_failed = true;
+			release(device);
+			STRAY_LOG_ERROR("NR: could not create the lifetime fence, so deferred frees fall back "
+				"to a %u-present ring. That is conservative and correct, but it cannot see a GPU "
+				"that has fallen further behind than that.",
+				static_cast<unsigned int>(nrlife::kNoFenceFreePresents));
+			nrlife::on_present_unfenced(g_timeline);
+			return;
+		}
+		release(device);
+		STRAY_LOG_INFO("NR: lifetime fence created on the swapchain queue. Every deferred free "
+			"and ReleaseFeature from here is gated on it.");
+	}
+
+	if (FAILED(queue->Signal(g_fence, nrlife::pending_signal(g_timeline))))
+	{
+		// A failed signal means the value will never complete, so DO NOT advance the timeline
+		// past it — that would free work the GPU may still be running.
+		nrlife::on_present_unfenced(g_timeline);
+		return;
+	}
+	nrlife::on_signalled(g_timeline, g_fence->GetCompletedValue());
+}
+
+} // namespace
+
+void on_present(ID3D12CommandQueue *queue)
+{
+	// DELIBERATELY NOT GATED ON g_enabled. Disabling NR is what QUEUES the teardown, so a
+	// disabled NR is precisely the state in which this has the most to do.
+	advance_timeline(queue);
+	nrp::set_timeline(g_timeline);
+
+	// Everything the GPU has passed, in one place and on one thread.
+	retire_keep_alive(/*all=*/false);
+	collect_graves();
+	nrp::collect();
+
+	// FEATURE 18'S RELEASE. Gated on both halves: the present boundary (we are on it) and the
+	// queue having completed the last evaluate. See nrlife::feature_release_ready.
+	if (nrlife::feature_release_ready(g_release_feature_requested || g_teardown_requested,
+			/*at_present=*/true, g_timeline, g_last_eval_tag))
+	{
+		const bool teardown = g_teardown_requested;
+		release_feature_now(teardown ? "NgxNR=0 teardown" : "rect change");
+		if (teardown)
+		{
+			// The whole working set goes back, not just the feature: the neural output texture,
+			// the validation readbacks and the codec's proxy, heap and pipelines. All of it via
+			// the graveyard, so a frame recorded moments ago is still safe.
+			bury(g_nr_output, "neural output texture (teardown)");
+			bury(g_crop_input.buffer, "validation crop: colour input (teardown)");
+			bury(g_crop_proxy.buffer, "validation crop: proxy (teardown)");
+			bury(g_crop_neural.buffer, "validation crop: neural output (teardown)");
+			nrp::request_shutdown();
+			g_nr_width = g_nr_height = 0;
+			g_nr_format = DXGI_FORMAT_UNKNOWN;
+			g_validation.store(Validation::pending, std::memory_order_release);
+			g_teardown_requested = false;
+			STRAY_LOG_WARN("NR: teardown complete. Re-enabling NgxNR rebuilds the feature and the "
+				"textures from scratch; the old ones are freed as their fences pass.");
+		}
+	}
+
 	if (!g_enabled || g_validation.load(std::memory_order_acquire) != Validation::in_flight)
 		return;
 	if (--g_validate_presents_left > 0)
@@ -1485,12 +1737,29 @@ void on_present()
 
 void shutdown()
 {
-	release_feature();
+	// IMMEDIATE, and the only call site where that is correct: this runs from
+	// DlssApp::on_device(created=false), i.e. the device is being destroyed and the caller has
+	// already established that nothing is executing on it. Anything still in the graveyard goes
+	// with it — there is no queue left to fence against.
+	if (!g_graves.empty())
+		STRAY_LOG_INFO("NR: shutdown with %u object(s) still waiting on the GPU timeline; the "
+			"device is going away, so they are released here.",
+			static_cast<unsigned int>(g_graves.size()));
+	release_feature_now("shutdown");
 	release(g_crop_input.buffer);
 	release(g_crop_proxy.buffer);
 	release(g_crop_neural.buffer);
 	nrp::shutdown();
 	release(g_nr_output);
+	for (Grave &g : g_graves)
+		g.obj->Release();
+	g_graves.clear();
+	release(g_fence);
+	g_fence_failed = false;
+	g_timeline = nrlife::Timeline{};
+	g_last_eval_tag = nrlife::Tag{};
+	g_release_feature_requested = false;
+	g_teardown_requested = false;
 	g_guide_latch = nrplan::GuideExtentLatch{};
 	// A snippet that was loaded but never initialised is a NORMAL, safe resting state — RenoDX
 	// says as much in its own words ("nvngx_dlssnr.dll was loaded but never initialized;

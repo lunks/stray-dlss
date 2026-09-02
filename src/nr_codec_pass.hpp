@@ -22,6 +22,8 @@
 // transition pair. The reference deployment binds it the same way.
 #pragma once
 
+#include "core/nr_lifetime.hpp"
+
 #include <cstdint>
 
 struct ID3D12Device;
@@ -54,6 +56,31 @@ TypedUavSupport probe_typed_uav(ID3D12Device *device, int format);
 bool initialise(ID3D12Device *device, ID3D12Resource *image, std::uint32_t width,
                 std::uint32_t height);
 
+// --- deferred destruction (src/core/nr_lifetime.hpp) ---
+//
+// Everything this pass owns is bound into command lists that NGX and we record and that the GPU
+// executes later, so none of it may be destroyed on the thread that decided to stop using it.
+// The proxy is DLSSNR.Color itself; the descriptor heap holds the UAVs both dispatches read; the
+// PSOs and the root signature are referenced by any list still in flight. A sibling port of this
+// integration crashed on exactly this transition (RemixProjGroup/dxvk-remix @ a69254ab).
+//
+// The GPU timeline these frees are decided against. ngx_nr owns the fence and hands the timeline
+// down every frame; a pass whose timeline is never set frees nothing, which is the safe
+// direction.
+void set_timeline(const nrlife::Timeline &timeline);
+
+// Tear down at the next safe point instead of now. Safe to call from ANY thread — the ini
+// reloader, the overlay checkbox — because it only moves the live set into the graveyard. Nothing
+// is destroyed until collect() runs at the present boundary with a timeline the GPU has passed.
+// A later initialise() simply builds a fresh set; the old one waits out its fence beside it.
+void request_shutdown();
+
+// Frees whatever the timeline says the GPU can no longer be reading. PRESENT BOUNDARY ONLY.
+void collect();
+
+// IMMEDIATE teardown, for device destruction only — there is no queue left to fence against at
+// that point. Logs loudly if anything was still waiting on the GPU, because that is the one call
+// site where the "is the GPU really idle?" question is answered by the caller and not by us.
 void shutdown();
 
 bool is_ready();
