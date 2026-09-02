@@ -55,7 +55,10 @@ T0=$(date +%s)
 UP_EPOCH=""
 game_running() { pgrep -x Stray-Win64-Shi >/dev/null 2>&1; }
 chain_present() { pgrep -f "AppId=$APPID" >/dev/null 2>&1; }
-field() { awk -F= -v k="$2" '$1 == k { print $2; f = 1 } END { if (!f) print "" }' "$1" 2>/dev/null; }
+# The probe is written by the game through Wine's C runtime in text mode, so its lines end
+# in \r\n; strip the CR or "ingame=1\r" never equals "1" (this exact bug kept the first run
+# pressing Enter in gameplay for minutes, 2026-09-02).
+field() { awk -F= -v k="$2" '{ sub(/\r$/, "", $2) } $1 == k { print $2; f = 1 } END { if (!f) print "" }' "$1" 2>/dev/null; }
 mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
 newer() { [ "$(mtime "$1")" -ge "$T0" ]; }
 find_keyboard() { awk '/^H: Handlers=/ && /sysrq/ { if (match($0, /event[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit } }' /proc/bus/input/devices; }

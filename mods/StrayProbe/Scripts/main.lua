@@ -64,7 +64,9 @@ local function write()
     local map = mapName()
     local menu = map:lower():find("menu", 1, true) ~= nil
     local ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
-    local f = io.open(STATE, "w")
+    -- "wb": the game's C runtime is Windows', and text mode turns "\n" into "\r\n", which
+    -- the shell readers then mis-compare ("1\r" ~= "1"). Binary mode writes what we say.
+    local f = io.open(STATE, "wb")
     if not f then return end
     f:write(string.format("seq=%d\nt=%d\npawn=%d\npc=%d\nmap=%s\ningame=%d\n",
         seq, os.time(), pawn, pc, map, ingame))
