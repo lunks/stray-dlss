@@ -674,7 +674,10 @@ void shutdown()
 	g_state.format_checked = false;
 	g_state.encoded_this_frame = false;
 	g_state.stats.live_retired = 0;
-	g_state.timeline = nrlife::Timeline{};
+	// The timeline is deliberately NOT reset. It is the OWNER's clock, pushed down every frame,
+	// and initialise() calls this on a device change — clearing it there would drop `have_fence`
+	// and silently demote every tag taken afterwards to the no-fence present ring. That is safe
+	// but it is not what was asked for, and it hid for exactly one CI round trip.
 }
 
 bool record_encode(ID3D12GraphicsCommandList *cmd, ID3D12Resource *image, std::uint32_t width,

@@ -41,4 +41,67 @@ struct GuideExtentLatch
 // first frame as a change would put a spurious reset into every session.
 bool latch_guide_extent(GuideExtentLatch &latch, std::uint32_t width, std::uint32_t height);
 
+// ---------------------------------------------------------------------------------------
+// NO CODEC, NO EVALUATE.
+//
+// Feature 18 is a DISPLAY-REFERRED image network. Our hook point — the intercepted TAA dispatch
+// — carries raw, unbounded, PRE-EXPOSED LINEAR HDR, which is not in its domain, and the HDR
+// codec's soft clip and exact sRGB encode are precisely what put it there. The proxy is not a
+// tuning stage that can be skipped; it IS the input contract. Measured with it missing: a neural
+// output whose max luminance read 0.0026 and red noise on the screen.
+//
+// A sibling port of this integration reached the same rule from the other direction. It moved
+// its pass to after the runtime's sRGB encode because feeding the network a linear image made
+// the runtime apply a second gamma curve on top — "lifted blacks and washed out greys in dark
+// scenes, exactly as reported" — and it declines the frames where that encode is suppressed
+// "rather than evaluating on an input domain the model was not trained on"
+// (RemixProjGroup/dxvk-remix, branch dlss-nr @ 2df9c812). Two ports, two hook points, one rule.
+//
+// So every way of arriving at EvaluateFeature without a correct proxy is enumerated here and
+// answered with a refusal rather than a fall-through.
+// ---------------------------------------------------------------------------------------
+enum class CodecGate
+{
+	evaluate,
+	// This call site does not run the encode/decode pair at all. The post-tonemap sites that
+	// legitimately bypassed the codec were removed on 2026-09-02, so reaching this now means an
+	// un-encoded image would have been handed to the network.
+	no_codec,
+	// The encode dispatch did not record, so the proxy holds whatever the last frame left.
+	encode_failed,
+	// NgxNRTrackExposure is on and the engine's exposure has never decoded, so the scale — which
+	// DEFINES the display-referred units — is unknown. Substituting the static scale silently
+	// moves the network's input domain, and feature 18's own temporal history was accumulated in
+	// the other one.
+	exposure_unknown,
+	// The scale is pinned at one of nrc's clamps (or is zero/negative/NaN). The proxy is then
+	// flat black or flat white: an image in the right FORMAT carrying no signal.
+	degenerate_scale,
+};
+
+struct CodecGateInputs
+{
+	bool codec_site = true;
+	bool encode_recorded = false;
+	bool track_exposure = true;
+	// Whether a plausible engine exposure has EVER been read this session, not whether this
+	// particular frame's View CB decoded: the smoothed factor legitimately carries across a bad
+	// frame, and one unreadable constant buffer is not an unknown operating point.
+	bool exposure_known = false;
+	float scale = 0.0f;
+};
+
+CodecGate codec_gate(const CodecGateInputs &in);
+
+// Any frame NR declines is a hole in feature 18's own temporal continuity: it reprojects its
+// accumulation with motion vectors describing one frame of motion, and a skipped frame makes
+// that reprojection wrong. The next evaluate must therefore carry DLSSNR.Reset — once.
+struct EvaluateGapLatch
+{
+	bool reset_pending = false;
+};
+
+void note_evaluate_gap(EvaluateGapLatch &latch);
+bool take_evaluate_reset(EvaluateGapLatch &latch);
+
 } // namespace stray_dlss::nrplan

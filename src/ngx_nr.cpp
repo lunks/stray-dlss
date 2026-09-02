@@ -33,6 +33,10 @@ const char *const kNrRefusalNames[kNrRefusalCount] = {
 	// A teardown or a resolution change is waiting on the GPU. Frames in this state are normal
 	// and brief; a rate that never falls means a fence that never advances.
 	"recreating",
+	// NO CODEC, NO EVALUATE (src/core/nr_hook_plan.hpp). The proxy IS the input contract of a
+	// display-referred network, so a frame that cannot produce a correct one is declined rather
+	// than handed raw HDR.
+	"no-codec", "exposure-unknown", "degenerate-scale",
 };
 
 } // namespace stray_dlss::nr
@@ -139,6 +143,9 @@ enum
 	kRefCodecFailed,
 	kRefCodecTopology,
 	kRefRecreating,
+	kRefNoCodec,
+	kRefExposureUnknown,
+	kRefDegenerateScale,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -205,6 +212,9 @@ bool g_track_exposure = true;
 // that, MVecScale silently goes from 2.0 to 1.42857 under a history accumulated against the old
 // grid. Rule and provenance: src/core/nr_hook_plan.hpp.
 nrplan::GuideExtentLatch g_guide_latch;
+// Any frame NR declines before the evaluate leaves a hole in feature 18's own temporal
+// continuity, so the next evaluate carries DLSSNR.Reset. (src/core/nr_hook_plan.hpp)
+nrplan::EvaluateGapLatch g_gap_latch;
 // The rect the codec actually processed this frame — the OUTPUT subrect, which can be smaller
 // than the colour texture's allocation (the GetOutputExtent Max() lesson, CLAUDE.md §5). Every
 // validation crop is centred on this rect so the three luminances describe the same pixels.
@@ -343,6 +353,18 @@ bool refuse(int reason, const char *fmt_msg)
 		}
 	}
 	return false;
+}
+
+// A refusal that happens BEFORE the evaluate. Feature 18 keeps its own temporal accumulation and
+// reprojects it with motion vectors describing exactly one frame of motion, so a frame it never
+// saw is a hole in that continuity — the next evaluate must not reproject across it. Refusals
+// that happen AFTER a successful evaluate (validating, degenerate-output) go through plain
+// refuse(): those frames DID reach the network, and forcing a reset for them would discard the
+// accumulation on every frame of the validation window.
+bool refuse_pre_evaluate(int reason, const char *fmt_msg)
+{
+	nrplan::note_evaluate_gap(g_gap_latch);
+	return refuse(reason, fmt_msg);
 }
 
 void set_error(const char *what, NVSDK_NGX_Result result)
@@ -1050,7 +1072,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// of demonstrably healthy frames before a leaked pre-release DLL contacts the GPU is us
 	// being more conservative than RenoDX ON PURPOSE — not a guess about their behaviour.
 	if (g_sr_evaluates_seen < g_warmup_frames)
-		return refuse(kRefWarmup, "waiting out the NR warmup window before initialising the "
+		return refuse_pre_evaluate(kRefWarmup, "waiting out the NR warmup window before initialising the "
 			"runtime.");
 
 	// FIRST USE: load (if not pre-loaded) and initialise, exactly once. Both halves latch, so
@@ -1058,7 +1080,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (!g_load_tried)
 		load_snippet_once();
 	if (!g_runtime_loaded)
-		return refuse(kRefDllMissing, "nvngx_dlssnr.dll was never loaded.");
+		return refuse_pre_evaluate(kRefDllMissing, "nvngx_dlssnr.dll was never loaded.");
 	if (!g_init_tried)
 	{
 		STRAY_LOG_WARN("NR: warmup complete (%llu SR evaluates) — initialising the NR runtime "
@@ -1069,13 +1091,13 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	if (device == nullptr || cmd == nullptr || in.image == nullptr || in.depth == nullptr ||
 		in.motion_vectors == nullptr || in.render_width == 0 || in.output_width == 0)
-		return refuse(kRefBadInputs, "a required resource or dimension was missing.");
+		return refuse_pre_evaluate(kRefBadInputs, "a required resource or dimension was missing.");
 
 	// A queued teardown or feature release owns the working set until the present boundary has
 	// carried it out. Evaluating into resources that are on their way to the graveyard is exactly
 	// the use-after-free this whole path exists to prevent, so decline and count it.
 	if (g_teardown_requested || g_release_feature_requested)
-		return refuse(kRefRecreating,
+		return refuse_pre_evaluate(kRefRecreating,
 			"a teardown or a feature release is queued and is waiting on the GPU fence.");
 
 	// The pass's deferred frees are decided against the same timeline this module owns.
@@ -1094,6 +1116,21 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	//                  because this site is TERMINAL (nothing carries it into the next frame).
 	const bool codec = in.site == Site::taa_dispatch;
 
+	// NO CODEC, NO EVALUATE — the site half of the rule, asked of the same pure gate that decides
+	// the rest of it (src/core/nr_hook_plan.hpp). The post-tonemap sites were removed on
+	// 2026-09-02 and nothing passes Site::post_tonemap today, but the branch below that would
+	// hand the network an image the codec never touched is still reachable code, and a
+	// display-referred network fed an un-encoded image is exactly the failure this project spent
+	// a session diagnosing. Refuse it here rather than leave a fall-through for a future caller
+	// to walk into.
+	// nrplan::codec_gate answers `no_codec` for exactly this input and is tested per reason; the
+	// check is made here, before anything is recorded, so no barrier needs unwinding.
+	if (!codec)
+		return refuse_pre_evaluate(kRefNoCodec,
+			"this call site does not run the HDR codec, and feature 18 is a display-referred "
+			"network: without the soft-clip + sRGB proxy its input is out of domain. The "
+			"post-tonemap sites that legitimately bypassed the codec were removed on 2026-09-02.");
+
 	// The residual needs the proxy, the neural answer and the original to be the SAME pixels.
 	// sr-shaped puts Color at render resolution and Output at display resolution, so there is no
 	// per-pixel correspondence to subtract across and no residual exists to carry. It is equally
@@ -1102,7 +1139,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// a 0.0026 neural output (src/core/nr_codec.hpp).
 	const bool post = g_topology == Topology::post_process;
 	if (!post)
-		return refuse(kRefCodecTopology,
+		return refuse_pre_evaluate(kRefCodecTopology,
 			"NgxNRTopology=sr cannot use the HDR colour codec: the residual transfer needs the "
 			"proxy, the neural answer and the original to be the same pixels, and sr-shaped puts "
 			"the colour input at render resolution and the output at display resolution. Use "
@@ -1123,21 +1160,21 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	{
 		const D3D12_RESOURCE_DESC cd = colour->GetDesc();
 		if (cd.MipLevels != 1 || cd.DepthOrArraySize != 1 || cd.SampleDesc.Count != 1)
-			return refuse(kRefMippedInput,
+			return refuse_pre_evaluate(kRefMippedInput,
 				"the colour input is not a plain single-mip, single-slice, non-MSAA 2D texture; "
 				"handing one to the neural runtime hangs the GPU instead of returning an error.");
 	}
 
 	// The result goes to OUR texture, never straight over the engine's output.
 	if (!ensure_output_texture(device, in.image))
-		return refuse(kRefAllocFailed, g_last_error);
+		return refuse_pre_evaluate(kRefAllocFailed, g_last_error);
 	if (!ensure_feature(cmd, in.render_width, in.render_height, in.output_width,
 			in.output_height))
 	{
 		if (g_release_feature_requested)
-			return refuse(kRefRecreating,
+			return refuse_pre_evaluate(kRefRecreating,
 				"the feature's rects moved; its release is deferred to the present boundary.");
-		return refuse(kRefCreateFailed, "feature 18 could not be created.");
+		return refuse_pre_evaluate(kRefCreateFailed, "feature 18 could not be created.");
 	}
 
 	ext_unhook::repair();
@@ -1158,7 +1195,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		// linear HDR, so what the snippet gets is the PROXY, never the engine's raw image.
 		// Nothing below reads `in.image` again until the decode. (src/core/nr_codec.hpp)
 		if (!nrp::initialise(device, in.image, cw, ch))
-			return refuse(kRefCodecFailed, nrp::last_error());
+			return refuse_pre_evaluate(kRefCodecFailed, nrp::last_error());
 
 		// TRACKED EXPOSURE. `1.0f` is the fallback paper white, not an exposure — see
 		// nrc::proxy_scale's signature.
@@ -1204,13 +1241,55 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 					? ", but the View CB was unreadable so the STATIC scale was used" : "",
 				static_cast<double>(codec_scale));
 		}
-		if (!nrp::record_encode(cmd, in.image, cw, ch, codec_scale, g_color_strength,
-				g_transfer_strength))
-			return refuse(kRefCodecFailed, nrp::last_error());
-
+		const bool encode_ok = nrp::record_encode(cmd, in.image, cw, ch, codec_scale,
+			g_color_strength, g_transfer_strength);
 		colour = nrp::proxy();
-		if (colour == nullptr)
-			return refuse(kRefCodecFailed, "the codec produced no proxy texture.");
+
+		// NO CODEC, NO EVALUATE. Every way of reaching EvaluateFeature without a correct proxy is
+		// enumerated by nrplan::codec_gate and refused here, because the proxy is not a tuning
+		// stage — it IS the input contract of a display-referred network, and the alternative is
+		// the raw-HDR path that measured a 0.0026 neural output with red noise on screen.
+		//
+		// `exposure_known` is deliberately "has a plausible exposure EVER been read", not "did
+		// this frame's View CB decode": the smoothed factor legitimately carries across one bad
+		// frame, and dropping NR for a single unreadable constant buffer would be worse than the
+		// problem. What it catches is the case where the scale's exposure term was never defined
+		// at all and the static scale was quietly substituted for it — a different input domain
+		// from the one feature 18's own history was accumulated in.
+		nrplan::CodecGateInputs gi;
+		gi.codec_site = true;
+		gi.encode_recorded = encode_ok && colour != nullptr;
+		gi.track_exposure = g_track_exposure;
+		gi.exposure_known = g_exposure_smoothed > 0.0f;
+		gi.scale = codec_scale;
+		const nrplan::CodecGate gate = nrplan::codec_gate(gi);
+		if (gate != nrplan::CodecGate::evaluate)
+		{
+			// Nothing has been transitioned yet, so there is no barrier to unwind — the refusal
+			// is recorded before the proxy is put into NON_PIXEL_SHADER_RESOURCE, on purpose.
+			switch (gate)
+			{
+			case nrplan::CodecGate::exposure_unknown:
+				return refuse_pre_evaluate(kRefExposureUnknown,
+					"NgxNRTrackExposure is on but the engine's exposure (View row 135.z) has "
+					"never decoded, so the codec's scale — which DEFINES the display-referred "
+					"units the network and its history work in — is unknown. Evaluating on the "
+					"static scale instead would silently move the input domain.");
+			case nrplan::CodecGate::degenerate_scale:
+				return refuse_pre_evaluate(kRefDegenerateScale,
+					"the codec scale is pinned at one of nrc's clamps, so the proxy is flat black "
+					"or flat white: the right format carrying no image.");
+			case nrplan::CodecGate::no_codec:
+				return refuse_pre_evaluate(kRefNoCodec,
+					"this call site does not run the HDR codec, so there is no proxy to hand the "
+					"network.");
+			case nrplan::CodecGate::encode_failed:
+			case nrplan::CodecGate::evaluate:
+			default:
+				return refuse_pre_evaluate(kRefCodecFailed,
+					encode_ok ? "the codec produced no proxy texture." : nrp::last_error());
+			}
+		}
 
 		// NVIDIA's guide wants NGX inputs in NON_PIXEL_SHADER_RESOURCE. The proxy is ours, so
 		// this costs nothing and removes one way to get a silently black result
@@ -1246,6 +1325,26 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// nothing else in the pipeline notices. Latch the extent and force ONE reset frame when it
 	// moves, exactly as the reference deployment does. (src/core/nr_hook_plan.hpp)
 	bool reset = in.reset;
+
+	// A FRAME NR DECLINED IS A HOLE IN FEATURE 18'S OWN TEMPORAL CONTINUITY. It reprojects its
+	// accumulation with motion vectors that describe exactly one frame of motion, so reprojecting
+	// across a gap fetches history from the wrong place for every pixel that moved — the same
+	// class of error as a wrong MVecScale, and it compounds through the accumulation rather than
+	// costing one frame (CLAUDE.md, "bad motion vectors do not produce one bad frame"). Taken
+	// exactly once, so a run of declined frames costs one reset and not one per frame.
+	if (nrplan::take_evaluate_reset(g_gap_latch))
+	{
+		reset = true;
+		static bool s_gap_logged = false;
+		if (!s_gap_logged)
+		{
+			s_gap_logged = true;
+			STRAY_LOG_INFO("NR: the previous frame(s) were declined, so this evaluate carries "
+				"DLSSNR.Reset — feature 18's accumulation must not be reprojected across a gap. "
+				"First occurrence only; the periodic NR line carries the refusal rate by reason, "
+				"which is what says whether this is happening constantly.");
+		}
+	}
 
 	// THE CODEC SCALE DEFINES THE UNITS NR'S HISTORY IS ACCUMULATED IN, so a scale change
 	// invalidates that history exactly as a guide-grid change does — and just as silently.
@@ -1366,7 +1465,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (NVSDK_NGX_FAILED(result))
 	{
 		set_error("EvaluateFeature(18)", result);
-		return refuse(kRefEvaluateFailed, g_last_error);
+		return refuse_pre_evaluate(kRefEvaluateFailed, g_last_error);
 	}
 
 	// Hold everything NGX touched alive past GPU execution, under the tag taken above.

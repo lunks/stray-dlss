@@ -144,6 +144,13 @@ bool test_nr_codec_deferred_destruction(Gpu &gpu)
 		return false;
 	}
 	check(nrp::is_ready(), "the codec pass came up");
+	// Again after the first initialise, which takes the device-change path. The pass must not
+	// lose the timeline there — it did once, and every tag silently fell back to the no-fence
+	// present ring, which passes a "nothing is freed early" test while proving nothing about the
+	// fence. Push it again and assert the pass is really on the fence.
+	nrp::set_timeline(timeline);
+	check(nrlife::tag_now(timeline).fence != 0,
+		"tags taken now name a real fence value, not the no-fence fallback");
 
 	// Hold our own reference on the proxy for the whole sequence, so the object survives long
 	// enough for us to ask whether the PASS has released it.
