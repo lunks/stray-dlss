@@ -262,8 +262,13 @@ if(STRAY_DLSS_BUILD_NATIVE)
         # accidental /MD build stays loadable against an old msvcp140.dll.
         _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
+    # /Z7, not /Zi: debug info goes into each .obj instead of a PDB shared by every object of
+    # the target. The linker's /DEBUG still emits the target PDB, so nothing downstream
+    # changes - but sccache (the plugin CI's compile cache, .github/workflows/dlss-plugin.yml)
+    # refuses to cache any /Zi compile whose /Fd is shared ("shared pdb" in its msvc.rs), and
+    # CMake+Ninja hands every object of a target the same /Fd.
     target_compile_options(stray_dlss_native PRIVATE
-        /W4 /permissive- /Zi
+        /W4 /permissive- /Z7
         $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
     # The SDK's C interface (CINTERFACE) trips /W4 inside d3d12.h itself; the slot check is a
     # set of negative-array-size typedefs, which are ERRORS at any warning level, so /W3 there

@@ -119,10 +119,40 @@ jobs:
           x86_64-w64-mingw32-gcc -c ../../src/backend_native/vtable_slots_check.c -o /tmp/obj/slots.o
           echo "the Win32 host compiles; the DXGI/D3D12 slot numbers are the SDK's"
 
+  # ---------------------------------------------------------------------------------------
+  # CACHING, and what must NEVER be cached.
+  #
+  # Measured on run 33579755872 (cold, 18:00 wall): Clone 8 s, Configure 79 s (FetchContent
+  # clones of ten public deps), Build 16:09 — of which ~4 min is the patternsleuth Rust crate
+  # through corrosion, ~10 min is cl.exe over Unreal/UE4SS/deps, ~1 min is LTCG linking.
+  # Three caches, in order of payoff:
+  #
+  #   1. sccache over every cl.exe invocation (CMAKE_*_COMPILER_LAUNCHER), GHA cache backend.
+  #      Requires /Z7: sccache refuses any /Zi compile whose /Fd is shared between objects
+  #      ("shared pdb", src/compiler/msvc.rs), and CMake+Ninja gives every object of a target
+  #      the same /Fd. RE-UE4SS's Shipping config hardcodes /Zi, so it is patched below and the
+  #      patch is ASSERTED against the configured flags. The linker's /DEBUG:FULL still emits
+  #      every PDB from the embedded records.
+  #   2. The cargo registry plus corrosion's target dir (build/cargo), keyed on rustc and the
+  #      two Cargo.lock files. patternsleuth is a public crate (trumank/patternsleuth).
+  #   3. FetchContent's cloned sources (build/_deps/*-src, *-subbuild), keyed on the file that
+  #      pins them. All public third-party code.
+  #
+  # NOT cached, on purpose: the RE-UE4SS checkout itself. Its deps/first/Unreal submodule is
+  # the PRIVATE Re-UE4SS/UEPseudo tree of Epic-licensed Unreal headers, fetched with a secret.
+  # This repo is public, and a cache saved on the base branch is restorable by a secret-less
+  # run (a fork's pull request), so those headers must never be under any cached path. They
+  # are not: the caches above hold compiled objects, Rust artifacts and public sources only,
+  # and the clone is 8 s anyway. Keep it that way — never add RE-UE4SS/ to a cache path.
+  #
+  # Also not cached: nvsdk_ngx_d.lib (a ~1 s, 1 MB download; a cache step costs as much).
+  # ---------------------------------------------------------------------------------------
   plugin:
     name: Plugin DLL (Windows, MSVC)
     runs-on: windows-latest
     needs: mingw
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -134,15 +164,26 @@ jobs:
         with:
           arch: x64
 
+      # No major tag exists for this action (v0.0.x only), so it is pinned to the release.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       # Rust is needed: deps/first/patternsleuth is a Rust crate that RE-UE4SS's CMake drives
       # through corrosion. windows-latest ships a toolchain; assert it rather than discover it
-      # halfway through a 20-minute build.
+      # halfway through a 20-minute build. The rustc version keys the cargo cache: a target
+      # dir built by another rustc is worthless to this one.
       - name: Check the toolchain
+        id: toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           cargo --version
           cmake --version
           ninja --version
+          sccache --version
+          $rustc = (rustc --version)
+          Write-Host $rustc
+          "rustc=$($rustc.Split(' ')[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # The NGX import library for the DYNAMIC CRT (_d): the plugin is /MD by UE4SS's ABI
       # contract, unlike the add-on (/MT, nvsdk_ngx_s.lib). Fetched, not committed, as ci.yml
@@ -235,6 +276,52 @@ jobs:
           }
           Write-Host "UE4SS sources are complete."
 
+      # Cache 2: the cargo registry and corrosion's target dir. Only PUBLIC crates live here
+      # (see the block comment above the job). The key needs the Cargo.lock files, which exist
+      # only after the clone, so this step sits after it. The prefix fallback is safe for the
+      # same reason: nothing under these paths came from a secret.
+      - name: Cache cargo (patternsleuth)
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/cargo
+          key: cargo-${{ runner.os }}-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('RE-UE4SS/deps/first/patternsleuth/Cargo.lock', 'RE-UE4SS/deps/first/patternsleuth_bind/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.toolchain.outputs.rustc }}-
+
+      # Cache 3: FetchContent's clones (glaze, glfw, imgui, fmt, polyhook2, zydis, raw_pdb,
+      # corrosion, ...), all public. Keyed on the file that pins them; NO prefix fallback, so a
+      # changed pin set starts clean rather than reusing a tree at the wrong tag.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/*-src
+            build/_deps/*-subbuild
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('RE-UE4SS/deps/third/CMakeLists.txt') }}
+
+      # Cache 1's precondition: RE-UE4SS's Shipping config compiles with /Zi
+      # (cmake/modules/CompilerOptions/msvc-compatible.cmake), which propagates to every
+      # target in the build, ours included. Under CMake+Ninja that is a per-TARGET shared PDB,
+      # which sccache cannot cache ("shared pdb"). /Z7 embeds the same records in each .obj;
+      # the link (/DEBUG:FULL) still produces every PDB. The substitution is asserted here and
+      # the configured flags are asserted again after Configure.
+      - name: Embed debug info (/Z7) so sccache can cache the compiles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $f = 'RE-UE4SS/cmake/modules/CompilerOptions/msvc-compatible.cmake'
+          $before = Get-Content $f -Raw
+          $after = $before -replace 'set\(Shipping_FLAGS "/Zi" PARENT_SCOPE\)', 'set(Shipping_FLAGS "/Z7" PARENT_SCOPE)'
+          if ($after -eq $before) {
+            throw "$f no longer contains 'set(Shipping_FLAGS ""/Zi"" PARENT_SCOPE)': RE-UE4SS changed its flag plumbing. Re-derive the /Z7 substitution before trusting sccache."
+          }
+          Set-Content $f $after -NoNewline
+          Select-String -Path $f -Pattern 'Shipping_FLAGS' | ForEach-Object { Write-Host $_.Line }
+
       # The layout RE-UE4SS documents for C++ mods: a parent project that adds RE-UE4SS and
       # then the mod. mods/StrayDLSS/CMakeLists.txt detects the UE4SS target and builds the
       # DLL only in that case.
@@ -251,16 +338,58 @@ jobs:
             'add_subdirectory(repo/mods/StrayDLSS StrayDLSS)')
           Get-Content CMakeLists.txt
 
+      # Quoted: pwsh does not expand $env: inside a bare -D argument (measured: CMake received the
+      # literal text "$env:BUILD_CONFIG").
+      #
+      # FETCHCONTENT_UPDATES_DISCONNECTED: with cache 3 restored, skip the per-dep update step
+      # (the pins cannot have moved without a new cache key). CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+      # is belt and braces: it turns any CMake-injected debug-format flag into /Z7 too.
       - name: Configure
         shell: pwsh
-        # Quoted: pwsh does not expand $env: inside a bare -D argument (measured: CMake received the
-        # literal text "$env:BUILD_CONFIG").
-        run: cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)" `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
+            -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
+          # The /Z7 substitution must have reached the flags every target compiles with, and the
+          # launcher must have landed: a cache that silently never engaged is a no-op, not a
+          # speed-up.
+          $cache = Get-Content build/CMakeCache.txt
+          $cfg = $env:BUILD_CONFIG.ToUpper()
+          foreach ($lang in @('C', 'CXX')) {
+            $line = $cache | Where-Object { $_ -like "CMAKE_${lang}_FLAGS_${cfg}:*" }
+            Write-Host $line
+            if (-not $line) { throw "CMAKE_${lang}_FLAGS_${cfg} is not in CMakeCache.txt" }
+            if ($line -notmatch '/Z7') { throw "CMAKE_${lang}_FLAGS_${cfg} lacks /Z7: $line" }
+            if ($line -match '/Zi\b') { throw "CMAKE_${lang}_FLAGS_${cfg} still carries /Zi, which sccache cannot cache: $line" }
+            $launcher = $cache | Where-Object { $_ -like "CMAKE_${lang}_COMPILER_LAUNCHER:*" }
+            Write-Host $launcher
+            if ($launcher -notmatch 'sccache') { throw "CMAKE_${lang}_COMPILER_LAUNCHER is not sccache: $launcher" }
+          }
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
       - name: Build the plugin
-        run: cmake --build build --target StrayDLSS --parallel
+        shell: pwsh
+        run: |
+          sccache --zero-stats | Out-Null
+          cmake --build build --target StrayDLSS --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      # Read this to know whether the cache did anything: "Cache hits" against "Cache misses",
+      # and every "Non-cacheable" reason. Zero compile requests means the launcher never
+      # engaged - that is a fault in the caching, so it fails the job.
+      - name: sccache stats
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stats = & sccache --show-stats | Out-String
+          Write-Host $stats
+          $m = [regex]::Match($stats, 'Compile requests\s+(\d+)')
+          if (-not $m.Success) { throw "sccache --show-stats printed no 'Compile requests' line" }
+          if ([int]$m.Groups[1].Value -eq 0) { throw "sccache saw zero compile requests: the compiler launcher never engaged" }
 
       # A DLL that does not export start_mod/uninstall_mod is FreeLibrary'd by UE4SS with a
       # warning and nothing else happens (UE4SS/src/Mod/CppMod.cpp resolves both by literal
@@ -300,8 +429,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/StrayDLSS/dlls | Out-Null
           # UE4SS loads <Mods>/<ModName>/dlls/main.dll, so ship it pre-named.
           Copy-Item "${{ steps.verify.outputs.dll }}" dist/StrayDLSS/dlls/main.dll
+          # The PDB is produced by the link (/DEBUG) from the /Z7 records in the objects. It used
+          # to be copied only if present; with the debug-format change it is asserted instead,
+          # so a build that silently lost its symbols cannot ship.
           $pdb = [IO.Path]::ChangeExtension("${{ steps.verify.outputs.dll }}", '.pdb')
-          if (Test-Path $pdb) { Copy-Item $pdb dist/StrayDLSS/dlls/main.pdb }
+          if (-not (Test-Path $pdb)) { throw "StrayDLSS.pdb was not produced next to the DLL ($pdb)" }
+          Copy-Item $pdb dist/StrayDLSS/dlls/main.pdb
           Copy-Item repo/mods/StrayDLSS/StrayDLSS.ini dist/StrayDLSS/
           Copy-Item repo/mods/StrayDLSS/README.md dist/
           Set-Content dist/mods.txt.fragment @(

@@ -122,6 +122,10 @@ set_property(TARGET StrayDLSS PROPERTY
 set_target_properties(StrayDLSS PROPERTIES OUTPUT_NAME "StrayDLSS")
 
 if(MSVC)
-    target_compile_options(StrayDLSS PRIVATE /Zi)
+    # /Z7 (debug info embedded in each .obj), not /Zi (a PDB shared by the whole target):
+    # sccache cannot cache a /Zi compile whose /Fd is shared between objects, and CMake+Ninja
+    # gives every object of a target the same /Fd. /DEBUG below still produces StrayDLSS.pdb
+    # from the embedded records, and CI asserts that PDB exists before staging the artifact.
+    target_compile_options(StrayDLSS PRIVATE /Z7)
     target_link_options(StrayDLSS PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()
