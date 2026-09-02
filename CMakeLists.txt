@@ -47,6 +47,18 @@ if(MSVC)
     else()
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
+
+    # std::mutex's constexpr constructor (MSVC STL >= 17.10) zero-initialises the mutex and
+    # skips _Mtx_init_in_situ; the FIRST lock against an OLDER msvcp140.dll then dereferences an
+    # uninitialised field and faults inside MSVCP140.dll. Stray's Proton prefix ships a Nov-2020
+    # msvcp140 (measured), so a /MD build that links it crashes on its first std::mutex lock.
+    # This macro keeps the pre-17.10 (init-in-situ) layout. It MUST cover EVERY target that
+    # constructs a std::mutex, not just the native library: src/log.cpp (the file sink, whose
+    # g_mutex init_file_sink locks as the first thing the UE4SS host does) lives in
+    # stray_dlss_core, and a per-target definition on stray_dlss_native alone left core without
+    # it — which crashed the plugin's start_mod in MSVCP140.dll +0x12eb0, before any log line
+    # (measured 2026-09-02). Global, so no translation unit can miss it. Harmless under /MT.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 endif()
 
 # ---------------------------------------------------------------------------------------
