@@ -195,6 +195,49 @@ with no validation and no error for an unknown key, so a typo or a stale name is
 indistinguishable from a value that was accepted and ignored. Any name we write must be
 confirmed present in the runtime binary first.
 
+#### The TYPE is as unvalidated as the name — and ours were wrong [SOFT, 2026-09-02]
+
+The name audit above answers "does the runtime know this key". It does **not** answer "does the
+runtime read it as the type we wrote", and that is a second, independent way to write a value
+that is silently never used.
+
+`NVSDK_NGX_Parameter` declares **separate virtual overloads** for `int` and `unsigned int`
+(`third_party/ngx/include/nvsdk_ngx_params.h:58-59`), so `Set(name, 0u)` and `Set(name, 0)` are
+different vtable slots storing under different type tags. The block has no validation and returns
+nothing, so a type mismatch presents exactly like the `DLSSNR.Scale` bug: a value that looks set
+and is never read.
+
+**We wrote every subrect and extent through the UNSIGNED overload.** `DLSSNR.{Color,Depth,MVec,
+Output}Subrect{BaseX,BaseY,Width,Height}` took `0u` and `std::uint32_t` extents;
+`DLSSNR.Width`/`Height` took `std::uint32_t`. Sixteen rect parameters plus two extents, all as
+`unsigned int`.
+
+**The audit says signed.** A sibling port of this integration states, from its own disassembly of
+the snippet: *"the subrect type question resolves in favour of what this port already does — the
+snippet Gets subrects as int, which is what is written here, whereas that fork writes unsigned
+and absorbs the mismatch in a type-agnostic parameter bag of its own rather than the driver's"*
+(RemixProjGroup/dxvk-remix, branch `dlss-nr`, commit `2df9c812`). "That fork" is a DXVK
+integration whose parameter bag is its own code, so the mismatch never reaches NGX there. **Ours
+is the real `NVSDK_NGX_Parameter`, so ours would.**
+
+**Status SOFT**, deliberately: we have not disassembled `nvngx_dlssnr.dll` ourselves for this, and
+one reading of someone else's disassembly is not the same as reading the binary. But the change
+costs nothing, it is the only available reading of the callee, and being wrong in the signed
+direction costs at most a rect the runtime ignores — which is what the unsigned form may already
+be doing.
+
+**Fixed 2026-09-02.** The rect and extent block now comes from `src/core/nr_params.{hpp,cpp}`,
+which carries the names AND the types as data, and `tests/test_nr_params.cpp` pins that every
+subrect and extent is `Type::i32`, that the name set is exactly the runtime's, that
+`DLSSNR.Scale` can never come back, and that a `uint32` extent above `INT32_MAX` is clamped rather
+than wrapped into a negative the runtime would take at face value.
+
+**Not audited, and therefore unchanged:** `DLSSNR.DepthInverted`, `DLSSNR.Enabled`,
+`DLSSNR.UseAutoMask`, `DLSSNR.UICorrection` and `DLSSNR.Hint.Render.Preset` are still written as
+`unsigned int`, and `DLSSNR.Reset` as `int`. The current configuration produces a correct image
+with those types, so they are left alone until someone reads the binary; **UNCONFIRMED** either
+way.
+
 The mapping from RenoDX's shipped `[RenoDX.DLSS5]` ini keys to runtime parameters:
 
 | ini key | value | runtime parameter |

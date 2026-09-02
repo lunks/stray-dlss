@@ -9,6 +9,7 @@
 #include "core/nr_codec.hpp"
 #include "core/nr_hook_plan.hpp"
 #include "core/nr_lifetime.hpp"
+#include "core/nr_params.hpp"
 
 #include <d3d12.h>
 
@@ -88,22 +89,9 @@ constexpr const char *kColor        = "DLSSNR.Color";
 constexpr const char *kDepth        = "DLSSNR.Depth";
 constexpr const char *kMVec         = "DLSSNR.MVec";
 constexpr const char *kOutput       = "DLSSNR.Output";
-constexpr const char *kColorBaseX   = "DLSSNR.ColorSubrectBaseX";
-constexpr const char *kColorBaseY   = "DLSSNR.ColorSubrectBaseY";
-constexpr const char *kColorW       = "DLSSNR.ColorSubrectWidth";
-constexpr const char *kColorH       = "DLSSNR.ColorSubrectHeight";
-constexpr const char *kDepthBaseX   = "DLSSNR.DepthSubrectBaseX";
-constexpr const char *kDepthBaseY   = "DLSSNR.DepthSubrectBaseY";
-constexpr const char *kDepthW       = "DLSSNR.DepthSubrectWidth";
-constexpr const char *kDepthH       = "DLSSNR.DepthSubrectHeight";
-constexpr const char *kMVecBaseX    = "DLSSNR.MVecSubrectBaseX";
-constexpr const char *kMVecBaseY    = "DLSSNR.MVecSubrectBaseY";
-constexpr const char *kMVecW        = "DLSSNR.MVecSubrectWidth";
-constexpr const char *kMVecH        = "DLSSNR.MVecSubrectHeight";
-constexpr const char *kOutBaseX     = "DLSSNR.OutputSubrectBaseX";
-constexpr const char *kOutBaseY     = "DLSSNR.OutputSubrectBaseY";
-constexpr const char *kOutW         = "DLSSNR.OutputSubrectWidth";
-constexpr const char *kOutH         = "DLSSNR.OutputSubrectHeight";
+// The subrect and extent names live in src/core/nr_params.hpp, together with their TYPES: the
+// snippet reads them as signed int, `Set(name, 0u)` and `Set(name, 0)` are different virtual
+// overloads, and an NGX parameter block reports no error for a mismatch. Pinned in CI.
 constexpr const char *kMVecScaleX   = "DLSSNR.MVecScaleX";
 constexpr const char *kMVecScaleY   = "DLSSNR.MVecScaleY";
 constexpr const char *kDepthInverted= "DLSSNR.DepthInverted";
@@ -111,13 +99,6 @@ constexpr const char *kReset        = "DLSSNR.Reset";
 constexpr const char *kIntensity    = "DLSSNR.Intensity";
 constexpr const char *kLocalTone    = "DLSSNR.LocalToneStrength";
 constexpr const char *kLocalStruct  = "DLSSNR.LocalStructureStrength";
-constexpr const char *kWidth        = "DLSSNR.Width";
-constexpr const char *kHeight       = "DLSSNR.Height";
-// "DLSSNR.ScalingRatio", NOT "DLSSNR.Scale". Both names appear in RenoDX's binary — it sets
-// each defensively across snippet builds — but only ScalingRatio is a real string in the
-// 310.8.0 runtime we load, so everything we ever wrote to "Scale" was silently discarded.
-// Verified by exact null-terminated string search over nvngx_dlssnr.dll.
-constexpr const char *kScalingRatio = "DLSSNR.ScalingRatio";
 // The remaining parameters RenoDX sets that we did not. Each one below is confirmed present
 // in the runtime; the seven RenoDX names that are ABSENT from this build (InputWidth,
 // InputHeight, OutputWidth, OutputHeight, Output.Width, Output.Height, Upscaling) are
@@ -335,6 +316,25 @@ void release(T *&p)
 	{
 		p->Release();
 		p = nullptr;
+	}
+}
+
+// Writes a built parameter block, honouring each entry's declared TYPE. The `int` and
+// `unsigned int` overloads of NVSDK_NGX_Parameter::Set are different virtual functions
+// (nvsdk_ngx_params.h:58-59), so this switch is the whole point of the builder existing.
+void apply_entries(NVSDK_NGX_Parameter *params, const nrparam::Entry *entries, int count)
+{
+	if (params == nullptr || entries == nullptr)
+		return;
+	for (int i = 0; i < count; ++i)
+	{
+		const nrparam::Entry &e = entries[i];
+		switch (e.type)
+		{
+		case nrparam::Type::i32: params->Set(e.name, e.i); break;
+		case nrparam::Type::u32: params->Set(e.name, e.u); break;
+		case nrparam::Type::f32: params->Set(e.name, e.f); break;
+		}
 	}
 }
 
@@ -566,10 +566,13 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	const std::uint32_t in_w = post ? out_w : render_w;
 	const std::uint32_t in_h = post ? out_h : render_h;
 
-	g_params->Set(kWidth, in_w);
-	g_params->Set(kHeight, in_h);
-	g_params->Set(kScalingRatio, out_w > 0 && in_w > 0
-		? static_cast<float>(out_w) / static_cast<float>(in_w) : 1.0f);
+	{
+		nrparam::Entry entries[nrparam::kMaxCreateEntries];
+		const int n = nrparam::build_create(in_w, in_h,
+			out_w > 0 && in_w > 0 ? static_cast<float>(out_w) / static_cast<float>(in_w) : 1.0f,
+			entries, nrparam::kMaxCreateEntries);
+		apply_entries(g_params, entries, n);
+	}
 	// Reversed-Z: UE 4.27 throughout, same flag SR carries. (CLAUDE.md §2.4)
 	g_params->Set(kDepthInverted, 1u);
 	g_params->Set(kEnabled, 1u);
@@ -1382,22 +1385,22 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kMVec, in.motion_vectors);
 	g_params->Set(kOutput, g_nr_output);
 
-	g_params->Set(kColorBaseX, 0u);
-	g_params->Set(kColorBaseY, 0u);
-	g_params->Set(kColorW, cw);
-	g_params->Set(kColorH, ch);
-	g_params->Set(kDepthBaseX, 0u);
-	g_params->Set(kDepthBaseY, 0u);
-	g_params->Set(kDepthW, in.render_width);
-	g_params->Set(kDepthH, in.render_height);
-	g_params->Set(kMVecBaseX, 0u);
-	g_params->Set(kMVecBaseY, 0u);
-	g_params->Set(kMVecW, in.render_width);
-	g_params->Set(kMVecH, in.render_height);
-	g_params->Set(kOutBaseX, 0u);
-	g_params->Set(kOutBaseY, 0u);
-	g_params->Set(kOutW, in.output_width);
-	g_params->Set(kOutH, in.output_height);
+	// The four rects, through the builder that carries their TYPES. Every one of these used to be
+	// written through the `unsigned int` overload while the snippet reads them as `int` — a
+	// different vtable slot and a different stored type, with no error either way.
+	// (src/core/nr_params.hpp, tests/test_nr_params.cpp)
+	{
+		nrparam::Rects rects;
+		rects.color_width = cw;
+		rects.color_height = ch;
+		rects.guide_width = in.render_width;
+		rects.guide_height = in.render_height;
+		rects.output_width = in.output_width;
+		rects.output_height = in.output_height;
+		nrparam::Entry entries[nrparam::kMaxRectEntries];
+		const int n = nrparam::build_rects(rects, entries, nrparam::kMaxRectEntries);
+		apply_entries(g_params, entries, n);
+	}
 
 	g_params->Set(kMVecScaleX, scale_x);
 	g_params->Set(kMVecScaleY, scale_y);

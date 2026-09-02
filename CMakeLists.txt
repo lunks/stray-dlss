@@ -85,6 +85,8 @@ add_library(stray_dlss_core STATIC
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
     src/core/nr_lifetime.hpp
+    src/core/nr_params.cpp
+    src/core/nr_params.hpp
     src/core/present_plan.cpp
     src/core/present_plan.hpp
     src/core/nr_history_plan.cpp
@@ -452,6 +454,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_codec.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
+        tests/test_nr_params.cpp
         tests/test_nr_history_plan.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp
