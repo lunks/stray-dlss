@@ -25,9 +25,12 @@ local function dumpParams(out, mat, arrayName)
         arr:ForEach(function(_, elem)
             local v = elem:get()
             local name, value = "?", "?"
+            -- An FName reaches Lua as userdata; tostring() prints its address (measured: the
+            -- first dump listed "FNameUserdata: 0000..."). ToString() gives the text.
             pcall(function()
                 local info = v.ParameterInfo
-                name = info and tostring(info.Name) or tostring(v.ParameterName)
+                local fn = info and info.Name or v.ParameterName
+                if fn ~= nil and type(fn) == "userdata" and fn.ToString then name = fn:ToString() else name = tostring(fn) end
             end)
             pcall(function()
                 if arrayName == "ScalarParameterValues" then
