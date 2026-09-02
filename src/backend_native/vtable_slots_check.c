@@ -1,15 +1,19 @@
 /* Compile-time proof that vtable_slots.hpp's numbers are d3d12.h's. C, because the Vtbl
  * structs only exist in the C interface; mingw's older d3d12.h lacks the ID3D12Device2 one,
  * so that single check is conditional. Nothing here is linked into anything. */
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #define CINTERFACE
 #define COBJMACROS
 #include <windows.h>
 #include <d3d12.h>
 #include <stddef.h>
 
+/* A negative array size is a compile error in every C standard MSVC and mingw speak; that
+ * is the whole assertion. The typedef's name carries the member so the error names it. */
 #define SLOT_IS(vtbl, member, index) \
-	_Static_assert(offsetof(vtbl, member) == (index) * sizeof(void *), #vtbl "::" #member " is not slot " #index)
+	typedef char slot_check_##vtbl##_##member[(offsetof(vtbl, member) == (index) * sizeof(void *)) ? 1 : -1]
 
 SLOT_IS(ID3D12DeviceVtbl, CreateCommandQueue, 8);
 SLOT_IS(ID3D12DeviceVtbl, CreateCommandAllocator, 9);
