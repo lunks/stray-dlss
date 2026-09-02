@@ -29,6 +29,12 @@ constexpr unsigned kDevice_CreateCommittedResource = 27;
 constexpr unsigned kDevice_CreatePlacedResource = 29;
 constexpr unsigned kDevice_CreateReservedResource = 30;
 constexpr unsigned kDevice2_CreatePipelineState = 47;
+// ID3D12Device3 48-50, ID3D12Device4 51-56, ID3D12Device5 57-64, ID3D12Device6 65,
+// ID3D12Device7 66-67, ID3D12Device8 68-72.
+constexpr unsigned kDevice4_CreateCommittedResource1 = 53;
+constexpr unsigned kDevice4_CreateReservedResource1 = 55;
+constexpr unsigned kDevice8_CreateCommittedResource2 = 69;
+constexpr unsigned kDevice8_CreatePlacedResource1 = 70;
 
 // IUnknown 0-2, ID3D12Object 3-6, ID3D12DeviceChild::GetDevice 7, ID3D12CommandList::GetType 8,
 // ID3D12GraphicsCommandList 9-59.

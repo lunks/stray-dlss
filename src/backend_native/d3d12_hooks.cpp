@@ -74,6 +74,16 @@ PFN_CreateComputePipelineState g_orig_CreateComputePipelineState = nullptr;
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 PFN_CreatePipelineState g_orig_CreatePipelineState = nullptr;
 #endif
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+using PFN_CreateCommittedResource1 = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device4 *, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, ID3D12ProtectedResourceSession *, REFIID, void **);
+using PFN_CreateReservedResource1 = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device4 *, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, ID3D12ProtectedResourceSession *, REFIID, void **);
+using PFN_CreateCommittedResource2 = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device8 *, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC1 *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, ID3D12ProtectedResourceSession *, REFIID, void **);
+using PFN_CreatePlacedResource1 = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device8 *, ID3D12Heap *, UINT64, const D3D12_RESOURCE_DESC1 *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **);
+PFN_CreateCommittedResource1 g_orig_CreateCommittedResource1 = nullptr;
+PFN_CreateReservedResource1 g_orig_CreateReservedResource1 = nullptr;
+PFN_CreateCommittedResource2 g_orig_CreateCommittedResource2 = nullptr;
+PFN_CreatePlacedResource1 g_orig_CreatePlacedResource1 = nullptr;
+#endif
 PFN_List_Reset g_orig_List_Reset = nullptr;
 PFN_List_SetDescriptorHeaps g_orig_List_SetDescriptorHeaps = nullptr;
 PFN_List_SetPipelineState g_orig_List_SetPipelineState = nullptr;
@@ -240,6 +250,40 @@ HRESULT STDMETHODCALLTYPE hk_CreateReservedResource(ID3D12Device *self, const D3
 		registry::note_created(static_cast<ID3D12Resource *>(*out));
 	return hr;
 }
+
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource1(ID3D12Device4 *self, const D3D12_HEAP_PROPERTIES *hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateCommittedResource1(self, hp, hf, desc, state, clear, session, riid, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+		registry::note_created(static_cast<ID3D12Resource *>(*out));
+	return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreateReservedResource1(ID3D12Device4 *self, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateReservedResource1(self, desc, state, clear, session, riid, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+		registry::note_created(static_cast<ID3D12Resource *>(*out));
+	return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreateCommittedResource2(ID3D12Device8 *self, const D3D12_HEAP_PROPERTIES *hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateCommittedResource2(self, hp, hf, desc, state, clear, session, riid, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+		registry::note_created(static_cast<ID3D12Resource *>(*out));
+	return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource1(ID3D12Device8 *self, ID3D12Heap *heap, UINT64 offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreatePlacedResource1(self, heap, offset, desc, state, clear, riid, out);
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+		registry::note_created(static_cast<ID3D12Resource *>(*out));
+	return hr;
+}
+#endif
 
 void STDMETHODCALLTYPE hk_CreateConstantBufferView(ID3D12Device *self, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
@@ -656,6 +700,28 @@ unsigned install_device_hooks(::ID3D12Device *device, bool query_device2)
 	// object covering its newest interface — measured); patch it only if the device is a
 	// Device2 at all.
 	(void)query_device2; // unused when the SDK has no ID3D12Device2 (mingw's local check)
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+	// The newer creation entry points share the one vtable (ID3D12Device8 on vkd3d-proton and
+	// WARP alike); patched without a query, like Device2's below on the proxy. A resource
+	// created through one of these and never viewed would otherwise be invisible to the
+	// registry, and a root CBV into it "unknown".
+	{
+		ID3D12Device8 *dev8 = nullptr;
+		const bool have8 = !query_device2 ||
+			(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dev8))) && dev8 != nullptr && static_cast<void *>(dev8) == static_cast<void *>(device));
+		if (dev8 != nullptr)
+			dev8->Release();
+		if (have8)
+		{
+			hook(slot::kDevice4_CreateCommittedResource1, reinterpret_cast<void *>(&hk_CreateCommittedResource1), reinterpret_cast<void **>(&g_orig_CreateCommittedResource1), "ID3D12Device4::CreateCommittedResource1");
+			hook(slot::kDevice4_CreateReservedResource1, reinterpret_cast<void *>(&hk_CreateReservedResource1), reinterpret_cast<void **>(&g_orig_CreateReservedResource1), "ID3D12Device4::CreateReservedResource1");
+			hook(slot::kDevice8_CreateCommittedResource2, reinterpret_cast<void *>(&hk_CreateCommittedResource2), reinterpret_cast<void **>(&g_orig_CreateCommittedResource2), "ID3D12Device8::CreateCommittedResource2");
+			hook(slot::kDevice8_CreatePlacedResource1, reinterpret_cast<void *>(&hk_CreatePlacedResource1), reinterpret_cast<void **>(&g_orig_CreatePlacedResource1), "ID3D12Device8::CreatePlacedResource1");
+		}
+		else
+			STRAY_LOG_WARN("native hooks: no ID3D12Device8 on this device; the *Resource1/2 creation entry points are not hooked");
+	}
+#endif
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 	if (!query_device2)
 	{

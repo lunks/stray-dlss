@@ -152,7 +152,8 @@ TEST_CASE("diff: identical inputs agree; one format difference is one mismatch n
 	e.view_cb_register = 5;
 	e.heaps[0] = reinterpret_cast<ID3D12DescriptorHeap *>(0x6000);
 	r = diff::compare(a, e);
-	CHECK(r.unknown.size() == 2); // the missing cb and the missing heap
+	CHECK(r.unknown.size() == 1); // the missing cb
+	CHECK(r.heap_identity.size() == 1); // the heap differs, reported apart, not a disagreement
 	CHECK(r.mismatches.size() == 1); // view_cb register
 	CHECK(r.mismatches[0].rfind("view_cb:", 0) == 0);
 }

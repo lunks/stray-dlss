@@ -20,6 +20,11 @@ struct Result
 	std::vector<std::string> mismatches; // both sides have the slot, values differ
 	std::vector<std::string> unknown;    // the oracle has it, the native side does not
 	std::vector<std::string> extra;      // the native side has it, the oracle does not
+	// Heap identities that differ. NOT a disagreement: under ReShade the oracle names its
+	// PROXY heap object and the native side the real one beneath (measured 2026-09-01:
+	// every TAA dispatch agreed on every register and differed only here). Reported so a
+	// real heap difference is still visible.
+	std::vector<std::string> heap_identity;
 	bool agree() const { return mismatches.empty() && unknown.empty() && extra.empty(); }
 };
 
@@ -50,6 +55,7 @@ struct Summary
 	std::uint64_t mismatch = 0;    // dispatches with >= 1 mismatch line
 	std::uint64_t unknown = 0;     // dispatches with >= 1 unknown slot
 	std::uint64_t extra = 0;
+	std::uint64_t heap_identity = 0; // dispatches whose only difference was heap identity
 	std::uint64_t unconsumed = 0;  // published but never consumed (the dispatch was suppressed, or the hook never fired)
 	std::uint64_t taa_dispatches = 0;  // of the compared, those whose hash is a known TAA permutation
 	std::uint64_t taa_disagree = 0;

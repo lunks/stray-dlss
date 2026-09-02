@@ -145,9 +145,11 @@ Result compare(const icept::DispatchBindings &expected, const icept::DispatchBin
 			found = found || actual.heaps[j] == expected.heaps[i];
 		if (!found)
 		{
-			char line[96];
-			std::snprintf(line, sizeof(line), "heap: oracle=%p native=UNKNOWN", static_cast<void *>(expected.heaps[i]));
-			r.unknown.push_back(line);
+			char line[128];
+			std::snprintf(line, sizeof(line), "heap: oracle=%p native=%p%s", static_cast<void *>(expected.heaps[i]),
+				actual.heap_count > 0 ? static_cast<void *>(actual.heaps[0]) : nullptr,
+				actual.heap_count == 0 ? " (none)" : "");
+			r.heap_identity.push_back(line);
 		}
 	}
 	return r;
@@ -222,6 +224,8 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 	if (r.agree())
 	{
 		++g_summary.agree;
+		if (!r.heap_identity.empty())
+			++g_summary.heap_identity;
 	}
 	else
 	{
@@ -242,6 +246,7 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 			for (const auto &l : r.mismatches) STRAY_LOG_WARN("  MISMATCH %s", l.c_str());
 			for (const auto &l : r.unknown) STRAY_LOG_WARN("  UNKNOWN  %s", l.c_str());
 			for (const auto &l : r.extra) STRAY_LOG_WARN("  EXTRA    %s", l.c_str());
+			for (const auto &l : r.heap_identity) STRAY_LOG_WARN("  HEAP-ID  %s", l.c_str());
 		}
 	}
 	g_last_native_unknown = native_unknown_lookups;
@@ -258,10 +263,11 @@ void log_summary(const char *when)
 {
 	const Summary s = summary();
 	STRAY_LOG_INFO("DIFF SUMMARY [%s] dispatches=%llu agree=%llu mismatch=%llu unknown=%llu extra=%llu "
-		"unconsumed=%llu | TAA dispatches=%llu disagree=%llu | disagreements=%llu",
+		"heap-identity-only=%llu unconsumed=%llu | TAA dispatches=%llu disagree=%llu | disagreements=%llu",
 		when, static_cast<unsigned long long>(s.dispatches), static_cast<unsigned long long>(s.agree),
 		static_cast<unsigned long long>(s.mismatch), static_cast<unsigned long long>(s.unknown),
-		static_cast<unsigned long long>(s.extra), static_cast<unsigned long long>(s.unconsumed),
+		static_cast<unsigned long long>(s.extra), static_cast<unsigned long long>(s.heap_identity),
+		static_cast<unsigned long long>(s.unconsumed),
 		static_cast<unsigned long long>(s.taa_dispatches), static_cast<unsigned long long>(s.taa_disagree),
 		static_cast<unsigned long long>(s.dispatches - s.agree));
 }

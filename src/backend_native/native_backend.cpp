@@ -240,9 +240,18 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 	{
 		icept::BufferRange br;
 		if (registry::buffer_for_va(cbv.second, br))
+		{
 			out.constant_buffers.emplace_back(cbv.first, icept::BufferRange{ br.buffer, br.offset, icept::kUnknownSize });
+		}
 		else
+		{
 			shadow::count_unknown_lookup();
+			static std::atomic<int> s_said{ 0 };
+			if (s_said.fetch_add(1) < 6)
+				STRAY_LOG_WARN("native resolve: root CBV param %u at GPU VA %llx is in no registered buffer "
+					"(registry: %llu live). Logged 6x.", cbv.first, static_cast<unsigned long long>(cbv.second),
+					static_cast<unsigned long long>(registry::stats().live));
+		}
 	}
 
 	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();

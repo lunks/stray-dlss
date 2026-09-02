@@ -36,6 +36,14 @@ SLOT_IS(ID3D12DeviceVtbl, CreateReservedResource, 30);
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 SLOT_IS(ID3D12Device2Vtbl, CreatePipelineState, 47);
 #endif
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+SLOT_IS(ID3D12Device4Vtbl, CreateCommittedResource1, 53);
+SLOT_IS(ID3D12Device4Vtbl, CreateReservedResource1, 55);
+#endif
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+SLOT_IS(ID3D12Device8Vtbl, CreateCommittedResource2, 69);
+SLOT_IS(ID3D12Device8Vtbl, CreatePlacedResource1, 70);
+#endif
 
 SLOT_IS(ID3D12GraphicsCommandListVtbl, Close, 9);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, Reset, 10);
