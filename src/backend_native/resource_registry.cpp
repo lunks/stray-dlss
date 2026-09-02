@@ -118,6 +118,8 @@ SentinelPage *allocate_page()
 std::mutex g_mutex;
 std::unordered_map<icept::ResourceId, icept::ResourceInfo> g_resources;
 std::unordered_set<icept::ResourceId> g_ever_seen;
+std::unordered_map<icept::ResourceId, std::uint64_t> g_generation;
+std::uint64_t g_next_generation = 0;
 core::VaMap g_vas;
 void (*g_listener)(icept::ResourceId) = nullptr;
 Stats g_stats;
@@ -171,6 +173,7 @@ void note_created(::ID3D12Resource *res)
 		if (g_resources.count(id) != 0)
 			return;
 		g_resources[id] = info;
+		g_generation[id] = ++g_next_generation;
 		g_ever_seen.insert(id);
 		if (va != 0 && info.buffer_size != 0)
 			g_vas.insert(va, info.buffer_size, id);
@@ -248,6 +251,7 @@ void detach()
 		std::lock_guard<std::mutex> lock(g_mutex);
 		orphaned = g_resources.size();
 		g_resources.clear();
+		g_generation.clear();
 		g_ever_seen.clear();
 		g_vas = core::VaMap{};
 		g_stats.live = 0;
@@ -273,6 +277,15 @@ bool is_live(icept::ResourceId res)
 		return false;
 	std::lock_guard<std::mutex> lock(g_mutex);
 	return g_resources.count(res) != 0;
+}
+
+std::uint64_t generation_of(icept::ResourceId res)
+{
+	if (res == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	const auto it = g_generation.find(res);
+	return it == g_generation.end() ? 0 : it->second;
 }
 
 bool ever_seen(icept::ResourceId res)
@@ -319,6 +332,7 @@ void on_destroyed(icept::ResourceId res)
 		std::lock_guard<std::mutex> lock(g_mutex);
 		if (g_resources.erase(res) == 0)
 			return;
+		g_generation.erase(res);
 		g_vas.erase(res);
 		++g_stats.destroyed;
 		g_stats.live = g_resources.size();
@@ -344,6 +358,7 @@ void clear_for_test()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 	g_resources.clear();
+	g_generation.clear();
 	g_ever_seen.clear();
 	g_vas = core::VaMap{};
 	g_stats = Stats{};

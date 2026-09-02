@@ -114,6 +114,7 @@ shadow::ViewEntry entry_for(ID3D12Resource *res, shadow::ViewKind kind, DXGI_FOR
 	if (!registry::describe(reinterpret_cast<icept::ResourceId>(res), info))
 		return e;
 	e.resource = reinterpret_cast<icept::ResourceId>(res);
+	e.resource_gen = registry::generation_of(e.resource);
 	e.is_buffer = info.is_buffer;
 	e.width = info.width;
 	e.height = info.height;
@@ -340,6 +341,7 @@ void STDMETHODCALLTYPE hk_CreateConstantBufferView(ID3D12Device *self, const D3D
 	if (registry::buffer_for_va(desc->BufferLocation, br))
 	{
 		e.resource = br.buffer;
+		e.resource_gen = registry::generation_of(br.buffer);
 		e.buffer_offset = br.offset;
 	}
 	else

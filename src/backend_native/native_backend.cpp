@@ -454,15 +454,13 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),
 		static_cast<unsigned long long>(r.unarmed),
 		static_cast<unsigned long long>(s.slots), static_cast<unsigned long long>(s.heaps));
-	// Growth of the shadow's containers, for the rehash/realloc hypothesis: a bucket count that
-	// changed since the last report means g_slots REHASHED in the interval; by_resource entries
-	// only ever grow between forget_resource calls.
+	// Growth of the shadow's map, for the rehash hypothesis: a bucket count that changed since
+	// the last report means g_slots REHASHED in the interval. (The reverse index that used to
+	// be reported here is gone - facts §27.)
 	{
 		const shadow::Stats sh = shadow::stats();
-		STRAY_LOG_INFO("NATIVE SHADOW GROWTH [%s] slots=%llu (buckets %llu) by_resource keys=%llu entries=%llu (buckets %llu)",
-			when, static_cast<unsigned long long>(sh.slots), static_cast<unsigned long long>(sh.slots_buckets),
-			static_cast<unsigned long long>(sh.by_resource_keys), static_cast<unsigned long long>(sh.by_resource_entries),
-			static_cast<unsigned long long>(sh.by_resource_buckets));
+		STRAY_LOG_INFO("NATIVE SHADOW GROWTH [%s] slots=%llu (buckets %llu)",
+			when, static_cast<unsigned long long>(sh.slots), static_cast<unsigned long long>(sh.slots_buckets));
 	}
 	if (mode() == Mode::drive)
 		STRAY_LOG_INFO("NATIVE DRIVE [%s] dispatches delivered=%llu suppressed=%llu compute-pipelines delivered=%llu",

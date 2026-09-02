@@ -44,6 +44,12 @@ const void *sentinel_vtable_for_test();
 void note_created(::ID3D12Resource *res);
 
 bool is_live(icept::ResourceId res);
+// This registration's GENERATION: a process-wide counter assigned at note_created, 0 when the
+// resource is not live. A descriptor slot stamped with the generation it was written under can
+// tell "this resource died" AND "this address now holds a different resource" with one
+// comparison at lookup time — which is what lets the shadow drop its reverse index (the
+// per-copy push_back that grew to 15M entries and cost up to 63 ms/frame, facts §27).
+std::uint64_t generation_of(icept::ResourceId res);
 // Whether this life ever registered it — tells a resource that DIED (sentinel fired) apart
 // from one the registry never saw (created before attach, or through an unhooked entry).
 // Only ever grows within a life; the address-reuse caveat (CLAUDE.md §5) does not bite

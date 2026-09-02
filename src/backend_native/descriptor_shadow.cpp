@@ -1,5 +1,6 @@
 #include "backend_native/descriptor_shadow.hpp"
 
+#include "backend_native/resource_registry.hpp"
 #include "log.hpp"
 
 #include <d3d12.h>
@@ -15,10 +16,11 @@ namespace {
 
 std::shared_mutex g_mutex;
 std::unordered_map<icept::DescriptorId, ViewEntry> g_slots;
-// Reverse index for forget_resource: resource -> the slots that reference it. Slots are
-// removed from here lazily (a slot rewritten to another resource stays listed under the
-// old one until that one dies, when the lookup simply finds a different resource and skips).
-std::unordered_map<icept::ResourceId, std::vector<icept::DescriptorId>> g_by_resource;
+// NO reverse index. The first design kept resource -> [slots] vectors, appended to on EVERY
+// copy and cleared only when the resource died; measured in The Slums (facts §27) that index
+// reached 15.4M entries, and the per-copy push_back/realloc under the exclusive lock cost
+// 6.7 -> 63.5 ms per frame across UE4's RHI threads. Liveness is now a generation stamp
+// compared at lookup, which needs no bookkeeping on the write path at all.
 
 struct HeapRecord
 {
@@ -46,8 +48,6 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 	slot = entry;
 	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	slot.via_copy = false;
-	if (entry.resource != 0)
-		g_by_resource[entry.resource].push_back(cpu);
 	++g_views;
 }
 
@@ -83,8 +83,6 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src)
 	copy.via_copy = true;
 	copy.src_slot = src;
 	g_slots[dst] = copy;
-	if (copy.resource != 0)
-		g_by_resource[copy.resource].push_back(dst);
 }
 
 void note_heap_bound(::ID3D12DescriptorHeap *heap)
@@ -136,11 +134,16 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 {
 	if (cpu == 0)
 		return false;
-	std::shared_lock<std::shared_mutex> lock(g_mutex);
-	const auto it = g_slots.find(cpu);
-	if (it == g_slots.end())
-		return false;
-	out = it->second;
+	{
+		std::shared_lock<std::shared_mutex> lock(g_mutex);
+		const auto it = g_slots.find(cpu);
+		if (it == g_slots.end())
+			return false;
+		out = it->second;
+	}
+	// Derived tombstone: the resource this slot named is gone, or its address now belongs to a
+	// newer registration. Outside the shadow's lock (the registry has its own).
+	out.dead = out.resource != 0 && out.resource_gen != 0 && registry::generation_of(out.resource) != out.resource_gen;
 	return true;
 }
 
@@ -155,21 +158,9 @@ bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
 	return false;
 }
 
-void forget_resource(icept::ResourceId res)
+void forget_resource(icept::ResourceId)
 {
-	if (res == 0)
-		return;
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	const auto it = g_by_resource.find(res);
-	if (it == g_by_resource.end())
-		return;
-	for (const icept::DescriptorId slot : it->second)
-	{
-		const auto s = g_slots.find(slot);
-		if (s != g_slots.end() && s->second.resource == res)
-			s->second.dead = true; // a tombstone, overwritten by the next write to the slot
-	}
-	g_by_resource.erase(it);
+	// Nothing to do: lookup() derives the tombstone from the registry generation.
 }
 
 std::uint64_t unknown_lookups() { return g_unknown_lookups.load(std::memory_order_relaxed); }
@@ -190,12 +181,6 @@ Stats stats()
 	s.slots = g_slots.size();
 	s.heaps = g_heaps.size();
 	s.slots_buckets = g_slots.bucket_count();
-	s.by_resource_keys = g_by_resource.size();
-	s.by_resource_buckets = g_by_resource.bucket_count();
-	std::uint64_t entries = 0;
-	for (const auto &kv : g_by_resource)
-		entries += kv.second.size();
-	s.by_resource_entries = entries;
 	return s;
 }
 
@@ -203,7 +188,6 @@ void clear_for_test()
 {
 	std::unique_lock<std::shared_mutex> lock(g_mutex);
 	g_slots.clear();
-	g_by_resource.clear();
 	g_heaps.clear();
 	g_unknown_lookups.store(0);
 	g_null_lookups.store(0);

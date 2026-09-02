@@ -40,9 +40,12 @@ struct ViewEntry
 	std::uint64_t seq = 0;
 	bool via_copy = false;
 	icept::DescriptorId src_slot = 0; // via_copy: the slot it was copied from
-	// A TOMBSTONE: the resource this slot referenced has died since the slot was written
-	// (registry sentinel). Kept rather than erased, so a later claim that this slot holds
-	// that resource is provably a stale map — the address may since have been reused.
+	// The registry generation the resource had when this slot was written (copies carry the
+	// source's). `dead` is DERIVED at lookup: the registry's current generation for the address
+	// differs (the resource died, or the address was reused by a newer resource). The slot is
+	// kept, so a later claim that it holds that resource is provably a stale map. This
+	// replaced a per-resource reverse index that grew without bound (facts §27).
+	std::uint64_t resource_gen = 0;
 	bool dead = false;
 };
 
@@ -60,7 +63,8 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out);
 // Via the bound heaps' spans. False when no bound heap contains the GPU handle.
 bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu);
 
-// From registry::on_destroyed: every slot referencing the resource becomes a tombstone.
+// From registry::on_destroyed. A no-op since the generation scheme: tombstones are derived at
+// lookup from the registry's generation, so nothing needs walking when a resource dies.
 void forget_resource(icept::ResourceId res);
 
 // The §6.2 counter: lookups (by CPU or GPU handle) that found nothing. Incremented by the
@@ -85,9 +89,6 @@ struct Stats
 	std::uint64_t slots = 0;    // live entries
 	std::uint64_t heaps = 0;    // known heap spans
 	std::uint64_t slots_buckets = 0;       // g_slots.bucket_count(): changes only on rehash
-	std::uint64_t by_resource_keys = 0;    // resources with a reverse-index vector
-	std::uint64_t by_resource_entries = 0; // sum of those vectors' sizes (grows until the resource dies)
-	std::uint64_t by_resource_buckets = 0;
 };
 Stats stats();
 void clear_for_test();
