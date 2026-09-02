@@ -694,7 +694,32 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			char scope[16] = "all";
 			host::cfg::get_string("NativeInstall", scope, sizeof(scope));
 			native::set_use_sentinel(host::cfg::get_bool("NativeSentinel", true));
-			const bool ok = native::install(native, mode, native::install_scope_from_string(scope));
+			// [STRAYDLSS] NativeTarget: real (default) patches vkd3d's own vtables beneath ReShade's
+			// proxies, so the hooks see REAL handles after ReShade's conversion — but also fire for
+			// every internal call ReShade itself makes. `proxy` patches ReShade's proxy vtables
+			// instead: only the game's calls, in ReShade's minted handle space. MEASURED 2026-09-01:
+			// `real` crashes the game at the device recreate with device-only, list-only and
+			// sentinel-off alike; `proxy` is the stacking bisection.
+			char target[16] = "real";
+			host::cfg::get_string("NativeTarget", target, sizeof(target));
+			ID3D12Device *install_on = native;
+			if (std::strcmp(target, "proxy") == 0)
+			{
+				ID3D12Device *proxy = reshade_proxy_device(native);
+				if (proxy != nullptr)
+				{
+					install_on = proxy;
+					STRAY_LOG_WARN("NativeTarget=proxy: installing the native hooks on ReShade's PROXY device %p "
+						"(vkd3d's real device is %p). Descriptor identities in the shadow are ReShade-minted.",
+						static_cast<void *>(proxy), static_cast<void *>(native));
+				}
+				else
+				{
+					STRAY_LOG_ERROR("NativeTarget=proxy requested but ReShade's proxy device could not be recovered; "
+						"installing on the real device instead.");
+				}
+			}
+			const bool ok = native::install(install_on, mode, native::install_scope_from_string(scope));
 			diff::set_enabled(ok && native::mode() == native::Mode::observe);
 			STRAY_LOG_WARN("NativeMode=%s ([STRAYDLSS] NativeMode, read as \"%s\"): %s. Grep 'DIFF' and "
 				"'NATIVE SHADOW'.", native::mode_name(native::mode()), native_mode, native::attach_report());
