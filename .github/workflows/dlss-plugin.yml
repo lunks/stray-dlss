@@ -353,21 +353,36 @@ jobs:
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
             -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
-          # The /Z7 substitution must have reached the flags every target compiles with, and the
-          # launcher must have landed: a cache that silently never engaged is a no-op, not a
-          # speed-up.
+          # The /Z7 substitution must have reached the flags every object is compiled with, and
+          # the launcher must have landed: a cache that silently never engaged is a no-op, not a
+          # speed-up. Read the generated build.ninja, not CMakeCache.txt: MEASURED (run
+          # 33590145973), CMAKE_C_FLAGS_GAME__SHIPPING__WIN64 is an EMPTY cache entry - CMake
+          # pre-creates the per-config flag variable for the active build type, so RE-UE4SS's
+          # "if(NOT DEFINED ...)" composition never writes it and its flags reach targets only
+          # through target compile options. Only the per-object FLAGS lines tell the truth.
+          $ninja = Get-Content build/build.ninja
+          $flagLines = @($ninja | Where-Object { $_ -match '^\s*FLAGS = ' })
+          $z7 = @($flagLines | Where-Object { $_ -match '/Z7\b' })
+          $zi = @($flagLines | Where-Object { $_ -match '/Zi\b' })
+          Write-Host "build.ninja FLAGS lines: total=$($flagLines.Count) with /Z7=$($z7.Count) with /Zi=$($zi.Count)"
+          foreach ($obj in @('UE4SS.dir\\src\\UE4SSProgram.cpp.obj', 'Unreal.dir\\src\\UObjectGlobals.cpp.obj', 'StrayDLSS.dir\\src\\Mod.cpp.obj')) {
+            $i = [array]::FindIndex($ninja, [Predicate[string]]{ param($l) $l -match "^build .*$obj" })
+            if ($i -lt 0) { throw "build.ninja has no build edge for $obj" }
+            $f = $ninja[($i + 1)..($i + 12)] | Where-Object { $_ -match '^\s*FLAGS = ' } | Select-Object -First 1
+            Write-Host "$obj`n  $f"
+            if ($f -notmatch '/Z7\b') { throw "$obj is not compiled with /Z7: $f" }
+          }
+          if ($z7.Count -eq 0) { throw "no object in build.ninja is compiled with /Z7" }
+          if ($zi.Count -gt 0) { $zi | Select-Object -First 3 | ForEach-Object { Write-Host $_ }; throw "$($zi.Count) FLAGS lines still carry /Zi, which sccache cannot cache" }
           $cache = Get-Content build/CMakeCache.txt
-          $cfg = $env:BUILD_CONFIG.ToUpper()
           foreach ($lang in @('C', 'CXX')) {
-            $line = $cache | Where-Object { $_ -like "CMAKE_${lang}_FLAGS_${cfg}:*" }
-            Write-Host $line
-            if (-not $line) { throw "CMAKE_${lang}_FLAGS_${cfg} is not in CMakeCache.txt" }
-            if ($line -notmatch '/Z7') { throw "CMAKE_${lang}_FLAGS_${cfg} lacks /Z7: $line" }
-            if ($line -match '/Zi\b') { throw "CMAKE_${lang}_FLAGS_${cfg} still carries /Zi, which sccache cannot cache: $line" }
             $launcher = $cache | Where-Object { $_ -like "CMAKE_${lang}_COMPILER_LAUNCHER:*" }
             Write-Host $launcher
             if ($launcher -notmatch 'sccache') { throw "CMAKE_${lang}_COMPILER_LAUNCHER is not sccache: $launcher" }
           }
+          $rules = @($ninja | Where-Object { $_ -match '^\s*command = .*sccache' })
+          Write-Host "build.ninja compile rules routed through sccache: $($rules.Count)"
+          if ($rules.Count -eq 0) { throw "no build.ninja rule invokes sccache: the launcher did not reach the generator" }
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
