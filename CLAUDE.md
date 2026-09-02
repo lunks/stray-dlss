@@ -2186,7 +2186,7 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
 * **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
   mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
-### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02, offline; box not yet seen)
+### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02; MEASURED on the box the same day, facts §31.7-31.10)
 
 Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
 
@@ -2224,7 +2224,31 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
   reversed-Z projection, `ColorBuffersHDR` from the swapchain format + colour space. Each is a
   knob (`NgxFGMvecScale`, `NgxFGCameraFar`, `NgxFGHDR`) so the box can A/B without a rebuild.
 * **Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` by function id** (`src/backend_native/
-  fg_reflex.cpp`), never `sl.reflex`; every status is logged and nothing gates on it.
+  fg_reflex.cpp`), never `sl.reflex`; every status is logged and nothing gates on it. On the
+  box all five entry points exist and `SetSleepMode`/`Sleep`/`SetLatencyMarker` return
+  `NVAPI_OK` (HARD); what they do under vkd3d-proton is UNCONFIRMED.
+
+**What the box settled on 2026-09-02 (facts §31.7-31.10), all HARD:** the present-twice path
+survives `SetFullscreenState(TRUE)` + `ResizeBuffers` (OptiScaler's wall) and three checkpoint
+reloads at exactly 2.00x presents per game present; the NGX core under Proton routes feature
+11 to the game-directory `nvngx_dlssg.dll` and `CreateFeature`/`EvaluateFeature` succeed with
+our own parameter block, no Streamline in the process; the interpolated frame differs from the
+real one and reaches the screen through the crop gate. Three things only the box could teach:
+
+1. **`DLSSG.MultiFrameIndex` is 1-BASED.** Index 0 makes every evaluate `FAIL_InvalidParameter`
+   and the snippet says why on the LoggingCallback ("Found index (0) but expected (1)").
+2. **Stray never calls `SetColorSpace1`**: its `R10G10B10A2` back buffer is UE4's 10-bit SDR
+   default, so `DLSSG.ColorBuffersHDR=0` (the auto rule needs the PQ colour space to say HDR).
+3. **The crop gate must treat a black REAL crop as a neutral look**, or every loading screen
+   revokes FG and re-validates three looks later (3 325 refused presents in one session);
+   and it must remember two looks, because the two alternating output textures of a
+   generator that writes nothing read as motion to a one-look memory (caught in CI).
+
+Steady-state gameplay is 2.00x; the only refusals are NGX's lazy init (~900 frames), ~60
+frames per checkpoint reload (no TAA dispatch, so no guides) and 0-3 per 600 otherwise. Every
+fps and pacing number from these sessions is SUSPECT (host CPU contention) and the pacing
+histogram's BIMODAL flag is a known false positive under an irregular source; re-read both on
+a quiet host. HUD-less (stage 3) is deferred until the user has judged stage 2 in motion.
 
 ## 6. Build, CI and testing
 

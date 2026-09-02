@@ -1052,6 +1052,19 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		if (diff::enabled())
 			diff::log_summary(when);
 		native::log_stats(when); // in drive mode this carries the NATIVE DRIVE delivered/suppressed counters
+		// DLSS-G's own accounting, so a source-missing refusal in the [fg] line can be
+		// attributed: no fresh guides (no TAA dispatch this frame: loads, menus, cuts), NGX not
+		// initialised yet, or the warm-up. Measured 2026-09-02: steady gameplay is 2.00x and
+		// every gap was one of those three (facts §31.10).
+		if (native::fg::enabled() && native::fg::config().mode == native::fg::Mode::ngx)
+		{
+			const ngxfg::Stats gs = ngxfg::stats();
+			STRAY_LOG_INFO("[fg/ngx] %s: created=%d publishes=%llu generates=%llu evaluate-failures=%llu | refused: no-publish=%llu not-ready=%llu warmup=%llu | %ux%u hdr=%d guides %ux%u | last evaluate 0x%08x",
+				when, gs.created ? 1 : 0, static_cast<unsigned long long>(gs.publishes), static_cast<unsigned long long>(gs.generates),
+				static_cast<unsigned long long>(gs.evaluate_failures), static_cast<unsigned long long>(gs.refused_no_publish),
+				static_cast<unsigned long long>(gs.refused_not_ready), static_cast<unsigned long long>(gs.refused_warmup),
+				gs.width, gs.height, gs.hdr, gs.render_width, gs.render_height, gs.last_evaluate_result);
+		}
 	}
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
@@ -1110,6 +1123,13 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				for (int i = 1; i < static_cast<int>(core::fg::Refusal::count); ++i)
 					refused += fs.refused[i];
 				std::fprintf(f, "fg_refused=%llu\n", refused);
+				const ngxfg::Stats gs = ngxfg::stats();
+				std::fprintf(f, "fg_ngx_created=%d\n", gs.created ? 1 : 0);
+				std::fprintf(f, "fg_ngx_generates=%llu\n", (unsigned long long)gs.generates);
+				std::fprintf(f, "fg_ngx_evaluate_failures=%llu\n", (unsigned long long)gs.evaluate_failures);
+				std::fprintf(f, "fg_ngx_refused_no_publish=%llu\n", (unsigned long long)gs.refused_no_publish);
+				std::fprintf(f, "fg_ngx_refused_not_ready=%llu\n", (unsigned long long)gs.refused_not_ready);
+				std::fprintf(f, "fg_ngx_refused_warmup=%llu\n", (unsigned long long)gs.refused_warmup);
 			}
 			std::fprintf(f, "shadow_mode=%s\n", native::shadow::mode() == native::shadow::Mode::fast ? "fast" : "debug");
 			std::fprintf(f, "ngx_attempted=%d\n",

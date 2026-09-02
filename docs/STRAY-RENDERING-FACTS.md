@@ -1502,3 +1502,50 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 4096/4
   user reports the interpolation looks right while moving; each is a knob.
 * The snippet does not populate `DLSSG.MultiFrameCountMax` / `MustCallEval` through this
   core, and the box's registry preset selects "Preset B" with UI recomposition (§31.8). HARD.
+
+### 31.10 Stage 2, final session of the day: the gate no longer flickers, 1.91x and climbing (2026-09-02 19:14-19:18)
+
+Plugin = CI run 33688856852 of `3fcc52a` (both-black looks are neutral). Same protocol.
+`stray-bench.sh --runs 3 --label fg3-dlssg-dark`: bench exit 0, three reloads + traverses,
+no crash directory, no new NVRM/Xid, zero `[ERROR]` lines. Verbatim:
+
+```
+fg/ngx: DLSS-G feature CREATED: 3840x2160 fmt 24 hdr=0 internal 1920x1080 | ...
+fg/ngx: first DLSS-G evaluate OK: backbuffer 3840x2160, guides 1920x1080, jitter=0.3750,0.0556 reset=1 fov=1.2870 rad aspect=1.7778 near=1.000 far=0.000 mvecScale=0.000521,0.000926 hdr=0
+fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4096, real 3376/4096)
+[fg] frame 12600: game presents=12601 issued=24043 generated=11443 (1.91x) | refused: no-previous-frame=2 not-validated=5 source-missing=1150 | pacer 11.79 ms hitches=13 | issued-interval p50=6 ms p99=18 ms unimodal | worker waits=191 | epoch=3 reconfigures=3
+```
+
+* `not-validated` stays at the 5 frames of the one initial validation for the whole session
+  (it was 3 325 in §31.9's run): no revoke through three reloads' black screens. HARD.
+* `source-missing=1150` of 12 601 is the load/reload frames with no TAA dispatch — the
+  remaining gap to 2.0x, and correct (no guides, no generated frame). The ratio climbs
+  towards 2.0x as gameplay frames accumulate (1.24x at 1200, 1.91x at 12 600). HARD.
+* SUSPECT (host contention): bench rows 81.6 / 80.2 / 82.2 engine fps, slowest bucket ~60, 0
+  hitch buckets, worst frame 17-18 ms; pacer 11.4-16.9 ms; the issued-interval histogram
+  read `unimodal` for most of this session and `BIMODAL` for a few windows (p50 6 ms, p99
+  17-19 ms) — the detector's false positive under an irregular source; not acted on.
+* The plugin log of this session is kept at `scratchpad/plugin-fg3.log` (agent-local); the
+  box was restored to the playable configuration afterwards (§ box state in the report).
+* **The `source-missing` refusals, attributed per 600-present window of the same log** (each
+  window's presents-issued ratio and its refusal delta):
+
+  ```
+  frame    600: ratio 1.00  +source-missing 599   <- NGX not initialised (lazy init deadline frame 900)
+  frame   1200: ratio 1.49  +source-missing 300   <- NGX init at ~900 + NgxFGWarmupFrames=120
+  frame   1800: ratio 2.00  +source-missing   0
+  frame   2400: ratio 1.90  +source-missing  60   <- checkpoint reload 1 (no TAA dispatch on the load)
+  frame   3000: ratio 2.00  +source-missing   1
+  frame   4200: ratio 1.90  +source-missing  61   <- reload 2
+  frame   7200: ratio 1.90  +source-missing  59   <- reload 3
+  frame  10200: ratio 1.95  +source-missing  33   <- reload 4 (the bench's cycles straddle windows)
+  frame  10800: ratio 1.95  +source-missing  29
+  every other window: ratio 2.00, +source-missing 0-3
+  ```
+
+  So **steady-state gameplay is exactly 2.00x**; the 9% headline is the startup (NGX's lazy
+  init, 899 frames) plus ~60 frames per checkpoint reload where the engine runs no TAA
+  dispatch and therefore publishes no guides, plus 0-3 frames per 600 (camera cuts / frames
+  without the pass). Legitimately not generatable: a generated frame needs this frame's depth
+  and motion vectors. HARD. The `[fg/ngx]` line and `fg_ngx_refused_*` status keys added in
+  the follow-up commit attribute future refusals without this reconstruction.
