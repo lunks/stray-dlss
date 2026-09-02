@@ -128,6 +128,30 @@ void fg_wait_idle(Gpu &gpu)
 	}
 }
 
+struct DecliningGenerator final : stray_dlss::native::fg::Generator
+{
+	int calls = 0;
+	bool generate(ID3D12GraphicsCommandList *, ID3D12Resource *, ID3D12Resource *, std::uint32_t, std::uint32_t, unsigned, std::uint64_t, const char **why) override
+	{
+		++calls;
+		*why = "harness: NGX is not available on this machine";
+		return false;
+	}
+};
+
+// Claims success but writes nothing: the generated texture keeps whatever the previous phase
+// left in it, so it is STALE against a moving real frame. The crop gate must keep it off the
+// screen.
+struct StaleGenerator final : stray_dlss::native::fg::Generator
+{
+	int calls = 0;
+	bool generate(ID3D12GraphicsCommandList *, ID3D12Resource *, ID3D12Resource *, std::uint32_t, std::uint32_t, unsigned, std::uint64_t, const char **) override
+	{
+		++calls;
+		return true;
+	}
+};
+
 } // namespace
 
 bool test_fg_present_twice(Gpu &gpu)
@@ -372,6 +396,57 @@ bool test_fg_present_twice(Gpu &gpu)
 	const fg::Stats before_thread = fg::stats();
 	if (!play(3, 6, "worker", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
 		return false;
+	// ngx mode with a generator that DECLINES (a machine without NGX, or a failed create): the
+	// real frame is presented alone, the refusal is counted under source-missing, and the crop
+	// gate never validates anything.
+	static DecliningGenerator declining;
+	declining = DecliningGenerator{};
+	fg::set_generator(&declining);
+	fc.mode = fg::Mode::ngx;
+	fc.pacing = fg::Pacing::none;
+	fc.wait_ms = 0;
+	fg::configure(fc);
+	{
+		const fg::Stats before = fg::stats();
+		if (!play(3, 3, "ngx-declining", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
+			return false;
+		const fg::Stats st = fg::stats();
+		std::printf("  declining generator: calls=%d presents +%llu issued +%llu generated +%llu source-missing +%llu validated=%d\n", declining.calls,
+			static_cast<unsigned long long>(st.game_presents - before.game_presents),
+			static_cast<unsigned long long>(st.presents_issued - before.presents_issued),
+			static_cast<unsigned long long>(st.generated_presented - before.generated_presented),
+			static_cast<unsigned long long>(st.refused[static_cast<int>(stray_dlss::core::fg::Refusal::source_missing)] - before.refused[static_cast<int>(stray_dlss::core::fg::Refusal::source_missing)]),
+			st.validated ? 1 : 0);
+		check(declining.calls == 3, "the generator was asked once per game present");
+		check(st.presents_issued - before.presents_issued == 3 && st.generated_presented == before.generated_presented, "a declining generator presents the real frame only, one present per game present");
+		check(st.refused[static_cast<int>(stray_dlss::core::fg::Refusal::source_missing)] - before.refused[static_cast<int>(stray_dlss::core::fg::Refusal::source_missing)] == 3, "each refusal is counted under source-missing");
+		check(!st.validated, "nothing validated");
+	}
+	// ngx mode with a generator that claims success but writes nothing (a stale output): the
+	// crop gate (readback a few presents later) must never validate it, so it never reaches the
+	// screen. The judge returns ok for the first two looks of a stale run and STALE from the
+	// third, so ok counts stay below the three-in-a-row validation needs.
+	static StaleGenerator stale;
+	stale = StaleGenerator{};
+	fg::set_generator(&stale);
+	{
+		const fg::Stats before = fg::stats();
+		if (!play(3, 8, "ngx-black", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
+			return false;
+		fg_wait_idle(gpu);
+		const fg::Stats st = fg::stats();
+		std::printf("  stale generator: calls=%d issued +%llu generated +%llu crops ok=%llu stale=%llu black=%llu validated=%d not-validated +%llu\n", stale.calls,
+			static_cast<unsigned long long>(st.presents_issued - before.presents_issued),
+			static_cast<unsigned long long>(st.generated_presented - before.generated_presented),
+			static_cast<unsigned long long>(st.crop_ok), static_cast<unsigned long long>(st.crop_stale), static_cast<unsigned long long>(st.crop_black), st.validated ? 1 : 0,
+			static_cast<unsigned long long>(st.refused[static_cast<int>(stray_dlss::core::fg::Refusal::not_validated)] - before.refused[static_cast<int>(stray_dlss::core::fg::Refusal::not_validated)]));
+		check(st.generated_presented == before.generated_presented, "a stale generated frame NEVER reached the screen");
+		check(st.presents_issued - before.presents_issued == 8, "the real frame was presented every time instead");
+		check((st.crop_stale + st.crop_black) >= 1 && !st.validated, "the crop gate judged the output stale (or black) and never validated it");
+	}
+	fg::set_generator(nullptr);
+	check(drain_validation(gpu, "fg-ngx-gates") == 0, "no validation errors from the crop readbacks and the refusal paths");
+
 	present::uninstall(); // drains the worker, releases the replacements and the ring
 	{
 		const fg::Stats st = fg::stats();
