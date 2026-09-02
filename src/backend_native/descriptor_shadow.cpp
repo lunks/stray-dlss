@@ -189,6 +189,13 @@ Stats stats()
 	s.copies = g_copies;
 	s.slots = g_slots.size();
 	s.heaps = g_heaps.size();
+	s.slots_buckets = g_slots.bucket_count();
+	s.by_resource_keys = g_by_resource.size();
+	s.by_resource_buckets = g_by_resource.bucket_count();
+	std::uint64_t entries = 0;
+	for (const auto &kv : g_by_resource)
+		entries += kv.second.size();
+	s.by_resource_entries = entries;
 	return s;
 }
 

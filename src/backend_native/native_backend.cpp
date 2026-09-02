@@ -9,6 +9,7 @@
 #include "core/root_signature_walk.hpp"
 #include "d3d12_restore.hpp"
 #include "log.hpp"
+#include "perf.hpp"
 
 #include <d3d12.h>
 
@@ -166,6 +167,8 @@ BoundTexture to_bound(std::uint32_t reg, icept::DescriptorId cpu, const shadow::
 
 bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, icept::DispatchBindings &out)
 {
+	perf::Scope _ps(perf::kResolve);
+	perf::count(perf::kCntResolves);
 	g_resolves.fetch_add(1, std::memory_order_relaxed);
 	root::ListState st;
 	if (ctx.native == nullptr || !root::snapshot(ctx.native, st))
@@ -451,6 +454,16 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),
 		static_cast<unsigned long long>(r.unarmed),
 		static_cast<unsigned long long>(s.slots), static_cast<unsigned long long>(s.heaps));
+	// Growth of the shadow's containers, for the rehash/realloc hypothesis: a bucket count that
+	// changed since the last report means g_slots REHASHED in the interval; by_resource entries
+	// only ever grow between forget_resource calls.
+	{
+		const shadow::Stats sh = shadow::stats();
+		STRAY_LOG_INFO("NATIVE SHADOW GROWTH [%s] slots=%llu (buckets %llu) by_resource keys=%llu entries=%llu (buckets %llu)",
+			when, static_cast<unsigned long long>(sh.slots), static_cast<unsigned long long>(sh.slots_buckets),
+			static_cast<unsigned long long>(sh.by_resource_keys), static_cast<unsigned long long>(sh.by_resource_entries),
+			static_cast<unsigned long long>(sh.by_resource_buckets));
+	}
 	if (mode() == Mode::drive)
 		STRAY_LOG_INFO("NATIVE DRIVE [%s] dispatches delivered=%llu suppressed=%llu compute-pipelines delivered=%llu",
 			when, static_cast<unsigned long long>(s.drive_dispatches), static_cast<unsigned long long>(s.drive_suppressed),

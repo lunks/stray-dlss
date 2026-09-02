@@ -11,6 +11,7 @@
 #include "core/dxgi_format.hpp"
 #include "core/fnv1a.hpp"
 #include "log.hpp"
+#include "perf.hpp"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -323,6 +324,8 @@ HRESULT STDMETHODCALLTYPE hk_CreatePlacedResource1(ID3D12Device8 *self, ID3D12He
 void STDMETHODCALLTYPE hk_CreateConstantBufferView(ID3D12Device *self, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateConstantBufferView(self, desc, handle);
+	perf::Scope _ps(perf::kShadowWrite);
+	perf::count(perf::kCntViews);
 	if (in_own_code())
 		return;
 	if (desc == nullptr || desc->BufferLocation == 0)
@@ -350,6 +353,8 @@ void STDMETHODCALLTYPE hk_CreateConstantBufferView(ID3D12Device *self, const D3D
 void STDMETHODCALLTYPE hk_CreateShaderResourceView(ID3D12Device *self, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateShaderResourceView(self, res, desc, handle);
+	perf::Scope _ps(perf::kShadowWrite);
+	perf::count(perf::kCntViews);
 	if (in_own_code())
 		return;
 	if (res == nullptr)
@@ -363,6 +368,8 @@ void STDMETHODCALLTYPE hk_CreateShaderResourceView(ID3D12Device *self, ID3D12Res
 void STDMETHODCALLTYPE hk_CreateUnorderedAccessView(ID3D12Device *self, ID3D12Resource *res, ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateUnorderedAccessView(self, res, counter, desc, handle);
+	perf::Scope _ps(perf::kShadowWrite);
+	perf::count(perf::kCntViews);
 	if (in_own_code())
 		return;
 	if (res == nullptr)
@@ -376,6 +383,8 @@ void STDMETHODCALLTYPE hk_CreateUnorderedAccessView(ID3D12Device *self, ID3D12Re
 void STDMETHODCALLTYPE hk_CreateRenderTargetView(ID3D12Device *self, ID3D12Resource *res, const D3D12_RENDER_TARGET_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateRenderTargetView(self, res, desc, handle);
+	perf::Scope _ps(perf::kShadowWrite);
+	perf::count(perf::kCntViews);
 	if (in_own_code())
 		return;
 	if (res == nullptr)
@@ -389,6 +398,8 @@ void STDMETHODCALLTYPE hk_CreateRenderTargetView(ID3D12Device *self, ID3D12Resou
 void STDMETHODCALLTYPE hk_CreateDepthStencilView(ID3D12Device *self, ID3D12Resource *res, const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateDepthStencilView(self, res, desc, handle);
+	perf::Scope _ps(perf::kShadowWrite);
+	perf::count(perf::kCntViews);
 	if (in_own_code())
 		return;
 	if (res == nullptr)
@@ -421,6 +432,8 @@ std::uint32_t increment_for(ID3D12Device *device, D3D12_DESCRIPTOR_HEAP_TYPE t)
 void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_starts, const UINT *dst_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE *src_starts, const UINT *src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
 	g_orig_CopyDescriptors(self, num_dst, dst_starts, dst_sizes, num_src, src_starts, src_sizes, type);
+	perf::Scope _ps(perf::kShadowCopy);
+	perf::count(perf::kCntCopyCalls);
 	if (in_own_code() || !shadowed_heap_type(type) || dst_starts == nullptr || src_starts == nullptr)
 		return;
 	// D3D12's rule: destination ranges are filled in order from the source ranges in order;
@@ -441,6 +454,7 @@ void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, cons
 				return;
 			shadow::note_copy(dst_starts[di].ptr + static_cast<std::uint64_t>(dj) * inc,
 				src_starts[si].ptr + static_cast<std::uint64_t>(sj) * inc);
+			perf::count(perf::kCntCopyDescs);
 			++sj;
 		}
 	}
@@ -449,6 +463,9 @@ void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, cons
 void STDMETHODCALLTYPE hk_CopyDescriptorsSimple(ID3D12Device *self, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
 	g_orig_CopyDescriptorsSimple(self, n, dst, src, type);
+	perf::Scope _ps(perf::kShadowCopy);
+	perf::count(perf::kCntCopyCalls);
+	perf::count(perf::kCntCopyDescs, n);
 	if (in_own_code() || !shadowed_heap_type(type))
 		return;
 	const std::uint32_t inc = increment_for(self, type);
@@ -520,6 +537,8 @@ HRESULT STDMETHODCALLTYPE hk_List_Reset(ID3D12GraphicsCommandList *self, ID3D12C
 	}
 	if (!in_own_code())
 	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_reset(self, pso);
 		if (icept::Sink *sk = drive_sink())
 			sk->on_command_list_reset(context_for(self));
@@ -535,6 +554,8 @@ void STDMETHODCALLTYPE hk_List_SetDescriptorHeaps(ID3D12GraphicsCommandList *sel
 	}
 	if (in_own_code())
 		return;
+	perf::Scope _ps(perf::kHeapBind);
+	perf::count(perf::kCntHeapBinds);
 	root::on_set_heaps(self, n, heaps);
 	for (UINT i = 0; i < n && heaps != nullptr; ++i)
 		shadow::note_heap_bound(heaps[i]);
@@ -548,6 +569,8 @@ void STDMETHODCALLTYPE hk_List_SetPipelineState(ID3D12GraphicsCommandList *self,
 	}
 	if (!in_own_code())
 	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_pso(self, pso);
 		// The pipeline handle is the ID3D12PipelineState* under both hosts (ReShade's
 		// pipeline.handle is the same pointer on D3D12), so the application's per-list
@@ -564,7 +587,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootSignature(ID3D12GraphicsCommandList
 		g_orig_List_SetComputeRootSignature(self, rs);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_root_signature(self, rs);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootDescriptorTable(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_DESCRIPTOR_HANDLE handle)
@@ -574,7 +601,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootDescriptorTable(ID3D12GraphicsComma
 		g_orig_List_SetComputeRootDescriptorTable(self, param, handle);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_table(self, param, handle.ptr);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList *self, UINT param, UINT value, UINT offset)
@@ -584,7 +615,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstant(ID3D12GraphicsCommand
 		g_orig_List_SetComputeRoot32BitConstant(self, param, value, offset);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_constants(self, param, offset, 1, &value);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstants(ID3D12GraphicsCommandList *self, UINT param, UINT n, const void *data, UINT offset)
@@ -594,7 +629,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRoot32BitConstants(ID3D12GraphicsComman
 		g_orig_List_SetComputeRoot32BitConstants(self, param, n, data, offset);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_constants(self, param, offset, n, static_cast<const std::uint32_t *>(data));
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
@@ -604,7 +643,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootConstantBufferView(ID3D12GraphicsCo
 		g_orig_List_SetComputeRootConstantBufferView(self, param, va);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_root_cbv(self, param, va);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
@@ -614,7 +657,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootShaderResourceView(ID3D12GraphicsCo
 		g_orig_List_SetComputeRootShaderResourceView(self, param, va);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_root_srv(self, param, va);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_SetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList *self, UINT param, D3D12_GPU_VIRTUAL_ADDRESS va)
@@ -624,7 +671,11 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootUnorderedAccessView(ID3D12GraphicsC
 		g_orig_List_SetComputeRootUnorderedAccessView(self, param, va);
 	}
 	if (!in_own_code())
+	{
+		perf::Scope _ps(perf::kRootBind);
+		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_root_uav(self, param, va);
+	}
 }
 
 void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x, UINT y, UINT z)

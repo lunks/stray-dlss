@@ -84,6 +84,10 @@ struct Stats
 	std::uint64_t copies = 0;   // descriptors copied
 	std::uint64_t slots = 0;    // live entries
 	std::uint64_t heaps = 0;    // known heap spans
+	std::uint64_t slots_buckets = 0;       // g_slots.bucket_count(): changes only on rehash
+	std::uint64_t by_resource_keys = 0;    // resources with a reverse-index vector
+	std::uint64_t by_resource_entries = 0; // sum of those vectors' sizes (grows until the resource dies)
+	std::uint64_t by_resource_buckets = 0;
 };
 Stats stats();
 void clear_for_test();
