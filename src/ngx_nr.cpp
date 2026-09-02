@@ -1715,8 +1715,17 @@ void advance_timeline(ID3D12CommandQueue *queue)
 
 void on_present(ID3D12CommandQueue *queue)
 {
-	// DELIBERATELY NOT GATED ON g_enabled. Disabling NR is what QUEUES the teardown, so a
-	// disabled NR is precisely the state in which this has the most to do.
+	// NOT gated on g_enabled: disabling NR is what QUEUES the teardown, so a disabled NR is
+	// precisely the state in which this has the most to do. It IS gated on there being anything
+	// to manage, so a session with NgxNR=0 from the start never creates a fence and never
+	// signals the game's queue — ngx_nr.hpp promises that configuration is byte-identical to
+	// before, and an unconditional per-present Signal would quietly break that promise.
+	const bool anything_to_do = g_enabled || g_teardown_requested ||
+		g_release_feature_requested || !g_graves.empty() || g_keep_alive_count != 0 ||
+		g_fence != nullptr;
+	if (!anything_to_do)
+		return;
+
 	advance_timeline(queue);
 	nrp::set_timeline(g_timeline);
 
