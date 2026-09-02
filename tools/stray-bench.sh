@@ -31,10 +31,31 @@ if [ -z "$REPLAY" ] && [ "$SYNTHETIC" -eq 0 ]; then
     [ -s "$DEFAULT_REPLAY" ] || { log "FAILED: default recording $DEFAULT_REPLAY is missing; stage tools/data/stray-recording-user1.txt or pass --synthetic"; exit 1; }
     REPLAY="$DEFAULT_REPLAY"
 fi
+# Host-load guard (facts §31, 2026-09-02): the LXC container shares the Proxmox host's kernel, so
+# /proc/loadavg IS the host's load - which is how a neighbour tenant's CPU burst (measured: four
+# java procs at 856/656/337/262% pushing the 32-core host to load 50) silently inflates the
+# plugin's CPU-side cost and invalidates a bench. The game alone is ~3.5 cores, so a quiet box is
+# well under load1/nproc = 0.3; refuse a cycle above STRAY_LOAD_MAX (default 0.5). steal is
+# ignored: an LXC is not a VM, so /proc/stat steal is always 0 here.
+STRAY_LOAD_MAX="${STRAY_LOAD_MAX:-0.5}"
+host_load_ok() {
+    local l1 np ratio
+    l1=$(cut -d" " -f1 /proc/loadavg)
+    np=$(nproc)
+    ratio=$(awk -v a="$l1" -v n="$np" 'BEGIN { printf "%.3f", (n > 0) ? a / n : 99 }')
+    if awk -v r="$ratio" -v m="$STRAY_LOAD_MAX" 'BEGIN { exit !(r > m) }'; then
+        log "REFUSING cycle: host load1=$l1 over ${np} CPUs = ${ratio} > ${STRAY_LOAD_MAX} (STRAY_LOAD_MAX). The container shares the Proxmox host kernel, so this is the HOST's load - a neighbour is busy; every number now is CPU-starved and invalid (facts §31). Wait for it to drop."
+        return 1
+    fi
+    log "host load1=$l1 over ${np} CPUs = ${ratio} (<= ${STRAY_LOAD_MAX}); proceeding"
+    return 0
+}
+
 require_ingame
 log "bench: scenario=${REPLAY:-synthetic Up+Left/Right}"
 log "bench: $RUNS x (reload + traverse), label=$LABEL, hosts: $( [ -f "$GAME_DIR/dxgi.dll" ] && echo -n 'ReShade ' ; grep -qE '^StrayDLSS *: *1' "$GAME_DIR/ue4ss/Mods/mods.txt" && echo -n 'plugin' ; echo )"
 for i in $(seq 1 "$RUNS"); do
+    host_load_ok || { log "bench: aborting at cycle $i - host contention (exit 4)"; exit 4; }
     shot=""; [ -n "$SHOT_DIR" ] && shot="$SHOT_DIR/$LABEL-$i.png"
     bash "$TOOLS_DIR/stray-reload.sh" ${shot:+--shot "$shot"} || { rc=$?; log "bench: reload $i failed (exit $rc)"; exit "$rc"; }
     sleep 3   # let the load settle before moving

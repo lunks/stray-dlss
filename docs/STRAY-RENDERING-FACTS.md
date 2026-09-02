@@ -1080,12 +1080,14 @@ gap (52 -> ~104) and eliminated the hitches; ~9% remains. With SR+NR (arms B/D/E
    descriptor through read_slot/write_slot and bumped one global atomic per descriptor (7 000x a
    frame across every RHI thread). Fixed by inlining the both-slots-flat case and batching the
    counter (bde9184); Config A's orphan count is 0 so it never touches the overflow.
-2. **The box drifts within a long session.** After hours of launches the same arm C read
-   100/86/84 across its three cycles where a cooler session read 104/104/102 flat - a decline too
-   large to attribute to our code alone (heap-table growth across reloads is a suspect worth
-   ruling out: fast::g_owned never shrinks, so a heap recreated on reload accumulates and widens
-   the slot_for search; measured create=29 stayed constant across cycles, so if it grows it does
-   so slowly). A tight A-vs-C parity number needs a thermally-settled box and a fixed cycle count.
+2. **SUSPECT - host CPU contention, not our code (see §31).** Every bench row in this section
+   taken after ~16:30 today is INVALID: the Proxmox host running the SteamOS LXC was CPU-starved
+   by a neighbour tenant (load 50 on 32 cores), which inflates the plugin's CPU-side cost
+   specifically. The "100/86/84" decline, the overflow "regression", and the "noregress"/"final"
+   rows are all suspect and must not be used to gate anything. The thermal wording here is
+   WITHDRAWN (no GPU throttle reason was ever active). The only trustworthy rows above are the
+   morning ones (52-60 -> ~104 progression, and add-on ~113) taken before the contention; the
+   real A-vs-C comparison must be re-run on a quiet host, guarded by the load check (§31).
 
 **The remaining ~9% and the next levers (per the buckets, Config A fast):** native hooks total
 3.5-5.5 ms/frame summed over threads - shadow-copy ~3 ms (7 000 flat atomic copies a frame, each
@@ -1137,3 +1139,33 @@ thread-local caches of last-list-state and last-heap, §30) are still the right 
 a REBOOTED box; on the degraded box a small CPU-shaving delta cannot be resolved against ~20 fps
 of box noise. The thermal explanation in §30 is withdrawn: no throttle reason was ever active;
 the loss is a per-session/system accumulation, not temperature.
+
+
+### 31.1 The cause was the Proxmox HOST, and the bench now guards against it (2026-09-02 ~18:00)
+
+The "box degraded" reading above is right about the symptom and now has its cause: the **Proxmox
+host** carrying the SteamOS LXC was under **CPU contention from another tenant** at the time - four
+java processes at 856% / 656% / 337% / 262% CPU pushed the 32-core host to a 1-minute load average
+of **50** (5-minute 61.6), ~1.6x oversubscribed, while the game wanted ~3.5 cores. The plugin's
+added cost is CPU-side (the native hooks, the resolve), which is exactly what a starved host
+inflates - so this is very likely the whole of the "drift" as well.
+
+**The container's loadavg IS the host's.** An LXC shares the host kernel, so `/proc/loadavg`
+inside container 113 reads the host's load (50.2 on 32 CPUs), which is precisely why the bench can
+detect a neighbour's burst at all. And `/proc/stat` steal is always 0 in an LXC (it is not a VM),
+so steal is not a usable signal here - loadavg is.
+
+**SUSPECT rows.** Every stray-bench.csv row after ~16:30 today - the "drift" C rows (100/86/84),
+the bisect rows (c90be36 84/81/82 and bde9184 95/99/78), the A rechecks (82/100/101 and post-Steam
+93/96/97), and every "final"/"noregress"/"overflow" row - is INVALID and draws no conclusion. The
+bisection §31 ran DURING the contention, which is why the same 06b8ff7f binary read 82 vs its
+morning 104; it does still show the overflow build is not slower than the pre-overflow one (both
+were equally starved), so the overflow is not exonerated OR convicted by it - re-run on a quiet
+host.
+
+**The guard.** stray-bench.sh now reads `/proc/loadavg` at the start of every cycle and REFUSES to
+run when load1/nproc exceeds STRAY_LOAD_MAX (default 0.5; the game alone is well under 0.3), naming
+the host contention. load1, load5 and nproc are written into every CSV row (gpu_sm@tempC too), so a
+starved run can never again be mistaken for a code regression. Pass 1 (the thread-local caches) and
+the build bisection (c90be36 vs bde9184 artifacts staged, accumulation counters at cycle
+boundaries) are ready to run in one go the moment the host is quiet (load1/nproc < 0.3).

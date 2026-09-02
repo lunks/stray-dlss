@@ -72,6 +72,7 @@ INJ=$!
 drivefield() { grep "^$1=" "$GAME_DIR/stray-dlss-status.txt" 2>/dev/null | tail -1 | cut -d= -f2; }
 ds0=$(drivefield native_drive_suppressed); pf0=$(drivefield frame)
 gpu0=$(nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv,noheader 2>/dev/null | tr -d " " | tr "," "@")
+read -r load1 load5 _ < /proc/loadavg; ncpu=$(nproc)
 TW0=$(date +%s.%N)
 samples=(); dts=(); f_prev=$(frame_now); t_prev=$TW0; f_start=$f_prev; t_first=$TW0; t_last=$TW0; f_end=$f_prev
 while kill -0 "$INJ" 2>/dev/null; do
@@ -117,8 +118,8 @@ fi
 ds1=$(drivefield native_drive_suppressed); pf1=$(drivefield frame)
 drive_ratio=$(awk -v a="${ds0:-}" -v b="${ds1:-}" -v pa="${pf0:-}" -v pb="${pf1:-}" 'BEGIN { if (a=="" || b=="" || pa=="" || pb=="") { print ""; exit } d = pb - pa; if (d > 0) printf "%.3f", (b - a) / d; else print "" }')
 [ -n "$drive_ratio" ] && log "DRIVE RATIO $LABEL: $drive_ratio (suppressed $ds0->$ds1 over presents $pf0->$pf1) - <0.995 is a refusal streak"
-[ -f "$CSV" ] || echo "time,label,avg_fps,slowest_bucket_fps,hitch_buckets,buckets,worst_sampled_ms,elapsed_s,drive_ratio,gpu_sm@tempC,map" > "$CSV"
-echo "$(date +%H:%M:%S),$LABEL,$avg,$slowest,$hitches,$n,$worst_ms,$elapsed,${drive_ratio:-},${gpu0:-},$(probe map)" >> "$CSV"
+[ -f "$CSV" ] || echo "time,label,avg_fps,slowest_bucket_fps,hitch_buckets,buckets,worst_sampled_ms,elapsed_s,drive_ratio,gpu_sm@tempC,load1,load5,nproc,map" > "$CSV"
+echo "$(date +%H:%M:%S),$LABEL,$avg,$slowest,$hitches,$n,$worst_ms,$elapsed,${drive_ratio:-},${gpu0:-},${load1:-},${load5:-},${ncpu:-},$(probe map)" >> "$CSV"
 chown deck:deck "$CSV" 2>/dev/null
 [ -n "$SHOT" ] && bash "$TOOLS_DIR/screenshot-gamescope.sh" "$SHOT" 4 >/dev/null 2>&1 && log "  screenshot: $SHOT"
 exit 0
