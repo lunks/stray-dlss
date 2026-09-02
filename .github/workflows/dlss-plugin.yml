@@ -81,7 +81,7 @@ jobs:
     name: Win32 half compiles (mingw proxy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
@@ -155,7 +155,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: repo
 
@@ -442,7 +442,7 @@ jobs:
             'StrayDLSS : 1')
           Get-ChildItem -Recurse dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: stray-dlss-plugin
           path: dist/
