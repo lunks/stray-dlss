@@ -363,20 +363,48 @@ native backend: mode=observe device=000000001FAF0080 device-slots=13 list-slots=
 All 24 patches applied; vkd3d-proton shares one static vtable per class (§11), so this reaches
 every device and command list process-wide.
 
-**Open — installing the hooks crashes the live game before a single dispatch is observed.**
-Immediately after the install line the add-on unloads (the game destroys that first device and
-recreates it — ReShade re-registers the add-on) and the process dies:
-`EXCEPTION_ACCESS_VIOLATION 0x0000000000000000`, `SecondsSinceStart=0`, empty UE4 callstack.
-`DIFF SUMMARY dispatches=0 disagreements=0` — the observer never ran a frame, so **there is no
-measured disagreement count yet**. The control is decisive: the byte-identical add-on with
-`NativeMode=off` reaches gameplay (`in_game=1`, 8 dispatch reports, clean close). So the fault
-is the install on vkd3d-proton 3.1.0, in a path both CI lanes (WARP, real-ReShade-on-WARP)
-exercise and pass — i.e. a vkd3d-proton-specific or device-recreate-timing interaction, not a
-logic error the debug layer can see.
+**RESOLVED the same evening — the crash was OUR lifecycle, not vkd3d, not ReShade's proxy.**
+The bisection (`NativeInstall=device`, `=list`, `NativeSentinel=0`) crashed identically for two
+disjoint hook sets and without the sentinel, which ruled out every hook body. The decisive run
+was `NativeTarget=proxy` (hooks on ReShade's proxy vtables instead): its install reported
+`patches=0` with no `VirtualProtect` error, i.e. **every slot already held our replacement**.
+ReShade **unloads and reloads the add-on DLL across the game's device recreate** (`Unloading
+add-on` … `Loading add-on` in `ReShade.log`, right after `init_device`); a process-global vtable
+patch outlives the image it points into, the DLL comes back at the same base with fresh
+statics — every `g_orig_*` NULL — and the first game call through a patched slot calls
+address 0: `EXCEPTION_ACCESS_VIOLATION 0x0000000000000000` at `SecondsSinceStart=0`, for any
+hook set, sentinel or not. Fix: `app::DlssApp::shutdown()` restores the slots on detach (only
+where they still hold our pointer), so the reload re-installs cleanly. In a UE4SS-mod
+configuration the DLL is never unloaded and this cannot occur.
 
-**Next step, instrumented but not yet run:** `[STRAYDLSS] NativeInstall=device|list` installs
-only the device-view hooks or only the command-list hooks, and `NativeSentinel=0` drops the
-`SetPrivateDataInterface` sentinel (the highest-suspicion call — it mutates every resource the
-game creates). One launch per combination localises the faulting hook set. A
-`VKD3D_DEBUG=warn PROTON_LOG=1` launch would also catch a vkd3d validation assert the release
-path swallows.
+(Two smaller facts from the same runs: `QueryInterface` on ReShade's proxy from inside its own
+`init_device` callback DEADLOCKS — the process sat alive for 600 s — so the proxy target patches
+`ID3D12Device2`'s slot without asking; and the game destroys and recreates its first D3D12
+device at startup on this title, which is what triggers the add-on reload in the first place.)
+
+**The observer then ran live, run E (2026-09-01 21:55, 240 s in The Slums):**
+
+```
+IN GAME (census=390, taa_pipelines=1)
+DIFF SUMMARY [frame 15000] dispatches=82688 agree=0 mismatch=3247 unknown=82688 extra=2077 unconsumed=0 | TAA dispatches=124 disagree=124 | disagreements=82688
+NATIVE SHADOW [frame 15000] mode=observe patches=24 resolves=82688 (no-layout 0) unknown-lookups=1005029 unknown-copies=3767242 root-signatures=51 pipelines=674 resources live=3049 (registered 37091, destroyed 34042, sentinel-failures 0) slots=468755 heaps=2
+DIFF hash=901e041a7cadc9db 480x270 TAA: 0 mismatch, 1 unknown, 0 extra
+  UNKNOWN  heap: oracle=00000000235F0018 native=UNKNOWN
+```
+
+* **The TAA pass agreed with ReShade on every register in all 124 of its dispatches** — `t0`-`t5`
+  (depth and stencil as one resource), `u0`, and the View constant buffer — and its single
+  "unknown" was the HEAP IDENTITY: the oracle names ReShade's proxy heap object, the native side
+  the real heap beneath it. That is an object-identity difference, not a binding one; it is now
+  its own class (`heap-identity-only`), not a disagreement, and is why `agree=0` reads 0 in
+  this build's summary for every dispatch.
+* The gameplay-time `mismatch=3247` / `extra=2077` were NOT characterised: the 40-line log cap
+  was spent on two menu hashes. All 170 logged `cb:` unknowns were root CBVs into ONE upload
+  buffer (`2a185df0`) the registry never saw — either created through an unhooked entry point
+  (`ID3D12Device4/8::Create*Resource1/2`, now hooked) or in the detach→reload window.
+* `unknown-copies=3.7M` is UE4 copying from null-descriptor slots, which the shadow records as
+  "nothing" on both sides — benign, but it is what inflates `unknown-lookups`.
+* Cost: `[perf]` was not compared; the session held 55 fps as before (SOFT, from the launcher's
+  cadence, not measured).
+
+Run F (per-hash logging, heap identity reclassified) follows in §15.
