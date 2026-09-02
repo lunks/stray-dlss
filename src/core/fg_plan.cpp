@@ -204,7 +204,7 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 	else
 	{
 		const bool real_moved = real.hash != prev_real_hash;
-		const bool generated_moved = generated.hash != prev_gen_hash;
+		const bool generated_moved = generated.hash != prev_gen_hash && (!have_prev2 || generated.hash != prev_gen_hash2);
 		if (real_moved && !generated_moved)
 		{
 			++stale_run;
@@ -220,6 +220,8 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 	{
 		// A black look is not a reference for the next one: the first valid look after it is
 		// a first look again.
+		prev_gen_hash2 = prev_gen_hash;
+		have_prev2 = have_prev;
 		prev_gen_hash = generated.hash;
 		prev_real_hash = real.hash;
 		have_prev = true;
@@ -230,8 +232,8 @@ CropVerdict CropJudge::judge(const CropStats &generated, const CropStats &real)
 void CropJudge::reset()
 {
 	stale_run = 0;
-	prev_gen_hash = prev_real_hash = 0;
-	have_prev = false;
+	prev_gen_hash = prev_gen_hash2 = prev_real_hash = 0;
+	have_prev = have_prev2 = false;
 }
 
 } // namespace stray_dlss::core::fg

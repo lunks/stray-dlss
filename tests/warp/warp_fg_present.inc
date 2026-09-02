@@ -396,6 +396,24 @@ bool test_fg_present_twice(Gpu &gpu)
 	const fg::Stats before_thread = fg::stats();
 	if (!play(3, 6, "worker", false, /*expect_reset=*/false, /*per_frame_counts=*/false))
 		return false;
+	// Back to the game thread (configure drains and stops the worker) so its counters are final.
+	fc.pacing = fg::Pacing::none;
+	fc.wait_ms = 0;
+	fg::configure(fc);
+	{
+		const fg::Stats st = fg::stats();
+		std::printf("  worker phase: game presents +%llu, issued +%llu, generated +%llu, worker waits %llu, issued-interval p50=%u p99=%u ms %s\n",
+			static_cast<unsigned long long>(st.game_presents - before_thread.game_presents),
+			static_cast<unsigned long long>(st.presents_issued - before_thread.presents_issued),
+			static_cast<unsigned long long>(st.generated_presented - before_thread.generated_presented),
+			static_cast<unsigned long long>(st.worker_waits), st.issued_p50_ms, st.issued_p99_ms,
+			st.issued_second_peak_ms >= 0 ? "bimodal" : "unimodal");
+		check(st.game_presents - before_thread.game_presents == 6, "the worker phase saw 6 game presents");
+		check(st.presents_issued - before_thread.presents_issued == 12, "the worker issued 12 presents for them (2 per frame: no reset happened)");
+		check(st.generated_presented - before_thread.generated_presented == 6, "6 generated frames were presented by the worker");
+	}
+	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
+
 	// ngx mode with a generator that DECLINES (a machine without NGX, or a failed create): the
 	// real frame is presented alone, the refusal is counted under source-missing, and the crop
 	// gate never validates anything.
@@ -447,21 +465,8 @@ bool test_fg_present_twice(Gpu &gpu)
 	fg::set_generator(nullptr);
 	check(drain_validation(gpu, "fg-ngx-gates") == 0, "no validation errors from the crop readbacks and the refusal paths");
 
-	present::uninstall(); // drains the worker, releases the replacements and the ring
-	{
-		const fg::Stats st = fg::stats();
-		std::printf("  worker phase: game presents +%llu, issued +%llu, generated +%llu, worker waits %llu, issued-interval p50=%u p99=%u ms %s\n",
-			static_cast<unsigned long long>(st.game_presents - before_thread.game_presents),
-			static_cast<unsigned long long>(st.presents_issued - before_thread.presents_issued),
-			static_cast<unsigned long long>(st.generated_presented - before_thread.generated_presented),
-			static_cast<unsigned long long>(st.worker_waits), st.issued_p50_ms, st.issued_p99_ms,
-			st.issued_second_peak_ms >= 0 ? "bimodal" : "unimodal");
-		check(st.game_presents - before_thread.game_presents == 6, "the worker phase saw 6 game presents");
-		check(st.presents_issued - before_thread.presents_issued == 12, "the worker issued 12 presents for them (2 per frame: no reset happened)");
-		check(st.generated_presented - before_thread.generated_presented == 6, "6 generated frames were presented by the worker");
-	}
+	present::uninstall(); // releases the replacements and the ring
 	fg::log_stats("harness");
-	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
 
 	// The harness's own command list still holds the readback copies that reference the REAL
 	// back buffers (a closed, un-reset list keeps its references); reset it before the swapchain

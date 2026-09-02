@@ -180,6 +180,19 @@ TEST_CASE("CropJudge: black is caught on the first look; stale needs the real fr
 	CHECK(j.judge(gen, real) == CropVerdict::identical);
 	CHECK(crop_weight(CropVerdict::identical) == CropWeight::good);
 	CHECK(crop_weight(CropVerdict::black) == CropWeight::bad);
+	// Two output textures alternating stale content (A, B, A, B) while the real frame moves:
+	// each look differs from the previous one, but not from the one before - not motion.
+	CropJudge alt;
+	CropStats a{ 0xAAAA, 3000, 4096 }, b{ 0xBBBB, 3000, 4096 }, r{ 0x1, 4000, 4096 };
+	CHECK(alt.judge(a, r) == CropVerdict::first);
+	r.hash = 0x2;
+	CHECK(alt.judge(b, r) == CropVerdict::ok); // only one look behind: cannot know yet
+	r.hash = 0x3;
+	CHECK(alt.judge(a, r) == CropVerdict::suspect); // equals the look before last
+	r.hash = 0x4;
+	CHECK(alt.judge(b, r) == CropVerdict::suspect);
+	r.hash = 0x5;
+	CHECK(alt.judge(a, r) == CropVerdict::stale);
 	// An empty crop is black, never a division by zero.
 	CropJudge z;
 	CHECK(z.judge(CropStats{}, CropStats{}) == CropVerdict::black);

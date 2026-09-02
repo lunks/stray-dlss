@@ -173,9 +173,14 @@ struct CropJudge
 	std::uint32_t stale_limit = 3;     // stale after this many in a row
 	double black_fraction = 0.01;      // black when nonzero/total is below this
 	std::uint64_t prev_gen_hash = 0;
+	std::uint64_t prev_gen_hash2 = 0; // the look before that: two alternating output textures must not read as motion
 	std::uint64_t prev_real_hash = 0;
 	bool have_prev = false;
+	bool have_prev2 = false;
 
+	// "Generated moved" means the crop differs from BOTH previous generated looks: the present
+	// path alternates two output textures, so a generator that writes nothing shows two stale
+	// images in turn, and a one-look memory would call that motion (CI caught it).
 	CropVerdict judge(const CropStats &generated, const CropStats &real);
 	void reset();
 };
