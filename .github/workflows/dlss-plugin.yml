@@ -146,18 +146,23 @@ jobs:
           UEPSEUDO_PAT: ${{ secrets.UEPSEUDO_PAT }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # The submodule URLs are git@github.com:..., which has no credentials in CI.
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
           git clone --no-checkout https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
           git -C RE-UE4SS fetch --depth 1 origin $env:UE4SS_SHA
           git -C RE-UE4SS checkout --detach FETCH_HEAD
           Write-Host "RE-UE4SS at $(git -C RE-UE4SS rev-parse HEAD)"
 
+          # The submodule URLs are git@github.com:..., which has no credentials in CI, so they
+          # are rewritten to https. ONE insteadOf rule per path, matched against the ORIGINAL
+          # URL: git applies exactly one rewrite (longest matching prefix) and never re-runs the
+          # rules on the result. MEASURED (run 33579551886): two rules meant to chain —
+          # ssh -> https, then https -> token — left the ssh URL rewritten to plain https with
+          # no credentials, and the clone died on "could not read Username".
           if ($env:UEPSEUDO_PAT) {
             Write-Host "UEPSEUDO_PAT is present: fetching every submodule at its recorded pin."
-            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "https://github.com/"
+            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "git@github.com:"
             git -C RE-UE4SS submodule update --init --recursive
           } else {
+            git config --global url."https://github.com/".insteadOf "git@github.com:"
             $warn = "UEPSEUDO_PAT is not set. deps/first/Unreal points at the PRIVATE repo " +
                     "Re-UE4SS/UEPseudo (404 unauthenticated), so the Unreal headers are being " +
                     "taken from the public mirror " +
