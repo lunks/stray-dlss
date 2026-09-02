@@ -71,8 +71,14 @@ local function write()
     f:close()
 end
 
+-- LoopAsync ticks on a UE4SS thread, not the game thread. Touching UObjects from there
+-- during a level teardown (a checkpoint reload) is exactly the kind of thing that faults
+-- inside ProcessEvent, and the reload crash measured 2026-09-02 sits in the UE4SS mod layer.
+-- So the tick only SCHEDULES the work; every engine query runs on the game thread.
 LoopAsync(1000, function()
-    pcall(write)
+    pcall(function()
+        ExecuteInGameThread(function() pcall(write) end)
+    end)
     return false   -- keep looping
 end)
 
