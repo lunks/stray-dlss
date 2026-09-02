@@ -500,8 +500,17 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src) { note_copy_ran
 
 void note_heap_bound(::ID3D12DescriptorHeap *heap)
 {
-	if (heap != nullptr && current_mode() == Mode::debug)
+	if (heap == nullptr)
+		return;
+	if (current_mode() == Mode::debug)
 		debug::note_heap_bound(heap);
+	else
+		// Fast registers heaps at CreateDescriptorHeap, but under ReShade-on-top (Config B) some
+		// online heaps are created before our device hook is installed or through the proxy
+		// device, so they are never seen at creation; the game still BINDS them here. Register on
+		// bind too (idempotent) - without it ~19% of frames resolved the pinned TAA inputs as
+		// unknown, the gate refused, the engine's TAA ran, and the image flickered (facts §29).
+		fast::note_heap_created(heap);
 }
 
 void note_heap_created(::ID3D12DescriptorHeap *heap)
