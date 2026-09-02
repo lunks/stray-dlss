@@ -441,11 +441,14 @@ void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, cons
 	// D3D12's rule: destination ranges are filled in order from the source ranges in order;
 	// a null size array means every range is one descriptor.
 	const std::uint32_t inc = increment_for(self, type);
+	// Walk destination ranges against source ranges and hand the shadow the longest runs that
+	// are consecutive on BOTH sides (the common case is one 1:1 range).
 	UINT si = 0, sj = 0; // source range, index within it
 	for (UINT di = 0; di < num_dst; ++di)
 	{
 		const UINT dn = dst_sizes != nullptr ? dst_sizes[di] : 1;
-		for (UINT dj = 0; dj < dn; ++dj)
+		UINT dj = 0;
+		while (dj < dn)
 		{
 			while (si < num_src && sj >= (src_sizes != nullptr ? src_sizes[si] : 1))
 			{
@@ -454,10 +457,13 @@ void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, cons
 			}
 			if (si >= num_src)
 				return;
-			shadow::note_copy(dst_starts[di].ptr + static_cast<std::uint64_t>(dj) * inc,
-				src_starts[si].ptr + static_cast<std::uint64_t>(sj) * inc);
-			perf::count(perf::kCntCopyDescs);
-			++sj;
+			const UINT sn = src_sizes != nullptr ? src_sizes[si] : 1;
+			const UINT run = (dn - dj) < (sn - sj) ? (dn - dj) : (sn - sj);
+			shadow::note_copy_range(dst_starts[di].ptr + static_cast<std::uint64_t>(dj) * inc,
+				src_starts[si].ptr + static_cast<std::uint64_t>(sj) * inc, run, inc);
+			perf::count(perf::kCntCopyDescs, run);
+			dj += run;
+			sj += run;
 		}
 	}
 }
@@ -471,8 +477,7 @@ void STDMETHODCALLTYPE hk_CopyDescriptorsSimple(ID3D12Device *self, UINT n, D3D1
 	if (in_own_code() || !shadowed_heap_type(type))
 		return;
 	const std::uint32_t inc = increment_for(self, type);
-	for (UINT i = 0; i < n; ++i)
-		shadow::note_copy(dst.ptr + static_cast<std::uint64_t>(i) * inc, src.ptr + static_cast<std::uint64_t>(i) * inc);
+	shadow::note_copy_range(dst.ptr, src.ptr, n, inc);
 }
 
 HRESULT STDMETHODCALLTYPE hk_CreateRootSignature(ID3D12Device *self, UINT node_mask, const void *blob, SIZE_T len, REFIID riid, void **out)

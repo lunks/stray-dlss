@@ -55,6 +55,10 @@ void note_null_view(icept::DescriptorId cpu);
 // One descriptor of a CopyDescriptors(Simple). An unknown source clears the destination
 // and is counted (see unknown_copies).
 void note_copy(icept::DescriptorId dst, icept::DescriptorId src);
+// A whole CopyDescriptors range: n consecutive descriptors `inc` bytes apart, sources read
+// before any destination is written (by-value semantics). One shard lock per run, not one per
+// descriptor - the fix for the lock convoy measured in facts §27.
+void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc);
 // SetDescriptorHeaps: records the heap's CPU/GPU spans. Cheap; re-read on every bind.
 void note_heap_bound(::ID3D12DescriptorHeap *heap);
 

@@ -14,14 +14,26 @@
 namespace stray_dlss::native::shadow {
 namespace {
 
-std::shared_mutex g_mutex;
-std::unordered_map<icept::DescriptorId, ViewEntry> g_slots;
-// NO reverse index. The first design kept resource -> [slots] vectors, appended to on EVERY
-// copy and cleared only when the resource died; measured in The Slums (facts §27) that index
-// reached 15.4M entries, and the per-copy push_back/realloc under the exclusive lock cost
-// 6.7 -> 63.5 ms per frame across UE4's RHI threads. Liveness is now a generation stamp
-// compared at lookup, which needs no bookkeeping on the write path at all.
+// SHARDED by descriptor address. MEASURED (facts §27, arm C on the user's traverse): with one
+// exclusive shared_mutex for the whole map, note_copy cost 6 -> 26 -> 53 ms per frame as UE4's
+// RHI threads pushed 2.7k -> 6.7k descriptor copies a frame through it - ~8 us per copy, the
+// signature of lock convoy (an SRW lock under Wine), not of the hash map (which never rehashed).
+// 64 shards keyed on the handle's 4 KB page put threads writing different regions of the
+// 500k-descriptor online heap on different locks, and the range API below takes a shard lock
+// once per RUN of consecutive descriptors rather than once per descriptor. No thread ever holds
+// two shard locks: a copy reads its sources under a shared lock, releases, then writes.
+constexpr unsigned kShardBits = 6;
+constexpr unsigned kShards = 1u << kShardBits;
+struct Shard
+{
+	std::shared_mutex mutex;
+	std::unordered_map<icept::DescriptorId, ViewEntry> slots;
+};
+Shard g_shards[kShards];
+inline unsigned shard_index(icept::DescriptorId cpu) { return static_cast<unsigned>((cpu >> 12) & (kShards - 1)); }
+inline Shard &shard_of(icept::DescriptorId cpu) { return g_shards[shard_index(cpu)]; }
 
+std::mutex g_heaps_mutex;
 struct HeapRecord
 {
 	::ID3D12DescriptorHeap *heap = nullptr;
@@ -34,8 +46,8 @@ std::atomic<std::uint64_t> g_null_lookups{ 0 };
 std::atomic<std::uint64_t> g_dead_lookups{ 0 };
 std::atomic<std::uint64_t> g_unknown_copies{ 0 };
 std::atomic<std::uint64_t> g_seq{ 0 };
-std::uint64_t g_views = 0;
-std::uint64_t g_copies = 0;
+std::atomic<std::uint64_t> g_views{ 0 };
+std::atomic<std::uint64_t> g_copies{ 0 };
 
 } // namespace
 
@@ -48,47 +60,87 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 	std::uint64_t gen = entry.resource_gen;
 	if (gen == 0 && entry.resource != 0)
 		gen = registry::generation_of(entry.resource);
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	ViewEntry &slot = g_slots[cpu];
+	Shard &sh = shard_of(cpu);
+	std::unique_lock<std::shared_mutex> lock(sh.mutex);
+	ViewEntry &slot = sh.slots[cpu];
 	slot = entry;
 	slot.resource_gen = gen;
 	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	slot.via_copy = false;
-	++g_views;
+	g_views.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_null_view(icept::DescriptorId cpu)
 {
 	if (cpu == 0)
 		return;
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	ViewEntry &slot = g_slots[cpu];
+	Shard &sh = shard_of(cpu);
+	std::unique_lock<std::shared_mutex> lock(sh.mutex);
+	ViewEntry &slot = sh.slots[cpu];
 	slot = ViewEntry{};
 	slot.is_null = true;
 	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-	++g_views;
+	g_views.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc)
+{
+	if (dst == 0 || n == 0)
+		return;
+	g_copies.fetch_add(n, std::memory_order_relaxed);
+	// Pass 1: read every source entry, one shared lock per run of sources in one shard.
+	// (A source that is itself in this copy's destination range is read as it was BEFORE the
+	// copy, which is D3D12's semantics for a CopyDescriptors: it copies by value.)
+	std::vector<ViewEntry> src_entries(n);
+	std::vector<unsigned char> known(n, 0);
+	{
+		std::uint32_t i = 0;
+		while (i < n)
+		{
+			const unsigned si = shard_index(src + static_cast<std::uint64_t>(i) * inc);
+			Shard &sh = g_shards[si];
+			std::shared_lock<std::shared_mutex> lock(sh.mutex);
+			for (; i < n && shard_index(src + static_cast<std::uint64_t>(i) * inc) == si; ++i)
+			{
+				const auto it = sh.slots.find(src + static_cast<std::uint64_t>(i) * inc);
+				if (it != sh.slots.end())
+				{
+					src_entries[i] = it->second;
+					known[i] = 1;
+				}
+			}
+		}
+	}
+	// Pass 2: write every destination, one exclusive lock per run of destinations in one shard.
+	std::uint32_t i = 0;
+	while (i < n)
+	{
+		const unsigned di = shard_index(dst + static_cast<std::uint64_t>(i) * inc);
+		Shard &sh = g_shards[di];
+		std::unique_lock<std::shared_mutex> lock(sh.mutex);
+		for (; i < n && shard_index(dst + static_cast<std::uint64_t>(i) * inc) == di; ++i)
+		{
+			const icept::DescriptorId d = dst + static_cast<std::uint64_t>(i) * inc;
+			if (!known[i])
+			{
+				// Not necessarily an error: a slot copied before we attached, a sampler, or a
+				// null descriptor. Counted so a persistent stream of them is visible.
+				sh.slots.erase(d);
+				g_unknown_copies.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			ViewEntry copy = src_entries[i];
+			copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+			copy.via_copy = true;
+			copy.src_slot = src + static_cast<std::uint64_t>(i) * inc;
+			sh.slots[d] = copy;
+		}
+	}
 }
 
 void note_copy(icept::DescriptorId dst, icept::DescriptorId src)
 {
-	if (dst == 0)
-		return;
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	++g_copies;
-	const auto it = g_slots.find(src);
-	if (it == g_slots.end())
-	{
-		// Not necessarily an error: a slot copied before we attached, a sampler, or a null
-		// descriptor. Counted so a persistent stream of them is visible.
-		g_slots.erase(dst);
-		g_unknown_copies.fetch_add(1, std::memory_order_relaxed);
-		return;
-	}
-	ViewEntry copy = it->second;
-	copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-	copy.via_copy = true;
-	copy.src_slot = src;
-	g_slots[dst] = copy;
+	note_copy_range(dst, src, 1, 0);
 }
 
 void note_heap_bound(::ID3D12DescriptorHeap *heap)
@@ -120,7 +172,7 @@ void note_heap_bound(::ID3D12DescriptorHeap *heap)
 	}
 	span.increment = inc;
 
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
+	std::lock_guard<std::mutex> lock(g_heaps_mutex);
 	for (HeapRecord &r : g_heaps)
 	{
 		if (r.heap == heap)
@@ -141,9 +193,10 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 	if (cpu == 0)
 		return false;
 	{
-		std::shared_lock<std::shared_mutex> lock(g_mutex);
-		const auto it = g_slots.find(cpu);
-		if (it == g_slots.end())
+		Shard &sh = shard_of(cpu);
+		std::shared_lock<std::shared_mutex> lock(sh.mutex);
+		const auto it = sh.slots.find(cpu);
+		if (it == sh.slots.end())
 			return false;
 		out = it->second;
 	}
@@ -157,7 +210,7 @@ bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
 {
 	if (gpu == 0)
 		return false;
-	std::shared_lock<std::shared_mutex> lock(g_mutex);
+	std::lock_guard<std::mutex> lock(g_heaps_mutex);
 	for (const HeapRecord &r : g_heaps)
 		if (core::gpu_to_cpu(gpu, r.span, cpu))
 			return true;
@@ -180,26 +233,39 @@ std::uint64_t write_sequence() { return g_seq.load(std::memory_order_relaxed); }
 
 Stats stats()
 {
-	std::shared_lock<std::shared_mutex> lock(g_mutex);
 	Stats s;
-	s.views = g_views;
-	s.copies = g_copies;
-	s.slots = g_slots.size();
-	s.heaps = g_heaps.size();
-	s.slots_buckets = g_slots.bucket_count();
+	s.views = g_views.load(std::memory_order_relaxed);
+	s.copies = g_copies.load(std::memory_order_relaxed);
+	for (Shard &sh : g_shards)
+	{
+		std::shared_lock<std::shared_mutex> lock(sh.mutex);
+		s.slots += sh.slots.size();
+		s.slots_buckets += sh.slots.bucket_count();
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_heaps_mutex);
+		s.heaps = g_heaps.size();
+	}
 	return s;
 }
 
 void clear_for_test()
 {
-	std::unique_lock<std::shared_mutex> lock(g_mutex);
-	g_slots.clear();
-	g_heaps.clear();
+	for (Shard &sh : g_shards)
+	{
+		std::unique_lock<std::shared_mutex> lock(sh.mutex);
+		sh.slots.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_heaps_mutex);
+		g_heaps.clear();
+	}
 	g_unknown_lookups.store(0);
 	g_null_lookups.store(0);
 	g_dead_lookups.store(0);
 	g_unknown_copies.store(0);
-	g_views = g_copies = 0;
+	g_views.store(0);
+	g_copies.store(0);
 }
 
 } // namespace stray_dlss::native::shadow
