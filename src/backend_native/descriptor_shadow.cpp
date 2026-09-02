@@ -43,9 +43,15 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 {
 	if (cpu == 0)
 		return;
+	// The generation stamp, taken here when the caller did not (a hand-built entry, as the
+	// harness writes them), outside the shadow's lock: the registry has its own.
+	std::uint64_t gen = entry.resource_gen;
+	if (gen == 0 && entry.resource != 0)
+		gen = registry::generation_of(entry.resource);
 	std::unique_lock<std::shared_mutex> lock(g_mutex);
 	ViewEntry &slot = g_slots[cpu];
 	slot = entry;
+	slot.resource_gen = gen;
 	slot.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	slot.via_copy = false;
 	++g_views;
