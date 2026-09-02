@@ -379,6 +379,9 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         tests/warp/log_stub.cpp
         src/mv_resolve.cpp
         src/d3d12_restore.cpp
+        # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
+        # 2026-09-02), so the harness that links present_owner must also link perf.
+        src/perf.cpp
         # The real ReShade bindings, so the ReShade-facing half of the restore is the code
         # under test rather than a reimplementation of it.
         src/backend_reshade/reshade_bindings.cpp
