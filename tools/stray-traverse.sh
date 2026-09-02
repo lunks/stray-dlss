@@ -66,6 +66,11 @@ else
     python3 "$INJECT" traverse "/dev/input/$KBD" "$TOTAL" "$SWAP" >/dev/null 2>&1 &
 fi
 INJ=$!
+# The drive ratio: engine-TAA dispatches we suppressed (i.e. evaluated DLSS for) per present,
+# read from the plugin's own status file over the window. ~1.0 means every frame was driven; a
+# ratio below ~0.995 is a refusal streak and fails the pass whatever the fps (facts §29/§30).
+drivefield() { grep "^$1=" "$GAME_DIR/stray-dlss-status.txt" 2>/dev/null | tail -1 | cut -d= -f2; }
+ds0=$(drivefield native_drive_suppressed); pf0=$(drivefield frame)
 TW0=$(date +%s.%N)
 samples=(); dts=(); f_prev=$(frame_now); t_prev=$TW0; f_start=$f_prev; t_first=$TW0; t_last=$TW0; f_end=$f_prev
 while kill -0 "$INJ" 2>/dev/null; do
@@ -108,8 +113,11 @@ else
     avg=""; slowest=""; hitches=""; n=0; worst_ms=""
     log "RESULT $LABEL: window completed in ${elapsed}s (no fps)"
 fi
-[ -f "$CSV" ] || echo "time,label,avg_fps,slowest_bucket_fps,hitch_buckets,buckets,worst_sampled_ms,elapsed_s,map" > "$CSV"
-echo "$(date +%H:%M:%S),$LABEL,$avg,$slowest,$hitches,$n,$worst_ms,$elapsed,$(probe map)" >> "$CSV"
+ds1=$(drivefield native_drive_suppressed); pf1=$(drivefield frame)
+drive_ratio=$(awk -v a="${ds0:-}" -v b="${ds1:-}" -v pa="${pf0:-}" -v pb="${pf1:-}" 'BEGIN { if (a=="" || b=="" || pa=="" || pb=="") { print ""; exit } d = pb - pa; if (d > 0) printf "%.3f", (b - a) / d; else print "" }')
+[ -n "$drive_ratio" ] && log "DRIVE RATIO $LABEL: $drive_ratio (suppressed $ds0->$ds1 over presents $pf0->$pf1) - <0.995 is a refusal streak"
+[ -f "$CSV" ] || echo "time,label,avg_fps,slowest_bucket_fps,hitch_buckets,buckets,worst_sampled_ms,elapsed_s,drive_ratio,map" > "$CSV"
+echo "$(date +%H:%M:%S),$LABEL,$avg,$slowest,$hitches,$n,$worst_ms,$elapsed,${drive_ratio:-},$(probe map)" >> "$CSV"
 chown deck:deck "$CSV" 2>/dev/null
 [ -n "$SHOT" ] && bash "$TOOLS_DIR/screenshot-gamescope.sh" "$SHOT" 4 >/dev/null 2>&1 && log "  screenshot: $SHOT"
 exit 0
