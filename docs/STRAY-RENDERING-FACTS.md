@@ -1005,3 +1005,51 @@ the specific mod was StrayFur.
 plugin driving — `present owner: factory ... (class implemented by ...\Win64\dxgi.dll)` (ReShade's
 proxy factory), `DLSS feature created: 1920x1080 -> 3840x2160`, three reload cycles, no crash,
 parity with the other SR+NR arms.
+
+
+## 29. The Config-B flicker: the online heap is created through ReShade's proxy device (2026-09-02)
+
+The user saw the image and the DLSS on-screen indicator flicker in sync under Config B (plugin
+with ReShade loaded on top, add-on `.disabled`), and NOT under Config A (plugin alone). The
+indicator is drawn by the NGX evaluate, so a flicker frame is a frame with no evaluate: our hook
+refused the pinned TAA dispatch and the engine's own TAA ran. Measured, and it is a number.
+
+The signal: `NATIVE DRIVE ... suppressed=` (engine-TAA dispatches replaced with DLSS) per bench
+window, as drive_ratio = suppressed-delta / present-delta:
+
+| arm | shadow | drive_ratio | still shadow-crop diff x1e3 |
+|---|---|---|---|
+| D (plugin alone) | fast | 1.00 | steady ~1.5 |
+| E (plugin+ReShade), before | fast | ~0.81 | alternates 1.5 <-> 20 (flicker) |
+| E, ShadowMode=debug | debug | 1.00 | flat ~1.5 |
+| E, fast + overflow (fix) | fast | 0.999 / 1.000 / 1.000 | ~4 + transient, no sustained alternation |
+
+So ~1 frame in 5 under Config-B fast was undriven - the engine TAA ran, the indicator blinked,
+and shadow regions (denoised differently by DLSS vs the engine's TAA) alternated. resolve_failed
+read 0 throughout: it was a resolve MISS, not an error - the pinned pass' depth/velocity/colour
+resolved to unknown, the gate refused ("depth or velocity SRV is missing or not known live"), and
+that path does not increment resolve_failed.
+
+The gap, named by the orphan counters (this fix's diagnostics), Config-B fast:
+`fast heaps: create=29 bind=0 | ORPHANS view=0 copy-src=0 copy-dst=3.86M overflow-live=61194`.
+Every view creation and every copy SOURCE fell in a heap the fast path registered at
+CreateDescriptorHeap; every copy DESTINATION did not. That destination is UE4's big online
+shader-visible descriptor heap, into which it copies thousands of descriptors a frame - and under
+ReShade it is created through ReShade's PROXY device, which our real-device CreateDescriptorHeap
+hook never sees. So the online slots the pinned TAA reads were never in the flat array. Config A
+has no proxy, so all ~30 heaps are ours and the orphan count is 0 (HARD).
+
+The proper fix: the fast path's overflow map. A view/copy/lookup whose handle is in no registered
+heap now goes to a sharded overflow map (touched ONLY by orphans, so Config A never locks there)
+instead of being dropped. The pinned TAA then resolves its online inputs from the overflow and
+drives every frame: drive_ratio 0.999-1.000, hitch buckets 0, under Config-B fast. The overflow's
+live size (61 194 = the online heap) and per-site orphan counts are in the NATIVE SHADOW GROWTH
+line; a proxy-device CreateDescriptorHeap patch that registers the online heap into the flat array
+(unwrapping ReShade's heap to the real pointer) would move those to the flat path and drop
+overflow-live to 0 - the remaining purely-perf refinement, since Config B is NR-bound (~52 fps)
+and the overflow's lock cost there is invisible.
+
+Interim shipping choice: ShadowMode=auto (dc29457) selects DEBUG under ReShade, which was already
+1.00 and flat and carries no overflow; the overflow makes FAST correct under ReShade too (drive
+1.0). Both fix the user's flicker. Config A is unaffected: fast, no overflow, no orphans, drive
+100%.
