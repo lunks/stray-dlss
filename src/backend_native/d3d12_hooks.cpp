@@ -655,6 +655,7 @@ unsigned install_device_hooks(::ID3D12Device *device, bool query_device2)
 	// ID3D12Device2::CreatePipelineState is a higher slot in the SAME vtable (one vtable per
 	// object covering its newest interface — measured); patch it only if the device is a
 	// Device2 at all.
+	(void)query_device2; // unused when the SDK has no ID3D12Device2 (mingw's local check)
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 	if (!query_device2)
 	{
