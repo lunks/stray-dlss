@@ -419,7 +419,19 @@ bool test_native_hooks_ue4_shaped_frame(Gpu &gpu)
 	check(u0 && u0->resource == id_of(output.Get()) && u0->width == 640 && u0->height == 360, "u0 is the output at its own size");
 	check(b.constant_buffers.size() == 1 && b.constant_buffers[0].first == 1 && b.constant_buffers[0].second.buffer == id_of(view_cb.Get()) &&
 		b.constant_buffers[0].second.offset == 0, "the root CBV at parameter 1 maps to the upload buffer");
-	check(b.heap_count == 1 && b.heaps[0] == online.Get(), "the online heap is reported");
+	{
+		// Under ReShade the harness holds a PROXY heap; the shadow reports the real one beneath.
+		ID3D12DescriptorHeap *real_online = online.Get();
+		if (running_under_reshade())
+		{
+			if (IUnknown *o = unwrap(online.Get()))
+			{
+				real_online = reinterpret_cast<ID3D12DescriptorHeap *>(o);
+				o->Release();
+			}
+		}
+		check(b.heap_count == 1 && b.heaps[0] == real_online, "the online heap is reported");
+	}
 	{
 		unsigned char copy[stray_dlss::ue4::kViewPrefixBytes];
 		stray_dlss::ue4::ViewParams vp{};
