@@ -1279,3 +1279,28 @@ in-process cross-check available today (the native host has no render-target-bin
 mirror error would show as a STALE presented frame; that is what the stage-1 screenshot
 protocol looks for.
 ||||||| df1b48d
+
+### 31.5 No Streamline, by construction — what the snippet reads that only Streamline used to supply
+
+Hard constraint from the user (2026-09-02): Streamline's interposer/swapchain layer is where
+OptiScaler's FG died on this box (CLAUDE.md §5), so `sl.interposer.dll`, `sl.dlss_g.dll`,
+`sl.common.dll` and the SDK are off the table in any form, including loading them ourselves.
+The snippet is driven through the NGX core exactly like SR, and OUR present owner does what
+Streamline's swapchain layer did. The question that constraint raises — does the snippet read
+anything only Streamline can supply? — was answered from the strings (31.1/31.2) and from
+Nukem's shim, which sits between `sl.dlss_g` and the snippet and so shows both sides:
+
+| what Streamline supplies | in the snippet's strings? | verdict |
+|---|---|---|
+| the pacer / present thread / `DLSSG.CmdQueue` `CmdAlloc` `FenceEvent` `Sync*Callback` `QueueSubmitCallback` | **no** (31.1: 0 exact, 0 fragment) | SL-internal; the snippet records onto the list it is handed and returns. Ours: the present owner (fg_present). HARD |
+| `DLSSG.EnableInterp` / `IsRecording` | **no** | SL-internal gating; Nukem reads them off SL's shared block, the snippet cannot. HARD |
+| Reflex (`eFailReflexNotDetectedAtRuntime`) | no `Reflex` marker name; only `DLSSG.ReflexWarp.Available` (a snippet OUTPUT) and `DLSSG.UseReflexMatrices` (S-only) | the snippet has no Reflex dependency; Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` (`src/backend_native/fg_reflex.cpp`), status-logged, never gating. HARD for the absence |
+| `GetCurrentBackBufferIndex` (`eFailGetCurrentBackBufferIndexNotCalled`) | no (`Present`, `Flip`: 0) | a property of SL's swapchain proxy; ours mirrors UE4's counter (31.4). HARD |
+| `DLSSG.GetCurrentSettingsCallback` `EstimateVRAMCallback` `MustCallEval` `MultiFrameCountMax` `ReflexWarp.Available` | yes, and Nukem's `PopulateParameters_Impl` SETS them | snippet OUTPUTS the core populates for the caller; we read `MultiFrameCountMax`/`MustCallEval` back after CreateFeature and log them. HARD |
+| every other `DLSSG.*` name `sl.dlss_g` sets (31.2, S+C) | yes | provided by `src/ngx_fg.cpp` per evaluate, values from the TAA hook's View CB and our resolve. HARD that the names are read; the VALUES' conventions (MvecScale, matrices' handedness, CameraFar=0) are UNCONFIRMED until an interpolated frame is judged on the box |
+
+So nothing the snippet reads is Streamline-only. What remains UNCONFIRMED is behavioural:
+whether the core under Proton routes feature 11 to a game-directory `nvngx_dlssg.dll` at all
+(it routed feature 11 for OptiScaler through SL, which uses the same core call, CLAUDE.md §5 —
+SOFT that our direct call is treated identically), and whether the snippet evaluates
+correctly with `DLSSG.OutputReal` provided by us rather than by SL (a knob, `NgxFGOutputReal`).

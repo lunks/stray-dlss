@@ -2186,6 +2186,46 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
 * **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
   mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
+### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02, offline; box not yet seen)
+
+Facts in `docs/STRAY-RENDERING-FACTS.md` §31. The parts that decide everything:
+
+* **`nvngx_dlssg.dll` has no present path, no queue and no pacer** (§31.1, HARD from the
+  strings): `EvaluateFeature` records the interpolation onto the list it is handed. Everything
+  Streamline's `sl.dlss_g` did around it — own the swapchain, present twice, pace, hand the
+  interpolated frame over — is ours, in `src/backend_native/fg_present.cpp`, and Streamline is
+  never loaded (user constraint: its swapchain layer is where OptiScaler's FG died here).
+* **The game is handed REPLACEMENT back buffers** from a hooked `IDXGISwapChain::GetBuffer`
+  and never touches the real ring. UE 4.27 never calls `GetCurrentBackBufferIndex`; it keeps
+  its own counter (+1 per Present, 0 after every Resize, `GetBuffer(i)` for every index after
+  a resize — §31.4, HARD from source), so `core::fg::GameIndexMirror` reproduces it and tells us
+  which replacement holds this frame. A mirror error would be a STALE presented frame — the
+  stage-1 screenshot protocol (magenta band on the generated frame) is what would show it.
+* **Two presents per game frame**: copy generated → real[current], Present; wait the pacer's
+  half interval on a worker thread; copy real → real[current], Present. `NgxFGPacing=0` is the
+  back-to-back control (the issued-interval histogram goes BIMODAL, which the `[fg]` line
+  reports), `=2` keeps everything on the game thread for bisection. `ResizeBuffers`,
+  `SetFullscreenState` and `ResizeTarget` drain the worker and bump an epoch first — the
+  fullscreen transition is where OptiScaler died, so it is the stage-1 test's point.
+* **A generated frame never reaches the screen unvalidated** (prime directive 2): in ngx mode a
+  64x64 crop of the generated and the real frame is read back three presents later and a black
+  or stale (real moved, generated did not, 3x) output REVOKES presenting it, loudly. Every
+  refusal is counted by reason (`[fg]` line, `fg_*` in the status file).
+* **Every `DLSSG.*` name written is in the snippet's exact null-terminated string set**
+  (§31.2, `tools/ngx_param_names.py`); the SL-only names (`EnableInterp`, `CmdQueue`, the sync
+  callbacks, `IsRecording`) are absent from the snippet and not written. Re-run the tool on the
+  box's SL 2.13 copy before trusting the list there.
+* **Stage 1 (`NgxFG=1 NgxFGMode=1`) needs no NGX**: the generated frame is the previous real
+  frame under a magenta band. Stage 2 (`NgxFGMode=2`) plugs `src/ngx_fg.cpp` in as the generator.
+  Stage 3 (HUD-less) is deferred until the user has inspected stage 2 on the box.
+* **Unverified conventions, in the order a wrong one would show:** `DLSSG.MvecScaleX/Y =
+  1/renderW, 1/renderH` for our pixel-space vectors (SL guide §7.0), UE4's row-major
+  row-vector matrices passed as SL's "row-major" ones, `CameraFar = 0` for the infinite
+  reversed-Z projection, `ColorBuffersHDR` from the swapchain format + colour space. Each is a
+  knob (`NgxFGMvecScale`, `NgxFGCameraFar`, `NgxFGHDR`) so the box can A/B without a rebuild.
+* **Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` by function id** (`src/backend_native/
+  fg_reflex.cpp`), never `sl.reflex`; every status is logged and nothing gates on it.
+
 ## 6. Build, CI and testing
 
 * **CMake + GitHub Actions, MSVC, x64 only.** No local build. `windows-latest` is now Windows Server

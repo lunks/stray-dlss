@@ -380,8 +380,14 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 	sk->on_present(pc);
 	// Frame generation's game-thread half: the generated frame's production (and, in ngx mode,
 	// the validation crop) recorded onto this same list, after everything the sink recorded.
-	if (pc.present_list != nullptr && fg::enabled() && fg::record(sc, pc.present_list, pc.frame))
+	// Executed whenever FG could have recorded: a generator that records feature-creation work
+	// and then declines (a failed evaluate) must still have that work run, and an empty closed
+	// list costs nothing.
+	if (pc.present_list != nullptr && fg::enabled() && fg::game_frame(sc) != nullptr)
+	{
+		fg::record(sc, pc.present_list, pc.frame);
 		g_list_used.store(true, std::memory_order_relaxed);
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);

@@ -35,3 +35,21 @@ are compiled under mingw by CI as the fast proxy for the MSVC build.
    * **Config B (ReShade coexists):** keep ReShade as `dxgi.dll`; the plugin unwraps its proxies.
    In both cases **do not** also run the ReShade add-on (`stray-dlss.addon64`) — two drivers of
    one TAA pass.
+
+## Frame generation (`NgxFG`, default 0)
+
+DLSS Frame Generation through the NGX core, **without Streamline** (facts §31). The plugin's
+present owner hands the game replacement back buffers, presents twice per game frame and paces
+the pair on a worker thread; `nvngx_dlssg.dll` (beside the game executable, like `nvngx_dlss.dll`)
+is driven exactly as SR is. Keys, all `[STRAYDLSS]` in `StrayDLSS.ini`:
+
+* `NgxFG=1` turns it on. `NgxFGMode=1` is the stage-1 experiment (the generated frame is the
+  previous real frame under a magenta band, no NGX: proves the present path alone);
+  `NgxFGMode=2` (default) generates through DLSS-G.
+* `NgxFGPacing` 1 worker thread (default), 0 back to back (control), 2 game thread with
+  `NgxFGWaitMs` between the presents. `NgxFGValidate=1` keeps a black or stale generated frame
+  off the screen. `NgxFGReflex` 0/1/2. `NgxFGHDR`, `NgxFGCameraFar`, `NgxFGMvecScale`,
+  `NgxFGOutputReal`, `NgxFGWarmupFrames` are the DLSS-G feature's knobs (`src/ngx_fg.hpp`).
+* Read the `[fg]` log line and the `fg_*` status-file keys: presents issued per game present
+  (~2x), refusals by reason, the pacer's estimate, whether the issued-interval histogram is
+  bimodal (= not paced), and the crop gate's verdicts.
