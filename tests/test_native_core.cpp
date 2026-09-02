@@ -272,15 +272,22 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	// convicts ReShade's copy bookkeeping.
 	static const auto all_live = [](icept::ResourceId) { return true; };
 	static const auto view_map = [](icept::DescriptorId v) -> icept::ResourceId { return v == 0xa000 ? 0x3333 : v == 0xa001 ? 0x2222 : 0; };
-	static const auto provenance = [](icept::DescriptorId slot, bool &copy, icept::DescriptorId &src) {
-		if (slot == 0xb800) { copy = true; src = 0xa000; return true; }  // source agrees with native
-		if (slot == 0xb801) { copy = true; src = 0xa001; return true; }  // source agrees with the oracle
-		if (slot == 0xb802) { copy = false; src = 0; return true; }
+	// The native shadow's entries: online slots b8xx copied from offline sources a00x; the
+	// source a001 was RE-CREATED for 0x2222 at seq 50, after the copy at seq 10.
+	static const auto slot_info = [](icept::DescriptorId slot, icept::ResourceId &res, std::uint64_t &seq, bool &copy,
+	                                 icept::DescriptorId &src, bool &dead) {
+		dead = false;
+		if (slot == 0xb800) { res = 0x3333; seq = 10; copy = true; src = 0xa000; return true; }  // source agrees with native (ReShade's map)
+		if (slot == 0xb801) { res = 0x3333; seq = 10; copy = true; src = 0xa001; return true; }  // source re-created for the oracle's resource
+		if (slot == 0xb802) { res = 0x3333; seq = 10; copy = false; src = 0; return true; }
+		if (slot == 0xa000) { res = 0x3333; seq = 5; copy = false; src = 0; return true; }
+		if (slot == 0xa001) { res = 0x2222; seq = 50; copy = false; src = 0; return true; }
+		if (slot == 0xc011) { res = 0x9999; seq = 10; copy = true; src = 0xa001; dead = true; return true; } // tombstone copied from the re-created source
 		return false;
 	};
 	diff::Adjudicator full;
 	full.oracle_live = all_live; full.native_live = all_live; full.native_seen = all_live;
-	full.oracle_view_resource = view_map; full.native_provenance = provenance;
+	full.oracle_view_resource = view_map; full.native_slot = slot_info;
 	icept::DispatchBindings o2, n2;
 	o2.srvs.push_back(BoundTexture{ 1, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
 	n2.srvs.push_back(BoundTexture{ 1, 0x3333, TexFormat::unknown, 0, 0, 0xb800 }); // copied from a slot ReShade maps to 0x3333
@@ -289,7 +296,7 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	o2.srvs.push_back(BoundTexture{ 3, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
 	n2.srvs.push_back(BoundTexture{ 3, 0x3333, TexFormat::unknown, 0, 0, 0xb802 }); // written by a view creation
 	o2.srvs.push_back(BoundTexture{ 10, 0x8144, TexFormat::unknown, 0, 0, 0xa002 }); // native: tombstone naming 0x8144
-	o2.srvs.push_back(BoundTexture{ 11, 0x8145, TexFormat::unknown, 0, 0, 0xa003 }); // native: tombstone naming another
+	o2.srvs.push_back(BoundTexture{ 11, 0x2222, TexFormat::unknown, 0, 0, 0xa001 }); // native: tombstone whose source was re-created for 0x2222
 	o2.srvs.push_back(BoundTexture{ 12, 0x8146, TexFormat::unknown, 0, 0, 0xa004 }); // native: never written
 	o2.srvs.push_back(BoundTexture{ 13, 0x8147, TexFormat::unknown, 0, 0, 0xa005 }); // native: not in the walk at all
 	n2.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 10, 0xc010, 2, 0x8144 });
@@ -299,22 +306,34 @@ TEST_CASE("diff adjudication: a stale oracle map is convicted by its own livenes
 	REQUIRE(r2.mismatches.size() == 3);
 	REQUIRE(r2.unknown.size() == 4);
 	CHECK(r2.mismatches[0].find("=> RESHADE-COPY-STALE") != std::string::npos);
-	CHECK(r2.mismatches[0].find("copied from a000, which ReShade's own view map says is res 3333") != std::string::npos);
-	CHECK(r2.mismatches[1].find("=> BOTH-LIVE") != std::string::npos);
+	CHECK(r2.mismatches[0].find("ReShade's view map says 3333") != std::string::npos);
+	CHECK(r2.mismatches[1].find("=> RESHADE-VIEW-RECREATED") != std::string::npos);
+	CHECK(r2.mismatches[1].find("which now holds res 2222 written at seq 50 - AFTER the copy") != std::string::npos);
 	CHECK(r2.mismatches[2].find("=> BOTH-LIVE") != std::string::npos);
 	CHECK(r2.mismatches[2].find("written by a view creation") != std::string::npos);
 	CHECK(r2.unknown[0].find("TOMBSTONE: res 8144 died after the slot was written; the oracle names that address") != std::string::npos);
 	CHECK(r2.unknown[0].find("=> RESHADE-STALE") != std::string::npos);
-	CHECK(r2.unknown[1].find("=> NATIVE-MISSED") != std::string::npos); // a tombstone of some OTHER resource proves nothing
+	CHECK(r2.unknown[1].find("=> RESHADE-VIEW-RECREATED") != std::string::npos); // the tombstone's source was re-created for the oracle's resource
 	CHECK(r2.unknown[2].find("never written since attach") != std::string::npos);
 	CHECK(r2.unknown[2].find("=> NATIVE-BLIND") != std::string::npos);
 	CHECK(r2.unknown[3].find("no such register") != std::string::npos);
 	CHECK(r2.unknown[3].find("=> NATIVE-MISSED") != std::string::npos);
 	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::reshade_copy_stale)] == 1);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::reshade_view_recreated)] == 2);
 	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::reshade_stale)] == 1);
 	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::native_blind)] == 1);
-	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 2);
-	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::both_live)] == 2);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::native_missed)] == 1);
+	CHECK(r2.verdicts[static_cast<int>(diff::Verdict::both_live)] == 1);
+	CHECK_FALSE(r2.oracle_wrong()); // NATIVE-BLIND and NATIVE-MISSED slots keep it unresolved
+	// A disagreement made only of ReShade-convicting slots is the oracle's fault, whole.
+	icept::DispatchBindings o3, n3;
+	o3.srvs.push_back(BoundTexture{ 10, 0x8144, TexFormat::unknown, 0, 0, 0xa002 });
+	o3.srvs.push_back(BoundTexture{ 11, 0x2222, TexFormat::unknown, 0, 0, 0xa001 });
+	n3.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 10, 0xc010, 2, 0x8144 });
+	n3.unresolved.push_back(icept::DispatchBindings::Unresolved{ 't', 11, 0xc011, 2, 0x9999 });
+	const diff::Result r3 = diff::compare(o3, n3, &full);
+	CHECK(r3.oracle_wrong());
+	CHECK_FALSE(diff::compare(o3, n3).oracle_wrong()); // unadjudicated never convicts
 	// Without an adjudicator every differing slot is unadjudicated and the lines are bare.
 	const diff::Result bare = diff::compare(oracle, native);
 	CHECK(bare.verdicts[static_cast<int>(diff::Verdict::unadjudicated)] == 7);

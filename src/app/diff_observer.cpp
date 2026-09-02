@@ -97,45 +97,58 @@ Judged judge(icept::ResourceId oracle_res, icept::ResourceId native_res, const A
 	return j;
 }
 
-// Refines a MISMATCH (both sides named a live resource) with the slot's provenance: if the
-// native shadow says the online slot was COPIED from source S, ReShade's own map for S is a
-// second answer from the oracle itself — and when it agrees with the native side, ReShade's
-// online copy bookkeeping is what disagrees.
+// Refines a MISMATCH (both sides named a live resource) with the slot's provenance. The
+// native shadow copies a descriptor's VALUE at copy time, as D3D12 does; ReShade's tracking
+// records the source VIEW HANDLE and resolves it at query time — so when the game re-creates
+// that offline view for another resource after the copy (UE4 recycles offline slots
+// constantly), ReShade reports the new resource for an online slot whose bytes still hold
+// the old one. The native shadow's current entry for the source, written AFTER the copy and
+// naming the oracle's resource, is the evidence. (Measured: run H, every BOTH-LIVE line.)
 void refine_mismatch(Judged &j, icept::ResourceId oracle_res, icept::ResourceId native_res,
                      icept::DescriptorId native_slot, const Adjudicator *adj)
 {
-	if (j.verdict != Verdict::both_live || adj == nullptr || adj->native_provenance == nullptr ||
-		adj->oracle_view_resource == nullptr || native_slot == 0)
+	if (j.verdict != Verdict::both_live || adj == nullptr || adj->native_slot == nullptr || native_slot == 0)
 		return;
-	bool via_copy = false;
-	icept::DescriptorId src = 0;
-	if (!adj->native_provenance(native_slot, via_copy, src))
+	icept::ResourceId res = 0, src_res = 0;
+	std::uint64_t seq = 0, src_seq = 0;
+	bool via_copy = false, dead = false, src_copy = false, src_dead = false;
+	icept::DescriptorId src = 0, src_src = 0;
+	if (!adj->native_slot(native_slot, res, seq, via_copy, src, dead))
 		return;
-	char buf[200];
+	char buf[240];
 	if (!via_copy)
 	{
-		std::snprintf(buf, sizeof(buf), " (native slot %llx written by a view creation)", static_cast<unsigned long long>(native_slot));
+		std::snprintf(buf, sizeof(buf), " (native slot %llx written by a view creation at seq %llu)",
+			static_cast<unsigned long long>(native_slot), static_cast<unsigned long long>(seq));
 		j.detail = buf;
 		return;
 	}
-	const icept::ResourceId src_res = adj->oracle_view_resource(src);
-	std::snprintf(buf, sizeof(buf), " (native slot %llx copied from %llx, which ReShade's own view map says is res %llx)",
-		static_cast<unsigned long long>(native_slot), static_cast<unsigned long long>(src), static_cast<unsigned long long>(src_res));
+	const bool have_src = adj->native_slot(src, src_res, src_seq, src_copy, src_src, src_dead);
+	const icept::ResourceId reshade_src = adj->oracle_view_resource != nullptr ? adj->oracle_view_resource(src) : 0;
+	std::snprintf(buf, sizeof(buf), " (native slot %llx copied at seq %llu from %llx, which now holds res %llx written at seq %llu%s; ReShade's view map says %llx)",
+		static_cast<unsigned long long>(native_slot), static_cast<unsigned long long>(seq), static_cast<unsigned long long>(src),
+		static_cast<unsigned long long>(have_src ? src_res : 0), static_cast<unsigned long long>(have_src ? src_seq : 0),
+		have_src && src_seq > seq ? " - AFTER the copy" : "", static_cast<unsigned long long>(reshade_src));
 	j.detail = buf;
-	if (src_res != 0 && src_res == native_res && src_res != oracle_res)
+	if (have_src && src_seq > seq && src_res == oracle_res && src_res != native_res)
+		j.verdict = Verdict::reshade_view_recreated;
+	else if (reshade_src != 0 && reshade_src == native_res && src_res != oracle_res)
 		j.verdict = Verdict::reshade_copy_stale;
 }
 
 // Refines an UNKNOWN (the native side had nothing) with the native resolver's own account of
 // the slot: a tombstone naming the oracle's resource convicts the oracle (the resource died
-// after the descriptor was written and its address was reused); a slot never written since
-// attach, or a heap span unknown, is the native side's blind spot.
-void refine_unknown(Judged &j, icept::ResourceId oracle_res, const icept::DispatchBindings *native, char kind, std::uint32_t reg)
+// after the descriptor was written and its address was reused); a tombstone whose source view
+// the game has since re-created for the oracle's resource convicts the oracle the same way
+// as refine_mismatch; a slot never written since attach, or a heap span unknown, is the
+// native side's blind spot.
+void refine_unknown(Judged &j, icept::ResourceId oracle_res, const icept::DispatchBindings *native, char kind,
+                    std::uint32_t reg, const Adjudicator *adj)
 {
 	if (native == nullptr || (j.verdict != Verdict::native_missed && j.verdict != Verdict::both_live))
 		return;
 	const auto *u = find_unresolved(*native, kind, reg);
-	char buf[200];
+	char buf[280];
 	if (u == nullptr)
 	{
 		j.detail = " (the native table walk produced no such register)";
@@ -144,13 +157,31 @@ void refine_unknown(Judged &j, icept::ResourceId oracle_res, const icept::Dispat
 	switch (u->reason)
 	{
 	case 2:
-		std::snprintf(buf, sizeof(buf), " (native slot %llx is a TOMBSTONE: res %llx died after the slot was written%s)",
-			static_cast<unsigned long long>(u->descriptor), static_cast<unsigned long long>(u->dead_resource),
-			u->dead_resource == oracle_res ? "; the oracle names that address" : "");
-		j.detail = buf;
+	{
 		if (u->dead_resource == oracle_res)
+		{
+			std::snprintf(buf, sizeof(buf), " (native slot %llx is a TOMBSTONE: res %llx died after the slot was written; the oracle names that address)",
+				static_cast<unsigned long long>(u->descriptor), static_cast<unsigned long long>(u->dead_resource));
+			j.detail = buf;
 			j.verdict = Verdict::reshade_stale;
+			break;
+		}
+		icept::ResourceId res = 0, src_res = 0;
+		std::uint64_t seq = 0, src_seq = 0;
+		bool via_copy = false, dead = false, src_copy = false, src_dead = false;
+		icept::DescriptorId src = 0, src_src = 0;
+		const bool have = adj != nullptr && adj->native_slot != nullptr && adj->native_slot(u->descriptor, res, seq, via_copy, src, dead);
+		const bool have_src = have && via_copy && adj->native_slot(src, src_res, src_seq, src_copy, src_src, src_dead);
+		std::snprintf(buf, sizeof(buf), " (native slot %llx is a TOMBSTONE: res %llx died after the slot was written at seq %llu%s%llx%s res %llx at seq %llu%s)",
+			static_cast<unsigned long long>(u->descriptor), static_cast<unsigned long long>(u->dead_resource),
+			static_cast<unsigned long long>(seq), via_copy ? "; copied from " : "", static_cast<unsigned long long>(via_copy ? src : 0),
+			have_src ? ", which now holds" : "", static_cast<unsigned long long>(have_src ? src_res : 0),
+			static_cast<unsigned long long>(have_src ? src_seq : 0), have_src && src_seq > seq ? " - AFTER the copy" : "");
+		j.detail = buf;
+		if (have_src && src_seq > seq && src_res == oracle_res)
+			j.verdict = Verdict::reshade_view_recreated;
 		break;
+	}
 	case 1:
 		std::snprintf(buf, sizeof(buf), " (native slot %llx never written since attach)", static_cast<unsigned long long>(u->descriptor));
 		j.detail = buf;
@@ -191,7 +222,7 @@ void compare_slots(const char prefix, const std::vector<BoundTexture> &expected,
 			std::snprintf(buf, sizeof(buf), "%c%u: oracle=(%s) native=UNKNOWN", prefix, e.slot, describe(e).c_str());
 			std::string line = buf;
 			Judged j = judge(e.resource, 0, adj);
-			refine_unknown(j, e.resource, native, prefix, e.slot);
+			refine_unknown(j, e.resource, native, prefix, e.slot, adj);
 			append_judgement(line, j, out);
 			out.unknown.push_back(line);
 			continue;
@@ -231,6 +262,7 @@ const char *verdict_name(Verdict v)
 	{
 	case Verdict::reshade_stale: return "RESHADE-STALE";
 	case Verdict::reshade_copy_stale: return "RESHADE-COPY-STALE";
+	case Verdict::reshade_view_recreated: return "RESHADE-VIEW-RECREATED";
 	case Verdict::native_blind: return "NATIVE-BLIND";
 	case Verdict::liveness_conflict: return "LIVENESS-CONFLICT";
 	case Verdict::native_missed: return "NATIVE-MISSED";
@@ -239,6 +271,19 @@ const char *verdict_name(Verdict v)
 	case Verdict::unadjudicated: return "unadjudicated";
 	}
 	return "?";
+}
+
+bool Result::oracle_wrong() const
+{
+	if (agree())
+		return false;
+	std::uint32_t convicting = verdicts[static_cast<int>(Verdict::reshade_stale)] +
+		verdicts[static_cast<int>(Verdict::reshade_copy_stale)] +
+		verdicts[static_cast<int>(Verdict::reshade_view_recreated)];
+	std::uint32_t total = 0;
+	for (int i = 0; i < kVerdictCount; ++i)
+		total += verdicts[i];
+	return total != 0 && convicting == total;
 }
 
 Result compare(const icept::DispatchBindings &expected, const icept::DispatchBindings &actual,
@@ -414,6 +459,16 @@ bool consume_and_compare(void *native_list, const icept::DispatchBindings &actua
 		if (!r.extra.empty()) ++g_summary.extra;
 		if (taa)
 			++g_summary.taa_disagree;
+		if (r.oracle_wrong())
+		{
+			++g_summary.dispatches_oracle_wrong;
+		}
+		else
+		{
+			++g_summary.dispatches_unresolved;
+			if (taa)
+				++g_summary.taa_dispatches_unresolved;
+		}
 		// Which kind led, so one hash with both a mismatch and an unknown gets both logged.
 		const std::uint64_t key = e.hash ^ (!r.mismatches.empty() ? 0x1ull : !r.unknown.empty() ? 0x2ull : 0x3ull);
 		unsigned &per_hash = g_logged_per_hash[key];
@@ -464,6 +519,10 @@ void log_summary(const char *when)
 		n += std::snprintf(verdicts + n, sizeof(verdicts) - n, "%s%s=%llu", i ? " " : "",
 			verdict_name(static_cast<Verdict>(i)), static_cast<unsigned long long>(s.verdicts[i]));
 	STRAY_LOG_INFO("DIFF VERDICTS [%s] slots: %s", when, verdicts);
+	STRAY_LOG_INFO("DIFF GATE [%s] disagreeing dispatches: oracle-wrong=%llu (every differing slot convicts ReShade) "
+		"UNRESOLVED=%llu (TAA unresolved=%llu) - the gate is UNRESOLVED=0",
+		when, static_cast<unsigned long long>(s.dispatches_oracle_wrong),
+		static_cast<unsigned long long>(s.dispatches_unresolved), static_cast<unsigned long long>(s.taa_dispatches_unresolved));
 }
 
 } // namespace stray_dlss::diff

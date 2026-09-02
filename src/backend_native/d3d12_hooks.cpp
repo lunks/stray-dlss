@@ -659,12 +659,16 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 			icept::ResourceId r = 0;
 			return icept::backend()->resource_from_view(v, r) ? r : 0;
 		};
-		adj.native_provenance = [](icept::DescriptorId slot, bool &via_copy, icept::DescriptorId &src) {
+		adj.native_slot = [](icept::DescriptorId slot, icept::ResourceId &res, std::uint64_t &seq, bool &via_copy,
+		                     icept::DescriptorId &src, bool &dead) {
 			shadow::ViewEntry e;
 			if (!shadow::lookup(slot, e))
 				return false;
+			res = e.resource;
+			seq = e.seq;
 			via_copy = e.via_copy;
 			src = e.src_slot;
+			dead = e.dead;
 			return true;
 		};
 		char note[160];

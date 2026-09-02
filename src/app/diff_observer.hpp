@@ -25,6 +25,9 @@ enum class Verdict : std::uint8_t
 	                    // shadow saw DIE after that very slot was written (tombstone; address reused)
 	reshade_copy_stale, // the slot was COPIED; ReShade's own view map for the copy's SOURCE agrees
 	                    // with the native answer, its online tracking does not: its copy bookkeeping
+	reshade_view_recreated, // the slot was COPIED from an offline view that the game RE-CREATED for
+	                    // another resource AFTER the copy; ReShade reports the re-created view's
+	                    // resource for the online slot, whose descriptor bytes still hold the old one
 	native_blind,       // the oracle names a live resource the registry never saw, or a slot the
 	                    // shadow never saw written since attach (no entry / no heap span)
 	liveness_conflict,  // the two liveness trackers disagree about the same resource
@@ -33,7 +36,7 @@ enum class Verdict : std::uint8_t
 	both_live,          // both sides name a resource live on both sides and they differ: ambiguous
 	unadjudicated,      // no liveness available (the pure comparison alone)
 };
-constexpr int kVerdictCount = 8;
+constexpr int kVerdictCount = 9;
 const char *verdict_name(Verdict v);
 
 // The evidence compare() may ask for. Any of the first three null makes every slot
@@ -48,8 +51,10 @@ struct Adjudicator
 	// ReShade's OWN view->resource map for a view handle (0 if unknown) — asked about the
 	// SOURCE slot of a copy the native shadow recorded, so ReShade can be checked against itself.
 	icept::ResourceId (*oracle_view_resource)(icept::DescriptorId view) = nullptr;
-	// The native shadow's provenance for an online slot: was it written by a copy, from where.
-	bool (*native_provenance)(icept::DescriptorId slot, bool &via_copy, icept::DescriptorId &src) = nullptr;
+	// The native shadow's whole entry for a slot: what it holds, at which write sequence, whether
+	// it was copied and from where, and whether that resource has since died (tombstone).
+	bool (*native_slot)(icept::DescriptorId slot, icept::ResourceId &res, std::uint64_t &seq, bool &via_copy,
+	                    icept::DescriptorId &src, bool &dead) = nullptr;
 };
 
 struct Result
@@ -66,6 +71,8 @@ struct Result
 	// Per differing slot (mismatch, unknown, extra), which side it convicts.
 	std::uint32_t verdicts[kVerdictCount] = {};
 	bool agree() const { return mismatches.empty() && unknown.empty() && extra.empty(); }
+	// A disagreement whose every differing slot convicts ReShade: the native side is right.
+	bool oracle_wrong() const;
 };
 
 // Pure. `expected` is the oracle's (ReShade's) resolve, `actual` the native backend's. With an
@@ -106,6 +113,11 @@ struct Summary
 	std::uint64_t taa_disagree = 0;
 	// Differing SLOTS by verdict, cumulative (a dispatch with 31 unknown cbs contributes 31).
 	std::uint64_t verdicts[kVerdictCount] = {};
+	// Disagreeing DISPATCHES by adjudication: every differing slot convicts ReShade
+	// (oracle_wrong), or at least one slot is unresolved / convicts the native side.
+	std::uint64_t dispatches_oracle_wrong = 0;
+	std::uint64_t dispatches_unresolved = 0;
+	std::uint64_t taa_dispatches_unresolved = 0;
 };
 Summary summary();
 
