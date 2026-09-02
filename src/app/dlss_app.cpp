@@ -277,6 +277,12 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			ngx::shutdown(g_state.native_device);
 		g_state.native_device = nullptr;
 		g_state.compute_pipeline_hashes.clear();
+		// The native hooks belong to THIS device: they hold its pointer as the CommandContext's
+		// device and the sentinels ride on its resources. The next init_device re-installs
+		// (the vtable is static per class, so the slots would still work, but the pointer
+		// would not). Under ReShade the add-on is reloaded across the recreate anyway (§14).
+		diff::set_enabled(false);
+		native::uninstall();
 		return;
 	}
 

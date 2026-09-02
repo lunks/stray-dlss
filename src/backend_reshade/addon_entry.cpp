@@ -116,6 +116,7 @@ void on_destroy_device(reshade::api::device *device)
 	if (device->get_api() != reshade::api::device_api::d3d12)
 		return;
 	app::instance().on_device(reinterpret_cast<ID3D12Device *>(device->get_native()), false);
+	select_backend(); // the native hooks are gone with the device: back to ReShade's answers
 	rsb::set_device(nullptr);
 }
 
