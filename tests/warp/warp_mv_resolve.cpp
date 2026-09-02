@@ -26,6 +26,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <exception>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1724,8 +1725,10 @@ LONG WINAPI harness_crash_handler(EXCEPTION_POINTERS *ep)
 	if (ep == nullptr || ep->ExceptionRecord == nullptr)
 		return EXCEPTION_CONTINUE_SEARCH;
 	const DWORD code = ep->ExceptionRecord->ExceptionCode;
-	if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
-		code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION)
+	// Every error-class code (0xC...), plus breakpoints and fail-fast-shaped ones: a silent
+	// non-zero exit with no line is what this exists to prevent. C++ exceptions (0xE06D7363)
+	// and thread-naming (0x406D1388) are routine and skipped.
+	if ((code & 0xF0000000u) != 0xC0000000u && code != 0x80000003u && code != 0x80000004u)
 		return EXCEPTION_CONTINUE_SEARCH;
 	void *addr = ep->ExceptionRecord->ExceptionAddress;
 	HMODULE m = nullptr;
@@ -1746,6 +1749,11 @@ int main(int argc, char **argv)
 {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	::AddVectoredExceptionHandler(1, &harness_crash_handler);
+	std::set_terminate([] {
+		std::printf("\n*** HARNESS TERMINATE: std::terminate was called (an exception escaped, or a joinable std::thread was destroyed)\n");
+		std::fflush(stdout);
+		std::abort();
+	});
 	for (int i = 1; i < argc; ++i)
 	{
 		const std::string arg = argv[i];
@@ -1796,8 +1804,10 @@ int main(int argc, char **argv)
 	test_drive_mode_restore_is_complete(gpu);
 	// After drive mode: the frame-generation present path over a real swapchain (needs drive).
 	test_fg_present_twice(gpu);
+	std::printf("[main] after the FG test\n");
 
 	stray_dlss::mv::shutdown();
+	std::printf("[main] after mv::shutdown\n");
 	drain_validation(gpu, "shutdown");
 
 	std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "PASS" : "FAIL",

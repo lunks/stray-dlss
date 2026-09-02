@@ -373,10 +373,14 @@ bool test_fg_present_twice(Gpu &gpu)
 	fg::log_stats("harness");
 	check(drain_validation(gpu, "fg-worker") == 0, "no validation errors from the worker thread's copies and presents");
 
+	std::printf("  releasing the swapchain...\n");
 	sc3.Reset();
 	sc1.Reset();
+	std::printf("  swapchain released; releasing the factory...\n");
 	factory.Reset();
+	std::printf("  factory released; destroying the window...\n");
 	::DestroyWindow(hwnd);
+	std::printf("  window destroyed\n");
 	native::set_sink(nullptr);
 	return true;
 }
