@@ -186,7 +186,8 @@ struct Chain
 
 	core::fg::GameIndexMirror mirror;
 	core::fg::Epoch epoch;
-	core::fg::Pacer pacer;
+	core::fg::Pacer pacer;      // the EMA, kept for the [fg] line and the sync/none modes
+	core::fg::Schedule sched;   // the phase-locked clock the worker presents on (thread mode)
 	core::fg::CropJudge judge;
 	std::uint32_t ok_run = 0;
 	bool validated = false;
@@ -305,7 +306,8 @@ std::thread g_worker;
 std::mutex g_wmutex;
 std::condition_variable g_wcv;    // hook -> worker: a pair is pending / hurry / stop
 std::condition_variable g_wdone;  // worker -> hook: the pair is done
-bool g_pending = false, g_hurry = false, g_stop = false, g_busy = false;
+bool g_pending = false, g_busy = false;
+std::atomic<bool> g_hurry{ false }, g_stop{ false }; // read by the worker's spin-wait without the lock
 Pair g_pair;
 std::atomic<long> g_last_present_hr{ S_OK };
 
@@ -527,6 +529,7 @@ void disarm_locked(Chain &c)
 	c.ok_run = 0;
 	c.judge.reset();
 	c.pacer.reset();
+	c.sched.reset();
 }
 
 // ---- the experiment's generated frame: previous real frame + magenta band ----
@@ -717,13 +720,36 @@ HRESULT present_one(Chain &c, const Pair &p, ID3D12Resource *src)
 	return hr;
 }
 
-// Waits `delay_ns` unless hurried (a new pair is waiting) or stopped. Worker-only.
-bool paced_wait(std::uint64_t delay_ns)
+// Waits until `target_ns` (steady clock) unless hurried or stopped; returns true when cut
+// short. Worker-only. MEASURED 2026-09-02 (facts §32.11): condition_variable::wait_for under
+// Wine wakes ~1 ms LATE (a 6.1 ms hold came out as 7.15 ms every frame, giving the display a
+// 7.1 / 5.0 rhythm instead of 6.05 / 6.05 on a 165 Hz VRR panel), so the last 1.5 ms are spun
+// on the dedicated worker thread. That costs ~1.5 ms of one core per present and lands the
+// present within a few microseconds of the target.
+bool wait_until(std::uint64_t target_ns)
 {
-	if (delay_ns == 0)
+	constexpr std::uint64_t kSpinWindow = 1'500'000;
+	for (;;)
+	{
+		const std::uint64_t now = now_ns();
+		if (now >= target_ns)
+			return false;
+		const std::uint64_t remaining = target_ns - now;
+		if (remaining > kSpinWindow)
+		{
+			std::unique_lock<std::mutex> lock(g_wmutex);
+			if (g_wcv.wait_for(lock, std::chrono::nanoseconds(remaining - kSpinWindow), [] { return g_hurry.load() || g_stop.load(); }))
+				return true;
+			continue;
+		}
+		while (now_ns() < target_ns)
+		{
+			if (g_hurry.load(std::memory_order_relaxed) || g_stop.load(std::memory_order_relaxed))
+				return true;
+			YieldProcessor();
+		}
 		return false;
-	std::unique_lock<std::mutex> lock(g_wmutex);
-	return g_wcv.wait_for(lock, std::chrono::nanoseconds(delay_ns), [] { return g_hurry || g_stop; });
+	}
 }
 
 void run_pair(Chain &c, Pair &p, bool on_worker)
@@ -745,21 +771,40 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 	{
 		if (p.generated != nullptr)
 		{
-			const HRESULT hr = present_one(c, p, p.generated);
-			if (SUCCEEDED(hr))
-			{
-				std::lock_guard<std::mutex> lock(g_smutex);
-				++g_stats.generated_presented;
-			}
 			bool hurried = false;
 			if (on_worker)
-				hurried = paced_wait(p.delay_ns);
-			else if (p.delay_ns != 0)
-				std::this_thread::sleep_for(std::chrono::nanoseconds(p.delay_ns));
+			{
+				// The phase-locked clock: generated at the midpoint after the previous real
+				// present, real one interval after it (core::fg::Schedule).
+				std::uint64_t t_gen = 0, t_real = 0;
+				c.sched.plan(p.t_hook, t_gen, t_real);
+				if (p.trace_slot >= 0)
+					g_trace[static_cast<unsigned>(p.trace_slot)].delay_ns = t_real - t_gen;
+				wait_until(t_gen);
+				const HRESULT hr = present_one(c, p, p.generated);
+				if (SUCCEEDED(hr))
+				{
+					std::lock_guard<std::mutex> lock(g_smutex);
+					++g_stats.generated_presented;
+				}
+				hurried = wait_until(t_real);
+			}
+			else
+			{
+				const HRESULT hr = present_one(c, p, p.generated);
+				if (SUCCEEDED(hr))
+				{
+					std::lock_guard<std::mutex> lock(g_smutex);
+					++g_stats.generated_presented;
+				}
+				if (p.delay_ns != 0)
+					std::this_thread::sleep_for(std::chrono::nanoseconds(p.delay_ns));
+			}
 			if (p.trace_slot >= 0)
 				g_trace[static_cast<unsigned>(p.trace_slot)].hurried = hurried;
 		}
 		g_last_present_hr.store(present_one(c, p, p.real));
+		c.sched.note_real_issued(now_ns());
 		if (p.trace_slot >= 0 && static_cast<unsigned>(p.trace_slot) + 1 == g_trace_count.load() &&
 			g_trace_count.load() >= static_cast<unsigned>(g_cfg.trace) && !g_trace_dumped.exchange(true))
 			dump_trace();
@@ -778,12 +823,12 @@ void worker_main()
 		Pair p;
 		{
 			std::unique_lock<std::mutex> lock(g_wmutex);
-			g_wcv.wait(lock, [] { return g_pending || g_stop; });
-			if (g_stop && !g_pending)
+			g_wcv.wait(lock, [] { return g_pending || g_stop.load(); });
+			if (g_stop.load() && !g_pending)
 				return;
 			p = g_pair;
 			g_pending = false;
-			g_hurry = false;
+			g_hurry.store(false);
 			g_busy = true;
 		}
 		run_pair(g_chain, p, /*on_worker=*/true);
@@ -799,7 +844,7 @@ void start_worker()
 {
 	if (g_worker.joinable())
 		return;
-	g_stop = false;
+	g_stop.store(false);
 	g_worker = std::thread(worker_main);
 }
 
@@ -809,10 +854,10 @@ void drain_worker()
 	if (!g_worker.joinable())
 		return;
 	std::unique_lock<std::mutex> lock(g_wmutex);
-	g_hurry = true;
+	g_hurry.store(true);
 	g_wcv.notify_all();
 	g_wdone.wait(lock, [] { return !g_pending && !g_busy; });
-	g_hurry = false;
+	g_hurry.store(false);
 }
 
 void stop_worker()
@@ -821,8 +866,8 @@ void stop_worker()
 		return;
 	{
 		std::lock_guard<std::mutex> lock(g_wmutex);
-		g_stop = true;
-		g_hurry = true;
+		g_stop.store(true);
+		g_hurry.store(true);
 	}
 	g_wcv.notify_all();
 	g_worker.join();
@@ -1048,6 +1093,7 @@ void after_reconfigure(IDXGISwapChain *sc, const char *what, bool drop_replaceme
 	{
 		c.pacer.reset();
 	}
+	c.sched.reset();
 	c.generated_valid = false;
 	c.epoch.end_reconfigure();
 	if (g_generator != nullptr)
@@ -1160,7 +1206,9 @@ bool present(const PresentArgs &args, long *hr_out)
 			std::lock_guard<std::mutex> slock(g_smutex);
 			++g_stats.game_presents;
 		}
-		const std::uint64_t auto_delay = c.pacer.on_game_present(now_ns());
+		const std::uint64_t t_now = now_ns();
+		const std::uint64_t auto_delay = c.pacer.on_game_present(t_now);
+		c.sched.on_game_present(t_now);
 		std::uint64_t delay = auto_delay;
 		if (g_cfg.wait_ms >= 0)
 			delay = static_cast<std::uint64_t>(g_cfg.wait_ms) * 1'000'000ull;
@@ -1192,7 +1240,7 @@ bool present(const PresentArgs &args, long *hr_out)
 		p.flags = args.flags;
 		p.orig_present = c.orig_present;
 		p.frame = args.frame;
-		p.t_hook = now_ns();
+		p.t_hook = t_now;
 		if (g_cfg.trace > 0 && !g_trace_dumped.load())
 		{
 			if (p.generated != nullptr)
@@ -1222,8 +1270,11 @@ bool present(const PresentArgs &args, long *hr_out)
 		c.generated_this = nullptr;
 		{
 			std::lock_guard<std::mutex> slock(g_smutex);
-			g_stats.pacer_interval_ms = c.pacer.interval_ns / 1e6;
+			g_stats.pacer_interval_ms = c.sched.interval_ns != 0 ? c.sched.interval_ns / 1e6 : c.pacer.interval_ns / 1e6;
 			g_stats.pacer_hitches = c.pacer.hitches;
+			g_stats.sched_reanchors = c.sched.reanchors;
+			g_stats.sched_holds = c.sched.holds;
+			g_stats.sched_catchups = c.sched.catchups;
 			g_stats.epoch = c.epoch.value;
 		}
 	}
@@ -1232,7 +1283,7 @@ bool present(const PresentArgs &args, long *hr_out)
 		std::unique_lock<std::mutex> lock(g_wmutex);
 		if (g_pending || g_busy)
 		{
-			g_hurry = true;
+			g_hurry.store(true);
 			g_wcv.notify_all();
 			{
 				std::lock_guard<std::mutex> slock(g_smutex);
@@ -1242,7 +1293,7 @@ bool present(const PresentArgs &args, long *hr_out)
 		}
 		g_pair = p;
 		g_pending = true;
-		g_hurry = false;
+		g_hurry.store(false);
 		lock.unlock();
 		g_wcv.notify_all();
 		*hr_out = g_last_present_hr.load();
@@ -1300,11 +1351,13 @@ void log_stats(const char *when)
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
 	const reflex::Status rs = reflex::status();
-	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer %.2f ms hitches=%llu | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
+	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),
 		s.game_presents != 0 ? static_cast<double>(s.presents_issued) / static_cast<double>(s.game_presents) : 0.0,
-		refusals, s.pacer_interval_ms, static_cast<unsigned long long>(s.pacer_hitches), s.issued_p50_ms, s.issued_p99_ms,
+		refusals, s.pacer_interval_ms, static_cast<unsigned long long>(s.pacer_hitches),
+		static_cast<unsigned long long>(s.sched_holds), static_cast<unsigned long long>(s.sched_catchups), static_cast<unsigned long long>(s.sched_reanchors),
+		s.issued_p50_ms, s.issued_p99_ms,
 		s.issued_second_peak_ms >= 0 ? "BIMODAL (back-to-back presents)" : "unimodal",
 		static_cast<unsigned long long>(s.worker_waits), static_cast<unsigned long long>(s.epoch), static_cast<unsigned long long>(s.reconfigures),
 		s.width, s.height, s.format, static_cast<int>(s.color_space),

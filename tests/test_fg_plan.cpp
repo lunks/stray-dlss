@@ -246,3 +246,65 @@ TEST_CASE("camera constants: invert4x4 round-trips a projection-like matrix and 
 	CHECK((cb.right[0] == 0.0f && cb.right[2] == 1.0f));
 	CHECK((cb.fwd[0] == -1.0f && cb.fwd[2] == 0.0f));
 }
+
+TEST_CASE("Schedule: median interval, generated at the midpoint of the previous real, early frames wait, late frames catch up, stalls re-anchor")
+{
+	const std::uint64_t ms = 1'000'000;
+	Schedule sc;
+	std::uint64_t g = 0, r = 0;
+	// No estimate: re-anchor on now.
+	sc.on_game_present(100 * ms);
+	sc.plan(100 * ms, g, r);
+	CHECK((g == 100 * ms && r == 100 * ms)); // half of 0
+	CHECK(sc.reanchors == 1);
+	sc.note_real_issued(100 * ms);
+	// A 12 ms cadence with one 30 ms hitch inside the window: the median stays 12, an EMA would not.
+	std::uint64_t t = 100 * ms;
+	for (int i = 0; i < 8; ++i)
+	{
+		t += (i == 4 ? 30 : 12) * ms;
+		sc.on_game_present(t);
+	}
+	CHECK(sc.interval_ns == 12 * ms);
+	// On the clock: previous real at R, game on time at R + 12 -> generated at R + 6? No: the
+	// generated frame cannot precede the hook; it goes out now, the real one at R + 12... which
+	// is now. Both "now" would be back to back, so the pair keeps its half spacing: real at +6.
+	sc.note_real_issued(t - 12 * ms + 6 * ms); // the previous real went out 6 ms after its hook
+	sc.plan(t, g, r);
+	CHECK(g == t);                 // midpoint (R + 6) == t: on time
+	CHECK(r == t + 6 * ms);        // R + 12
+	CHECK(sc.holds == 1);
+	// An EARLY game frame (2 ms after the previous real, 4 ms before the midpoint): the clock
+	// wants gen at +4 / real at +10, but the hold is capped at three quarters of an interval
+	// (+9) so the pacer is never still holding at the next game present; the pair keeps its
+	// half spacing.
+	sc.note_real_issued(r);
+	const std::uint64_t early = r + 2 * ms;
+	sc.plan(early, g, r);
+	CHECK(r == early + 9 * ms);
+	CHECK(g == early + 3 * ms);
+	CHECK(sc.capped == 1);
+	// A LATE game frame (3 ms after the midpoint): generated now, real catches up 6 ms later,
+	// not at the old clock (which would be only 3 ms away).
+	sc.note_real_issued(r);
+	const std::uint64_t late = r + 9 * ms;
+	sc.plan(late, g, r);
+	CHECK(g == late);
+	CHECK(r == late + 6 * ms);
+	CHECK(sc.catchups == 1);
+	// A very early frame is never held more than three quarters of an interval past its own
+	// present, so the pacer can never still be holding when the next game present arrives.
+	sc.note_real_issued(r);
+	std::uint64_t vearly = r - 8 * ms; // the game presented before the previous real even went out
+	sc.plan(vearly, g, r);
+	CHECK(r == vearly + 9 * ms);
+	CHECK(g == vearly + 3 * ms);
+	// A stall (game silent for 2 intervals) re-anchors on now.
+	sc.note_real_issued(r);
+	const std::uint64_t stall = r + 40 * ms;
+	sc.plan(stall, g, r);
+	CHECK((g == stall && r == stall + 6 * ms));
+	CHECK(sc.reanchors == 2);
+	sc.reset();
+	CHECK(sc.interval_ns == 0);
+}

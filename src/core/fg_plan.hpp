@@ -71,6 +71,35 @@ struct Pacer
 	void reset();
 };
 
+// ---- the phase-locked schedule (the pacer's second generation, measured 2026-09-02) ----
+//
+// Holding the real frame a fixed half-interval AFTER the game's Present anchors on the wrong
+// event: the gaps the display receives are (I_k - d, d), where I_k is the game's ACTUAL
+// interval this frame and d the predicted half of it, so every bit of the game's own frame-time
+// jitter lands on one gap of the pair (6, 6, 8, 6, 10, 6 ...) - what the user felt on a 165 Hz
+// VRR panel. The fix is to schedule against the PREVIOUS REAL present, on a clock: real N+1 is
+// due at real N + I, the generated frame at the midpoint, and an early game frame waits while
+// a late one catches up. Added latency is bounded by one interval; a stall re-anchors.
+struct Schedule
+{
+	static constexpr unsigned kWindow = 16;
+	std::uint64_t samples[kWindow] = {};
+	unsigned count = 0, next = 0;
+	std::uint64_t interval_ns = 0;      // the median of the window; 0 = no estimate
+	std::uint64_t last_hook_ns = 0;
+	std::uint64_t last_real_ns = 0;     // when the previous REAL frame was issued
+	std::uint64_t hitch_ns = 100'000'000;
+	std::uint64_t reanchors = 0, holds = 0, catchups = 0, capped = 0;
+
+	// Feeds the game's Present timestamp (updates the interval estimate).
+	void on_game_present(std::uint64_t now_ns);
+	// Plans the pair for the game present at `t_hook`: when to issue the generated and the real
+	// frame. Without an estimate or after a stall both are "now" / "now + half" (re-anchor).
+	void plan(std::uint64_t t_hook, std::uint64_t &t_gen, std::uint64_t &t_real);
+	void note_real_issued(std::uint64_t t) { last_real_ns = t; }
+	void reset();
+};
+
 // A 1 ms histogram of present-to-present intervals. Two of them are kept: the game's own
 // cadence and the intervals between the presents WE issue — a correctly paced 2x sequence
 // makes the second unimodal around half the first; back-to-back presents make it bimodal

@@ -129,8 +129,9 @@ struct Stats
 	std::uint32_t width = 0, height = 0;
 	unsigned format = 0;
 	unsigned color_space = ~0u;          // the last SetColorSpace1 seen (DXGI_COLOR_SPACE_TYPE), ~0 = never
-	double pacer_interval_ms = 0.0;
+	double pacer_interval_ms = 0.0;   // the schedule's median interval (thread mode)
 	std::uint64_t pacer_hitches = 0;
+	std::uint64_t sched_reanchors = 0, sched_holds = 0, sched_catchups = 0;
 	std::uint32_t issued_p50_ms = 0, issued_p99_ms = 0; // intervals between the presents WE issued
 	int issued_second_peak_ms = -1;                     // >= 0: bimodal (back-to-back)
 	std::uint64_t worker_waits = 0;      // game-thread waits on a busy worker

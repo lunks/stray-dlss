@@ -59,6 +59,89 @@ void Pacer::reset()
 	hitches = 0;
 }
 
+// ---- Schedule ----
+
+void Schedule::on_game_present(std::uint64_t now_ns)
+{
+	if (last_hook_ns != 0 && now_ns > last_hook_ns)
+	{
+		const std::uint64_t d = now_ns - last_hook_ns;
+		if (d < hitch_ns)
+		{
+			samples[next] = d;
+			next = (next + 1) % kWindow;
+			if (count < kWindow)
+				++count;
+			// The median of the window: robust to the occasional 30 ms frame the EMA chased.
+			std::uint64_t sorted[kWindow];
+			for (unsigned i = 0; i < count; ++i)
+				sorted[i] = samples[i];
+			for (unsigned i = 1; i < count; ++i)
+			{
+				const std::uint64_t v = sorted[i];
+				unsigned j = i;
+				while (j > 0 && sorted[j - 1] > v)
+				{
+					sorted[j] = sorted[j - 1];
+					--j;
+				}
+				sorted[j] = v;
+			}
+			interval_ns = sorted[count / 2];
+		}
+	}
+	last_hook_ns = now_ns;
+}
+
+void Schedule::plan(std::uint64_t t_hook, std::uint64_t &t_gen, std::uint64_t &t_real)
+{
+	const std::uint64_t half = interval_ns / 2;
+	if (interval_ns == 0 || last_real_ns == 0 || t_hook > last_real_ns + interval_ns + half)
+	{
+		// No clock yet, or the game stalled past one and a half intervals: re-anchor on now.
+		++reanchors;
+		t_gen = t_hook;
+		t_real = t_hook + half;
+		return;
+	}
+	// On the clock: the generated frame at the midpoint after the previous real one, the real
+	// frame one interval after it - but never before the game's own present (a late frame
+	// catches up), and never held more than HALF an interval past it. The half cap is what
+	// keeps the game unthrottled: a hold of at most half can never still be pending when the
+	// next game present arrives one interval later, so the hook timestamps stay the game's own
+	// cadence and the median keeps tracking it (a longer hold would lock the game to the
+	// pacer's clock and the estimate could never adapt downward).
+	t_gen = last_real_ns + half;
+	if (t_gen < t_hook)
+		t_gen = t_hook;
+	t_real = last_real_ns + interval_ns;
+	if (t_real < t_gen + half)
+		t_real = t_gen + half; // the pair keeps its own half-interval spacing
+	// Cap: three quarters of an interval past the game's present, so the hold has always ended
+	// before the next game present arrives (no throttling, and the hook timestamps stay the
+	// game's own cadence for the median to track).
+	const std::uint64_t cap = t_hook + interval_ns - half / 2;
+	if (t_real > cap)
+	{
+		t_real = cap;
+		t_gen = t_real - half;
+		if (t_gen < t_hook)
+			t_gen = t_hook;
+		++capped;
+	}
+	else if (t_real == last_real_ns + interval_ns)
+		++holds;
+	else
+		++catchups;
+}
+
+void Schedule::reset()
+{
+	count = next = 0;
+	interval_ns = last_hook_ns = last_real_ns = 0;
+	reanchors = holds = catchups = capped = 0;
+}
+
 // ---- IntervalHistogram ----
 
 void IntervalHistogram::add(std::uint64_t interval_ns)
