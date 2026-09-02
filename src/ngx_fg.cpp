@@ -219,7 +219,7 @@ int resolve_hdr(unsigned format, unsigned color_space)
 }
 
 #if STRAY_DLSS_ENABLE_NGX
-// Every name here is in facts §30.2's PRESENT set. Keep it that way.
+// Every name here is in facts §31.2's PRESENT set. Keep it that way.
 bool create_feature(ID3D12GraphicsCommandList *list, ID3D12CommandQueue *queue, ID3D12Device *device,
                     std::uint32_t w, std::uint32_t h, unsigned format, const FrameConstants &c)
 {

@@ -2,7 +2,7 @@
 // numbers, kept out of the D3D12 code so it runs in the Linux doctest lane. Nothing here
 // touches a device; the present owner (src/backend_native/fg_present.cpp) is the thin shell.
 //
-// The design it serves (facts §30.4): the game is handed REPLACEMENT back buffers through a
+// The design it serves (facts §31.4): the game is handed REPLACEMENT back buffers through a
 // hooked IDXGISwapChain::GetBuffer, renders into them believing they are the swapchain's, and
 // at each of its Presents we copy the frame it rendered into the REAL current back buffer and
 // present — twice per game frame once a generated frame exists: the generated one first, the
@@ -16,7 +16,7 @@
 
 namespace stray_dlss::core::fg {
 
-// ---- the game's back-buffer index, mirrored (facts §30.4, HARD from UE 4.27.2 source) ----
+// ---- the game's back-buffer index, mirrored (facts §31.4, HARD from UE 4.27.2 source) ----
 //
 // FD3D12Viewport keeps CurrentBackBufferIndex_RHIThread: 0 after every Resize (which follows
 // every ResizeBuffers and every SetFullscreenState), +1 modulo NumBackBuffers after every
@@ -174,7 +174,7 @@ struct CropJudge
 
 } // namespace stray_dlss::core::fg
 
-// ---- the camera constants DLSS-G takes (facts §30.2), from the View CB's matrices ----
+// ---- the camera constants DLSS-G takes (facts §31.2), from the View CB's matrices ----
 namespace stray_dlss::core::fg {
 
 // Row-major 4x4 inverse by cofactors. False (out untouched) when singular.

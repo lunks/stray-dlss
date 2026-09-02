@@ -83,6 +83,18 @@ std::atomic<std::uint64_t> g_orphan_copy_dst{ 0 };
 std::atomic<std::uint64_t> g_heaps_via_create{ 0 };
 std::atomic<std::uint64_t> g_heaps_via_bind{ 0 };
 
+// The OVERFLOW map: handles whose heap the flat table never registered (created before our
+// device patches, through ReShade's proxy device, or an offline staging heap never bound).
+// Sharded like the old shadow but ONLY EVER TOUCHED BY ORPHANS - Config A never reaches it, so
+// its lock never contends there; under Config B it keeps the shadow CORRECT until the proxy
+// path registers the real heaps (facts §29). Its running size and the orphan hit counters are
+// in the status line; both must fall to 0 once every heap is registered.
+struct Ov { std::uint64_t w0 = 0, w1 = 0, w2 = 0; };
+constexpr unsigned kOvShards = 64;
+struct OvShard { std::shared_mutex m; std::unordered_map<icept::DescriptorId, Ov> map; };
+OvShard g_ov[kOvShards];
+inline OvShard &ov_of(icept::DescriptorId c) { return g_ov[(c >> 6) & (kOvShards - 1)]; }
+
 Slot *slot_for(std::uint64_t cpu)
 {
 	const std::vector<Heap *> *t = g_table.load(std::memory_order_acquire);
@@ -177,31 +189,71 @@ void note_heap_created(::ID3D12DescriptorHeap *heap, bool via_bind)
 		static_cast<unsigned long long>(gpu_base), gpu_base != 0 ? "shader-visible/ONLINE" : "cpu-only/OFFLINE", g_owned.size());
 }
 
-void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
+// Write a packed slot: flat and lock-free when the heap is registered, else into the overflow
+// map under a shard lock. site 0 = a view creation, 1 = a copy destination (for the counters).
+void write_slot(icept::DescriptorId cpu, std::uint64_t w0, std::uint64_t w1, std::uint64_t w2, int site)
+{
+	if (Slot *s = slot_for(cpu))
+	{
+		s->w0.store(w0, std::memory_order_relaxed);
+		s->w2.store(w2, std::memory_order_relaxed);
+		s->w1.store(w1, std::memory_order_release);
+	}
+	else
+	{
+		OvShard &o = ov_of(cpu);
+		std::unique_lock<std::shared_mutex> lk(o.m);
+		o.map[cpu] = Ov{ w0, w1, w2 };
+		if (site == 0) g_orphan_view.fetch_add(1, std::memory_order_relaxed);
+		else g_orphan_copy_dst.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+// A copy from an unknown source makes the destination unknown again.
+void write_unwritten(icept::DescriptorId cpu)
+{
+	if (Slot *s = slot_for(cpu))
+		s->w1.store(0, std::memory_order_release);
+	else
+	{
+		OvShard &o = ov_of(cpu);
+		std::unique_lock<std::shared_mutex> lk(o.m);
+		o.map.erase(cpu);
+	}
+}
+// Read a packed slot; false if the slot is unknown. *orphan (optional) says it was in overflow.
+bool read_slot(icept::DescriptorId cpu, std::uint64_t &w0, std::uint64_t &w1, std::uint64_t &w2, bool *orphan = nullptr)
 {
 	Slot *s = slot_for(cpu);
-	if (s == nullptr)
+	if (orphan) *orphan = (s == nullptr);
+	if (s != nullptr)
 	{
-		g_orphan_view.fetch_add(1, std::memory_order_relaxed);
-		return; // a heap we never saw created (pre-attach / proxy / offline); resolver: unknown
+		w1 = s->w1.load(std::memory_order_acquire);
+		if ((w1 & kWritten) == 0) return false;
+		w0 = s->w0.load(std::memory_order_relaxed);
+		w2 = s->w2.load(std::memory_order_relaxed);
+		return true;
 	}
+	OvShard &o = ov_of(cpu);
+	std::shared_lock<std::shared_mutex> lk(o.m);
+	const auto it = o.map.find(cpu);
+	if (it == o.map.end()) return false;
+	w0 = it->second.w0; w1 = it->second.w1; w2 = it->second.w2;
+	return (w1 & kWritten) != 0;
+}
+
+void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
+{
 	std::uint64_t gen = entry.resource_gen;
 	if (gen == 0 && entry.resource != 0)
 		gen = registry::generation_of(entry.resource);
-	s->w0.store(entry.resource, std::memory_order_relaxed);
-	s->w2.store((entry.buffer_offset & 0xFFFFFFFFull) | ((entry.buffer_size & 0xFFFFFFFFull) << 32), std::memory_order_relaxed);
-	s->w1.store(pack_w1(entry.kind, false, entry.dxgi_format, gen), std::memory_order_release);
+	const std::uint64_t w2 = (entry.buffer_offset & 0xFFFFFFFFull) | ((entry.buffer_size & 0xFFFFFFFFull) << 32);
+	write_slot(cpu, entry.resource, pack_w1(entry.kind, false, entry.dxgi_format, gen), w2, 0);
 	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_null_view(icept::DescriptorId cpu)
 {
-	Slot *s = slot_for(cpu);
-	if (s == nullptr)
-		return;
-	s->w0.store(0, std::memory_order_relaxed);
-	s->w2.store(0, std::memory_order_relaxed);
-	s->w1.store(kWritten | kNull, std::memory_order_release);
+	write_slot(cpu, 0, kWritten | kNull, 0, 0);
 	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -210,41 +262,49 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 {
 	for (std::uint32_t i = 0; i < n; ++i)
 	{
-		Slot *d = slot_for(dst + static_cast<std::uint64_t>(i) * inc);
-		if (d == nullptr)
+		const icept::DescriptorId s = src + static_cast<std::uint64_t>(i) * inc;
+		const icept::DescriptorId d = dst + static_cast<std::uint64_t>(i) * inc;
+		Slot *ds = slot_for(d);
+		Slot *ss = slot_for(s);
+		if (ds != nullptr && ss != nullptr)
 		{
-			g_orphan_copy_dst.fetch_add(1, std::memory_order_relaxed);
+			// The common case, Config A and the online heap once it is registered: both slots are
+			// flat. Pure lock-free atomics, no counter contention (g_slot_writes is bumped once
+			// per range below, not per descriptor - that per-descriptor atomic across every RHI
+			// thread cost Config A ~15 fps, facts §30).
+			const std::uint64_t sw1 = ss->w1.load(std::memory_order_acquire);
+			if ((sw1 & kWritten) == 0)
+			{
+				ds->w1.store(0, std::memory_order_release);
+				unknown_copies.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			ds->w0.store(ss->w0.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			ds->w2.store(ss->w2.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			ds->w1.store(sw1, std::memory_order_release);
 			continue;
 		}
-		Slot *sp = slot_for(src + static_cast<std::uint64_t>(i) * inc);
-		if (sp == nullptr)
+		// Orphan path (Config B: the online heap in overflow until the proxy patch). Rare, so a
+		// little redundancy here is fine; Config A never reaches it (orphans=0).
+		if (ss == nullptr)
 			g_orphan_copy_src.fetch_add(1, std::memory_order_relaxed);
-		const std::uint64_t sw1 = sp != nullptr ? sp->w1.load(std::memory_order_acquire) : 0;
-		if (sp == nullptr || (sw1 & kWritten) == 0)
+		std::uint64_t w0 = 0, w1 = 0, w2 = 0;
+		if (!read_slot(s, w0, w1, w2))
 		{
-			d->w1.store(0, std::memory_order_release); // now unknown
+			write_unwritten(d);
 			unknown_copies.fetch_add(1, std::memory_order_relaxed);
 			continue;
 		}
-		const std::uint64_t sw0 = sp->w0.load(std::memory_order_relaxed);
-		const std::uint64_t sw2 = sp->w2.load(std::memory_order_relaxed);
-		d->w0.store(sw0, std::memory_order_relaxed);
-		d->w2.store(sw2, std::memory_order_relaxed);
-		d->w1.store(sw1, std::memory_order_release);
+		write_slot(d, w0, w1, w2, 1);
 	}
 	g_slot_writes.fetch_add(n, std::memory_order_relaxed);
 }
 
 bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 {
-	Slot *s = slot_for(cpu);
-	if (s == nullptr)
+	std::uint64_t w0 = 0, w1 = 0, w2 = 0;
+	if (!read_slot(cpu, w0, w1, w2))
 		return false;
-	const std::uint64_t w1 = s->w1.load(std::memory_order_acquire);
-	if ((w1 & kWritten) == 0)
-		return false;
-	const std::uint64_t w0 = s->w0.load(std::memory_order_relaxed);
-	const std::uint64_t w2 = s->w2.load(std::memory_order_relaxed);
 	out = ViewEntry{};
 	out.kind = static_cast<ViewKind>((w1 >> 8) & 0xF);
 	out.is_null = (w1 & kNull) != 0;
@@ -273,6 +333,12 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 
 std::uint64_t slots_written() { return g_slot_writes.load(std::memory_order_relaxed); }
 std::size_t heap_count() { const auto *t = g_table.load(std::memory_order_acquire); return t ? t->size() : 0; }
+std::uint64_t overflow_size()
+{
+	std::uint64_t n = 0;
+	for (OvShard &o : g_ov) { std::shared_lock<std::shared_mutex> lk(o.m); n += o.map.size(); }
+	return n;
+}
 void orphan_counts(std::uint64_t &view, std::uint64_t &csrc, std::uint64_t &cdst, std::uint64_t &via_c, std::uint64_t &via_b)
 { view=g_orphan_view.load(); csrc=g_orphan_copy_src.load(); cdst=g_orphan_copy_dst.load(); via_c=g_heaps_via_create.load(); via_b=g_heaps_via_bind.load(); }
 
@@ -284,6 +350,7 @@ void clear_for_test()
 	g_slot_writes.store(0);
 	g_orphan_view.store(0); g_orphan_copy_src.store(0); g_orphan_copy_dst.store(0);
 	g_heaps_via_create.store(0); g_heaps_via_bind.store(0);
+	for (OvShard &o : g_ov) { std::unique_lock<std::shared_mutex> lk(o.m); o.map.clear(); }
 }
 
 } // namespace fast
@@ -567,6 +634,7 @@ std::uint64_t write_sequence() { return g_seq.load(std::memory_order_relaxed); }
 void fast_orphan_counts(std::uint64_t &view, std::uint64_t &copy_src, std::uint64_t &copy_dst,
                         std::uint64_t &heaps_created, std::uint64_t &heaps_bound)
 { fast::orphan_counts(view, copy_src, copy_dst, heaps_created, heaps_bound); }
+std::uint64_t fast_overflow_size() { return fast::overflow_size(); }
 
 Stats stats()
 {

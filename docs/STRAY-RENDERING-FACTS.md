@@ -1006,7 +1006,98 @@ plugin driving — `present owner: factory ... (class implemented by ...\Win64\d
 proxy factory), `DLSS feature created: 1920x1080 -> 3840x2160`, three reload cycles, no crash,
 parity with the other SR+NR arms.
 
-## 30. The DLSS-G (NGX feature 11) parameter contract, read out of `nvngx_dlssg.dll` (2026-09-02, offline)
+
+## 29. The Config-B flicker: the online heap is created through ReShade's proxy device (2026-09-02)
+
+The user saw the image and the DLSS on-screen indicator flicker in sync under Config B (plugin
+with ReShade loaded on top, add-on `.disabled`), and NOT under Config A (plugin alone). The
+indicator is drawn by the NGX evaluate, so a flicker frame is a frame with no evaluate: our hook
+refused the pinned TAA dispatch and the engine's own TAA ran. Measured, and it is a number.
+
+The signal: `NATIVE DRIVE ... suppressed=` (engine-TAA dispatches replaced with DLSS) per bench
+window, as drive_ratio = suppressed-delta / present-delta:
+
+| arm | shadow | drive_ratio | still shadow-crop diff x1e3 |
+|---|---|---|---|
+| D (plugin alone) | fast | 1.00 | steady ~1.5 |
+| E (plugin+ReShade), before | fast | ~0.81 | alternates 1.5 <-> 20 (flicker) |
+| E, ShadowMode=debug | debug | 1.00 | flat ~1.5 |
+| E, fast + overflow (fix) | fast | 0.999 / 1.000 / 1.000 | ~4 + transient, no sustained alternation |
+
+So ~1 frame in 5 under Config-B fast was undriven - the engine TAA ran, the indicator blinked,
+and shadow regions (denoised differently by DLSS vs the engine's TAA) alternated. resolve_failed
+read 0 throughout: it was a resolve MISS, not an error - the pinned pass' depth/velocity/colour
+resolved to unknown, the gate refused ("depth or velocity SRV is missing or not known live"), and
+that path does not increment resolve_failed.
+
+The gap, named by the orphan counters (this fix's diagnostics), Config-B fast:
+`fast heaps: create=29 bind=0 | ORPHANS view=0 copy-src=0 copy-dst=3.86M overflow-live=61194`.
+Every view creation and every copy SOURCE fell in a heap the fast path registered at
+CreateDescriptorHeap; every copy DESTINATION did not. That destination is UE4's big online
+shader-visible descriptor heap, into which it copies thousands of descriptors a frame - and under
+ReShade it is created through ReShade's PROXY device, which our real-device CreateDescriptorHeap
+hook never sees. So the online slots the pinned TAA reads were never in the flat array. Config A
+has no proxy, so all ~30 heaps are ours and the orphan count is 0 (HARD).
+
+The proper fix: the fast path's overflow map. A view/copy/lookup whose handle is in no registered
+heap now goes to a sharded overflow map (touched ONLY by orphans, so Config A never locks there)
+instead of being dropped. The pinned TAA then resolves its online inputs from the overflow and
+drives every frame: drive_ratio 0.999-1.000, hitch buckets 0, under Config-B fast. The overflow's
+live size (61 194 = the online heap) and per-site orphan counts are in the NATIVE SHADOW GROWTH
+line; a proxy-device CreateDescriptorHeap patch that registers the online heap into the flat array
+(unwrapping ReShade's heap to the real pointer) would move those to the flat path and drop
+overflow-live to 0 - the remaining purely-perf refinement, since Config B is NR-bound (~52 fps)
+and the overflow's lock cost there is invisible.
+
+Interim shipping choice: ShadowMode=auto (dc29457) selects DEBUG under ReShade, which was already
+1.00 and flat and carries no overflow; the overflow makes FAST correct under ReShade too (drive
+1.0). Both fix the user's flicker. Config A is unaffected: fast, no overflow, no orphans, drive
+100%.
+
+
+## 30. Perf work after the shadow rewrite: where the plugin stands vs the add-on (2026-09-02)
+
+The SR-only deficit (facts §26: plugin ~20 fps under the add-on with 6-10 hitch buckets) was
+hunted with the per-call-site [perf] buckets, on the user's recorded traverse, 3 reload+traverse
+cycles per arm. Changes, each measured, one at a time, CI green before each deploy:
+
+| change | arm C avg (recorded) | hitch buckets | what the buckets named |
+|---|---|---|---|
+| baseline (sharded-only, pre-work) | 52-60 | 4-8 | shadow-copy 6-63 ms/frame - the reverse-index push_back |
+| drop the reverse index (generation liveness) | ~57 | 6-8 | shadow-copy still 6-63 ms - the exclusive lock |
+| shard by address + range copies | ~85 | 0-1 | shadow-copy 5-14 ms - per-call std::vector allocs |
+| allocation-free stack-chunked copy | ~87 | 0 | shadow-copy 3.6-11 ms - the sharded map itself (hash+lock) |
+| root_shadow per-list shared_mutex | ~87 | 0 | root-bind 0.5->0.9 ms (the second, smaller convoy) |
+| **fast flat lock-free shadow** (default) | **~104** | **0** | shadow-copy 1-3 ms, hitches gone - the parity change |
+
+against **add-on SR-only (arm A) ~113 fps / 0 hitches**. So the fast shadow closed most of the
+gap (52 -> ~104) and eliminated the hitches; ~9% remains. With SR+NR (arms B/D/E) everything is
+~52 fps (NR-bound) and at parity already (facts §26).
+
+**Two caveats on the last rows, stated honestly:**
+
+1. **The overflow map (§29) regressed Config A to ~88 fps** because note_copy_range routed every
+   descriptor through read_slot/write_slot and bumped one global atomic per descriptor (7 000x a
+   frame across every RHI thread). Fixed by inlining the both-slots-flat case and batching the
+   counter (bde9184); Config A's orphan count is 0 so it never touches the overflow.
+2. **The box drifts within a long session.** After hours of launches the same arm C read
+   100/86/84 across its three cycles where a cooler session read 104/104/102 flat - a decline too
+   large to attribute to our code alone (heap-table growth across reloads is a suspect worth
+   ruling out: fast::g_owned never shrinks, so a heap recreated on reload accumulates and widens
+   the slot_for search; measured create=29 stayed constant across cycles, so if it grows it does
+   so slowly). A tight A-vs-C parity number needs a thermally-settled box and a fixed cycle count.
+
+**The remaining ~9% and the next levers (per the buckets, Config A fast):** native hooks total
+3.5-5.5 ms/frame summed over threads - shadow-copy ~3 ms (7 000 flat atomic copies a frame, each
+a slot_for binary search + 3 atomic stores), root-bind ~1 ms (a shared_mutex map lookup per
+SetComputeRoot*, 700-860/frame), resolve ~0.6 ms. The obvious next pass is a thread-local cache
+of the last (list -> ListState*) so consecutive SetComputeRoot* on one list skip the map lookup,
+and of the last heap in slot_for so a run of copies into the online heap skips the binary search -
+both target the two named buckets with no lock. drive_ratio is 0.999-1.000 and orphans 0 in every
+Config A arm, so correctness is not in question; this is pure CPU shaving. Deferred: it wants a
+stable box and is its own pass with its own table.
+
+## 31. The DLSS-G (NGX feature 11) parameter contract, read out of `nvngx_dlssg.dll` (2026-09-02, offline)
 
 Frame generation, stage 2 of the FG plan. CLAUDE.md §5 rule: an NGX parameter block is an
 untyped string->value map with no validation, so **a name the snippet does not implement is
@@ -1028,7 +1119,7 @@ The contract was read from the newest public Streamline SDK release on GitHub,
 carries the same name set. Run `python3 tools/ngx_param_names.py <box copy> --check <the
 list below>` first thing; a name that flips to ABSENT retires the corresponding write.
 
-### 30.1 Verdicts, verbatim from the tool (release 2.12.0 snippet)
+### 31.1 Verdicts, verbatim from the tool (release 2.12.0 snippet)
 
 94 of the 106 names checked are PRESENT (exact `\0NAME\0`). Every one the plugin writes is in
 the PRESENT set. The 12 ABSENT ones, and why each was checked:
@@ -1059,7 +1150,7 @@ interpolation work onto the command list it is handed, and presenting the result
 caller's job.** HARD (from the strings; the OptiScaler session in CLAUDE.md §5 measured the
 snippet's `Dispatch Result: Ok` through SL, which is the same call).
 
-### 30.2 The full `DLSSG.*` name set of the 2.12.0 snippet (135 names), classified
+### 31.2 The full `DLSSG.*` name set of the 2.12.0 snippet (135 names), classified
 
 Classification is from three sources: present in the snippet (S), present in `sl.dlss_g.dll`
 (C, i.e. the reference caller sets it), read by Nukem's dlssg-to-fsr3 (N, i.e. a caller-set
@@ -1113,7 +1204,7 @@ internal). `DLSSG.UserDebugText` is in the development snippet and `sl.dlss_g` o
 `DLSSG.SyncWaitCallback[Data]` `DLSSG.SyncWaitOnlyCallback[Data]` `DLSSG.VkOFAModeRequest`
 `DLSSG.run_lowres_mvec_pass`.
 
-### 30.3 Other facts read from the same binaries and the SDK
+### 31.3 Other facts read from the same binaries and the SDK
 
 * **Snippet-side exports** (the API `nvngx.dll` calls; the same shape as `nvngx_dlssnr.dll`,
   CLAUDE.md §5): `NVSDK_NGX_D3D12_Init`, `_Init_Ext`, `_CreateFeature`, `_EvaluateFeature`,
@@ -1149,12 +1240,12 @@ internal). `DLSSG.UserDebugText` is in the development snippet and `sl.dlss_g` o
 * **What DLSS-G under Streamline requires that the snippet does NOT:** the SL guide's "DLSS-G
   takes over frame presenting" (§12.0), the Reflex requirement (§8.0), and
   `eFailGetCurrentBackBufferIndexNotCalled` are all properties of `sl.dlss_g`'s swapchain
-  proxy and pacer. None of those names or mechanisms exist in the snippet (30.1). Driving the
+  proxy and pacer. None of those names or mechanisms exist in the snippet (31.1). Driving the
   snippet through the NGX core makes presenting, pacing and the back-buffer index OUR job — the
   present-twice design below — and removes the Streamline-only failure modes. HARD for the
   absence; the consequence is the design bet of this branch.
 
-### 30.4 UE 4.27.2's back-buffer indexing, from the source (`D3D12Viewport.cpp`, `WindowsD3D12Viewport.cpp`, mirror @ `306a7e9`)
+### 31.4 UE 4.27.2's back-buffer indexing, from the source (`D3D12Viewport.cpp`, `WindowsD3D12Viewport.cpp`, mirror @ `306a7e9`)
 
 The present-twice design hands the game REPLACEMENT back buffers (our textures returned from a
 hooked `IDXGISwapChain::GetBuffer`) and copies the presented image into the real swapchain
@@ -1187,3 +1278,4 @@ ResizeBuffers/ResizeBuffers1 — `core::fg_plan::GameIndexMirror`, unit-tested. 
 in-process cross-check available today (the native host has no render-target-bind tap), so a
 mirror error would show as a STALE presented frame; that is what the stage-1 screenshot
 protocol looks for.
+||||||| df1b48d

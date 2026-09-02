@@ -230,7 +230,7 @@ bool test_fg_present_twice(Gpu &gpu)
 	}
 
 	// UE 4.27's viewport: GetBuffer(i) for every index right after creation / resize, then its
-	// own counter from 0 (facts §30.4). The colours make every frame identifiable.
+	// own counter from 0 (facts §31.4). The colours make every frame identifiable.
 	const float colours[6][4] = {
 		{ 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },
 		{ 1.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 1.0f, 1.0f }, { 0.5f, 0.5f, 0.5f, 1.0f },

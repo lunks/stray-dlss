@@ -426,8 +426,40 @@ bool test_descriptor_shadow_fast(Gpu &gpu)
 	tex.Reset();
 	check(sh::lookup(cpu, got) && got.dead && got.resource == e.resource, "fast: after the resource died the slot is a tombstone naming it");
 
-	std::printf("  fast slots_written=%llu heaps=%llu\n",
-		static_cast<unsigned long long>(sh::stats().slots), static_cast<unsigned long long>(sh::stats().heaps));
+	// ORPHAN safety net: a heap the fast path was NEVER told about still resolves, via the
+	// overflow map - the Config-B correctness fix (facts §29). Fresh live resource, unregistered
+	// offline heap, no note_heap_created for it.
+	ComPtr<ID3D12Resource> tex2;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex2)));
+	reg::note_created(tex2.Get());
+	D3D12_DESCRIPTOR_HEAP_DESC hdo = {};
+	hdo.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	hdo.NumDescriptors = 8;
+	ComPtr<ID3D12DescriptorHeap> unreg;
+	HR(gpu.device->CreateDescriptorHeap(&hdo, IID_PPV_ARGS(&unreg))); // deliberately NOT registered
+	const std::uint64_t ov_before = sh::fast_overflow_size();
+	const D3D12_CPU_DESCRIPTOR_HANDLE uo = unreg->GetCPUDescriptorHandleForHeapStart();
+	sh::ViewEntry oe;
+	oe.kind = sh::ViewKind::srv;
+	oe.resource = reinterpret_cast<stray_dlss::icept::ResourceId>(tex2.Get());
+	oe.dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	sh::note_view(uo.ptr, oe);
+	check(sh::fast_overflow_size() == ov_before + 1, "fast: a view into an UNREGISTERED heap lands in the overflow map");
+	check(sh::lookup(uo.ptr, got) && got.resource == oe.resource && got.width == 64 && !got.dead,
+		"fast: an orphan view still resolves (via overflow) with its dimensions and liveness");
+	D3D12_CPU_DESCRIPTOR_HANDLE on8 = online->GetCPUDescriptorHandleForHeapStart();
+	on8.ptr += 7 * inc;
+	sh::note_copy(on8.ptr, uo.ptr);
+	check(sh::lookup(on8.ptr, got) && got.resource == oe.resource, "fast: a copy FROM an orphan source resolves in the online heap");
+	std::uint64_t ov_v = 0, ocs = 0, ocd = 0, hc = 0, hb = 0;
+	sh::fast_orphan_counts(ov_v, ocs, ocd, hc, hb);
+	check(ov_v >= 1 && ocs >= 1, "fast: the orphan-view and orphan-copy-source counters fired");
+
+	std::printf("  fast slots_written=%llu heaps=%llu overflow=%llu orphans(view=%llu csrc=%llu)\n",
+		static_cast<unsigned long long>(sh::stats().slots), static_cast<unsigned long long>(sh::stats().heaps),
+		static_cast<unsigned long long>(sh::fast_overflow_size()),
+		static_cast<unsigned long long>(ov_v), static_cast<unsigned long long>(ocs));
 	sh::set_mode(sh::Mode::debug); // leave the harness back on debug for the remaining tests
 	sh::clear_for_test();
 	return true;

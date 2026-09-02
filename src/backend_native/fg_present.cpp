@@ -55,7 +55,7 @@ using PFN_ResizeTarget = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, const DX
 using PFN_SetColorSpace1 = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
 using PFN_Present = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
 
-constexpr unsigned kMaxReplacements = 8; // DXGI allows up to 16; UE4 asks for 3 (facts §30.4)
+constexpr unsigned kMaxReplacements = 8; // DXGI allows up to 16; UE4 asks for 3 (facts §31.4)
 constexpr unsigned kListRing = 3;
 constexpr std::uint32_t kBandRows = 120;   // the experiment's magenta band, top of the generated frame
 constexpr std::uint32_t kCrop = 64;        // the validation crop, centred
@@ -334,7 +334,7 @@ bool create_texture_like(ID3D12Device *device, const D3D12_RESOURCE_DESC &like, 
 
 // Caller holds g_mutex. Builds the replacements, the generated pair, the RTV heap and the crop
 // readbacks from the real back buffer 0's desc. The game's GetBuffer(0) arrives right after
-// creation / resize, when the object is fully built (facts §20/§30.4).
+// creation / resize, when the object is fully built (facts §20/§31.4).
 bool arm_locked(Chain &c)
 {
 	if (c.armed)
@@ -427,7 +427,7 @@ bool arm_locked(Chain &c)
 }
 
 // Caller holds g_mutex. Drops the textures (the game released its references before the
-// resize, facts §30.4; ours go here). The worker is already drained.
+// resize, facts §31.4; ours go here). The worker is already drained.
 void disarm_locked(Chain &c)
 {
 	c.ring.wait_all();

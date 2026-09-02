@@ -102,6 +102,9 @@ std::uint64_t write_sequence();
 // heap, by call site, plus how many heaps were first seen at CREATE vs at BIND. Zero in Config A.
 void fast_orphan_counts(std::uint64_t &view, std::uint64_t &copy_src, std::uint64_t &copy_dst,
                         std::uint64_t &heaps_created, std::uint64_t &heaps_bound);
+// Live entries in the fast path's overflow map (orphan handles). Must reach 0 once every heap
+// is registered through the proper (proxy-device) path.
+std::uint64_t fast_overflow_size();
 
 struct Stats
 {
