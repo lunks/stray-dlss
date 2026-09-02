@@ -22,7 +22,37 @@ investigation; the numbers in `Scripts/main.lua` cite their source inline.
 | **1** | Apply the nine scalars where the game's own `M_Fur_2sidedshading_backpackON_HDScreenshots` differs from the shipped fur material: finer tips, height variation, roughness 0.8, stronger AO. Shading only; no geometry, no cost. | none — the values are the developers' own |
 | **2** | Raise `LayerCount` (shells) on the component and on every LOD, keep `MinScreenSize` at 0 so distance never drops the fur; optionally `FurLength` / `ShellBias`. Cost scales linearly with shells. | one **UNCONFIRMED**, below |
 
-## What is UNCONFIRMED — verify in this order on the first launch
+## Verified on hardware (2026-09-02, three launches)
+
+All four unknowns below are settled, in the order they were listed:
+
+1. **The hook fires.** `NotifyOnNewObject` resolves the nativized `DynamicClass`; the mod
+   applied to `BP_CatPawn_C_2147480326` in `BaseMap` ~25 s after load, every launch.
+2. **The player cat's shipped values** — the number nobody could read from the pak:
+   `LayerCount=16  FurLength=1.15  ShellBias=1.0  MinScreenSize=0.0`. Twice the companion
+   cats' 8 shells, which is why the mod's original 16 was a no-op.
+3. **GFur does NOT rebuild on a property write, and a visibility toggle does not force it.**
+   The rebuild trigger is the plugin's own BlueprintCallable, `GFurComponent:RegenerateFur()`
+   (no parameters, found in the object dump). With it: `AFTER: LayerCount=32 FurLength=2.0`,
+   and the user reports the face visibly furrier than the shipped game.
+4. **Material scalars apply live** — `applied 9/9 HD scalars` — once
+   `CreateDynamicMaterialInstance` is called with its real three-parameter signature
+   `(ElementIndex, SourceMaterial, OptionalName)`; two parameters throw.
+
+Verbatim from `ue4ss/UE4SS.log`, launch three:
+
+```
+[StrayFur]   material slot 0: applied 9/9 HD scalars
+[StrayFur]   SHIPPED: LayerCount=16 FurLength=1.1499999761581 ShellBias=1.0 MinScreenSize=0.0
+[StrayFur]   RegenerateFur() -> called
+[StrayFur]   AFTER:   LayerCount=32 FurLength=2.0 ShellBias=1.0 MinScreenSize=0.0 (0 LODs)
+```
+
+`(0 LODs)`: the `LODs` array iterates empty. Either the component carries no per-LOD
+overrides or the TArray-of-struct walk does not iterate; with `MinScreenSize=0` nothing
+undoes the change either way, so it has not mattered. UNCONFIRMED which.
+
+## Historical: what was UNCONFIRMED before the first launch
 
 1. **Does the hook fire?** Look for `[StrayFur] applying to …BP_CatPawn_C…` in `ue4ss/UE4SS.log`.
    The mod registers `NotifyOnNewObject` on the nativized class **and** polls with
