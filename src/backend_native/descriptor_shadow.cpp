@@ -88,53 +88,64 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 	if (dst == 0 || n == 0)
 		return;
 	g_copies.fetch_add(n, std::memory_order_relaxed);
-	// Pass 1: read every source entry, one shared lock per run of sources in one shard.
-	// (A source that is itself in this copy's destination range is read as it was BEFORE the
-	// copy, which is D3D12's semantics for a CopyDescriptors: it copies by value.)
-	std::vector<ViewEntry> src_entries(n);
-	std::vector<unsigned char> known(n, 0);
+	// No heap allocation: process the run in fixed stack-sized chunks. D3D12 forbids a
+	// CopyDescriptors whose source and destination ranges overlap, so within a chunk the
+	// sources can be snapshotted before the destinations are written with no aliasing worry.
+	// (The earlier per-call std::vector<ViewEntry>(n) allocated twice per copy - 776-1364 times
+	// a frame - which was the bulk of the shadow-copy cost, facts §28.)
+	constexpr std::uint32_t kChunk = 32;
+	ViewEntry scratch[kChunk];
+	bool known[kChunk];
+	std::uint32_t base = 0;
+	while (base < n)
 	{
+		const std::uint32_t m = (n - base) < kChunk ? (n - base) : kChunk;
+		// Read this chunk's sources: one shared lock per run of sources in one shard.
 		std::uint32_t i = 0;
-		while (i < n)
+		while (i < m)
 		{
-			const unsigned si = shard_index(src + static_cast<std::uint64_t>(i) * inc);
+			const icept::DescriptorId s0 = src + static_cast<std::uint64_t>(base + i) * inc;
+			const unsigned si = shard_index(s0);
 			Shard &sh = g_shards[si];
 			std::shared_lock<std::shared_mutex> lock(sh.mutex);
-			for (; i < n && shard_index(src + static_cast<std::uint64_t>(i) * inc) == si; ++i)
+			for (; i < m; ++i)
 			{
-				const auto it = sh.slots.find(src + static_cast<std::uint64_t>(i) * inc);
-				if (it != sh.slots.end())
-				{
-					src_entries[i] = it->second;
-					known[i] = 1;
-				}
+				const icept::DescriptorId s = src + static_cast<std::uint64_t>(base + i) * inc;
+				if (shard_index(s) != si)
+					break;
+				const auto it = sh.slots.find(s);
+				known[i] = it != sh.slots.end();
+				if (known[i])
+					scratch[i] = it->second;
 			}
 		}
-	}
-	// Pass 2: write every destination, one exclusive lock per run of destinations in one shard.
-	std::uint32_t i = 0;
-	while (i < n)
-	{
-		const unsigned di = shard_index(dst + static_cast<std::uint64_t>(i) * inc);
-		Shard &sh = g_shards[di];
-		std::unique_lock<std::shared_mutex> lock(sh.mutex);
-		for (; i < n && shard_index(dst + static_cast<std::uint64_t>(i) * inc) == di; ++i)
+		// Write this chunk's destinations: one exclusive lock per run of destinations in one shard.
+		i = 0;
+		while (i < m)
 		{
-			const icept::DescriptorId d = dst + static_cast<std::uint64_t>(i) * inc;
-			if (!known[i])
+			const icept::DescriptorId d0 = dst + static_cast<std::uint64_t>(base + i) * inc;
+			const unsigned di = shard_index(d0);
+			Shard &sh = g_shards[di];
+			std::unique_lock<std::shared_mutex> lock(sh.mutex);
+			for (; i < m; ++i)
 			{
-				// Not necessarily an error: a slot copied before we attached, a sampler, or a
-				// null descriptor. Counted so a persistent stream of them is visible.
-				sh.slots.erase(d);
-				g_unknown_copies.fetch_add(1, std::memory_order_relaxed);
-				continue;
+				const icept::DescriptorId d = dst + static_cast<std::uint64_t>(base + i) * inc;
+				if (shard_index(d) != di)
+					break;
+				if (!known[i])
+				{
+					sh.slots.erase(d);
+					g_unknown_copies.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+				ViewEntry copy = scratch[i];
+				copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+				copy.via_copy = true;
+				copy.src_slot = src + static_cast<std::uint64_t>(base + i) * inc;
+				sh.slots[d] = copy;
 			}
-			ViewEntry copy = src_entries[i];
-			copy.seq = g_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-			copy.via_copy = true;
-			copy.src_slot = src + static_cast<std::uint64_t>(i) * inc;
-			sh.slots[d] = copy;
 		}
+		base += m;
 	}
 }
 
