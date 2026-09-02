@@ -16,6 +16,16 @@ struct ID3D12DescriptorHeap;
 
 namespace stray_dlss::native::shadow {
 
+// TWO implementations behind this one interface (facts §28), chosen once at init:
+//   fast  - per-heap flat arrays of lock-free atomics; the default, the perf path.
+//   debug - the sharded hash map that also carries provenance (seq, via_copy, src_slot) for the
+//           diff observer's adjudication; the WARP provenance assertions run against it.
+// d3d12_hooks.cpp calls the same shadow:: functions regardless; the mode dispatches inside.
+enum class Mode : std::uint8_t { fast, debug };
+void set_mode(Mode m);   // idempotent; call once before any note_*; logs the choice
+Mode mode();
+const char *mode_name();
+
 enum class ViewKind : std::uint8_t { srv, uav, cbv, rtv, dsv };
 
 struct ViewEntry
@@ -59,8 +69,11 @@ void note_copy(icept::DescriptorId dst, icept::DescriptorId src);
 // before any destination is written (by-value semantics). One shard lock per run, not one per
 // descriptor - the fix for the lock convoy measured in facts §27.
 void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc);
-// SetDescriptorHeaps: records the heap's CPU/GPU spans. Cheap; re-read on every bind.
+// SetDescriptorHeaps: records the heap's CPU/GPU spans (debug path; fast ignores it).
 void note_heap_bound(::ID3D12DescriptorHeap *heap);
+// CreateDescriptorHeap: the fast path allocates this heap's flat slot array here, so a CPU
+// handle -> (heap, index) is arithmetic over an append-only heap list. Debug ignores it.
+void note_heap_created(::ID3D12DescriptorHeap *heap);
 
 // True for any recorded slot, tombstones included (check ViewEntry::dead).
 bool lookup(icept::DescriptorId cpu, ViewEntry &out);

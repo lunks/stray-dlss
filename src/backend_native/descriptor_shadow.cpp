@@ -1,11 +1,14 @@
 #include "backend_native/descriptor_shadow.hpp"
 
 #include "backend_native/resource_registry.hpp"
+#include "core/dxgi_format.hpp"
 #include "log.hpp"
 
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -14,14 +17,260 @@
 namespace stray_dlss::native::shadow {
 namespace {
 
-// SHARDED by descriptor address. MEASURED (facts §27, arm C on the user's traverse): with one
-// exclusive shared_mutex for the whole map, note_copy cost 6 -> 26 -> 53 ms per frame as UE4's
-// RHI threads pushed 2.7k -> 6.7k descriptor copies a frame through it - ~8 us per copy, the
-// signature of lock convoy (an SRW lock under Wine), not of the hash map (which never rehashed).
-// 64 shards keyed on the handle's 4 KB page put threads writing different regions of the
-// 500k-descriptor online heap on different locks, and the range API below takes a shard lock
-// once per RUN of consecutive descriptors rather than once per descriptor. No thread ever holds
-// two shard locks: a copy reads its sources under a shared lock, releases, then writes.
+// The selected implementation, set once at init (default fast). Read relaxed on the hot path.
+std::atomic<std::uint8_t> g_mode{ static_cast<std::uint8_t>(Mode::fast) };
+inline Mode current_mode() { return static_cast<Mode>(g_mode.load(std::memory_order_relaxed)); }
+
+// Counters shared by both implementations (the resolver drives them; the status file reads them).
+std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
+std::atomic<std::uint64_t> g_null_lookups{ 0 };
+std::atomic<std::uint64_t> g_dead_lookups{ 0 };
+std::atomic<std::uint64_t> g_unknown_copies{ 0 };
+std::atomic<std::uint64_t> g_seq{ 0 };   // debug-only write sequence (provenance)
+std::atomic<std::uint64_t> g_views{ 0 };
+std::atomic<std::uint64_t> g_copies{ 0 };
+
+
+// ======================= FAST PATH: per-heap flat lock-free arrays =======================
+// A descriptor heap is a contiguous array; a CPU handle is cpu_base + index*increment. So the
+// shadow is one std::atomic word triple per slot, allocated once at CreateDescriptorHeap, and a
+// write/copy is a handful of relaxed atomic stores with NO hash, NO lock, NO allocation - the
+// design ReShade uses and the fix for the copy cost that sharding only reduced (facts §28).
+namespace fast {
+
+// Per slot, three atomic words. Publication order: w0 (resource) and w2 (cbv) are written first
+// (relaxed), then w1 last with release, and a reader loads w1 first with acquire - so a slot seen
+// "written" has its w0/w2 already visible. A slot in flight (being rewritten by its owner while
+// read) is undefined to use per D3D12 anyway.
+struct Slot
+{
+	std::atomic<std::uint64_t> w0{ 0 }; // resource id (0 = none/null)
+	std::atomic<std::uint64_t> w1{ 0 }; // bit0 written, bit1 is_null, bits8-11 kind, bits16-31 dxgi_format, bits32-63 generation
+	std::atomic<std::uint64_t> w2{ 0 }; // cbv: offset (low 32) | size (high 32)
+};
+constexpr std::uint64_t kWritten = 1ull;
+constexpr std::uint64_t kNull = 2ull;
+inline std::uint64_t pack_w1(ViewKind kind, bool is_null, std::uint32_t fmt, std::uint64_t gen)
+{
+	return kWritten | (is_null ? kNull : 0) | (static_cast<std::uint64_t>(kind) << 8) |
+	       (static_cast<std::uint64_t>(fmt & 0xFFFF) << 16) | ((gen & 0xFFFFFFFFull) << 32);
+}
+
+struct Heap
+{
+	std::uint64_t cpu_base = 0;
+	std::uint64_t cpu_end = 0; // cpu_base + count*inc
+	std::uint64_t gpu_base = 0; // 0 if not shader-visible
+	std::uint32_t count = 0;
+	std::uint32_t inc = 0;
+	std::unique_ptr<Slot[]> slots;
+};
+
+// Ownership: heaps live forever here (UE4 makes a handful). The published table is an immutable
+// sorted-by-cpu_base snapshot, swapped under g_reg and read lock-free via an atomic pointer; the
+// old snapshot is leaked (a few pointers).
+std::mutex g_reg;
+std::vector<std::unique_ptr<Heap>> g_owned;              // guarded by g_reg
+std::vector<Heap *> *g_owned_leaked_snapshots_unused = nullptr; // (documentation)
+std::atomic<const std::vector<Heap *> *> g_table{ nullptr };
+std::atomic<std::uint64_t> g_slot_writes{ 0 };
+
+Slot *slot_for(std::uint64_t cpu)
+{
+	const std::vector<Heap *> *t = g_table.load(std::memory_order_acquire);
+	if (t == nullptr || cpu == 0)
+		return nullptr;
+	// Binary search: last heap whose cpu_base <= cpu.
+	std::size_t lo = 0, hi = t->size();
+	while (lo < hi)
+	{
+		const std::size_t mid = (lo + hi) / 2;
+		if ((*t)[mid]->cpu_base <= cpu)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo == 0)
+		return nullptr;
+	Heap *h = (*t)[lo - 1];
+	if (cpu < h->cpu_base || cpu >= h->cpu_end || h->inc == 0)
+		return nullptr;
+	const std::uint64_t idx = (cpu - h->cpu_base) / h->inc;
+	if (idx >= h->count)
+		return nullptr;
+	return &h->slots[static_cast<std::size_t>(idx)];
+}
+
+bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
+{
+	const std::vector<Heap *> *t = g_table.load(std::memory_order_acquire);
+	if (t == nullptr)
+		return false;
+	for (Heap *h : *t)
+	{
+		if (h->gpu_base == 0)
+			continue;
+		const std::uint64_t gpu_end = h->gpu_base + static_cast<std::uint64_t>(h->count) * h->inc;
+		if (gpu >= h->gpu_base && gpu < gpu_end)
+		{
+			cpu = h->cpu_base + (gpu - h->gpu_base); // same index*inc offset on both sides
+			return true;
+		}
+	}
+	return false;
+}
+
+void note_heap_created(::ID3D12DescriptorHeap *heap)
+{
+	if (heap == nullptr)
+		return;
+	const D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
+	if (desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+	    desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
+		return; // samplers are never resolved
+	const std::uint64_t cpu_base = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+	std::uint64_t gpu_base = 0;
+	if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0)
+		gpu_base = heap->GetGPUDescriptorHandleForHeapStart().ptr;
+	std::uint32_t inc = 0;
+	{
+		ID3D12Device *device = nullptr;
+		if (SUCCEEDED(heap->GetDevice(IID_PPV_ARGS(&device))) && device != nullptr)
+		{
+			inc = device->GetDescriptorHandleIncrementSize(desc.Type);
+			device->Release();
+		}
+	}
+	if (inc == 0 || desc.NumDescriptors == 0)
+		return;
+
+	std::lock_guard<std::mutex> lock(g_reg);
+	for (const auto &h : g_owned)
+		if (h->cpu_base == cpu_base)
+			return; // already known (idempotent)
+	auto h = std::make_unique<Heap>();
+	h->cpu_base = cpu_base;
+	h->cpu_end = cpu_base + static_cast<std::uint64_t>(desc.NumDescriptors) * inc;
+	h->gpu_base = gpu_base;
+	h->count = desc.NumDescriptors;
+	h->inc = inc;
+	h->slots = std::make_unique<Slot[]>(desc.NumDescriptors);
+	g_owned.push_back(std::move(h));
+	auto *snapshot = new std::vector<Heap *>();
+	for (const auto &e : g_owned)
+		snapshot->push_back(e.get());
+	std::sort(snapshot->begin(), snapshot->end(), [](Heap *a, Heap *b) { return a->cpu_base < b->cpu_base; });
+	g_table.store(snapshot, std::memory_order_release); // old snapshot leaked on purpose
+	STRAY_LOG_INFO("descriptor_shadow(fast): heap %p registered: %u descriptors, inc %u, cpu %llx gpu %llx (%s), %zu heaps",
+		static_cast<void *>(heap), desc.NumDescriptors, inc, static_cast<unsigned long long>(cpu_base),
+		static_cast<unsigned long long>(gpu_base), gpu_base != 0 ? "shader-visible" : "CPU-only", g_owned.size());
+}
+
+void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
+{
+	Slot *s = slot_for(cpu);
+	if (s == nullptr)
+		return; // a heap we never saw created (pre-attach); the resolver treats it as unknown
+	std::uint64_t gen = entry.resource_gen;
+	if (gen == 0 && entry.resource != 0)
+		gen = registry::generation_of(entry.resource);
+	s->w0.store(entry.resource, std::memory_order_relaxed);
+	s->w2.store((entry.buffer_offset & 0xFFFFFFFFull) | ((entry.buffer_size & 0xFFFFFFFFull) << 32), std::memory_order_relaxed);
+	s->w1.store(pack_w1(entry.kind, false, entry.dxgi_format, gen), std::memory_order_release);
+	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_null_view(icept::DescriptorId cpu)
+{
+	Slot *s = slot_for(cpu);
+	if (s == nullptr)
+		return;
+	s->w0.store(0, std::memory_order_relaxed);
+	s->w2.store(0, std::memory_order_relaxed);
+	s->w1.store(kWritten | kNull, std::memory_order_release);
+	g_slot_writes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc,
+                     std::atomic<std::uint64_t> &unknown_copies)
+{
+	for (std::uint32_t i = 0; i < n; ++i)
+	{
+		Slot *d = slot_for(dst + static_cast<std::uint64_t>(i) * inc);
+		if (d == nullptr)
+			continue;
+		Slot *sp = slot_for(src + static_cast<std::uint64_t>(i) * inc);
+		const std::uint64_t sw1 = sp != nullptr ? sp->w1.load(std::memory_order_acquire) : 0;
+		if (sp == nullptr || (sw1 & kWritten) == 0)
+		{
+			d->w1.store(0, std::memory_order_release); // now unknown
+			unknown_copies.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		const std::uint64_t sw0 = sp->w0.load(std::memory_order_relaxed);
+		const std::uint64_t sw2 = sp->w2.load(std::memory_order_relaxed);
+		d->w0.store(sw0, std::memory_order_relaxed);
+		d->w2.store(sw2, std::memory_order_relaxed);
+		d->w1.store(sw1, std::memory_order_release);
+	}
+	g_slot_writes.fetch_add(n, std::memory_order_relaxed);
+}
+
+bool lookup(icept::DescriptorId cpu, ViewEntry &out)
+{
+	Slot *s = slot_for(cpu);
+	if (s == nullptr)
+		return false;
+	const std::uint64_t w1 = s->w1.load(std::memory_order_acquire);
+	if ((w1 & kWritten) == 0)
+		return false;
+	const std::uint64_t w0 = s->w0.load(std::memory_order_relaxed);
+	const std::uint64_t w2 = s->w2.load(std::memory_order_relaxed);
+	out = ViewEntry{};
+	out.kind = static_cast<ViewKind>((w1 >> 8) & 0xF);
+	out.is_null = (w1 & kNull) != 0;
+	out.dxgi_format = static_cast<std::uint32_t>((w1 >> 16) & 0xFFFF);
+	out.resource_gen = (w1 >> 32) & 0xFFFFFFFFull;
+	out.resource = static_cast<icept::ResourceId>(w0);
+	if (!out.is_null && out.resource != 0)
+	{
+		icept::ResourceInfo info;
+		if (registry::describe(out.resource, info))
+		{
+			out.is_buffer = info.is_buffer;
+			out.width = info.width;
+			out.height = info.height;
+			out.is_3d = info.is_3d;
+			const std::uint32_t f = out.dxgi_format != 0 ? out.dxgi_format : info.dxgi_format;
+			out.dxgi_format = f;
+			out.format = info.is_buffer ? TexFormat::unknown : tex_format_from_dxgi(f);
+		}
+		out.buffer_offset = w2 & 0xFFFFFFFFull;
+		out.buffer_size = (w2 >> 32) & 0xFFFFFFFFull;
+		out.dead = out.resource_gen != 0 && registry::generation_of(out.resource) != out.resource_gen;
+	}
+	return true;
+}
+
+std::uint64_t slots_written() { return g_slot_writes.load(std::memory_order_relaxed); }
+std::size_t heap_count() { const auto *t = g_table.load(std::memory_order_acquire); return t ? t->size() : 0; }
+
+void clear_for_test()
+{
+	std::lock_guard<std::mutex> lock(g_reg);
+	g_owned.clear();
+	g_table.store(nullptr, std::memory_order_release); // old snapshots leaked; test-only
+	g_slot_writes.store(0);
+}
+
+} // namespace fast
+
+// ======================= DEBUG PATH: sharded hash map with provenance =======================
+// Carries seq / via_copy / src_slot for the diff observer's adjudication (facts §16); the WARP
+// provenance assertions run against this path. Sharded so it is not itself a convoy in the rare
+// debug session; the fast path above is what ships.
+namespace debug {
+
 constexpr unsigned kShardBits = 6;
 constexpr unsigned kShards = 1u << kShardBits;
 struct Shard
@@ -41,22 +290,8 @@ struct HeapRecord
 };
 std::vector<HeapRecord> g_heaps;
 
-std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
-std::atomic<std::uint64_t> g_null_lookups{ 0 };
-std::atomic<std::uint64_t> g_dead_lookups{ 0 };
-std::atomic<std::uint64_t> g_unknown_copies{ 0 };
-std::atomic<std::uint64_t> g_seq{ 0 };
-std::atomic<std::uint64_t> g_views{ 0 };
-std::atomic<std::uint64_t> g_copies{ 0 };
-
-} // namespace
-
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 {
-	if (cpu == 0)
-		return;
-	// The generation stamp, taken here when the caller did not (a hand-built entry, as the
-	// harness writes them), outside the shadow's lock: the registry has its own.
 	std::uint64_t gen = entry.resource_gen;
 	if (gen == 0 && entry.resource != 0)
 		gen = registry::generation_of(entry.resource);
@@ -72,8 +307,6 @@ void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
 
 void note_null_view(icept::DescriptorId cpu)
 {
-	if (cpu == 0)
-		return;
 	Shard &sh = shard_of(cpu);
 	std::unique_lock<std::shared_mutex> lock(sh.mutex);
 	ViewEntry &slot = sh.slots[cpu];
@@ -85,14 +318,6 @@ void note_null_view(icept::DescriptorId cpu)
 
 void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc)
 {
-	if (dst == 0 || n == 0)
-		return;
-	g_copies.fetch_add(n, std::memory_order_relaxed);
-	// No heap allocation: process the run in fixed stack-sized chunks. D3D12 forbids a
-	// CopyDescriptors whose source and destination ranges overlap, so within a chunk the
-	// sources can be snapshotted before the destinations are written with no aliasing worry.
-	// (The earlier per-call std::vector<ViewEntry>(n) allocated twice per copy - 776-1364 times
-	// a frame - which was the bulk of the shadow-copy cost, facts §28.)
 	constexpr std::uint32_t kChunk = 32;
 	ViewEntry scratch[kChunk];
 	bool known[kChunk];
@@ -100,7 +325,6 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 	while (base < n)
 	{
 		const std::uint32_t m = (n - base) < kChunk ? (n - base) : kChunk;
-		// Read this chunk's sources: one shared lock per run of sources in one shard.
 		std::uint32_t i = 0;
 		while (i < m)
 		{
@@ -119,7 +343,6 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 					scratch[i] = it->second;
 			}
 		}
-		// Write this chunk's destinations: one exclusive lock per run of destinations in one shard.
 		i = 0;
 		while (i < m)
 		{
@@ -149,26 +372,16 @@ void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint
 	}
 }
 
-void note_copy(icept::DescriptorId dst, icept::DescriptorId src)
-{
-	note_copy_range(dst, src, 1, 0);
-}
-
 void note_heap_bound(::ID3D12DescriptorHeap *heap)
 {
-	if (heap == nullptr)
-		return;
-	// Read every time: three trivial calls, and a heap pointer reused by the runtime for a
-	// new heap would otherwise carry a stale span forever.
 	const D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
 	if (desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-		return; // samplers are never resolved
+		return;
 	core::HeapSpan span;
 	span.cpu_base = heap->GetCPUDescriptorHandleForHeapStart().ptr;
 	span.gpu_base = (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0
 		? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0;
 	span.count = desc.NumDescriptors;
-	// The increment is a device constant; ask the heap's device once.
 	static std::atomic<std::uint32_t> s_increment{ 0 };
 	std::uint32_t inc = s_increment.load(std::memory_order_relaxed);
 	if (inc == 0)
@@ -182,18 +395,11 @@ void note_heap_bound(::ID3D12DescriptorHeap *heap)
 		}
 	}
 	span.increment = inc;
-
 	std::lock_guard<std::mutex> lock(g_heaps_mutex);
 	for (HeapRecord &r : g_heaps)
-	{
-		if (r.heap == heap)
-		{
-			r.span = span;
-			return;
-		}
-	}
+		if (r.heap == heap) { r.span = span; return; }
 	g_heaps.push_back(HeapRecord{ heap, span });
-	STRAY_LOG_INFO("descriptor_shadow: heap %p bound: %u descriptors, inc %u, cpu %llx gpu %llx (%s)",
+	STRAY_LOG_INFO("descriptor_shadow(debug): heap %p bound: %u descriptors, inc %u, cpu %llx gpu %llx (%s)",
 		static_cast<void *>(heap), span.count, span.increment,
 		static_cast<unsigned long long>(span.cpu_base), static_cast<unsigned long long>(span.gpu_base),
 		span.gpu_base != 0 ? "shader-visible" : "CPU-only");
@@ -201,8 +407,6 @@ void note_heap_bound(::ID3D12DescriptorHeap *heap)
 
 bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 {
-	if (cpu == 0)
-		return false;
 	{
 		Shard &sh = shard_of(cpu);
 		std::shared_lock<std::shared_mutex> lock(sh.mutex);
@@ -211,16 +415,12 @@ bool lookup(icept::DescriptorId cpu, ViewEntry &out)
 			return false;
 		out = it->second;
 	}
-	// Derived tombstone: the resource this slot named is gone, or its address now belongs to a
-	// newer registration. Outside the shadow's lock (the registry has its own).
 	out.dead = out.resource != 0 && out.resource_gen != 0 && registry::generation_of(out.resource) != out.resource_gen;
 	return true;
 }
 
 bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
 {
-	if (gpu == 0)
-		return false;
 	std::lock_guard<std::mutex> lock(g_heaps_mutex);
 	for (const HeapRecord &r : g_heaps)
 		if (core::gpu_to_cpu(gpu, r.span, cpu))
@@ -228,9 +428,105 @@ bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
 	return false;
 }
 
+std::uint64_t slots()
+{
+	std::uint64_t n = 0;
+	for (Shard &sh : g_shards)
+	{
+		std::shared_lock<std::shared_mutex> lock(sh.mutex);
+		n += sh.slots.size();
+	}
+	return n;
+}
+std::size_t heap_count() { std::lock_guard<std::mutex> lock(g_heaps_mutex); return g_heaps.size(); }
+
+void clear_for_test()
+{
+	for (Shard &sh : g_shards)
+	{
+		std::unique_lock<std::shared_mutex> lock(sh.mutex);
+		sh.slots.clear();
+	}
+	std::lock_guard<std::mutex> lock(g_heaps_mutex);
+	g_heaps.clear();
+}
+
+} // namespace debug
+
+} // namespace
+
+// -------- mode selection --------
+void set_mode(Mode m)
+{
+	g_mode.store(static_cast<std::uint8_t>(m), std::memory_order_relaxed);
+	STRAY_LOG_INFO("descriptor_shadow: mode = %s", mode_name());
+}
+Mode mode() { return current_mode(); }
+const char *mode_name() { return current_mode() == Mode::fast ? "fast (flat lock-free arrays)" : "debug (sharded map + provenance)"; }
+
+// -------- the public interface: dispatch on the mode --------
+void note_view(icept::DescriptorId cpu, const ViewEntry &entry)
+{
+	if (cpu == 0)
+		return;
+	if (current_mode() == Mode::fast)
+		fast::note_view(cpu, entry);
+	else
+		debug::note_view(cpu, entry);
+}
+
+void note_null_view(icept::DescriptorId cpu)
+{
+	if (cpu == 0)
+		return;
+	if (current_mode() == Mode::fast)
+		fast::note_null_view(cpu);
+	else
+		debug::note_null_view(cpu);
+}
+
+void note_copy_range(icept::DescriptorId dst, icept::DescriptorId src, std::uint32_t n, std::uint32_t inc)
+{
+	if (dst == 0 || n == 0)
+		return;
+	g_copies.fetch_add(n, std::memory_order_relaxed);
+	if (current_mode() == Mode::fast)
+		fast::note_copy_range(dst, src, n, inc, g_unknown_copies);
+	else
+		debug::note_copy_range(dst, src, n, inc);
+}
+
+void note_copy(icept::DescriptorId dst, icept::DescriptorId src) { note_copy_range(dst, src, 1, 0); }
+
+void note_heap_bound(::ID3D12DescriptorHeap *heap)
+{
+	if (heap != nullptr && current_mode() == Mode::debug)
+		debug::note_heap_bound(heap);
+}
+
+void note_heap_created(::ID3D12DescriptorHeap *heap)
+{
+	if (heap != nullptr && current_mode() == Mode::fast)
+		fast::note_heap_created(heap);
+}
+
+bool lookup(icept::DescriptorId cpu, ViewEntry &out)
+{
+	if (cpu == 0)
+		return false;
+	return current_mode() == Mode::fast ? fast::lookup(cpu, out) : debug::lookup(cpu, out);
+}
+
+bool gpu_to_cpu(std::uint64_t gpu, icept::DescriptorId &cpu)
+{
+	if (gpu == 0)
+		return false;
+	return current_mode() == Mode::fast ? fast::gpu_to_cpu(gpu, cpu) : debug::gpu_to_cpu(gpu, cpu);
+}
+
 void forget_resource(icept::ResourceId)
 {
-	// Nothing to do: lookup() derives the tombstone from the registry generation.
+	// Nothing to do in either mode: lookup() derives the tombstone from the registry generation.
 }
 
 std::uint64_t unknown_lookups() { return g_unknown_lookups.load(std::memory_order_relaxed); }
@@ -247,34 +543,28 @@ Stats stats()
 	Stats s;
 	s.views = g_views.load(std::memory_order_relaxed);
 	s.copies = g_copies.load(std::memory_order_relaxed);
-	for (Shard &sh : g_shards)
+	if (current_mode() == Mode::fast)
 	{
-		std::shared_lock<std::shared_mutex> lock(sh.mutex);
-		s.slots += sh.slots.size();
-		s.slots_buckets += sh.slots.bucket_count();
+		s.slots = fast::slots_written();
+		s.heaps = fast::heap_count();
 	}
+	else
 	{
-		std::lock_guard<std::mutex> lock(g_heaps_mutex);
-		s.heaps = g_heaps.size();
+		s.slots = debug::slots();
+		s.heaps = debug::heap_count();
 	}
 	return s;
 }
 
 void clear_for_test()
 {
-	for (Shard &sh : g_shards)
-	{
-		std::unique_lock<std::shared_mutex> lock(sh.mutex);
-		sh.slots.clear();
-	}
-	{
-		std::lock_guard<std::mutex> lock(g_heaps_mutex);
-		g_heaps.clear();
-	}
+	debug::clear_for_test();
+	fast::clear_for_test();
 	g_unknown_lookups.store(0);
 	g_null_lookups.store(0);
 	g_dead_lookups.store(0);
 	g_unknown_copies.store(0);
+	g_seq.store(0);
 	g_views.store(0);
 	g_copies.store(0);
 }

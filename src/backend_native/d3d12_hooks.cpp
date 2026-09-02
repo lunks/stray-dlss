@@ -38,6 +38,7 @@ std::atomic<std::uint32_t> g_increment{ 0 };
 
 using PFN_CreateCommandQueue = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, const D3D12_COMMAND_QUEUE_DESC *, REFIID, void **);
 using PFN_CreateCommittedResource = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **);
+using PFN_CreateDescriptorHeap = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **);
 using PFN_CreatePlacedResource = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, ID3D12Heap *, UINT64, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **);
 using PFN_CreateReservedResource = HRESULT(STDMETHODCALLTYPE *)(ID3D12Device *, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **);
 using PFN_CreateConstantBufferView = void(STDMETHODCALLTYPE *)(ID3D12Device *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
@@ -65,6 +66,7 @@ using PFN_List_Dispatch = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *,
 
 PFN_CreateCommandQueue g_orig_CreateCommandQueue = nullptr;
 PFN_CreateCommittedResource g_orig_CreateCommittedResource = nullptr;
+PFN_CreateDescriptorHeap g_orig_CreateDescriptorHeap = nullptr;
 PFN_CreatePlacedResource g_orig_CreatePlacedResource = nullptr;
 PFN_CreateReservedResource g_orig_CreateReservedResource = nullptr;
 PFN_CreateConstantBufferView g_orig_CreateConstantBufferView = nullptr;
@@ -261,6 +263,24 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommandQueue(ID3D12Device *self, const D3D12_
 	// device forwards here with the real ones), and it picks by identity or by type.
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && desc != nullptr)
 		present::note_queue(static_cast<ID3D12CommandQueue *>(*out), static_cast<int>(desc->Type));
+	return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hk_CreateDescriptorHeap(ID3D12Device *self, const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **out)
+{
+	const HRESULT hr = g_orig_CreateDescriptorHeap(self, desc, riid, out);
+	// The fast shadow needs every CBV_SRV_UAV/RTV/DSV heap the moment it exists, to allocate its
+	// flat slot array; note_heap_created is a no-op in debug mode. QueryInterface for the heap
+	// (out is void**) so the arg type is right.
+	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && !in_own_code())
+	{
+		ID3D12DescriptorHeap *heap = nullptr;
+		if (SUCCEEDED(static_cast<IUnknown *>(*out)->QueryInterface(IID_PPV_ARGS(&heap))) && heap != nullptr)
+		{
+			shadow::note_heap_created(heap);
+			heap->Release();
+		}
+	}
 	return hr;
 }
 
@@ -891,6 +911,7 @@ unsigned install_device_hooks(::ID3D12Device *device, bool query_device2)
 		}
 	};
 	hook(slot::kDevice_CreateCommandQueue, reinterpret_cast<void *>(&hk_CreateCommandQueue), reinterpret_cast<void **>(&g_orig_CreateCommandQueue), "ID3D12Device::CreateCommandQueue");
+	hook(slot::kDevice_CreateDescriptorHeap, reinterpret_cast<void *>(&hk_CreateDescriptorHeap), reinterpret_cast<void **>(&g_orig_CreateDescriptorHeap), "ID3D12Device::CreateDescriptorHeap");
 	hook(slot::kDevice_CreateCommittedResource, reinterpret_cast<void *>(&hk_CreateCommittedResource), reinterpret_cast<void **>(&g_orig_CreateCommittedResource), "ID3D12Device::CreateCommittedResource");
 	hook(slot::kDevice_CreatePlacedResource, reinterpret_cast<void *>(&hk_CreatePlacedResource), reinterpret_cast<void **>(&g_orig_CreatePlacedResource), "ID3D12Device::CreatePlacedResource");
 	hook(slot::kDevice_CreateReservedResource, reinterpret_cast<void *>(&hk_CreateReservedResource), reinterpret_cast<void **>(&g_orig_CreateReservedResource), "ID3D12Device::CreateReservedResource");

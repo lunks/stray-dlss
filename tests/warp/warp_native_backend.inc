@@ -251,9 +251,10 @@ bool test_registry_va_ranges_ring_and_placed(Gpu &gpu)
 
 bool test_descriptor_shadow_copy_chain(Gpu &gpu)
 {
-	std::printf("\n[test] descriptor shadow: offline view -> copy into the online heap -> GPU handle -> entry\n");
+	std::printf("\n[test] descriptor shadow (DEBUG mode): offline view -> copy into the online heap -> GPU handle -> entry\n");
 	namespace sh = stray_dlss::native::shadow;
 	namespace reg = stray_dlss::native::registry;
+	sh::set_mode(sh::Mode::debug); // this test asserts provenance (seq / via_copy / src_slot)
 	sh::clear_for_test();
 	reg::set_destroy_listener(&sh::forget_resource);
 
@@ -341,6 +342,97 @@ bool test_descriptor_shadow_copy_chain(Gpu &gpu)
 
 // A stream the way CD3DX12_PIPELINE_STATE_STREAM lays it out: type, payload at its own
 // alignment, each subobject padded to pointer alignment.
+bool test_descriptor_shadow_fast(Gpu &gpu)
+{
+	std::printf("\n[test] descriptor shadow (FAST mode): flat lock-free arrays - write, copy, ranges, gpu_to_cpu, liveness\n");
+	namespace sh = stray_dlss::native::shadow;
+	namespace reg = stray_dlss::native::registry;
+	sh::set_mode(sh::Mode::fast);
+	sh::clear_for_test();
+	reg::arm();
+
+	D3D12_HEAP_PROPERTIES def = {};
+	def.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC td = {};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = 64; td.Height = 64; td.DepthOrArraySize = 1; td.MipLevels = 1;
+	td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; td.SampleDesc.Count = 1;
+	ComPtr<ID3D12Resource> tex;
+	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&tex)));
+	reg::note_created(tex.Get());
+
+	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	hd.NumDescriptors = 8;
+	ComPtr<ID3D12DescriptorHeap> offline, online;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&offline)));
+	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	HR(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&online)));
+	// Fast mode learns a heap's flat array at creation; drive it directly (the hooks are a later test).
+	sh::note_heap_created(offline.Get());
+	sh::note_heap_created(online.Get());
+	const UINT inc = gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	sd.Texture2D.MipLevels = 1;
+	const D3D12_CPU_DESCRIPTOR_HANDLE off0 = offline->GetCPUDescriptorHandleForHeapStart();
+	gpu.device->CreateShaderResourceView(tex.Get(), &sd, off0);
+	sh::ViewEntry e;
+	e.kind = sh::ViewKind::srv;
+	e.resource = reinterpret_cast<stray_dlss::icept::ResourceId>(tex.Get());
+	e.dxgi_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	sh::note_view(off0.ptr, e);
+
+	sh::ViewEntry got;
+	check(sh::lookup(off0.ptr, got) && got.resource == e.resource && got.kind == sh::ViewKind::srv,
+		"fast: the written slot holds the SRV entry, resource and kind");
+	check(got.width == 64 && got.height == 64 && !got.dead,
+		"fast: dimensions are reconstructed from the registry, and the live resource is not dead");
+
+	// Copy into the online heap; the GPU handle maps back and the entry follows.
+	D3D12_CPU_DESCRIPTOR_HANDLE on5 = online->GetCPUDescriptorHandleForHeapStart();
+	on5.ptr += 5 * inc;
+	gpu.device->CopyDescriptorsSimple(1, on5, off0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	sh::note_copy(on5.ptr, off0.ptr);
+	stray_dlss::icept::DescriptorId cpu = 0;
+	const D3D12_GPU_DESCRIPTOR_HANDLE gpu5 = { online->GetGPUDescriptorHandleForHeapStart().ptr + 5 * inc };
+	check(sh::gpu_to_cpu(gpu5.ptr, cpu) && cpu == on5.ptr, "fast: GPU handle of online[5] maps back to its CPU handle");
+	check(sh::lookup(cpu, got) && got.resource == e.resource && got.width == 64, "fast: the copied slot holds the SRV entry");
+
+	// A range copy of several descriptors in one call.
+	D3D12_CPU_DESCRIPTOR_HANDLE off_run = off0; // off0..off0+2 -> online[0..2]
+	sh::ViewEntry e1 = e; sh::note_view(off_run.ptr + inc, e1);
+	D3D12_CPU_DESCRIPTOR_HANDLE on0 = online->GetCPUDescriptorHandleForHeapStart();
+	sh::note_copy_range(on0.ptr, off0.ptr, 2, inc);
+	check(sh::lookup(on0.ptr, got) && got.resource == e.resource, "fast: note_copy_range propagates the first of the run");
+	check(sh::lookup(on0.ptr + inc, got) && got.resource == e.resource, "fast: note_copy_range propagates the second of the run");
+
+	// A null view is a KNOWN empty slot and copying it carries that.
+	D3D12_CPU_DESCRIPTOR_HANDLE off1 = off0; off1.ptr += 3 * inc;
+	sh::note_null_view(off1.ptr);
+	D3D12_CPU_DESCRIPTOR_HANDLE on6 = on5; on6.ptr += inc;
+	sh::note_copy(on6.ptr, off1.ptr);
+	check(sh::lookup(on6.ptr, got) && got.is_null && got.resource == 0, "fast: a copy of a null view is a known-null slot");
+
+	// A slot never written is UNKNOWN (lookup fails), distinct from null.
+	D3D12_CPU_DESCRIPTOR_HANDLE on7 = on6; on7.ptr += inc;
+	check(!sh::lookup(on7.ptr, got), "fast: an untouched slot reads as unknown, not as a stale entry");
+
+	// Liveness by generation: when the resource dies its slots read as tombstones naming it.
+	tex.Reset();
+	check(sh::lookup(cpu, got) && got.dead && got.resource == e.resource, "fast: after the resource died the slot is a tombstone naming it");
+
+	std::printf("  fast slots_written=%llu heaps=%llu\n",
+		static_cast<unsigned long long>(sh::stats().slots), static_cast<unsigned long long>(sh::stats().heaps));
+	sh::set_mode(sh::Mode::debug); // leave the harness back on debug for the remaining tests
+	sh::clear_for_test();
+	return true;
+}
+
 bool test_native_stream_walk()
 {
 	std::printf("\n[test] pipeline-state stream walk finds the CS and stops honestly\n");

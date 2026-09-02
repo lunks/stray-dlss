@@ -5,6 +5,7 @@
 #include "app/dlss_app.hpp"
 
 #include "app/diff_observer.hpp"
+#include "backend_native/descriptor_shadow.hpp"
 #include "backend_native/native_backend.hpp"
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
@@ -329,6 +330,15 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool perf_log = true;
 	perf_log = host::cfg::get_bool("PerfLog", perf_log);
 	perf::set_enabled(perf_log);
+
+	// [STRAYDLSS] ShadowMode: fast (default, flat lock-free arrays) or debug (sharded map with
+	// provenance for the diff observer). Selected once, before the game creates any descriptor
+	// heap. A perf measurement is fast-mode only; the mode is logged and written to the status
+	// file so a number can never be attributed to the wrong shadow (facts §28).
+	char shadow_mode[16] = "fast";
+	host::cfg::get_string("ShadowMode", shadow_mode, sizeof(shadow_mode));
+	const bool shadow_debug = shadow_mode[0] == 'd' || shadow_mode[0] == 'D';
+	native::shadow::set_mode(shadow_debug ? native::shadow::Mode::debug : native::shadow::Mode::fast);
 
 	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
 	// stack (one CreateFeature attempt, released; SR keeps running), 2 = full RR-first
@@ -1043,6 +1053,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "taa_pipelines=%u\n", g_state.taa_pipelines_seen.load());
 			std::fprintf(f, "dispatches=%u\n", g_state.dispatches_seen.load());
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
+			std::fprintf(f, "shadow_mode=%s\n", native::shadow::mode() == native::shadow::Mode::fast ? "fast" : "debug");
 			std::fprintf(f, "ngx_attempted=%d\n",
 				g_state.ngx_attempted.load(std::memory_order_relaxed) ? 1 : 0);
 			// in_game under the NATIVE HOST cannot use the shader census: the host feeds

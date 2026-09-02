@@ -1759,7 +1759,9 @@ int main(int argc, char **argv)
 	test_registry_liveness(gpu);
 	test_registry_sentinel_survives_detach(gpu);
 	test_registry_va_ranges_ring_and_placed(gpu);
+	stray_dlss::native::shadow::set_mode(stray_dlss::native::shadow::Mode::debug); // the harness proves the debug shadow as today
 	test_descriptor_shadow_copy_chain(gpu);
+	test_descriptor_shadow_fast(gpu);
 	test_native_stream_walk();
 	test_native_hooks_ue4_shaped_frame(gpu);
 	test_drive_mode_restore_is_complete(gpu);
