@@ -34,7 +34,7 @@ local TIER2 = true          -- raise shell count / length
 -- a no-op; anything that should be felt as "more fur" has to go above it.
 local LAYERS      = 32      -- shells (player ships 16, companions 8)
 local LAYERS_LOD  = 32      -- per-LOD shells; keep >= LAYERS or LODs undo it
-local FUR_LENGTH  = nil     -- nil = leave the game's value; e.g. 1.25 = +25%
+local FUR_LENGTH  = 2.0     -- shipped 1.15; the single most VISIBLE knob. nil = leave alone
 local SHELL_BIAS  = nil     -- nil = leave; 0..1, higher packs shells toward the root
 local MIN_SCREEN  = 0.0     -- never drop the fur for distance
 
@@ -130,11 +130,12 @@ local function applyDensity(gfur)
         end)
     end
 
-    -- UNCONFIRMED: does GFur rebuild its shells for a live component? Toggling visibility
-    -- is BlueprintCallable and normally recreates the render state; if the log shows the
-    -- new LayerCount but the fur looks unchanged, this is the line that did not work.
-    pcall(function() gfur:SetVisibility(false, false) end)
-    pcall(function() gfur:SetVisibility(true, false) end)
+    -- MEASURED (second launch): setting LayerCount 16->32 plus a visibility toggle produced
+    -- no visible change - the property changed, the geometry did not. GFur exposes the
+    -- real trigger as a BlueprintCallable: GFurComponent:RegenerateFur() (no params),
+    -- found in the object dump. Call it after every geometry-affecting write.
+    local ok, err = pcall(function() gfur:RegenerateFur() end)
+    log("  RegenerateFur() -> " .. (ok and "called" or ("FAILED: " .. tostring(err))))
 
     log(string.format("  AFTER:   LayerCount=%s FurLength=%s ShellBias=%s MinScreenSize=%s (%d LODs)",
         tostring(num(get(gfur, "LayerCount"))), tostring(num(get(gfur, "FurLength"))),
