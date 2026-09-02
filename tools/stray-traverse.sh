@@ -41,14 +41,23 @@ log "traverse: hold UP, alternate LEFT/RIGHT every ${SWAP}s, ${TOTAL}s total (la
 QUIET="$GAME_DIR/stray-probe-quiet"; BENCH="$GAME_DIR/stray-probe-bench"
 rm -f "$FRAME"; touch "$QUIET" "$BENCH"; chown deck:deck "$QUIET" "$BENCH" 2>/dev/null
 trap 'rm -f "$QUIET" "$BENCH"' EXIT
-for _ in $(seq 1 12); do [ -n "$(frame_now)" ] && break; sleep 0.25; done
-COUNTER=1; [ -n "$(frame_now)" ] && [ "$(frame_now)" != "-1" ] || { COUNTER=0; log "no engine frame counter (probe too old, or GetFrameCount unavailable): timing only"; }
+# The probe's I/O and its engine reads alternate on different threads, so the FIRST
+# write of a window carries whatever was collected last time: -1 on a fresh launch, or
+# the previous window's final frame (measured 2026-09-02: that stale start inflated a
+# window to 277 fps against a true ~140). Wait for a real value, then for it to CHANGE,
+# and only then take the start frame.
+for _ in $(seq 1 16); do v=$(frame_now); [ -n "$v" ] && [ "$v" != "-1" ] && break; sleep 0.25; done
+COUNTER=1; v=$(frame_now); [ -n "$v" ] && [ "$v" != "-1" ] || { COUNTER=0; log "no engine frame counter (probe too old, or GetFrameCount unavailable): timing only"; }
+if [ "$COUNTER" -eq 1 ]; then
+    for _ in $(seq 1 8); do sleep 0.25; [ "$(frame_now)" != "$v" ] && break; done
+    [ "$(frame_now)" != "$v" ] || { COUNTER=0; log "frame counter is not advancing: timing only"; }
+fi
 
 # The key script runs in the background so this shell can sample the counter meanwhile.
 python3 "$INJECT" traverse "/dev/input/$KBD" "$TOTAL" "$SWAP" >/dev/null 2>&1 &
 INJ=$!
 TW0=$(date +%s.%N)
-samples=(); dts=(); f_prev=$(frame_now); t_prev=$TW0; f_start=$f_prev
+samples=(); dts=(); f_prev=$(frame_now); t_prev=$TW0; f_start=$f_prev; t_first=$TW0; t_last=$TW0; f_end=$f_prev
 while kill -0 "$INJ" 2>/dev/null; do
     sleep 0.25
     tick_checks "traverse" "$T0"
@@ -57,13 +66,14 @@ while kill -0 "$INJ" 2>/dev/null; do
         if [ "$f_now" != "$f_prev" ]; then
             samples+=("$(awk -v a="$f_prev" -v b="$f_now" -v ta="$t_prev" -v tb="$t_now" 'BEGIN { d = tb - ta; if (d > 0) printf "%.1f", (b - a) / d; else print "0" }')")
             dts+=("$(field "$FRAME" dt)")
-            f_prev=$f_now; t_prev=$t_now
+            f_prev=$f_now; t_prev=$t_now; f_end=$f_now; t_last=$t_now
         fi
     fi
 done
 wait "$INJ" 2>/dev/null
-TW1=$(date +%s.%N); elapsed=$(awk -v a="$TW0" -v b="$TW1" 'BEGIN { printf "%.1f", b - a }')
-f_end=$(frame_now)
+# Average over the SAMPLED span (first to last counter change), so the file's <=250 ms
+# lag at either end cancels instead of biasing the window.
+elapsed=$(awk -v a="$t_first" -v b="$t_last" 'BEGIN { printf "%.1f", b - a }')
 # Lift the flags and wait for one full probe write, so whatever runs next (another
 # reload's require_ingame) reads engine state, not the quiet stub.
 rm -f "$QUIET" "$BENCH"; trap - EXIT
