@@ -93,6 +93,30 @@ bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint3
 // the value check this and fall back to a static scale.
 bool pre_exposure_plausible(const ViewParams &p);
 
+// DO TWO SURVIVING CANDIDATES DESCRIBE THE SAME VIEW?
+//
+// `view_fits_dispatch` closed the LOUD half of the wrong-view bug: an impostor whose rect was
+// LARGER than the dispatch covers made the matcher refuse the real TAA pass, which showed up as
+// `unclaimed` and as the visible flicker (facts §36.18-36.19). It cannot close the QUIET half.
+// A second View uniform buffer whose rect is SMALLER than the dispatch covers passes every test
+// we have — plausibility, row 135 and the fit bound — so if it sits on a lower root parameter it
+// still wins the slot-order search, and DLSS is then fed another view's jitter, ClipToPrevClip
+// and CameraCut with no counter firing at all. `wrongView` was ~1.8 per candidate dispatch, so
+// the impostor is offered constantly; only the subset that failed loudly was ever measured.
+//
+// The instrument is ambiguity, not replay. Comparing the old "first plausible" rule against the
+// new "first plausible that fits" rule can only ever reproduce the loud case, because the two
+// rules differ EXACTLY when the first plausible candidate does not fit. What the quiet case
+// looks like is instead: MORE THAN ONE surviving candidate on the same dispatch. If exactly one
+// survives on every dispatch there is no quiet residue and the search's answer is forced; if two
+// survive, the slot order decided which view DLSS was told about, and that count is the residue.
+//
+// Equivalent means "indistinguishable to everything downstream": two root parameters may point
+// at the same suballocation, or at two byte-identical copies of one view's uniform buffer, and
+// neither is ambiguity. Compared exactly (bitwise-equal floats), because that is what reading
+// the same bytes twice produces; a tolerance would only hide a real second view.
+bool view_params_equivalent(const ViewParams &a, const ViewParams &b);
+
 // TemporalAAParams.zw IS TemporalJitterPixels, already in render-resolution pixels. NGX takes
 // it with NO sign flip. (docs/RESEARCH.md §3.3)
 Float2 ngx_jitter_offset(const ViewParams &p);
