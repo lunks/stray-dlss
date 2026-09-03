@@ -256,7 +256,7 @@ int g_mv_dispatch_mode = 2;
 // mark() below). Turn this off when chasing a periodic hitch — it is a per-dispatch (so
 // roughly per-frame) file write and a plausible suspect, even though a single small write is
 // individually cheap.
-bool g_stage_file_enabled = true;
+bool g_stage_file_enabled = false;
 
 // A crash-survivable breadcrumb. The Phase B path dies with an access violation after
 // surviving many frames, so the trigger is something that CHANGES rather than the first call.

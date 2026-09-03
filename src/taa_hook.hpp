@@ -53,8 +53,9 @@ void dump_summary();
 // [STRAYDLSS] NgxEvaluate. Separate from EnableNGX, which only brings NGX up: this is the
 // first switch that changes what the player sees, so it is opt-in on its own.
 void set_ngx_evaluate(bool enabled);
-// [STRAYDLSS] StageFile, default ON. Disables the per-dispatch crash breadcrumb
-// (stray-dlss-stage.txt, taa_hook.cpp's mark()) — a hitch-hunting knob, not a correctness one.
+// [STRAYDLSS] StageFile, default OFF. Enables the per-dispatch crash breadcrumb
+// (stray-dlss-stage.txt, taa_hook.cpp's mark()) — six file writes per dispatch, so it is a
+// crash-naming tool to switch on deliberately, never something to leave running.
 void set_stage_file(bool enabled);
 // [STRAYDLSS] NgxRR: 0 off (SR unchanged), 1 probe (ngx_backend runs it), 2 full — the
 // RR-first evaluate with per-frame SR fallback. Mirrors ngx::set_rr_mode; the hook keeps

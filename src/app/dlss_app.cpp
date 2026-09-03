@@ -338,9 +338,12 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
 
-	// [STRAYDLSS] StageFile, default ON: the per-dispatch crash breadcrumb
-	// (stray-dlss-stage.txt). Turn this off when chasing a periodic hitch.
-	taa_hook::set_stage_file(host::cfg::get_bool("StageFile", true));
+	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
+	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
+	// closed. What it still costs is SIX synchronous open-write-close cycles per intercepted
+	// dispatch — roughly 400-1000 file operations a second through Wine's filesystem layer, on
+	// the render thread. Set it to 1 to get the breadcrumb back when a new crash needs naming.
+	taa_hook::set_stage_file(host::cfg::get_bool("StageFile", false));
 
 	// [STRAYDLSS] StatusFile, default ON: the machine-readable heartbeat rewritten every
 	// StatusFileFrames presents (stray-dlss-status.txt). Turn StatusFile off, or raise
