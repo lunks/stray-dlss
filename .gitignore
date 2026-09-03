@@ -27,3 +27,8 @@ third_party/ngx/lib/
 # Python bytecode caches (one was committed by accident in 517f3fb).
 __pycache__/
 *.pyc
+
+# The DLSSNR runtime (165 MB, leaked pre-release, never redistributable). Kept at the repo
+# root so binary investigation needs no box round trip; md5 eea91faf55a8993656c66815f0497b3b,
+# byte-identical to what the game loads.
+/nvngx_dlssnr.dll
