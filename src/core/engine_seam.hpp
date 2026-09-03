@@ -328,18 +328,25 @@ struct Announcement
 // where `+16` is no longer `ResourceRHI` but whatever the next allocation put there.
 //
 // The rule is therefore the narrowest one that is still always true: dereference ONLY the
-// newest announcement, only on the thread that made it, and only before the frame has turned
-// over. A claim that fails this is not an error — L1 declines and the heuristic supplies that
-// frame's inputs, exactly as `EngineSeamInputs=0` would — but it is COUNTED, because a rate
-// that climbs means the ledger has slipped a graph behind and identity is suspect too.
+// newest announcement, and only before the frame has turned over. A claim that fails this is
+// not an error — L1 declines and the heuristic supplies that frame's inputs, exactly as
+// `EngineSeamInputs=0` would — but it is COUNTED, because a rate that climbs means the ledger
+// has slipped a graph behind and identity is suspect too.
+//
+// THREAD IDENTITY IS NOT PART OF THE RULE, and a version of this that required it shipped and
+// made L1 inert (`stale=4147` of 4147, `resolved=0`; see §12.8 of the report). AddPasses runs
+// during RDG setup and the dispatch during graph execution, on different threads by design.
+// Thread identity governs OWNERSHIP, not VALIDITY: memory held by a live stack frame is
+// readable from any thread. The two ids below are carried so the caller can REPORT the pair
+// and notice if it ever changes; `announcement_is_fresh` does not look at them.
 struct Freshness
 {
 	std::uint64_t announce_sequence = 0; // Announcement::sequence
 	std::uint64_t ledger_sequence = 0;   // Ledger::sequence(), i.e. the newest announcement
 	std::uint64_t announce_frame = 0;    // Announcement::frame
 	std::uint64_t current_frame = 0;     // the ledger's frame at claim time
-	std::uint64_t announce_thread = 0;   // Announcement::thread
-	std::uint64_t current_thread = 0;    // the thread recording the dispatch
+	std::uint64_t announce_thread = 0;   // Announcement::thread — REPORTED, never tested
+	std::uint64_t current_thread = 0;    // the dispatch-recording thread — REPORTED, never tested
 };
 bool announcement_is_fresh(const Freshness &f);
 

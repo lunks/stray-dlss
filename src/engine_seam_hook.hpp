@@ -71,8 +71,13 @@ struct Verdict
 	bool fresh = false;
 	std::uint64_t announce_frame = 0;
 	std::uint64_t current_frame = 0;
+	// REPORTED, never gated on. Requiring these two to be equal is what made L1 inert on the
+	// box (report §12.8): UE 4.27 announces during RDG setup and dispatches during graph
+	// execution, on different threads by design.
 	std::uint64_t announce_thread = 0;
 	std::uint64_t current_thread = 0;
+	bool threads_first_seen = false; // this claim latched the announce/claim thread pair
+	bool threads_changed = false;    // the pair moved mid-session — worth one WARN
 	std::uint64_t ledger_sequence = 0;
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);

@@ -78,6 +78,14 @@ std::uint64_t g_l1_stale = 0;
 bool g_l1_first_logged = false;
 bool g_l1_stale_logged = false;
 bool g_l1_disagree_logged = false;
+// The announce/claim THREAD PAIR, latched on the first claim and reported if it ever changes.
+// Nothing is gated on it — requiring the two to be equal is what made L1 inert on the box —
+// but the pair is a fingerprint of the engine's threading model, and a session in which it
+// moves is a session in which something about RDG execution changed under us. One WARN.
+std::uint64_t g_l1_announce_thread = 0;
+std::uint64_t g_l1_claim_thread = 0;
+bool g_l1_threads_latched = false;
+bool g_l1_thread_change_logged = false;
 // A read or a call that the guards let through and the CPU refused. Non-zero means an offset
 // or a vtable slot in seam::kRdgResourceRhiOffset / kRhiGetNativeResourceSlot is wrong on this
 // executable, and L1 disables itself for the session rather than roll the dice again.
@@ -697,6 +705,25 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 		f.announce_thread = a->thread;
 		f.current_thread = static_cast<std::uint64_t>(GetCurrentThreadId());
 		v.fresh = seam::announcement_is_fresh(f);
+		// Latch the thread pair. Not a gate — a REPORT, so that "AddPasses and the dispatch
+		// are on different threads" stays a visible, named property of this engine build
+		// rather than an assumption buried in a predicate.
+		if (!g_l1_threads_latched)
+		{
+			g_l1_threads_latched = true;
+			g_l1_announce_thread = f.announce_thread;
+			g_l1_claim_thread = f.current_thread;
+			v.threads_first_seen = true;
+		}
+		else if (f.announce_thread != g_l1_announce_thread ||
+			f.current_thread != g_l1_claim_thread)
+		{
+			if (!g_l1_thread_change_logged)
+			{
+				g_l1_thread_change_logged = true;
+				v.threads_changed = true;
+			}
+		}
 		v.announce_frame = f.announce_frame;
 		v.current_frame = f.current_frame;
 		v.announce_thread = f.announce_thread;
@@ -792,6 +819,26 @@ EngineInputs resolve_inputs(const Verdict &v)
 	// frame's FRDGAllocator has been reset and `+16` is now somebody else's FIntPoint.
 	gi.fresh = v.fresh;
 
+	// The thread pair, said once. It is not a gate and must never become one again; it is
+	// here so that "AddPasses and the dispatch run on different threads" is a MEASUREMENT in
+	// the log rather than an assumption in a predicate.
+	if (v.threads_first_seen)
+		STRAY_LOG_INFO("ENGINE SEAM L1: AddPasses announced on thread %llu and the dispatch "
+			"was recorded on thread %llu%s. UE 4.27 runs RDG setup and graph execution "
+			"separately, so these differing is NORMAL and is not tested - only the "
+			"announcement being the newest and the frame not having turned over are. Latched: "
+			"if this pair changes mid-session it gets one WARN.",
+			static_cast<unsigned long long>(v.announce_thread),
+			static_cast<unsigned long long>(v.current_thread),
+			v.announce_thread == v.current_thread ? " (the same thread)" : "");
+	if (v.threads_changed)
+		STRAY_LOG_WARN("ENGINE SEAM L1: the announce/claim thread pair CHANGED - now %llu -> "
+			"%llu. Nothing is gated on it, so this costs nothing by itself, but the engine's "
+			"RDG threading moved under us and that is worth knowing before trusting any "
+			"lifetime argument that assumed it did not. Once per session.",
+			static_cast<unsigned long long>(v.announce_thread),
+			static_cast<unsigned long long>(v.current_thread));
+
 	const seam::L1Gate gate_verdict = seam::l1_gate(gi);
 	if (gate_verdict == seam::L1Gate::off || gate_verdict == seam::L1Gate::faulted)
 		return out;
@@ -808,19 +855,26 @@ EngineInputs resolve_inputs(const Verdict &v)
 			}
 		}
 		if (first)
+			// Name the CONDITION that failed, not just the numbers. The first version of this
+			// line printed six values and left the reader to spot which pair differed - and
+			// the pair that differed was the threads, which should never have been a gate.
 			STRAY_LOG_WARN("ENGINE SEAM L1: declining to dereference a STALE announcement - "
-				"seq %llu against the ledger's newest %llu, announced on frame %llu / thread "
-				"%llu, claimed on frame %llu / thread %llu. The claim itself stands (the rect "
-				"identifies the pass); only FPassInputs is refused, so this frame uses the "
-				"heuristic's inputs exactly as EngineSeamInputs=0 would. An FRDGTexture is "
-				"owned by the FRDGBuilder that made it, so once a newer graph exists the "
-				"pointer addresses recycled arena memory - dereferencing one is what crashed "
-				"3365f02. Once per session; the rate is in the [seam] line's l1: stale=.",
+				"%s%s(seq %llu vs newest %llu, frame %llu vs %llu; threads %llu -> %llu, NOT "
+				"tested). The claim itself stands (the rect identifies the pass); only "
+				"FPassInputs is refused, so this frame uses the heuristic's inputs exactly as "
+				"EngineSeamInputs=0 would. An FRDGTexture belongs to the FRDGBuilder that made "
+				"it, so once a newer graph exists the pointer addresses recycled arena memory "
+				"- dereferencing one is what crashed 3365f02. Once per session; the rate is in "
+				"the [seam] line's l1: stale=.",
+				v.sequence != v.ledger_sequence ? "A NEWER ANNOUNCEMENT EXISTS, so a newer "
+					"graph does too. " : "",
+				v.announce_frame != v.current_frame ? "THE FRAME TURNED OVER between announce "
+					"and claim, so the announcing graph has completed. " : "",
 				static_cast<unsigned long long>(v.sequence),
 				static_cast<unsigned long long>(v.ledger_sequence),
 				static_cast<unsigned long long>(v.announce_frame),
-				static_cast<unsigned long long>(v.announce_thread),
 				static_cast<unsigned long long>(v.current_frame),
+				static_cast<unsigned long long>(v.announce_thread),
 				static_cast<unsigned long long>(v.current_thread));
 		return out;
 	}

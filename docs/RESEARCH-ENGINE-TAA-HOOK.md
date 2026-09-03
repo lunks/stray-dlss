@@ -903,10 +903,12 @@ inverted: it converts a fallback into a crash.
 
 **1. Freshness, `seam::announcement_is_fresh` (pure, `tests/test_engine_seam.cpp`).** L1 may
 dereference an announcement's `FPassInputs` only when it is the **newest** announcement (`sequence
-== Ledger::sequence()`), from the **same frame**, on the **same thread** that announced. Anything
-else is declined and counted as `l1: stale=`. `Announcement` therefore carries the announcing OS
-thread id, because `FRDGBuilder` is a stack object and another thread's claim reaches memory that
-thread may already have unwound.
+== Ledger::sequence()`) and the **frame has not turned over** (`announce_frame == current_frame`).
+Anything else is declined and counted as `l1: stale=`.
+
+> **This first shipped with a THIRD condition — same thread — and that was wrong. See §12.8**,
+> which is the correction and the measurement that forced it. `Announcement` still carries the
+> announcing OS thread id, but it is **reported, never tested**.
 
 **`claim()` itself is untouched.** Correlation keeps its slack, so `announced`, `claimed`,
 `unclaimed`, `orphans` and `lookalikesRefused` are byte-identical to `3365f02` and the
@@ -965,3 +967,85 @@ The `[seam]` line's `l1:` group now reads
 * **Whether the dispatch-recording thread is ever a different thread from the announcing one.**
   The freshness gate would catch it and count it as `stale`, and the WARN prints both thread ids,
   so the same launch answers this too.
+
+### 12.8 The fix worked and the guard was still wrong: THREAD IDENTITY IS NOT LIFETIME (2026-09-03)
+
+**Measured on the box.** DLL md5 `83628ea2…` (`13250b0`), menu, no input, same config.
+
+**The crash is gone.** `faults=0 off=0`, no crash, 4200+ frames — so the `VirtualQuery` + SEH
+guards and the fault latch did their job, and this section exists as a data point rather than as
+another symbolization exercise. That part stands unchanged.
+
+**And L1 was completely inert.** Its own WARN named the reason, which is the one redeeming thing
+about the mistake:
+
+```
+ENGINE SEAM L1: declining to dereference a STALE announcement - seq 1 against the ledger's
+newest 1, announced on frame 0 / thread 1400, claimed on frame 0 / thread 1152.
+```
+
+* `seq 1` against newest `1` — it **is** the newest.
+* `frame 0` against `frame 0` — the frame had **not** turned over.
+* thread **1400** announcing against **1152** claiming — the third condition, and the only one
+  that failed. It failed on **every single claim**:
+
+```
+[seam] frame 4200: announced=4203 claimed=4147 unclaimed=53 orphans=0 lookalikesRefused=1747
+  | l1: resolved=0 partial=0 fellBack=0 stale=4147 faults=0 off=0
+[frame 3600] NR STAGE: … guides-absent=121 guides-stale=26   NR RESETS: total=25 from: frame-gap=24
+```
+
+`stale=4147` is every claim; `resolved=0` is not one resolve in the session. The build was
+behaving exactly as `EngineSeamInputs=0` while every other counter reported L1 switched on, and
+`unclaimed=53` / `guides-stale=26` / `frame-gap=24` moved together again — the blips were back.
+
+**Why the condition was wrong, and it is structural rather than marginal.** UE 4.27 calls
+`ITemporalUpscaler::AddPasses` during RDG graph **setup**; the D3D12 `Dispatch` our hook sees is
+recorded during graph **execution**. Those are not required to be the same thread, and on this
+build they are not: the pair was stable for the whole session, so this is the engine's design and
+not a race.
+
+**The reasoning error, which is the part worth keeping.** The argument for the condition was
+"`FRDGBuilder` is a stack object, so only the announcing thread may dereference what it holds".
+The premise is true and the conclusion does not follow. **Thread identity governs OWNERSHIP, not
+VALIDITY.** A stack object being alive is a statement about whether its frame has returned, not
+about which thread may read it; memory held by a live stack frame is readable from any thread, and
+the engine itself reads `ResourceRHI` on the recording thread in order to bind the texture. The
+lifetime argument in §12.3 never needed the thread at all: a **newer announcement** means a newer
+graph, and **a present between announce and claim** means the announcing graph has completed.
+Those two are the lifetime. Each is independently sufficient against the crash sequence, which is
+now pinned as its own test so that dropping the third condition cannot have left the guard resting
+on one leg.
+
+**The wider lesson, and this project has now paid for it twice in one day.** A guard that is
+"obviously safe" and costs nothing to add is not free: this one cost the entire feature, silently,
+and would have read as "L1 doesn't help" rather than as "L1 never ran" if the decline had not been
+counted and named. **A defensive condition needs the same provenance discipline as a functional
+one** — HARD, SOFT or UNCONFIRMED — because a wrong one does not fail loudly, it just never fires
+the thing it guards. The same-thread test was UNCONFIRMED, presented as reasoning, and shipped as
+a gate.
+
+**What changed.**
+
+* `announcement_is_fresh` tests **newest + same frame only**. The thread ids stay in `Freshness`
+  and in the stale WARN, which now also **names which condition failed** in words rather than
+  printing six numbers and leaving the reader to spot the differing pair — that is what cost this
+  round trip to read.
+* The announce/claim **thread pair is latched and reported**: one INFO on the first claim saying
+  what the pair is and that differing threads are normal and untested, and one WARN if the pair
+  ever changes mid-session. The identity stays visible as a measurement without being a gate.
+* The regression test for the ordinary frame now uses the box's **measured pair (1400 announcing,
+  1152 recording)** rather than a tidy same-thread one, so a re-introduced thread test fails in CI
+  instead of on the box.
+
+**Still UNCONFIRMED, and worth naming rather than assuming:** *what* thread 1152 is. The NGX cubin
+lines in the same session carry `tid:1152` and the earlier crash context's `ThreadName` read
+`GameThread`, which do not obviously agree with each other or with "the RHI thread". Nothing
+depends on the answer now, which is the point — but the latch above will say if the pair ever
+moves.
+
+**Also open:** whether newest + same frame is sufficient in practice, which only the box can
+answer. The residual hole is a second graph inside one present interval whose dispatch claims an
+announcement the first graph's dispatch never consumed. It needs an unclaimed announcement AND a
+rect-matching look-alike in the same frame, and if it happens the `VirtualQuery` + SEH guards make
+it a counted fault rather than a crash — which is exactly why those stay whatever else changes.

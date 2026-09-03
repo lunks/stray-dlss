@@ -2923,3 +2923,41 @@ been reset. Correlation survives that slack; pointers do not.
 **Not yet measured:** whether that stale claim is the only way L1 saw a dead pointer. `l1: stale=`
 in the `[seam]` line counts it from now on, with one WARN naming the sequence, frame and thread
 gap — one launch settles it.
+
+### 36.10 The crash fix holds; the same-thread guard in it made L1 inert (2026-09-03)
+
+DLL md5 `83628ea2…` (`13250b0`), menu, no input, `EngineSeam=3`, `EngineSeamInputs=1`, FG on,
+NR on.
+
+**Crash fixed. `faults=0 off=0`, no crash, 4200+ frames.** The `VirtualQuery` + SEH guards and
+the fault latch hold, so this session is a measurement rather than another crash dump.
+
+**But L1 resolved nothing**, and its own WARN said why:
+
+```
+ENGINE SEAM L1: declining to dereference a STALE announcement - seq 1 against the ledger's
+newest 1, announced on frame 0 / thread 1400, claimed on frame 0 / thread 1152.
+
+[seam] frame 4200: announced=4203 claimed=4147 unclaimed=53 orphans=0 lookalikesRefused=1747
+  | l1: resolved=0 partial=0 fellBack=0 stale=4147 faults=0 off=0
+[frame 3600] NR STAGE: … guides-absent=121 guides-stale=26   NR RESETS: total=25 from: frame-gap=24
+```
+
+`seq 1` **was** the newest and `frame 0` **was** the same frame; only the third condition — same
+thread — failed, and it failed on all 4147 claims. `resolved=0`.
+
+**HARD, and new: `ITemporalUpscaler::AddPasses` and the D3D12 `Dispatch` run on DIFFERENT
+THREADS on this build, stably.** Announce on **1400**, dispatch recorded on **1152**, unchanged
+for the whole session — the engine's design (RDG graph setup vs graph execution), not a race.
+**UNCONFIRMED: what thread 1152 is.** The session's NGX cubin lines also carry `tid:1152`, and
+the earlier crash context's `ThreadName` read `GameThread`; those do not obviously agree, and
+nothing now depends on the answer.
+
+**Consequence.** The same-thread condition is dropped: thread identity governs OWNERSHIP, not
+VALIDITY, and the lifetime argument only ever needed "newest announcement" and "the frame has not
+turned over" (report §12.8). The two ids are still carried, still printed in the stale WARN, and
+the announce/claim pair is now latched with one WARN if it ever moves — reported, never gated.
+
+**Also measured here:** with L1 inert the blips return exactly as before —
+`unclaimed=53`, `guides-stale=26`, `frame-gap=24` tracking together — which is a third
+independent confirmation that `unclaimed` is the user's "DLSS flip" and that L1 is what closes it.

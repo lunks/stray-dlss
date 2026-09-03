@@ -763,24 +763,52 @@ TEST_CASE("only the newest announcement, same frame, same thread, may be derefer
 		stale.current_frame = 101;
 		CHECK_FALSE(announcement_is_fresh(stale));
 	}
-	SUBCASE("a different thread is claiming than announced")
+	SUBCASE("A DIFFERENT CLAIMING THREAD IS STILL FRESH - this is the NORMAL case")
 	{
-		// FRDGBuilder is a stack object. Another thread's claim reaches memory the announcing
-		// thread may already have unwound.
-		Freshness stale = f;
-		stale.current_thread = 43;
-		CHECK_FALSE(announcement_is_fresh(stale));
+		// MEASURED ON THE BOX (report §12.8, facts §36.10): UE 4.27 announced on thread 1400
+		// and recorded the dispatch on thread 1152, stably, for a whole session. An earlier
+		// version of this predicate required the two to be equal and made L1 INERT -
+		// `stale=4147` of 4147 claims, `resolved=0`, the feature silently equivalent to
+		// EngineSeamInputs=0 while every other counter said it was on.
+		//
+		// The reasoning error, pinned here so it is not repeated: thread identity governs
+		// OWNERSHIP, not VALIDITY. FRDGBuilder being a stack object means the announcing
+		// thread's frame must not have returned; it does not mean only that thread may read
+		// what its allocator holds. Memory held by a live stack frame is readable from any
+		// thread, and the engine itself reads ResourceRHI on the recording thread in order to
+		// bind the texture. Lifetime is the two conditions above, and neither is about threads.
+		Freshness other = f;
+		other.announce_thread = 1400;
+		other.current_thread = 1152;
+		CHECK(announcement_is_fresh(other));
 	}
-	SUBCASE("an unset sequence or thread is never fresh")
+	SUBCASE("an unset sequence is never fresh, and an unset thread does not matter")
 	{
 		Freshness zero = f;
 		zero.announce_sequence = 0;
 		zero.ledger_sequence = 0;
 		CHECK_FALSE(announcement_is_fresh(zero));
+		// Thread ids are reported, never tested, so a zero one cannot decline a frame.
 		Freshness nothread = f;
 		nothread.announce_thread = 0;
 		nothread.current_thread = 0;
-		CHECK_FALSE(announcement_is_fresh(nothread));
+		CHECK(announcement_is_fresh(nothread));
+	}
+	SUBCASE("either lifetime condition ALONE catches the crash sequence")
+	{
+		// Both fire together in the real sequence; each must be sufficient on its own, so
+		// that neither is load-bearing only by accident — and so that dropping the thread
+		// test cannot have left the guard resting on one condition.
+		Freshness newer = f;
+		newer.ledger_sequence = f.announce_sequence + 1;
+		newer.announce_thread = 1400;
+		newer.current_thread = 1152;
+		CHECK_FALSE(announcement_is_fresh(newer));
+		Freshness turned = f;
+		turned.current_frame = f.announce_frame + 1;
+		turned.announce_thread = 1400;
+		turned.current_thread = 1152;
+		CHECK_FALSE(announcement_is_fresh(turned));
 	}
 }
 
@@ -828,16 +856,17 @@ TEST_CASE("the freshness gate does NOT change what the ledger claims")
 TEST_CASE("the ordinary frame is fresh, so L1 keeps working")
 {
 	// The regression that would matter most: a gate so strict that L1 never resolves would
-	// "fix" the crash by deleting the feature — and the box has measured what that costs
-	// (EngineSeamInputs=0: unclaimed=159 over 16200 frames). One announce, one claim, same
-	// frame, same thread — the shape of every normal frame — must pass.
+	// "fix" the crash by deleting the feature. THAT ALREADY HAPPENED ONCE — a same-thread
+	// requirement shipped and declined 4147 of 4147 claims — so this case is written with the
+	// box's own measured thread pair (announce 1400, dispatch 1152) rather than with a tidy
+	// same-thread one, precisely so a re-introduced thread test fails here.
 	Ledger led;
 	led.begin_frame(5);
 	Announcement a;
 	a.out_width = 2560;
 	a.out_height = 1440;
 	a.frame = 5;
-	a.thread = 77;
+	a.thread = 1400;
 	led.announce(a);
 
 	const Announcement *got = led.claim(Ledger::expected_groups(2560),
@@ -849,7 +878,7 @@ TEST_CASE("the ordinary frame is fresh, so L1 keeps working")
 	f.announce_frame = got->frame;
 	f.current_frame = led.frame();
 	f.announce_thread = got->thread;
-	f.current_thread = 77;
+	f.current_thread = 1152;
 	CHECK(announcement_is_fresh(f));
 }
 

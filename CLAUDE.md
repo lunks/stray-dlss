@@ -576,14 +576,39 @@ Config and saves live in the **Proton prefix**:
 > boundary is not a lifetime.** Ask which one you are relying on before dereferencing anything
 > the engine handed you.
 >
-> **Fixed by:** `seam::announcement_is_fresh` — dereference only the newest announcement, same
-> frame, same thread — leaving `claim()` and every correlation counter untouched; a `VirtualQuery`
-> readability check where `plausible_heap_ptr` was only ever a numeric RANGE test; **SEH around
-> both the read and the `GetNativeResource` call**, explicitly and by name, because those two
-> sites dereference and call through offsets no test outside the engine can prove; and a fault
-> latching L1 off for the session at ERROR rather than re-rolling every frame. Read `l1: stale=`
-> and `faults=` in the `[seam]` line first — `stale=` is the counter whose absence cost this
-> round trip.
+> **Fixed by:** `seam::announcement_is_fresh` — dereference only the newest announcement, and
+> only before the frame has turned over — leaving `claim()` and every correlation counter
+> untouched; a `VirtualQuery` readability check where `plausible_heap_ptr` was only ever a numeric
+> RANGE test; **SEH around both the read and the `GetNativeResource` call**, explicitly and by
+> name, because those two sites dereference and call through offsets no test outside the engine
+> can prove; and a fault latching L1 off for the session at ERROR rather than re-rolling every
+> frame. Read `l1: stale=` and `faults=` in the `[seam]` line first — `stale=` is the counter
+> whose absence cost this round trip.
+>
+> **AND THE FIRST FIX SHIPPED A THIRD CONDITION — same thread — WHICH WAS WRONG AND MADE L1
+> INERT (2026-09-03, facts §36.10, report §12.8).** The crash stayed fixed (`faults=0 off=0`,
+> 4200+ frames), and `stale=4147` of 4147 claims with `resolved=0`: the build behaved as
+> `EngineSeamInputs=0` while every other counter said L1 was on, and the blips came back. **HARD,
+> and new: `AddPasses` announces on one thread and the D3D12 `Dispatch` is recorded on another**
+> — 1400 and 1152 on this build, stable all session, because UE 4.27 runs RDG graph SETUP and
+> graph EXECUTION separately.
+>
+> **The reasoning error is the durable part, and it is a sibling of the one above. THREAD
+> IDENTITY GOVERNS OWNERSHIP, NOT VALIDITY.** "`FRDGBuilder` is a stack object" means the
+> announcing thread's frame must not have returned; it does not mean only that thread may read
+> what its allocator holds. Memory held by a live stack frame is readable from any thread — and
+> the engine itself reads `ResourceRHI` on the recording thread in order to bind the texture. The
+> lifetime argument only ever needed *newest announcement* and *the frame has not turned over*,
+> each independently sufficient.
+>
+> **And the process lesson, which this file has now paid for twice in one day: a defensive
+> condition needs the same HARD / SOFT / UNCONFIRMED discipline as a functional one.** A wrong
+> guard does not fail loudly — it silently never fires the thing it guards, and reads as "the
+> feature does not help" rather than "the feature never ran". The same-thread test was
+> UNCONFIRMED, presented as reasoning, and shipped as a gate; only the fact that the decline was
+> COUNTED and NAMED turned it into a one-line diagnosis instead of another bisect. The thread
+> pair is now latched and reported — one INFO, and one WARN if it ever moves — and gated on
+> nothing.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does

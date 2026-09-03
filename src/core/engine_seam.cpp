@@ -544,9 +544,24 @@ bool announcement_is_fresh(const Freshness &f)
 	// Same frame: a present between announce and claim means the graph completed.
 	if (f.announce_frame != f.current_frame)
 		return false;
-	// Same thread: the builder is a stack object on the announcing thread.
-	if (f.announce_thread == 0 || f.announce_thread != f.current_thread)
-		return false;
+	// AND NOTHING ABOUT THE THREAD. The first version of this predicate also demanded
+	// `announce_thread == current_thread`, and it was WRONG — structurally, not marginally.
+	// It made L1 inert on the box: `stale=4147` of 4147 claims, `resolved=0`, every claim
+	// declined with a stable pair (announced on 1400, claimed on 1152) all session. UE 4.27
+	// calls `ITemporalUpscaler::AddPasses` during RDG graph SETUP and issues the dispatch
+	// during graph EXECUTION, and those are not required to be the same thread.
+	//
+	// The reasoning error is worth naming because it is easy to repeat: thread identity
+	// governs OWNERSHIP, not VALIDITY. `FRDGBuilder` being a stack object means the
+	// ANNOUNCING thread's frame must not have returned — it does not mean only that thread
+	// may read what the allocator holds. Memory owned by a live stack frame is readable from
+	// any thread, and if the engine can read `ResourceRHI` on the recording thread (it must,
+	// to bind the texture) then so can we. The two conditions above are the lifetime, and
+	// they are sufficient: a newer announcement means a newer graph, and a present between
+	// announce and claim means the announcing graph has completed. Neither is about threads.
+	//
+	// The thread ids stay in this struct because the CALLER reports them — the pair is
+	// latched and a change is worth one WARN — but nothing is gated on them.
 	return true;
 }
 
