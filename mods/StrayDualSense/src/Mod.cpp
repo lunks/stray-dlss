@@ -521,16 +521,27 @@ void ReadAuthoredTriggerEffectOnGameThread()
 // ever fires says so in the status line rather than looking like a silent submix.
 // ---------------------------------------------------------------------------------------
 std::chrono::steady_clock::time_point g_lastSubmixAttempt{};
+int g_submixAttempts = 0;
+
+// The scan walks tens of thousands of pointers ON THE GAME THREAD. A second between attempts is
+// right while there is a real chance of success — the engine may still be starting its audio —
+// but a session where it will never bind must not pay that forever, so it backs off.
+constexpr int kSubmixFastAttempts   = 10;
+constexpr int kSubmixFastIntervalMs = 1000;
+constexpr int kSubmixSlowIntervalMs = 5000;
 
 void MaybeBindSubmixOnGameThread()
 {
     if (!sds::Rt().SubmixWantsBinding())
         return;
     const auto now = std::chrono::steady_clock::now();
+    const int interval = g_submixAttempts < kSubmixFastAttempts ? kSubmixFastIntervalMs
+                                                                : kSubmixSlowIntervalMs;
     if (g_lastSubmixAttempt.time_since_epoch().count() != 0 &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastSubmixAttempt).count() < 1000)
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastSubmixAttempt).count() < interval)
         return;
     g_lastSubmixAttempt = now;
+    ++g_submixAttempts;
 
     const void* imageBase = nullptr;
     size_t      imageSize = 0;

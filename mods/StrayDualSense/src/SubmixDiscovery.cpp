@@ -40,7 +40,123 @@ std::int32_t ReadI32(const void* at)
     return v;
 }
 
+// VirtualQuery is a kernel transition, and a 0x8000-byte pointer scan plus a second hop asks
+// for it tens of thousands of times. THIS RUNS ON THE GAME THREAD, once a second until it
+// binds, so uncached it would be a visible hitch every second — a worse regression than the bug
+// it is chasing. Heap pointers cluster into a handful of large regions, so a tiny
+// most-recently-used cache collapses nearly all of it.
+//
+// Scoped to ONE discovery pass on purpose: memory that was readable a minute ago need not be,
+// and the call site that actually dereferences (CallRegisterSubmixBufferListener) re-checks
+// with the uncached Readable().
+struct RegionCache
+{
+    static constexpr int kEntries = 24;
+    struct Entry { const unsigned char* base = nullptr; std::size_t size = 0; bool readable = false; };
+    Entry entries[kEntries];
+    int   count = 0;
+    unsigned long long hits = 0, misses = 0;
+
+    const Entry* Find(const unsigned char* p)
+    {
+        for (int i = 0; i < count; ++i)
+            if (p >= entries[i].base && p < entries[i].base + entries[i].size)
+            {
+                ++hits;
+                return &entries[i];
+            }
+        return nullptr;
+    }
+    void Add(const Entry& e)
+    {
+        ++misses;
+        if (count < kEntries)
+        {
+            entries[count++] = e;
+            return;
+        }
+        // Replace the smallest: the big heap regions are the ones worth keeping.
+        int smallest = 0;
+        for (int i = 1; i < count; ++i)
+            if (entries[i].size < entries[smallest].size) smallest = i;
+        entries[smallest] = e;
+    }
+};
+
+bool ReadableCached(RegionCache& cache, const void* p, std::size_t bytes)
+{
+    if (p == nullptr || bytes == 0)
+        return false;
+    const auto* cur = static_cast<const unsigned char*>(p);
+    const auto* end = cur + bytes;
+    while (cur < end)
+    {
+        if (const RegionCache::Entry* e = cache.Find(cur))
+        {
+            if (!e->readable)
+                return false;
+            cur = e->base + e->size;
+            continue;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(cur, &mbi, sizeof(mbi)) != sizeof(mbi))
+            return false;
+        const DWORD prot = mbi.Protect & 0xFFu;
+        const bool ok = mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0 &&
+                        (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                         prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                         prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+        RegionCache::Entry e;
+        e.base     = static_cast<const unsigned char*>(mbi.BaseAddress);
+        e.size     = mbi.RegionSize;
+        e.readable = ok;
+        cache.Add(e);
+        if (!ok)
+            return false;
+        cur = e.base + e.size;
+    }
+    return true;
+}
+
 // Does this look like a C++ vtable for a class compiled into the game executable?
+bool LooksLikeVtableCached(RegionCache& cache, const void* vtable, const void* base,
+                           std::size_t size)
+{
+    if (!InImage(vtable, base, size))
+        return false;
+    if (!ReadableCached(cache, vtable, sizeof(void*) * kVtableProbeSlots))
+        return false;
+    const void* const* slots = static_cast<const void* const*>(vtable);
+    for (int i = 0; i < kVtableProbeSlots; ++i)
+        if (slots[i] == nullptr || !InImage(slots[i], base, size))
+            return false;
+    return true;
+}
+
+bool LooksLikeUObjectCached(RegionCache& cache, const void* p)
+{
+    const void* cur = p;
+    for (int i = 0; i < kUObjectChainDepth; ++i)
+    {
+        if (!ReadableCached(cache, cur, kUObjectClassOffset + sizeof(void*)))
+            return false;
+        const void* cls = ReadPtr(static_cast<const unsigned char*>(cur) + kUObjectClassOffset);
+        if (cls == nullptr || (reinterpret_cast<std::uintptr_t>(cls) & 7u) != 0)
+            return false;
+        if (cls == cur)
+            return i > 0;
+        cur = cls;
+    }
+    return false;
+}
+
+std::size_t ReadableWindowCached(RegionCache& cache, const void* p, std::size_t want)
+{
+    while (want >= 0x100 && !ReadableCached(cache, p, want))
+        want /= 2;
+    return ReadableCached(cache, p, want) ? want : 0;
+}
+
 bool LooksLikeVtable(const void* vtable, const void* base, std::size_t size)
 {
     if (!InImage(vtable, base, size))
@@ -73,14 +189,15 @@ std::size_t ReadableWindow(const void* p, std::size_t want)
 // Searched as int32 AND as float: the stock header says int32, but this is a LICENSEE build
 // and a float costs nothing to check. The OFFSET of the first hit is recorded, so a run that
 // finds one measures where it lives instead of us deriving it from stock headers.
-std::int32_t FindSampleRate(const void* obj, int& hits, std::size_t& firstAt, int& distinct)
+std::int32_t FindSampleRate(RegionCache& cache, const void* obj, int& hits,
+                            std::size_t& firstAt, int& distinct)
 {
     hits = 0;
     firstAt = 0;
     distinct = 0;
     std::int32_t seen[8] = {};
     int seenCount = 0;
-    const std::size_t window = ReadableWindow(obj, kFingerprintBytes);
+    const std::size_t window = ReadableWindowCached(cache, obj, kFingerprintBytes);
     if (window < sizeof(std::int32_t))
         return 0;
     const auto* bytes = static_cast<const unsigned char*>(obj);
@@ -133,6 +250,7 @@ struct ScanContext
     std::size_t imageSize = 0;
     std::vector<DeviceCandidate>* out = nullptr;
     std::size_t maxCandidates = 0;
+    RegionCache cache;
 };
 
 // Record one pointee, if it is new and looks like a C++ object of a class in the exe.
@@ -155,10 +273,10 @@ bool Consider(ScanContext& ctx, const void* owner, std::size_t k, bool fromWorld
         return false;
     if (InImage(p, ctx.imageBase, ctx.imageSize))    // FAudioDevice is heap-allocated
         return false;
-    if (!Readable(p, sizeof(void*)))
+    if (!ReadableCached(ctx.cache, p, sizeof(void*)))
         return false;
     const void* vtable = ReadPtr(p);
-    if (!LooksLikeVtable(vtable, ctx.imageBase, ctx.imageSize))
+    if (!LooksLikeVtableCached(ctx.cache, vtable, ctx.imageBase, ctx.imageSize))
         return false;
 
     for (const DeviceCandidate& c : *ctx.out)
@@ -172,8 +290,8 @@ bool Consider(ScanContext& ctx, const void* owner, std::size_t k, bool fromWorld
     cand.fromWorld    = fromWorld;
     cand.viaContainer    = viaContainer;
     cand.containerOffset = containerOffset;
-    cand.isUObject    = LooksLikeUObject(p);
-    cand.sampleRate   = FindSampleRate(p, cand.sampleRateHits, cand.sampleRateAt,
+    cand.isUObject    = LooksLikeUObjectCached(ctx.cache, p);
+    cand.sampleRate   = FindSampleRate(ctx.cache, p, cand.sampleRateHits, cand.sampleRateAt,
                                        cand.distinctRates);
 
     // Corroboration from the bytes AROUND the pointer, if the handle really is laid out as
@@ -186,7 +304,7 @@ bool Consider(ScanContext& ctx, const void* owner, std::size_t k, bool fromWorld
             const std::int32_t objIndex = ReadI32(bytes + k - 8);
             cand.worldIndexMatch = fromWorld && ownerIndex > 0 && objIndex == ownerIndex;
         }
-        if (Readable(bytes + k + 8, sizeof(std::int32_t)))
+        if (ReadableCached(ctx.cache, bytes + k + 8, sizeof(std::int32_t)))
         {
             const std::uint32_t id = static_cast<std::uint32_t>(ReadI32(bytes + k + 8));
             if (id < kMaxPlausibleDeviceId)
@@ -198,7 +316,7 @@ bool Consider(ScanContext& ctx, const void* owner, std::size_t k, bool fromWorld
             cand.managerBefore = mgr != nullptr &&
                                  (reinterpret_cast<std::uintptr_t>(mgr) & 7u) == 0 &&
                                  !InImage(mgr, ctx.imageBase, ctx.imageSize) &&
-                                 Readable(mgr, sizeof(void*));
+                                 ReadableCached(ctx.cache, mgr, sizeof(void*));
         }
     }
     ctx.out->push_back(cand);
@@ -214,7 +332,7 @@ void ScanObject(ScanContext& ctx, const void* object, std::size_t scanBytes, boo
 {
     if (object == nullptr)
         return;
-    const std::size_t window = ReadableWindow(object, scanBytes);
+    const std::size_t window = ReadableWindowCached(ctx.cache, object, scanBytes);
     if (window < 16)
     {
         SDS_LOG_WARN("submix discovery: %s at %p is not readable; skipped.", what, object);
@@ -227,13 +345,16 @@ void ScanObject(ScanContext& ctx, const void* object, std::size_t scanBytes, boo
         SDS_LOG_INFO("submix discovery: scanning %s at %p over 0x%zX bytes%s", what, object,
                      window, window != scanBytes ? "  <- SHRUNK, the object ends sooner" : "");
 
-    const std::size_t before = ctx.out->size();
-    for (std::size_t k = 0; k + sizeof(void*) <= window; k += 8)
-        Consider(ctx, object, k, fromWorld, ownerIndex, false, 0);
-    const std::size_t direct = ctx.out->size() - before;
-
     if (!secondHop)
+    {
+        const std::size_t before = ctx.out->size();
+        for (std::size_t k = 0; k + sizeof(void*) <= window; k += 8)
+            Consider(ctx, object, k, fromWorld, ownerIndex, false, 0);
+        SDS_LOG_INFO("submix discovery: %s -> %zu direct candidate(s) (VirtualQuery %llu hit / "
+                     "%llu miss)", what, ctx.out->size() - before, ctx.cache.hits,
+                     ctx.cache.misses);
         return;
+    }
 
     // Second hop — THE FAudioDeviceManager PATH. `UEngine::AudioDeviceManager` (Engine.h:1732)
     // is a plain heap object with no vtable of its own, so the direct scan cannot see it; but
@@ -252,21 +373,23 @@ void ScanObject(ScanContext& ctx, const void* object, std::size_t scanBytes, boo
         const void* p = ReadPtr(bytes + k);
         if (p == nullptr || (reinterpret_cast<std::uintptr_t>(p) & 7u) != 0)
             continue;
-        if (InImage(p, ctx.imageBase, ctx.imageSize) || !Readable(p, sizeof(void*)))
+        if (InImage(p, ctx.imageBase, ctx.imageSize) ||
+            !ReadableCached(ctx.cache, p, sizeof(void*)))
             continue;
         // A container is a heap block that is NOT itself a polymorphic object — exactly what
         // FAudioDeviceManager is.
-        if (LooksLikeVtable(ReadPtr(p), ctx.imageBase, ctx.imageSize))
+        if (LooksLikeVtableCached(ctx.cache, ReadPtr(p), ctx.imageBase, ctx.imageSize))
             continue;
-        const std::size_t inner = ReadableWindow(p, kContainerWindow);
+        const std::size_t inner = ReadableWindowCached(ctx.cache, p, kContainerWindow);
         if (inner < 16)
             continue;
         ++containers;
         for (std::size_t j = 0; j + sizeof(void*) <= inner; j += 8)
             Consider(ctx, p, j, fromWorld, 0, true, k);
     }
-    SDS_LOG_INFO("submix discovery: %s -> %zu direct candidate(s), %zu container(s) followed, "
-                 "%zu total so far", what, direct, containers, ctx.out->size());
+    SDS_LOG_INFO("submix discovery: %s -> %zu container(s) followed, %zu candidate(s) total "
+                 "(VirtualQuery %llu hit / %llu miss)", what, containers, ctx.out->size(),
+                 ctx.cache.hits, ctx.cache.misses);
 }
 
 const char* SourceName(const DeviceCandidate& c)
@@ -395,14 +518,30 @@ DiscoveryResult FindAudioDevice(const DiscoveryInput& in)
     ctx.out           = &r.candidates;
     ctx.maxCandidates = in.maxCandidates;
 
+    // DIRECT SCAN FIRST, and only fall through to the second hop if it did not answer. The hop
+    // is an order of magnitude more work — up to 96 containers x 128 pointers per object — and
+    // this runs ON THE GAME THREAD every second until it binds. Paying for it on a run that
+    // already knows the answer would be a hitch a second for nothing.
     if (in.useEngine)
         ScanObject(ctx, in.engineObject, in.scanBytes, false, 0, "UEngine", in.logCandidates,
-                   in.secondHop);
+                   false);
     if (in.useWorld)
         ScanObject(ctx, in.worldObject, in.scanBytes, true, worldIndex, "UWorld",
-                   in.logCandidates, in.secondHop);
+                   in.logCandidates, false);
 
-    const Choice choice = ChooseDevice(r.candidates, r.uobjectTestUsable);
+    Choice choice = ChooseDevice(r.candidates, r.uobjectTestUsable);
+    if (choice.index < 0 && in.secondHop)
+    {
+        const std::size_t direct = r.candidates.size();
+        if (in.useEngine)
+            ScanObject(ctx, in.engineObject, in.scanBytes, false, 0, "UEngine containers",
+                       in.logCandidates, true);
+        if (in.useWorld)
+            ScanObject(ctx, in.worldObject, in.scanBytes, true, worldIndex, "UWorld containers",
+                       in.logCandidates, true);
+        if (r.candidates.size() != direct)
+            choice = ChooseDevice(r.candidates, r.uobjectTestUsable);
+    }
 
     if (in.logCandidates)
     {
