@@ -29,6 +29,28 @@
 -- periodic hitch, to rule its write in or out without losing the other, or the mod's
 -- existing stray-probe-quiet flag file (see quiet(), below), which suppresses the engine
 -- queries but keeps the heartbeat's own liveness write going.
+-- ARMED ONLY WHEN THE LAUNCHER ASKED FOR IT.
+--
+-- The probe exists so tools/launch-stray-safe.sh can tell gameplay from the title screen, and
+-- that is the only time anyone needs it. Left running it costs a file write and one engine read
+-- on the GAME THREAD every second, forever — which is exactly the shape of the ~1 Hz frame-time
+-- blip the user reports, and a diagnostic that perturbs what it measures is worse than none.
+--
+-- So: the launcher writes `stray-probe-armed` before asking Steam to start the game, and this
+-- consumes it (deletes it) at load. A launch the user starts from Steam therefore finds no flag
+-- and the probe does nothing at all — no loops scheduled, not merely no writes. The flag is
+-- one-shot by deletion rather than by the launcher cleaning up, because the launcher does not
+-- outlive every session and a stale flag would silently re-arm the next Steam launch.
+local ARM_FLAG = "stray-probe-armed"
+local function consume_arm_flag()
+    local f = io.open(ARM_FLAG, "rb")
+    if not f then return false end
+    f:close()
+    os.remove(ARM_FLAG)          -- one-shot: the next Steam launch must not inherit it
+    return true
+end
+local ARMED = consume_arm_flag()
+
 local HEARTBEAT_ENABLED     = true   -- STATE (stray-game-state.txt), once a second
 local HEARTBEAT_INTERVAL_MS = 1000
 local BENCH_ENABLED         = true   -- FRAME (stray-frame.txt), 4x/s while stray-probe-bench
@@ -170,14 +192,15 @@ local function flush()
     end
 end
 
-if HEARTBEAT_ENABLED then
+if ARMED and HEARTBEAT_ENABLED then
     LoopAsync(HEARTBEAT_INTERVAL_MS, function()
         pcall(flush)                                                    -- async thread: file I/O
         pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
         return false   -- keep looping
     end)
 else
-    print("[StrayProbe] HEARTBEAT_ENABLED=false: not writing " .. STATE .. "\n")
+    print("[StrayProbe] idle: " .. (ARMED and ("HEARTBEAT_ENABLED=false, not writing " .. STATE)
+        or "not armed (no " .. ARM_FLAG .. "), so this session costs nothing") .. "\n")
 end
 
 -- BENCH COUNTER, host-independent. While stray-probe-bench exists (stray-traverse.sh
@@ -207,7 +230,7 @@ end
 local function flushFrame()     -- async thread: the write, atomic (see atomicWrite)
     atomicWrite(FRAME, string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time()))
 end
-if BENCH_ENABLED then
+if ARMED and BENCH_ENABLED then
     LoopAsync(BENCH_INTERVAL_MS, function()
         if benchFlag() then
             pcall(flushFrame)
