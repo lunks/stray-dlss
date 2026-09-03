@@ -510,6 +510,46 @@ Gate decide(const GateInputs &in)
 // Ledger
 // ---------------------------------------------------------------------------------------
 
+const char *l1_gate_name(L1Gate g)
+{
+	switch (g)
+	{
+	case L1Gate::off:     return "off";
+	case L1Gate::faulted: return "faulted";
+	case L1Gate::stale:   return "stale";
+	case L1Gate::resolve: return "resolve";
+	}
+	return "?";
+}
+
+L1Gate l1_gate(const L1GateInputs &in)
+{
+	// The off-switch first and unconditionally, so EngineSeamInputs=0 can never reach a
+	// dereference by any other route — including a fault latch or a freshness verdict.
+	if (!in.inputs_enabled || in.mode != Mode::authoritative || !in.hooked || !in.announced)
+		return L1Gate::off;
+	if (in.faulted)
+		return L1Gate::faulted;
+	if (!in.fresh)
+		return L1Gate::stale;
+	return L1Gate::resolve;
+}
+
+bool announcement_is_fresh(const Freshness &f)
+{
+	// Newest: any newer announcement means a newer FRDGBuilder exists, and the older one's
+	// allocator has been (or is about to be) reset under us.
+	if (f.announce_sequence == 0 || f.announce_sequence != f.ledger_sequence)
+		return false;
+	// Same frame: a present between announce and claim means the graph completed.
+	if (f.announce_frame != f.current_frame)
+		return false;
+	// Same thread: the builder is a stack object on the announcing thread.
+	if (f.announce_thread == 0 || f.announce_thread != f.current_thread)
+		return false;
+	return true;
+}
+
 std::uint32_t Ledger::expected_groups(std::uint32_t extent)
 {
 	return (extent + kTaaTileSize - 1u) / kTaaTileSize;

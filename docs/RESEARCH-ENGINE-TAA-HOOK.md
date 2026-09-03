@@ -792,3 +792,176 @@ menu runs the TAA pass. Read, in order:
 
 If `unclaimed` is still non-zero, the breakdown now says which of the six gates to fix, which is
 the thing this round trip bought whatever else it settles.
+
+---
+
+## 12. L1 CRASHED THE GAME, and the reason is the difference between IDENTITY and POINTERS (2026-09-03)
+
+**Measured on the box.** Branch `engine-seam-l1` tip `3365f02`, plugin DLL md5 `bc1fa257…`
+(CI run 33790794760), `EngineSeam=3`, `EngineSeamInputs=1`, FG on, NR on, launched into the main
+menu with **no input**. The game died at `SecondsSinceStart 24`, about frame 600:
+
+```
+Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000021c000003c0
+```
+
+### 12.1 The stack, symbolized — and it dissolves both apparent tensions
+
+The crash context carried seven `main` offsets and no names. They were resolved against the PDB
+from that exact CI artifact (`llvm-symbolizer --obj=main.dll --relative-address`, the PDB
+renamed to the basename recorded in the DLL's debug directory), innermost first:
+
+| frame | symbol | source |
+|---|---|---|
+| `VCRUNTIME140+0x562` | `memcpy` | — |
+| `main+0x771f6` | `seamhook::l1_read_u64` | `src/engine_seam_hook.cpp:434` |
+| `main+0xad4e7` | `seam::resolve_rhi_fn` | `src/core/engine_seam.cpp` |
+| `main+0x772ba` | `seamhook::resolve_one` | `src/engine_seam_hook.cpp:455` |
+| `main+0x75520` | `seamhook::resolve_inputs` | `src/engine_seam_hook.cpp:659` |
+| `main+0x6be7f` | `taa_hook::intercept_dispatch` | `src/taa_hook.cpp:1337` |
+| `main+0x7abf` | `app::DlssApp::on_dispatch` | `src/app/dlss_app.cpp:1001` |
+| `main+0x7bddb` | `native::hooks::hk_List_Dispatch` | `src/backend_native/d3d12_hooks.cpp:779` |
+
+Line 434 is `l1_read_u64`'s `std::memcpy`. So:
+
+* **"a `memcpy` in VCRUNTIME, but L1 does pointer-chain walks" was a false tension.** L1's chain
+  walk *is* `std::memcpy`, one qword at a time, and MSVC emitted a CRT call rather than an inline
+  load. The two descriptions are the same code.
+* **"the fault is on the GameThread, and L1 runs on the render thread" was also false.** The
+  bottom frame is the game calling `ID3D12GraphicsCommandList::Dispatch` through our own vtable
+  hook, so L1 ran on whichever thread recorded that dispatch. The crash context's `ThreadName`
+  describes that thread; it does not place our code anywhere we did not already know it was.
+* **"the address is handle-shaped, like the descriptor-handle faults in §1" was a coincidence of
+  shape, and the shape is still the clue.** `0x0000021c000003c0` is two int32s — `0x3c0` = **960**
+  and `0x21c` = **540** — i.e. an `FIntPoint(960, 540)` read as one pointer. 960x540 is exactly a
+  half-resolution buffer at this session's 1920x1080 render extent. It is not a descriptor handle;
+  it is a texture extent, sitting where L1 expected `FRDGResource::ResourceRHI`.
+
+### 12.2 The bisect
+
+Same DLL, same everything, one ini key:
+
+| `EngineSeamInputs` | outcome |
+|---|---|
+| `0` | **no crash**, frame 16200, ~16 minutes. `l1: resolved=0 partial=0 fellBack=0` (the switch really was off), `unclaimed=159` of 16203 announcements — all `noDispatch` |
+| `1` | **crash at ~frame 600**, after `ENGINE SEAM L1: first resolve …` reported colour, depth AND velocity all `(ok, registered=1)`, and `announced=603 claimed=603 unclaimed=0` |
+
+Two things fall out of this and both matter.
+
+**The offsets are not simply wrong.** The first resolve returned three distinct pointers that our
+own resource registry already knew were live `ID3D12Resource`s. Three independent hits by chance is
+not a thing that happens, so `FRDGResource::ResourceRHI @16` and `GetNativeResource` at vtable slot
+7 are **right when the object is right**. Changing the constants would not have fixed this.
+
+**L1 must not be abandoned.** `unclaimed=159` returns the moment L1 is switched off, and
+`unclaimed` is the user's "DLSS flip" (§11). The feature was doing its job.
+
+### 12.3 The root cause: the ledger claims IDENTITY with slack, and L1 read POINTERS through it
+
+`Ledger::claim` returns the **first unconsumed announcement whose rect matches**, and
+`retire_stale` keeps an announcement alive for `kRetireAfterAnnouncements` (4) newer announcements
+or `kRetireAfterFrames` (8) presents. That slack is deliberate and correct **for correlation**: a
+dispatch that arrives late still names the right pass, and `unclaimed` stays honest rather than
+counting a timing wobble as a missed frame.
+
+It is fatal for **pointers**. `FRDGTexture` is allocated from the frame's `FRDGAllocator`, which
+`FRDGBuilder` resets when `Execute` finishes. The instant a newer graph exists, the pointer
+`FPassInputs` gave us addresses **recycled arena memory** — where `+16` is no longer `ResourceRHI`
+but whatever the next allocation put there. An `FIntPoint(960, 540)`, for instance.
+
+The sequence, and note that every step is invisible in the counters:
+
+1. Frame N: `AddPasses` announces. The real dispatch does **not** reach `claim()` — either the
+   structural matcher rejected it (**which is the exact failure L1 exists to work around**) or it
+   never arrived. The announcement stays pending; nothing is counted, because `unclaimed` only
+   increments at *retire*.
+2. Frame N+1: `AddPasses` announces again, same rect. Two slots pending.
+3. Frame N+1's dispatch calls `claim()`, which scans in order and returns the **older** slot.
+   Rect-identical, so `claimed` increments and `unclaimed` stays 0. Correlation is still right.
+4. L1 dereferences that slot's `FRDGTexture*`. Frame N's builder is gone.
+
+From then on the ledger runs one graph behind until a retire breaks the chain — and every claim
+in between hands L1 a dead pointer. **The `unclaimed=159` measured with L1 off is the frequency of
+step 1: roughly 1 announcement per 100 frames misses its own dispatch.** At ~600 frames that is
+around six opportunities, which is exactly where the crash landed.
+
+Most dead reads are harmless: the qword is null, or unaligned, or outside the canonical range, so
+`plausible_heap_ptr` refuses and L1 falls back. The crash needs one qword that *looks* like a
+pointer. `(960, 540)` is 8-aligned, above `0x10000` and canonical, so it passed every guard L1
+had — and the next read faulted.
+
+### 12.4 The second defect: `plausible_heap_ptr` is a RANGE test, not a readability test
+
+L1's own comment admitted there was "no portable way to make the read itself fault-proof" and
+argued the defence was in depth — short chain, vtable inside the module, function in executable
+memory, answer recognised by our registry. **Every one of those checks is on a RESULT, and the
+first bad read faults before any of them can run.** Shipping a dereference of engine memory whose
+layout *and* lifetime are both `[derived]`, behind a numeric range check, is prime directive 2
+inverted: it converts a fallback into a crash.
+
+### 12.5 The fix
+
+**1. Freshness, `seam::announcement_is_fresh` (pure, `tests/test_engine_seam.cpp`).** L1 may
+dereference an announcement's `FPassInputs` only when it is the **newest** announcement (`sequence
+== Ledger::sequence()`), from the **same frame**, on the **same thread** that announced. Anything
+else is declined and counted as `l1: stale=`. `Announcement` therefore carries the announcing OS
+thread id, because `FRDGBuilder` is a stack object and another thread's claim reaches memory that
+thread may already have unwound.
+
+**`claim()` itself is untouched.** Correlation keeps its slack, so `announced`, `claimed`,
+`unclaimed`, `orphans` and `lookalikesRefused` are byte-identical to `3365f02` and the
+`unclaimed=0` L1 bought is preserved. A stale claim is still a claim; it just supplies no engine
+inputs, and that frame uses the heuristic exactly as `EngineSeamInputs=0` would. A test pins that
+the ledger still hands back the older announcement in the step-1-to-4 sequence above, and that the
+freshness verdict on it is false.
+
+**2. The read cannot kill the process, and this is deliberate.**
+`VirtualQuery` first — the page must be `MEM_COMMIT`, readable, not `PAGE_GUARD`/`PAGE_NOACCESS`,
+and hold all 8 bytes — which is the check `plausible_heap_ptr` never was. Then **SEH**
+(`__try`/`__except`) around the `memcpy` *and* around the `GetNativeResource` call, MSVC-only
+(`#if defined(_MSC_VER)`; the mingw fast lane has no `__try` and keeps the `VirtualQuery` guard).
+Both guarded functions are leaves holding no object that needs unwinding, which is what MSVC
+requires of `__try`.
+
+**This is an explicit, named exception to "never swallow a fault".** These two sites dereference
+and *call through* offsets that are `[derived]` from engine source and cannot be proven from
+outside the engine. The alternative to catching the fault is not correctness, it is a dead game
+with a stack trace that has to be symbolized by hand — which is what this section is.
+
+**3. A fault latches L1 off for the session, loudly.** The first fault logs at ERROR with the
+faulting address and both `[derived]` constants by name, and `l1_gate` returns `faulted` for the
+rest of the run. A guard that fires every frame is a diagnosis; a guard that fires every frame and
+keeps going is a crash report waiting to be re-filed.
+
+**4. `l1_gate` is pure, so `EngineSeamInputs=0` is TESTED rather than asserted.** It checks the
+off-switch first and unconditionally, so no fault latch, freshness verdict or seam state can route
+around it, and an exhaustive sweep over the other five inputs pins that.
+
+### 12.6 What to read on the next launch
+
+The `[seam]` line's `l1:` group now reads
+`resolved= partial= fellBack= stale= faults= off=`.
+
+* **`stale=` is the number this whole section is about.** Zero means the ledger never slipped a
+  graph behind. Non-zero and climbing means it does, routinely — L1 is safe but declining, and the
+  next step is to stop `claim()` serving a previous frame's announcement at all rather than to
+  refuse the pointer afterwards. It is accompanied by one WARN, once per session, printing the
+  announcement's sequence against the ledger's newest, and both frames and both threads. **That is
+  the single line that would have identified this crash without a symbolization round trip.**
+* **`faults=` must be 0, and `off=0`.** Non-zero means one of `kRdgResourceRhiOffset` /
+  `kRhiGetNativeResourceSlot` is wrong on this executable; the ERROR line carries the address.
+* `ENGINE SEAM L1: first resolve …` now also prints the three raw `FRDGTexture*` and the
+  announcement's sequence, frame and thread, so a fault line has its inputs beside it.
+
+### 12.7 What is still open
+
+* **Whether the stale claim is the *only* way L1 saw a dead pointer.** The mechanism is derived
+  from `Ledger`'s own retire rules and fits every measurement (crash only with `EngineSeamInputs=1`,
+  not on the first resolve, hundreds of frames in, a value shaped like a half-res extent, and an
+  `unclaimed` rate with L1 off that supplies the trigger at the right frequency) — but it was not
+  observed directly, because nothing was counting. `stale=` counts it now, and one launch settles
+  it: `stale=0` with no crash would mean the mechanism is something else and the SEH guard is what
+  is holding the line.
+* **Whether the dispatch-recording thread is ever a different thread from the announcing one.**
+  The freshness gate would catch it and count it as `stale`, and the WARN prints both thread ids,
+  so the same launch answers this too.

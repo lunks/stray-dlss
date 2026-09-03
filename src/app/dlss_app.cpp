@@ -1212,7 +1212,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				// 640 to match seamhook::log_report's own buffer: the line grew the
 				// per-reason refusal breakdown and the l1: group, and a truncated status
 				// line is a counter silently missing from automation.
-				char seam[640] = {};
+				char seam[768] = {};
 				if (seamhook::format_report(seam, sizeof(seam)) > 0)
 					std::fprintf(f, "%s\n", seam);
 			}

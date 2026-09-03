@@ -309,8 +309,64 @@ struct Announcement
 	std::uint64_t colour_rdg = 0;
 	std::uint64_t depth_rdg = 0;
 	std::uint64_t velocity_rdg = 0;
+	// The OS thread that announced. An FRDGTexture is owned by the FRDGBuilder that made it,
+	// and that builder lives on one thread's stack for the length of one Execute — so a claim
+	// from another thread is a claim against memory that thread may already have recycled.
+	std::uint64_t thread = 0;
 	bool consumed = false;
 };
+
+// WHETHER AN ANNOUNCEMENT'S FRDGTexture POINTERS MAY STILL BE DEREFERENCED.
+//
+// This is the guard L1 shipped without, and its absence is what crashed the game
+// (docs/RESEARCH-ENGINE-TAA-HOOK.md §12). The ledger deliberately holds an announcement for up
+// to `kRetireAfterAnnouncements` newer announcements or `kRetireAfterFrames` presents, because
+// CORRELATION wants that slack: a dispatch that arrives late still names the right rect, and
+// `unclaimed` stays honest. IDENTITY survives that slack; POINTERS do not. `FRDGTexture` is
+// allocated from the frame's `FRDGAllocator`, which the builder resets when Execute finishes,
+// so the instant the announcing graph is gone the pointer addresses recycled arena memory —
+// where `+16` is no longer `ResourceRHI` but whatever the next allocation put there.
+//
+// The rule is therefore the narrowest one that is still always true: dereference ONLY the
+// newest announcement, only on the thread that made it, and only before the frame has turned
+// over. A claim that fails this is not an error — L1 declines and the heuristic supplies that
+// frame's inputs, exactly as `EngineSeamInputs=0` would — but it is COUNTED, because a rate
+// that climbs means the ledger has slipped a graph behind and identity is suspect too.
+struct Freshness
+{
+	std::uint64_t announce_sequence = 0; // Announcement::sequence
+	std::uint64_t ledger_sequence = 0;   // Ledger::sequence(), i.e. the newest announcement
+	std::uint64_t announce_frame = 0;    // Announcement::frame
+	std::uint64_t current_frame = 0;     // the ledger's frame at claim time
+	std::uint64_t announce_thread = 0;   // Announcement::thread
+	std::uint64_t current_thread = 0;    // the thread recording the dispatch
+};
+bool announcement_is_fresh(const Freshness &f);
+
+// Whether L1 may dereference this frame's FPassInputs, and if not, why. Pure so that the
+// off-switch is TESTED rather than asserted: `[STRAYDLSS] EngineSeamInputs=0` must leave the
+// plugin behaving exactly as it did before L1 existed, and `off` is the only outcome it can
+// produce. Every other outcome except `resolve` also falls back to the heuristic — the
+// difference is only what the [seam] line counts and what it says once.
+enum class L1Gate : std::uint8_t
+{
+	off = 0,   // EngineSeamInputs=0, not authoritative, seam not live, or nothing announced
+	faulted,   // a guarded read or call already faulted; L1 is off for the session
+	stale,     // claimed from an announcement whose FRDGBuilder is gone — do NOT dereference
+	resolve,   // safe to walk FRDGTexture -> FRHITexture -> ID3D12Resource
+};
+const char *l1_gate_name(L1Gate g);
+
+struct L1GateInputs
+{
+	bool inputs_enabled = false; // [STRAYDLSS] EngineSeamInputs
+	Mode mode = Mode::off;
+	bool hooked = false;
+	bool announced = false;      // this dispatch claimed an announcement
+	bool faulted = false;        // the session has already seen a guarded read fault
+	bool fresh = false;          // announcement_is_fresh for the claimed announcement
+};
+L1Gate l1_gate(const L1GateInputs &in);
 
 struct LedgerCounters
 {
@@ -357,6 +413,7 @@ public:
 	std::size_t pending() const;
 	const LedgerCounters &counters() const { return m_counters; }
 	std::uint64_t sequence() const { return m_sequence; }
+	std::uint64_t frame() const { return m_frame; }
 
 	// ceil(extent / kTaaTileSize), the group count UE 4.27 issues for a Main* config.
 	static std::uint32_t expected_groups(std::uint32_t extent);

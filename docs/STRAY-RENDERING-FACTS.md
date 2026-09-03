@@ -2867,3 +2867,59 @@ evalFailed` / `evaluated`, all continuous) are what settle it in one menu launch
   registry already knows.
 * Whether `unclaimed` reaches 0 with the engine's inputs in place, and whether `guides-stale`
   and `frame-gap` follow it down.
+
+### 36.9 L1's offsets are CONFIRMED, and L1 crashed the game anyway (2026-09-03)
+
+Plugin DLL md5 `bc1fa257…`, branch tip `3365f02`, CI run 33790794760. `EngineSeam=3`,
+`StatusFile=0`, FG on, NR on. Steam launch into the main menu, **no input**.
+
+**The offsets in §36.8 are answered, and they are RIGHT.** The first-resolve line came back with
+all three:
+
+```
+ENGINE SEAM L1: first resolve of the engine's own FPassInputs - colour=00000000516B5630
+  (ok, registered=1) depth=000000005168CCB0 (ok, registered=1) velocity=0000000051697A80
+  (ok, registered=1)
+[seam] frame 600: seam=found mode=authoritative hooked=1 announced=603 claimed=603 unclaimed=0
+  orphans=0 lookalikesRefused=0 overflow=0 unreadableRect=0 | notClaimed: noDispatch=0 | ...
+```
+
+Three distinct pointers, each one our own resource registry already knew was a live
+`ID3D12Resource`. `FRDGResource::ResourceRHI @16` and `GetNativeResource` at vtable slot 7 are
+therefore **HARD on this executable**, not [derived] — *when the object is right*.
+
+**And `unclaimed=0` was reached**, which is what L1 was built for.
+
+**Then, at `SecondsSinceStart 24` (about frame 600), the game died:**
+
+```
+Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000021c000003c0
+ThreadName GameThread
+PCallStack: VCRUNTIME140+0x562, main+0x771f6, +0xad4e7, +0x772ba, +0x75520, +0x6be7f,
+            +0x7abf, +0x7bddb, Stray-Win64-Shipping+0x172293b
+```
+
+Symbolized against that run's own PDB, the seven `main` frames are, innermost first:
+`l1_read_u64` (`engine_seam_hook.cpp:434`, the `memcpy`), `resolve_rhi_fn`, `resolve_one`,
+`resolve_inputs`, `taa_hook::intercept_dispatch`, `DlssApp::on_dispatch`, `hk_List_Dispatch`.
+The faulting address is two int32s — `0x3c0` = **960**, `0x21c` = **540** — an `FIntPoint`, not a
+descriptor handle: a half-resolution extent at this session's 1920x1080 render size, sitting where
+`ResourceRHI` was expected.
+
+**Bisect, same DLL, one ini key changed:**
+
+| `EngineSeamInputs` | result |
+|---|---|
+| `0` | no crash, frame 16200, ~16 min. `l1: resolved=0 partial=0 fellBack=0`. `unclaimed=159` of 16203, all `noDispatch` |
+| `1` | crash at ~frame 600, after a clean first resolve and `unclaimed=0` |
+
+So the fault is L1's dereference, the offsets are not the fault, and switching L1 off costs
+`unclaimed=159` — about **1 announcement per 100 frames misses its own dispatch**, which is the
+rate the leading root cause needs (`docs/RESEARCH-ENGINE-TAA-HOOK.md` §12): the ledger deliberately
+holds an announcement across up to 4 newer ones so a late dispatch still correlates, and a claim
+served from a previous frame's announcement hands L1 an `FRDGTexture*` whose `FRDGAllocator` has
+been reset. Correlation survives that slack; pointers do not.
+
+**Not yet measured:** whether that stale claim is the only way L1 saw a dead pointer. `l1: stale=`
+in the `[seam]` line counts it from now on, with one WARN naming the sequence, frame and thread
+gap — one launch settles it.

@@ -724,3 +724,223 @@ TEST_CASE("every refusal reason has a distinct, stable name for the [seam] line"
 		CHECK(cseen.insert(n).second);
 	}
 }
+
+// -----------------------------------------------------------------------------------------
+// Freshness: the guard whose absence crashed 3365f02 on the box.
+//
+// The crash was an EXCEPTION_ACCESS_VIOLATION reading 0x0000021c000003c0 inside l1_read_u64's
+// memcpy, seven frames under our own Dispatch hook. That address is two int32s (960, 540) — an
+// FIntPoint — read as one qword out of `rdg + 16`, i.e. the FRDGTexture had been recycled. The
+// ledger holds an announcement across up to kRetireAfterAnnouncements newer ones ON PURPOSE, so
+// that a late dispatch still claims the right rect and `unclaimed` stays honest. Identity
+// survives that slack. POINTERS DO NOT.
+
+TEST_CASE("only the newest announcement, same frame, same thread, may be dereferenced")
+{
+	Freshness f;
+	f.announce_sequence = 7;
+	f.ledger_sequence = 7;
+	f.announce_frame = 100;
+	f.current_frame = 100;
+	f.announce_thread = 42;
+	f.current_thread = 42;
+	CHECK(announcement_is_fresh(f));
+
+	SUBCASE("a newer announcement exists, so the announcing graph is gone")
+	{
+		// THIS IS THE CRASH. The engine announced in frame N, no dispatch claimed it (the
+		// structural matcher rejected the real one — the very failure L1 exists to work
+		// around), frame N+1 announced again, and N+1's dispatch claimed the OLDER slot,
+		// because Ledger::claim returns the first unconsumed rect match. Rect-identical, so
+		// nothing in the counters moved: `claimed` still incremented, `unclaimed` stayed 0.
+		Freshness stale = f;
+		stale.ledger_sequence = 8;
+		CHECK_FALSE(announcement_is_fresh(stale));
+	}
+	SUBCASE("a present has happened in between")
+	{
+		Freshness stale = f;
+		stale.current_frame = 101;
+		CHECK_FALSE(announcement_is_fresh(stale));
+	}
+	SUBCASE("a different thread is claiming than announced")
+	{
+		// FRDGBuilder is a stack object. Another thread's claim reaches memory the announcing
+		// thread may already have unwound.
+		Freshness stale = f;
+		stale.current_thread = 43;
+		CHECK_FALSE(announcement_is_fresh(stale));
+	}
+	SUBCASE("an unset sequence or thread is never fresh")
+	{
+		Freshness zero = f;
+		zero.announce_sequence = 0;
+		zero.ledger_sequence = 0;
+		CHECK_FALSE(announcement_is_fresh(zero));
+		Freshness nothread = f;
+		nothread.announce_thread = 0;
+		nothread.current_thread = 0;
+		CHECK_FALSE(announcement_is_fresh(nothread));
+	}
+}
+
+TEST_CASE("the freshness gate does NOT change what the ledger claims")
+{
+	// The whole point: L1 drove `unclaimed` to 0 and it must stay there. Freshness gates only
+	// the DEREFERENCE, so correlation is byte-identical to 3365f02 — a stale claim is still a
+	// claim, it just supplies no engine inputs, and that frame uses the heuristic exactly as
+	// EngineSeamInputs=0 would.
+	Ledger led;
+	led.begin_frame(1);
+
+	Announcement first;
+	first.out_width = 3840;
+	first.out_height = 2160;
+	first.frame = 1;
+	first.thread = 9;
+	led.announce(first);
+
+	// Frame 1's dispatch never arrives. Frame 2 announces the same rect.
+	led.begin_frame(2);
+	Announcement second = first;
+	second.frame = 2;
+	led.announce(second);
+
+	const Announcement *got = led.claim(Ledger::expected_groups(3840),
+		Ledger::expected_groups(2160));
+	REQUIRE(got != nullptr);
+	CHECK(led.counters().claimed == 1);
+	CHECK(led.counters().unclaimed == 0);
+	// It handed back the OLDER announcement — correct for identity, and exactly the pointer
+	// that must not be read.
+	CHECK(got->frame == 1);
+
+	Freshness f;
+	f.announce_sequence = got->sequence;
+	f.ledger_sequence = led.sequence();
+	f.announce_frame = got->frame;
+	f.current_frame = 2;
+	f.announce_thread = got->thread;
+	f.current_thread = 9;
+	CHECK_FALSE(announcement_is_fresh(f));
+}
+
+TEST_CASE("the ordinary frame is fresh, so L1 keeps working")
+{
+	// The regression that would matter most: a gate so strict that L1 never resolves would
+	// "fix" the crash by deleting the feature — and the box has measured what that costs
+	// (EngineSeamInputs=0: unclaimed=159 over 16200 frames). One announce, one claim, same
+	// frame, same thread — the shape of every normal frame — must pass.
+	Ledger led;
+	led.begin_frame(5);
+	Announcement a;
+	a.out_width = 2560;
+	a.out_height = 1440;
+	a.frame = 5;
+	a.thread = 77;
+	led.announce(a);
+
+	const Announcement *got = led.claim(Ledger::expected_groups(2560),
+		Ledger::expected_groups(1440));
+	REQUIRE(got != nullptr);
+	Freshness f;
+	f.announce_sequence = got->sequence;
+	f.ledger_sequence = led.sequence();
+	f.announce_frame = got->frame;
+	f.current_frame = led.frame();
+	f.announce_thread = got->thread;
+	f.current_thread = 77;
+	CHECK(announcement_is_fresh(f));
+}
+
+TEST_CASE("EngineSeamInputs=0 is a clean off-switch, and nothing can route around it")
+{
+	// The off-switch must leave the plugin behaving exactly as cf31bd9d did — no dereference
+	// of engine memory by any route. It is pure so that this is a TEST rather than a claim.
+	L1GateInputs in;
+	in.inputs_enabled = false;
+	in.mode = Mode::authoritative;
+	in.hooked = true;
+	in.announced = true;
+	in.faulted = false;
+	in.fresh = true;
+	CHECK(l1_gate(in) == L1Gate::off);
+
+	SUBCASE("and it stays off whatever else is true")
+	{
+		for (bool faulted : { false, true })
+			for (bool fresh : { false, true })
+				for (bool hooked : { false, true })
+					for (bool announced : { false, true })
+					{
+						L1GateInputs o = in;
+						o.faulted = faulted;
+						o.fresh = fresh;
+						o.hooked = hooked;
+						o.announced = announced;
+						CHECK(l1_gate(o) == L1Gate::off);
+					}
+	}
+}
+
+TEST_CASE("L1 resolves only on the one combination that is safe")
+{
+	L1GateInputs in;
+	in.inputs_enabled = true;
+	in.mode = Mode::authoritative;
+	in.hooked = true;
+	in.announced = true;
+	in.faulted = false;
+	in.fresh = true;
+	CHECK(l1_gate(in) == L1Gate::resolve);
+
+	SUBCASE("levels below authoritative never dereference")
+	{
+		for (Mode m : { Mode::off, Mode::discover, Mode::observe })
+		{
+			L1GateInputs o = in;
+			o.mode = m;
+			CHECK(l1_gate(o) == L1Gate::off);
+		}
+	}
+	SUBCASE("no live seam, or nothing announced, is off - not a fallback dereference")
+	{
+		L1GateInputs a = in;
+		a.hooked = false;
+		CHECK(l1_gate(a) == L1Gate::off);
+		L1GateInputs b = in;
+		b.announced = false;
+		CHECK(l1_gate(b) == L1Gate::off);
+	}
+	SUBCASE("a fault latches the session off, ahead of freshness")
+	{
+		L1GateInputs o = in;
+		o.faulted = true;
+		CHECK(l1_gate(o) == L1Gate::faulted);
+		o.fresh = false;
+		CHECK(l1_gate(o) == L1Gate::faulted);
+	}
+	SUBCASE("a stale announcement declines, and says so distinctly from off")
+	{
+		L1GateInputs o = in;
+		o.fresh = false;
+		CHECK(l1_gate(o) == L1Gate::stale);
+		// Distinct because the [seam] line has to tell "the user turned L1 off" apart from
+		// "the ledger slipped a graph behind", which is the crash's own signature.
+		CHECK(std::strcmp(l1_gate_name(L1Gate::stale), l1_gate_name(L1Gate::off)) != 0);
+	}
+}
+
+TEST_CASE("every L1 gate outcome has a distinct, stable name")
+{
+	const L1Gate all[] = { L1Gate::off, L1Gate::faulted, L1Gate::stale, L1Gate::resolve };
+	std::set<std::string> seen;
+	for (L1Gate g : all)
+	{
+		const char *n = l1_gate_name(g);
+		REQUIRE(n != nullptr);
+		CHECK(std::strlen(n) > 0);
+		CHECK(std::strcmp(n, "?") != 0);
+		CHECK(seen.insert(n).second);
+	}
+}

@@ -64,6 +64,16 @@ struct Verdict
 	std::uint64_t colour_rdg = 0;
 	std::uint64_t depth_rdg = 0;
 	std::uint64_t velocity_rdg = 0;
+	// May those three pointers be dereferenced? Only while the announcing FRDGBuilder lives:
+	// newest announcement, same frame, same thread (seam::announcement_is_fresh). The ledger
+	// claims IDENTITY with slack on purpose; POINTERS get none. False is a normal, counted
+	// decline - L1 sits the frame out and the heuristic supplies the inputs.
+	bool fresh = false;
+	std::uint64_t announce_frame = 0;
+	std::uint64_t current_frame = 0;
+	std::uint64_t announce_thread = 0;
+	std::uint64_t current_thread = 0;
+	std::uint64_t ledger_sequence = 0;
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
 

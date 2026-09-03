@@ -551,11 +551,39 @@ Config and saves live in the **Proton prefix**:
 > time (`ResourceRHI`@16 -> the `FRHITexture` vptr -> `GetNativeResource` at slot 7 ->
 > `ID3D12Resource*`) and REPLACE the role guesses and the liveness verdict — a resource the engine
 > is about to bind is alive by construction. The heuristic stays as an assertion and as a counted
-> fallback (`[STRAYDLSS] EngineSeamInputs`, default 1). **Both offsets are [derived] and
-> UNCONFIRMED on this exe**; a wrong one must pass five guards, the last being that our own
-> registry recognises the pointer, or it falls back and is counted. The `[seam]` line now carries
+> fallback (`[STRAYDLSS] EngineSeamInputs`, default 1). The `[seam]` line now carries
 > continuous per-reason counters (`notClaimed` / `claimedButNoSR` / `evaluated` / `l1:`) — the
 > WARN says *which* gate, the counters say *how often*, and conflating them cost a round trip.
+>
+> **BOTH OFFSETS ARE NOW HARD, AND L1 STILL CRASHED THE GAME (2026-09-03, facts §36.9, report
+> §12).** The first resolve returned all three pointers `(ok, registered=1)` — three independent
+> hits in our own resource registry, which chance does not produce — so `ResourceRHI@16` and slot
+> 7 are right. The game then died at frame ~600 with `EXCEPTION_ACCESS_VIOLATION reading
+> 0x0000021c000003c0`, seven frames deep in `l1_read_u64`'s own `memcpy`. That address is two
+> int32s, **960 and 540** — an `FIntPoint`, a half-res extent — sitting where `ResourceRHI` was
+> expected, i.e. **recycled RDG arena memory**. A bisect on `EngineSeamInputs` alone confirmed
+> it: `0` ran 16 200 frames clean (and gave back `unclaimed=159`), `1` crashed at 600.
+>
+> **The lesson, and it generalises past this feature: the ledger claims IDENTITY with deliberate
+> slack, and L1 read POINTERS through it.** `Ledger::claim` returns the oldest unconsumed rect
+> match and `retire_stale` keeps an announcement for 4 newer announcements or 8 presents — right
+> for correlation, because a late dispatch still names the right pass and `unclaimed` stays
+> honest. But `FRDGTexture` is allocated from the frame's `FRDGAllocator`, which the builder
+> resets at the end of `Execute`, so the moment a newer graph exists the pointer addresses
+> somebody else's allocation. One frame whose dispatch misses `claim()` — which is the exact
+> failure L1 exists to work around — puts the ledger permanently one graph behind, invisibly:
+> `claimed` still increments and `unclaimed` stays 0. **An identity that survives a frame
+> boundary is not a lifetime.** Ask which one you are relying on before dereferencing anything
+> the engine handed you.
+>
+> **Fixed by:** `seam::announcement_is_fresh` — dereference only the newest announcement, same
+> frame, same thread — leaving `claim()` and every correlation counter untouched; a `VirtualQuery`
+> readability check where `plausible_heap_ptr` was only ever a numeric RANGE test; **SEH around
+> both the read and the `GetNativeResource` call**, explicitly and by name, because those two
+> sites dereference and call through offsets no test outside the engine can prove; and a fault
+> latching L1 off for the session at ERROR rather than re-rolling every frame. Read `l1: stale=`
+> and `faults=` in the `[seam]` line first — `stale=` is the counter whose absence cost this
+> round trip.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does

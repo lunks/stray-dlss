@@ -70,8 +70,20 @@ std::uint64_t g_outcomes[static_cast<std::size_t>(seam::SeamRefusal::count)] = {
 std::uint64_t g_l1_resolved = 0;      // all three of colour/depth/velocity came back registered
 std::uint64_t g_l1_partial = 0;       // depth+velocity resolved, colour did not
 std::uint64_t g_l1_fell_back = 0;     // neither depth nor velocity resolved; heuristic used
+// The claim was served from an announcement whose FRDGBuilder is gone, so the FPassInputs
+// pointers must not be dereferenced. NOT an error - L1 declines and the heuristic supplies
+// that frame - but THE number to read: a climbing rate means the ledger has slipped a graph
+// behind, which is the bug that crashed the game (docs/RESEARCH-ENGINE-TAA-HOOK.md §12).
+std::uint64_t g_l1_stale = 0;
 bool g_l1_first_logged = false;
+bool g_l1_stale_logged = false;
 bool g_l1_disagree_logged = false;
+// A read or a call that the guards let through and the CPU refused. Non-zero means an offset
+// or a vtable slot in seam::kRdgResourceRhiOffset / kRhiGetNativeResourceSlot is wrong on this
+// executable, and L1 disables itself for the session rather than roll the dice again.
+std::atomic<std::uint64_t> g_l1_faults{ 0 };
+std::atomic<std::uint64_t> g_l1_fault_va{ 0 };
+std::atomic<bool> g_l1_disabled{ false };
 
 std::uint64_t read_ptr(const void *base, std::size_t offset)
 {
@@ -101,6 +113,10 @@ void add_passes_thunk(const void *self, void *graph_builder, const void *view,
 	// them, :1300-1312 runs the passes), and FRDGTexture's own layout is not established.
 	Announcement a;
 	a.frame = g_frame.load(std::memory_order_relaxed);
+	// The thread is part of the announcement because it is part of the POINTERS' validity:
+	// FRDGBuilder is a stack object, so only this thread, in this frame, before another
+	// AddPasses, may dereference what FPassInputs names (seam::announcement_is_fresh).
+	a.thread = static_cast<std::uint64_t>(GetCurrentThreadId());
 	if (pass_inputs != nullptr)
 	{
 		a.colour_rdg = read_ptr(pass_inputs, seam::kPassInputsSceneColor);
@@ -422,6 +438,61 @@ bool plausible_heap_ptr(std::uint64_t va)
 	return va >= 0x10000ull && va < 0x0000800000000000ull;
 }
 
+// Is this address actually READABLE, right now? `plausible_heap_ptr` is a RANGE test — it
+// says the number could be a pointer, never that anything is mapped there — and shipping a
+// dereference behind it is what crashed the game: `rdg+16` came back 0x0000021c000003c0,
+// which is two int32s (960, 540) read as one qword, i.e. an FIntPoint from recycled RDG arena
+// memory. It is 8-aligned, above 0x10000 and canonical, so every guard L1 had passed it, and
+// the next read faulted inside memcpy (docs/RESEARCH-ENGINE-TAA-HOOK.md §12).
+bool committed_and_readable(std::uint64_t va, std::size_t n)
+{
+	MEMORY_BASIC_INFORMATION mbi{};
+	const SIZE_T got = VirtualQuery(
+		reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(va)), &mbi, sizeof(mbi));
+	if (got != sizeof(mbi) || mbi.State != MEM_COMMIT)
+		return false;
+	// PAGE_GUARD and PAGE_NOACCESS both fault; a guard page would additionally arm a
+	// STATUS_GUARD_PAGE_VIOLATION for whoever owns it, so never touch one.
+	if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+		return false;
+	constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+		PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	if ((mbi.Protect & kReadable) == 0)
+		return false;
+	const std::uint64_t base = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
+	const std::uint64_t size = static_cast<std::uint64_t>(mbi.RegionSize);
+	if (va < base || size < n)
+		return false;
+	return va - base <= size - n;
+}
+
+// The read itself, under SEH. EXPLICIT AND DELIBERATE: this dereferences engine memory whose
+// layout (FRDGResource::ResourceRHI @16) and lifetime are both [derived], so the honest
+// engineering position is that it CAN fault and the process must survive it saying so — a
+// loud failure rather than a quiet wrong image, and here rather than a dead game
+// (CLAUDE.md §0.2). MSVC only; the mingw lane has no __try and relies on the VirtualQuery
+// guard above, which is why the fault counter says which build it is reading.
+// The function holds no object needing unwinding, which is what MSVC requires of __try.
+bool read_u64_guarded(std::uint64_t va, std::uint64_t *out)
+{
+#if defined(_MSC_VER)
+	__try
+	{
+		std::memcpy(out, reinterpret_cast<const void *>(static_cast<std::uintptr_t>(va)),
+			sizeof(*out));
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+#else
+	std::memcpy(out, reinterpret_cast<const void *>(static_cast<std::uintptr_t>(va)),
+		sizeof(*out));
+	return true;
+#endif
+}
+
 bool l1_read_u64(void *, std::uint64_t va, std::uint64_t *out)
 {
 	// The FRDGTexture field read and the vtable read are heap; the vtable SLOT read must be
@@ -429,8 +500,14 @@ bool l1_read_u64(void *, std::uint64_t va, std::uint64_t *out)
 	// keeps one reader for all three hops while still rejecting nonsense.
 	if (!plausible_heap_ptr(va) && !region_covers(va, sizeof(std::uint64_t), false))
 		return false;
-	std::memcpy(out, reinterpret_cast<const void *>(static_cast<std::uintptr_t>(va)),
-		sizeof(*out));
+	if (!committed_and_readable(va, sizeof(std::uint64_t)))
+		return false;
+	if (!read_u64_guarded(va, out))
+	{
+		g_l1_faults.fetch_add(1, std::memory_order_relaxed);
+		g_l1_fault_va.store(va, std::memory_order_relaxed);
+		return false;
+	}
 	return true;
 }
 
@@ -440,6 +517,30 @@ bool l1_is_code(void *, std::uint64_t va)
 }
 
 using GetNativeResourceFn = void *(*)(void *rhi);
+
+// The one CALL into engine code on this path, under the same SEH as the reads and for the
+// same reason: `fn` came out of a vtable slot index that is [derived], and it is invoked with
+// a `this` that came out of an offset that is [derived]. Both survived four guards; neither is
+// proven. A fault here is a counted refusal, not a dead game.
+bool call_native_resource_guarded(std::uint64_t fn, std::uint64_t rhi, void **out)
+{
+#if defined(_MSC_VER)
+	__try
+	{
+		*out = reinterpret_cast<GetNativeResourceFn>(static_cast<std::uintptr_t>(fn))(
+			reinterpret_cast<void *>(static_cast<std::uintptr_t>(rhi)));
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+#else
+	*out = reinterpret_cast<GetNativeResourceFn>(static_cast<std::uintptr_t>(fn))(
+		reinterpret_cast<void *>(static_cast<std::uintptr_t>(rhi)));
+	return true;
+#endif
+}
 
 // One FRDGTexture -> ID3D12Resource. `status` always says why on failure.
 std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &registered)
@@ -459,8 +560,14 @@ std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &regis
 	// The one call into engine code on this path. It is FRHITexture::GetNativeResource, whose
 	// D3D12 override returns FD3D12Resource::GetResource() — an ID3D12Resource* — and which
 	// takes nothing but `this` (D3D12Texture.h:311-331).
-	void *native = reinterpret_cast<GetNativeResourceFn>(static_cast<std::uintptr_t>(fn))(
-		reinterpret_cast<void *>(static_cast<std::uintptr_t>(rhi)));
+	void *native = nullptr;
+	if (!call_native_resource_guarded(fn, rhi, &native))
+	{
+		g_l1_faults.fetch_add(1, std::memory_order_relaxed);
+		g_l1_fault_va.store(rhi, std::memory_order_relaxed);
+		status = seam::RhiChain::rhi_unreadable;
+		return 0;
+	}
 	const std::uint64_t id = reinterpret_cast<std::uint64_t>(native);
 	if (id == 0)
 		return 0;
@@ -578,6 +685,23 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 		v.out_width = a->out_width;
 		v.out_height = a->out_height;
 		v.sequence = a->sequence;
+		// IDENTITY is claimed with the ledger's deliberate slack (up to kRetireAfter*), which
+		// is what keeps `unclaimed` honest when a dispatch arrives late. POINTERS are not:
+		// they are only dereferenceable while the announcing FRDGBuilder still lives. Decide
+		// that here, once, next to the claim that knows both clocks.
+		seam::Freshness f;
+		f.announce_sequence = a->sequence;
+		f.ledger_sequence = g_ledger.sequence();
+		f.announce_frame = a->frame;
+		f.current_frame = g_ledger.frame();
+		f.announce_thread = a->thread;
+		f.current_thread = static_cast<std::uint64_t>(GetCurrentThreadId());
+		v.fresh = seam::announcement_is_fresh(f);
+		v.announce_frame = f.announce_frame;
+		v.current_frame = f.current_frame;
+		v.announce_thread = f.announce_thread;
+		v.current_thread = f.current_thread;
+		v.ledger_sequence = f.ledger_sequence;
 	}
 	return v;
 }
@@ -602,6 +726,7 @@ int format_report(char *buffer, std::size_t size)
 	std::uint64_t l1r = 0;
 	std::uint64_t l1p = 0;
 	std::uint64_t l1f = 0;
+	std::uint64_t l1s = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		for (std::size_t i = 0; i < static_cast<std::size_t>(seam::SeamRefusal::count); ++i)
@@ -609,6 +734,7 @@ int format_report(char *buffer, std::size_t size)
 		l1r = g_l1_resolved;
 		l1p = g_l1_partial;
 		l1f = g_l1_fell_back;
+		l1s = g_l1_stale;
 	}
 	// `unclaimed` and every non-zero refusal below it are the SAME failure seen at different
 	// depths: the engine ran its primary upscale and DLSS did not. Their sum is the number of
@@ -617,7 +743,7 @@ int format_report(char *buffer, std::size_t size)
 		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
 		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu | "
 		"claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu | evaluated=%llu | "
-		"l1: resolved=%llu partial=%llu fellBack=%llu",
+		"l1: resolved=%llu partial=%llu fellBack=%llu stale=%llu faults=%llu off=%d",
 		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
 		static_cast<unsigned long long>(c.announced),
 		static_cast<unsigned long long>(c.claimed),
@@ -641,24 +767,84 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::eval_failed)]),
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::none)]),
 		static_cast<unsigned long long>(l1r), static_cast<unsigned long long>(l1p),
-		static_cast<unsigned long long>(l1f));
+		static_cast<unsigned long long>(l1f), static_cast<unsigned long long>(l1s),
+		static_cast<unsigned long long>(g_l1_faults.load(std::memory_order_relaxed)),
+		g_l1_disabled.load(std::memory_order_relaxed) ? 1 : 0);
 }
 
 EngineInputs resolve_inputs(const Verdict &v)
 {
 	EngineInputs out;
-	bool on = false;
+	seam::L1GateInputs gi;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		on = g_inputs_enabled && g_mode == seam::Mode::authoritative;
+		gi.inputs_enabled = g_inputs_enabled;
+		gi.mode = g_mode;
 	}
-	if (!on || !v.announced || !hooked())
+	gi.hooked = hooked();
+	gi.announced = v.announced;
+	// A fault already told us an offset is wrong on this executable. Rolling the dice again
+	// every frame is how a diagnosis becomes a crash report; L1 stays off for the session.
+	gi.faulted = g_l1_disabled.load(std::memory_order_acquire);
+	// THE GUARD THE CRASH WAS MISSING. The ledger holds an announcement across up to
+	// kRetireAfterAnnouncements newer ones, so a dispatch that missed its own frame claims a
+	// PREVIOUS frame's announcement — correct for identity, fatal for pointers, because that
+	// frame's FRDGAllocator has been reset and `+16` is now somebody else's FIntPoint.
+	gi.fresh = v.fresh;
+
+	const seam::L1Gate gate_verdict = seam::l1_gate(gi);
+	if (gate_verdict == seam::L1Gate::off || gate_verdict == seam::L1Gate::faulted)
 		return out;
+	if (gate_verdict == seam::L1Gate::stale)
+	{
+		bool first = false;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			++g_l1_stale;
+			if (!g_l1_stale_logged)
+			{
+				g_l1_stale_logged = true;
+				first = true;
+			}
+		}
+		if (first)
+			STRAY_LOG_WARN("ENGINE SEAM L1: declining to dereference a STALE announcement - "
+				"seq %llu against the ledger's newest %llu, announced on frame %llu / thread "
+				"%llu, claimed on frame %llu / thread %llu. The claim itself stands (the rect "
+				"identifies the pass); only FPassInputs is refused, so this frame uses the "
+				"heuristic's inputs exactly as EngineSeamInputs=0 would. An FRDGTexture is "
+				"owned by the FRDGBuilder that made it, so once a newer graph exists the "
+				"pointer addresses recycled arena memory - dereferencing one is what crashed "
+				"3365f02. Once per session; the rate is in the [seam] line's l1: stale=.",
+				static_cast<unsigned long long>(v.sequence),
+				static_cast<unsigned long long>(v.ledger_sequence),
+				static_cast<unsigned long long>(v.announce_frame),
+				static_cast<unsigned long long>(v.announce_thread),
+				static_cast<unsigned long long>(v.current_frame),
+				static_cast<unsigned long long>(v.current_thread));
+		return out;
+	}
 	out.enabled = true;
 
 	out.colour = resolve_one(v.colour_rdg, out.colour_status, out.colour_registered);
 	out.depth = resolve_one(v.depth_rdg, out.depth_status, out.depth_registered);
 	out.velocity = resolve_one(v.velocity_rdg, out.velocity_status, out.velocity_registered);
+
+	// A fault means an offset is wrong, not that this frame was unlucky. Say so once, at ERROR,
+	// with the address the CPU refused - and stop. The heuristic runs the rest of the session.
+	if (g_l1_faults.load(std::memory_order_relaxed) != 0 &&
+		!g_l1_disabled.exchange(true, std::memory_order_acq_rel))
+	{
+		STRAY_LOG_ERROR("ENGINE SEAM L1 DISABLED: a guarded read or call into engine memory "
+			"FAULTED at %#llx. The guards caught it (the game is alive and this line exists "
+			"because of it), but a fault means one of the [derived] offsets is wrong on THIS "
+			"executable - FRDGResource::ResourceRHI @%zu or FRHITexture::GetNativeResource "
+			"slot %u. L1 is off for the rest of the session and the heuristic supplies DLSS "
+			"SR's inputs; set EngineSeamInputs=0 to make that the deliberate configuration. "
+			"Paste this line: the offset is one constant, not another round trip.",
+			static_cast<unsigned long long>(g_l1_fault_va.load(std::memory_order_relaxed)),
+			seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot);
+	}
 
 	bool log_first = false;
 	{
@@ -681,14 +867,21 @@ EngineInputs resolve_inputs(const Verdict &v)
 			"registered=%d). These REPLACE the heuristic's register-role guesses and its "
 			"liveness verdict for every frame they resolve; the heuristic stays as an "
 			"assertion. Offsets are [derived] (FRDGResource::ResourceRHI @%zu, "
-			"FRHITexture::GetNativeResource slot %u) and this line is what confirms them.",
+			"FRHITexture::GetNativeResource slot %u) and this line is what confirms them. "
+			"FRDGTexture in: colour=%p depth=%p velocity=%p (seq %llu, frame %llu, thread %llu) "
+			"- paste these with any L1 fault line, they are the inputs to the offset.",
 			reinterpret_cast<void *>(out.colour), seam::rhi_chain_name(out.colour_status),
 			out.colour_registered ? 1 : 0,
 			reinterpret_cast<void *>(out.depth), seam::rhi_chain_name(out.depth_status),
 			out.depth_registered ? 1 : 0,
 			reinterpret_cast<void *>(out.velocity), seam::rhi_chain_name(out.velocity_status),
 			out.velocity_registered ? 1 : 0,
-			seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot);
+			seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot,
+			reinterpret_cast<void *>(v.colour_rdg), reinterpret_cast<void *>(v.depth_rdg),
+			reinterpret_cast<void *>(v.velocity_rdg),
+			static_cast<unsigned long long>(v.sequence),
+			static_cast<unsigned long long>(v.announce_frame),
+			static_cast<unsigned long long>(v.announce_thread));
 	return out;
 }
 
@@ -726,7 +919,7 @@ void log_report(const char *when)
 	}
 	if (m == seam::Mode::off)
 		return;
-	char line[640] = {};
+	char line[768] = {};
 	format_report(line, sizeof(line));
 	// `unclaimed` is the number that must stay at zero: an announced primary upscale we never
 	// intercepted is a frame that ran the engine's TAA. `lookalikesRefused` is EXPECTED to
