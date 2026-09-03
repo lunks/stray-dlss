@@ -2153,3 +2153,93 @@ Measured and dead: mangoapp/MangoHud's NVML polling, `pvestatd`, `rrdcached`,
 instant, §32.16); VRAM pressure and thermal/clock throttling; anything in our own render path
 (§32.14, 89% of the stall is outside every hook we own); and StrayProbe or our status-file write
 (both excluded by period, §32.14, and by the frame/second A/B, §32.16).
+
+## 32.18 The caller NAMED: UE4 itself, ~21 QueryVideoMemoryInfo calls PER FRAME (2026-09-02 22:51)
+
+§32.16 left the user-space caller SOFT. `[STRAYDLSS] VramQueryWatch` (default OFF,
+`src/backend_native/vram_query_watch.cpp`) patches `IDXGIAdapter3::QueryVideoMemoryInfo` on the
+adapter reached by the device's own LUID and logs, per call, the return address, the module it
+lands in and the forwarded call's duration. One SR-only gameplay session answers it:
+
+```
+vram query watch: INSTALLED on IDXGIAdapter3::QueryVideoMemoryInfo (adapter LUID 00000000:000003f2)
+[vram] QueryVideoMemoryInfo CALLER: module=Stray-Win64-Shipping.exe ret=00006FFFF8DE8BDC offset=+0x1768bdc
+vram query watch: calls=167146 callers: Stray-Win64-Shipping.exe=167146
+```
+
+**The caller is the GAME. 167 146 calls, 100% of them from `Stray-Win64-Shipping.exe`, from a
+SINGLE return address** (`+0x1768bdc` — only one CALLER line was ever emitted, and the watch logs
+one per distinct module). Not vkd3d-proton, not DXVK, not DXVK-NVAPI, not NVML. HARD.
+
+**And the rate is the finding.** The periodic report advances 12 618 calls per 600 presents —
+**~21 calls PER FRAME**, roughly 2 100 per second at this frame rate, alternating
+`group=0` (LOCAL) and `group=1` (NON_LOCAL). Each one is a real ioctl into the NVIDIA driver
+that takes the global RM lock.
+
+| | |
+|---|---|
+| typical call | **0.01 - 0.06 ms** |
+| slow calls (logged above 5 ms) | **median 14.7 ms, max 36.5 ms** |
+| ratio | ~1000x |
+
+**The slow ones arrive in bursts of 3, every 11.46 s, and the regularity is extraordinary:**
+`2.43, 6.92, 11.42, 11.53, 11.39, 11.46, 11.49, 11.45, 11.46, 11.46, 11.46` seconds between
+burst starts. **That is §32.16's menu burst period (11.4 s) reproduced exactly**, now with the
+call that causes it named.
+
+### What this does NOT explain, stated plainly
+
+**Only 21 of 133 stalls in that session fall within 100 ms of a logged slow call.** So the VRAM
+query is *a* cause — the 11.46 s burst — and **not the whole stall population**. Possible
+readings, none yet tested: the watch only logs calls above 5 ms, so a stall built from several
+2-4 ms calls is invisible to it; or a second mechanism shares the RM lock. **Do not present this
+as the complete explanation of the blink.** The earlier gameplay session measured stalls 1.00 s
+apart (§32.16) where this one bursts at 11.46 s, so the cadence itself varies between runs and
+is not yet understood.
+
+### Against expectation, and worth recording as a research lesson
+
+A source review of UE 4.27.2 (`AlexMercer-MA/UnrealEngine-4.27`, all 60 files of
+`D3D12RHI/Private/`) predicted the opposite on two counts, and BOTH predictions were wrong
+against the running game:
+
+* It found the per-frame path `FD3D12CommandContextBase::RHIEndFrame` (`D3D12CommandContext.cpp:571`)
+  -> `UpdateMemoryStats()` (`:642`, body `:695`) -> `FD3D12Adapter::GetLocalVideoMemoryInfo`
+  (`D3D12Adapter.cpp:1204`) -> `QueryVideoMemoryInfo` (`:1210`), with **no throttle of any kind**
+  and **no cvar gating it** — the only related cvar being `D3D12.AdjustTexturePoolSizeBasedOnBudget`
+  (default 0) on the separate `RHIGetTextureMemoryStats` path.
+* It predicted the whole body is compiled out by `#if PLATFORM_WINDOWS && STATS`, and that
+  `STATS` is 0 in a Shipping non-editor build (`Build.h:324-326`, `FORCE_USE_STATS` default 0) —
+  i.e. that a retail game **never makes this call**.
+
+**The measurement says a retail `Stray-Win64-Shipping.exe` makes it 21 times a frame.** So either
+this title ships with `STATS` forced on, or the calls come from a path the review did not cover.
+Either way: **a source review of the stock engine is a hypothesis about a licensee's build, never
+a fact about it.** The binary is the authority, and one vtable patch settled in a single session
+what the source reading got backwards twice.
+
+## 32.19 Proposed, NOT built: cache the answer in the slot we already own
+
+Recorded as a proposal because the coordinator asked for one rather than an implementation.
+
+**The case.** ~2 100 driver round-trips per second, each taking the global RM lock, for a
+statistic whose value moves slowly and which the engine only feeds to memory counters. The
+normal cost alone (~20 us x 2 100/s) is ~4% of a core; the tail is a 14-36 ms frame.
+
+**The change.** The hook already forwards through `original_for`; make it serve a cached
+`DXGI_QUERY_VIDEO_MEMORY_INFO` per `(node, group)` and refresh from the driver only every N ms
+(a few hundred), returning the cached copy otherwise. At 500 ms that is ~1 000x fewer ioctls and
+proportionally less chance of meeting the lock held.
+
+**Why it is safe here, and the one reason it might not be.** UE 4.27 consumes this only through
+`UpdateMemoryStats`'s `SET_MEMORY_STAT` counters and, if `D3D12.AdjustTexturePoolSizeBasedOnBudget`
+were ever set to 1, through texture-pool sizing — a stale-by-half-a-second budget is harmless to
+the first and merely slightly late for the second. **The risk is that Stray's build uses it for
+something the stock source does not show**, which is exactly the assumption that just proved
+wrong above; so ship it OFF, behind its own key, and A/B it with the same `[stall]` and `[vram]`
+lines that found the problem.
+
+**Acceptance, pre-registered:** medians of at least 15 stalls. The 11.46 s burst must disappear
+from the `[vram]` log, and the `[stall]` rate must fall by at least the 21/133 share the bursts
+account for. Anything less means the remaining stalls are the second mechanism, which is a
+separate investigation and should be reported as such rather than absorbed into this one.
