@@ -1,6 +1,7 @@
 #include "engine_seam_hook.hpp"
 
 #include "core/engine_seam.hpp"
+#include "intercept/backend.hpp"
 #include "log.hpp"
 
 #include <windows.h>
@@ -53,6 +54,25 @@ bool g_first_call_logged = false;
 // storage that outlives the Region vector. Sections are enumerated exactly once.
 constexpr std::size_t kMaxSections = 96;
 char g_section_names[kMaxSections][9];
+
+// The module map RETAINED past discovery, because L1 needs `is_code` on every claim: the
+// GetNativeResource pointer we are about to call must be inside an executable section of the
+// game's own module. Written once under g_mutex during discovery, read-only afterwards.
+std::vector<Region> g_regions;
+std::uint64_t g_module_lo = 0;
+std::uint64_t g_module_hi = 0;
+
+// [STRAYDLSS] EngineSeamInputs. L1: take the SR inputs from the engine's own FPassInputs.
+bool g_inputs_enabled = true;
+// Continuous outcome counters for dispatches the ENGINE announced and we claimed.
+std::uint64_t g_outcomes[static_cast<std::size_t>(seam::SeamRefusal::count)] = {};
+// L1 resolution outcomes, so a fallback is never silent.
+std::uint64_t g_l1_resolved = 0;      // all three of colour/depth/velocity came back registered
+std::uint64_t g_l1_partial = 0;       // depth+velocity resolved, colour did not
+std::uint64_t g_l1_fell_back = 0;     // neither depth nor velocity resolved; heuristic used
+std::uint64_t g_l1_chain[static_cast<std::size_t>(seam::RhiChain::count)] = {};
+bool g_l1_first_logged = false;
+bool g_l1_disagree_logged = false;
 
 std::uint64_t read_ptr(const void *base, std::size_t offset)
 {
@@ -267,6 +287,22 @@ void run_discovery(int level)
 	image.count = regions.size();
 	const Discovery d = seam::discover(image);
 
+	// Keep the map: L1 needs `is_code` on every claim, and the module is mapped for the
+	// process's life.
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_regions = regions;
+		g_module_lo = 0;
+		g_module_hi = 0;
+		for (const Region &r : g_regions)
+		{
+			if (g_module_lo == 0 || r.va < g_module_lo)
+				g_module_lo = r.va;
+			if (r.va + r.size > g_module_hi)
+				g_module_hi = r.va + r.size;
+		}
+	}
+
 	QueryPerformanceCounter(&t1);
 	const double ms = freq.QuadPart != 0
 		? 1000.0 * static_cast<double>(t1.QuadPart - t0.QuadPart) /
@@ -354,15 +390,102 @@ void run_discovery(int level)
 			: "MODE=OBSERVE: counting only - DLSS is still gated by the heuristic matcher.");
 }
 
+// --------------------------------------------------------------------------------------
+// L1: the guarded reader
+// --------------------------------------------------------------------------------------
+
+bool region_covers(std::uint64_t va, std::size_t n, bool want_code)
+{
+	for (const Region &r : g_regions)
+	{
+		if (want_code && !r.executable)
+			continue;
+		if (r.size < n || va < r.va)
+			continue;
+		if (va - r.va <= r.size - n)
+			return true;
+	}
+	return false;
+}
+
+// A plausibility test for a heap pointer we are about to dereference. There is no portable
+// way to make the read itself fault-proof (SEH is MSVC-only and this file also has to compile
+// under mingw for the fast CI lane), so the defence is in depth: reject the obviously wrong,
+// keep the chain short, require the vtable to live inside the game's own module, require the
+// function to be in executable memory, and finally require the ANSWER to be a resource our
+// own registry already knows. A wrong offset has to pass all five to do damage.
+bool plausible_heap_ptr(std::uint64_t va)
+{
+	if (va == 0 || (va & 7ull) != 0)
+		return false;
+	// User-mode canonical range on Win64. Wine/Proton place both the exe and the heap well
+	// inside it; the point is to reject small integers and sign-extended garbage.
+	return va >= 0x10000ull && va < 0x0000800000000000ull;
+}
+
+bool l1_read_u64(void *, std::uint64_t va, std::uint64_t *out)
+{
+	// The FRDGTexture field read and the vtable read are heap; the vtable SLOT read must be
+	// inside the module (a UE 4.27 vtable is in the exe's read-only data). Accepting either
+	// keeps one reader for all three hops while still rejecting nonsense.
+	if (!plausible_heap_ptr(va) && !region_covers(va, sizeof(std::uint64_t), false))
+		return false;
+	std::memcpy(out, reinterpret_cast<const void *>(static_cast<std::uintptr_t>(va)),
+		sizeof(*out));
+	return true;
+}
+
+bool l1_is_code(void *, std::uint64_t va)
+{
+	return region_covers(va, 1, true);
+}
+
+using GetNativeResourceFn = void *(*)(void *rhi);
+
+// One FRDGTexture -> ID3D12Resource. `status` always says why on failure.
+std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &registered)
+{
+	registered = false;
+	seam::RdgReader reader;
+	reader.read_u64 = &l1_read_u64;
+	reader.is_code = &l1_is_code;
+	reader.ctx = nullptr;
+
+	std::uint64_t rhi = 0;
+	std::uint64_t fn = 0;
+	status = seam::resolve_rhi_fn(reader, rdg, &rhi, &fn);
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_l1_chain[static_cast<std::size_t>(status)];
+	}
+	if (status != seam::RhiChain::ok)
+		return 0;
+
+	// The one call into engine code on this path. It is FRHITexture::GetNativeResource, whose
+	// D3D12 override returns FD3D12Resource::GetResource() — an ID3D12Resource* — and which
+	// takes nothing but `this` (D3D12Texture.h:311-331).
+	void *native = reinterpret_cast<GetNativeResourceFn>(static_cast<std::uintptr_t>(fn))(
+		reinterpret_cast<void *>(static_cast<std::uintptr_t>(rhi)));
+	const std::uint64_t id = reinterpret_cast<std::uint64_t>(native);
+	if (id == 0)
+		return 0;
+	// THE VALIDATION. Our own registry sees every ID3D12Resource the process creates; a
+	// pointer it has never seen is not a resource, whatever the chain thought.
+	icept::Backend *b = icept::backend();
+	registered = b != nullptr && b->is_resource_live(static_cast<icept::ResourceId>(id));
+	return id;
+}
+
 } // namespace
 
-void configure(int level, bool fallback)
+void configure(int level, bool fallback, bool inputs)
 {
 	const seam::Mode m = seam::mode_from_level(level);
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_mode = m;
 		g_fallback_allowed = fallback;
+		g_inputs_enabled = inputs;
 	}
 	if (m == seam::Mode::off)
 	{
@@ -454,6 +577,9 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 	if (const Announcement *a = g_ledger.claim(group_x, group_y))
 	{
 		v.announced = true;
+		v.colour_rdg = a->colour_rdg;
+		v.depth_rdg = a->depth_rdg;
+		v.velocity_rdg = a->velocity_rdg;
 		v.out_width = a->out_width;
 		v.out_height = a->out_height;
 		v.sequence = a->sequence;
@@ -477,9 +603,26 @@ int format_report(char *buffer, std::size_t size)
 		std::lock_guard<std::mutex> lock(g_mutex);
 		m = g_mode;
 	}
+	std::uint64_t out[static_cast<std::size_t>(seam::SeamRefusal::count)] = {};
+	std::uint64_t l1r = 0;
+	std::uint64_t l1p = 0;
+	std::uint64_t l1f = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		for (std::size_t i = 0; i < static_cast<std::size_t>(seam::SeamRefusal::count); ++i)
+			out[i] = g_outcomes[i];
+		l1r = g_l1_resolved;
+		l1p = g_l1_partial;
+		l1f = g_l1_fell_back;
+	}
+	// `unclaimed` and every non-zero refusal below it are the SAME failure seen at different
+	// depths: the engine ran its primary upscale and DLSS did not. Their sum is the number of
+	// frames that published no guides, which is what NR reports as guides-stale / frame-gap.
 	return std::snprintf(buffer, size,
 		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
-		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu",
+		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu | "
+		"claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu | evaluated=%llu | "
+		"l1: resolved=%llu partial=%llu fellBack=%llu",
 		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
 		static_cast<unsigned long long>(c.announced),
 		static_cast<unsigned long long>(c.claimed),
@@ -487,7 +630,94 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(c.orphans),
 		static_cast<unsigned long long>(c.rect_mismatch),
 		static_cast<unsigned long long>(c.overflow),
-		static_cast<unsigned long long>(g_unreadable.load(std::memory_order_relaxed)));
+		static_cast<unsigned long long>(g_unreadable.load(std::memory_order_relaxed)),
+		"noDispatch", static_cast<unsigned long long>(c.unclaimed),
+		seam::seam_refusal_name(seam::SeamRefusal::dead_inputs),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::dead_inputs)]),
+		seam::seam_refusal_name(seam::SeamRefusal::role_unresolved),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::role_unresolved)]),
+		seam::seam_refusal_name(seam::SeamRefusal::mv_failed),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::mv_failed)]),
+		seam::seam_refusal_name(seam::SeamRefusal::create_failed),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::create_failed)]),
+		seam::seam_refusal_name(seam::SeamRefusal::eval_failed),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::eval_failed)]),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::none)]),
+		static_cast<unsigned long long>(l1r), static_cast<unsigned long long>(l1p),
+		static_cast<unsigned long long>(l1f));
+}
+
+EngineInputs resolve_inputs(const Verdict &v)
+{
+	EngineInputs out;
+	bool on = false;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		on = g_inputs_enabled && g_mode == seam::Mode::authoritative;
+	}
+	if (!on || !v.announced || !hooked())
+		return out;
+	out.enabled = true;
+
+	out.colour = resolve_one(v.colour_rdg, out.colour_status, out.colour_registered);
+	out.depth = resolve_one(v.depth_rdg, out.depth_status, out.depth_registered);
+	out.velocity = resolve_one(v.velocity_rdg, out.velocity_status, out.velocity_registered);
+
+	bool log_first = false;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (out.depth_ok() && out.velocity_ok() && out.colour_ok())
+			++g_l1_resolved;
+		else if (out.depth_ok() && out.velocity_ok())
+			++g_l1_partial;
+		else
+			++g_l1_fell_back;
+		if (!g_l1_first_logged)
+		{
+			g_l1_first_logged = true;
+			log_first = true;
+		}
+	}
+	if (log_first)
+		STRAY_LOG_INFO("ENGINE SEAM L1: first resolve of the engine's own FPassInputs - "
+			"colour=%p (%s, registered=%d) depth=%p (%s, registered=%d) velocity=%p (%s, "
+			"registered=%d). These REPLACE the heuristic's register-role guesses and its "
+			"liveness verdict for every frame they resolve; the heuristic stays as an "
+			"assertion. Offsets are [derived] (FRDGResource::ResourceRHI @%zu, "
+			"FRHITexture::GetNativeResource slot %u) and this line is what confirms them.",
+			reinterpret_cast<void *>(out.colour), seam::rhi_chain_name(out.colour_status),
+			out.colour_registered ? 1 : 0,
+			reinterpret_cast<void *>(out.depth), seam::rhi_chain_name(out.depth_status),
+			out.depth_registered ? 1 : 0,
+			reinterpret_cast<void *>(out.velocity), seam::rhi_chain_name(out.velocity_status),
+			out.velocity_registered ? 1 : 0,
+			seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot);
+	return out;
+}
+
+void note_outcome(seam::SeamRefusal r)
+{
+	const std::size_t i = static_cast<std::size_t>(r);
+	if (i >= static_cast<std::size_t>(seam::SeamRefusal::count))
+		return;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	++g_outcomes[i];
+}
+
+// One WARN, once, when the engine's answer and the heuristic's disagree about a resource.
+void note_input_disagreement(const char *which, std::uint64_t engine, std::uint64_t heuristic)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (g_l1_disagree_logged)
+			return;
+		g_l1_disagree_logged = true;
+	}
+	STRAY_LOG_WARN("ENGINE SEAM L1 ASSERTION: the engine's %s is %p and the heuristic's "
+		"register walk says %p. The ENGINE's is used. This is not necessarily a bug - the "
+		"heuristic infers colour-vs-history from last frame's u0 and can pick the other slot - "
+		"but it is the first thing to read if the image is wrong. Once per session.",
+		which, reinterpret_cast<void *>(engine), reinterpret_cast<void *>(heuristic));
 }
 
 void log_report(const char *when)
@@ -499,7 +729,7 @@ void log_report(const char *when)
 	}
 	if (m == seam::Mode::off)
 		return;
-	char line[320] = {};
+	char line[640] = {};
 	format_report(line, sizeof(line));
 	// `unclaimed` is the number that must stay at zero: an announced primary upscale we never
 	// intercepted is a frame that ran the engine's TAA. `lookalikesRefused` is EXPECTED to

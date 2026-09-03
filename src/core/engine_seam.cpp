@@ -388,6 +388,79 @@ Discovery discover(const Image &image)
 }
 
 // ---------------------------------------------------------------------------------------
+// L1: the FRDGTexture -> FRHITexture -> GetNativeResource chain
+// ---------------------------------------------------------------------------------------
+
+const char *rhi_chain_name(RhiChain c)
+{
+	switch (c)
+	{
+	case RhiChain::ok:             return "ok";
+	case RhiChain::null_rdg:       return "null-rdg";
+	case RhiChain::rhi_null:       return "rhi-null";
+	case RhiChain::rhi_unreadable: return "rhi-unreadable";
+	case RhiChain::fn_not_code:    return "fn-not-code";
+	case RhiChain::count:          break;
+	}
+	return "?";
+}
+
+const char *seam_refusal_name(SeamRefusal r)
+{
+	switch (r)
+	{
+	case SeamRefusal::none:            return "evaluated";
+	case SeamRefusal::dead_inputs:     return "deadInputs";
+	case SeamRefusal::role_unresolved: return "roleUnresolved";
+	case SeamRefusal::mv_failed:       return "mvFailed";
+	case SeamRefusal::create_failed:   return "createFailed";
+	case SeamRefusal::eval_failed:     return "evalFailed";
+	case SeamRefusal::count:           break;
+	}
+	return "?";
+}
+
+RhiChain resolve_rhi_fn(const RdgReader &r, std::uint64_t rdg,
+                        std::uint64_t *out_rhi, std::uint64_t *out_fn)
+{
+	if (out_rhi != nullptr)
+		*out_rhi = 0;
+	if (out_fn != nullptr)
+		*out_fn = 0;
+	if (r.read_u64 == nullptr || r.is_code == nullptr)
+		return RhiChain::rhi_unreadable;
+	if (rdg == 0)
+		return RhiChain::null_rdg;
+
+	// FRDGResource::ResourceRHI. Null is the ordinary answer for a texture the graph has not
+	// allocated yet, and it is NOT an error — it is why this runs at dispatch time rather than
+	// at AddPasses time.
+	std::uint64_t rhi = 0;
+	if (!r.read_u64(r.ctx, rdg + kRdgResourceRhiOffset, &rhi))
+		return RhiChain::rhi_unreadable;
+	if (rhi == 0)
+		return RhiChain::rhi_null;
+
+	// The FRHITexture's vtable, then the GetNativeResource slot in it.
+	std::uint64_t vtable = 0;
+	if (!r.read_u64(r.ctx, rhi, &vtable) || vtable == 0)
+		return RhiChain::rhi_unreadable;
+	std::uint64_t fn = 0;
+	if (!r.read_u64(r.ctx, vtable + 8ull * kRhiGetNativeResourceSlot, &fn) || fn == 0)
+		return RhiChain::rhi_unreadable;
+	// The last guard before the live half calls it. A wrong offset that survived every read
+	// above almost always lands here, and a refusal costs one fallback frame.
+	if (!r.is_code(r.ctx, fn))
+		return RhiChain::fn_not_code;
+
+	if (out_rhi != nullptr)
+		*out_rhi = rhi;
+	if (out_fn != nullptr)
+		*out_fn = fn;
+	return RhiChain::ok;
+}
+
+// ---------------------------------------------------------------------------------------
 // Mode and gate
 // ---------------------------------------------------------------------------------------
 

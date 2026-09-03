@@ -349,8 +349,14 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// 2026-09-03 (facts §36): orphans=0 over 8570 announcements, two look-alikes caught.
 	// EngineSeamFallback (default 1): at level 3 with no live seam, run the heuristic (said
 	// loudly at ERROR level) rather than refuse every frame. docs/RESEARCH-ENGINE-TAA-HOOK.md.
+	// EngineSeamInputs (default 1): L1 - take DLSS SR's colour, depth and velocity from the
+	// engine's own FPassInputs instead of inferring them from bound registers, and take its
+	// liveness verdict from the fact that the engine is about to bind them. Every resolved
+	// pointer is checked against our resource registry first; a failure falls back to the
+	// heuristic and is counted in the [seam] line's `l1:` group, never silent.
 	seamhook::configure(host::cfg::get_int("EngineSeam", 3),
-		host::cfg::get_bool("EngineSeamFallback", true));
+		host::cfg::get_bool("EngineSeamFallback", true),
+		host::cfg::get_bool("EngineSeamInputs", true));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long

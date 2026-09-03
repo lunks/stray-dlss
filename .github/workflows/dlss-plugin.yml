@@ -33,7 +33,7 @@ name: StrayDLSS plugin
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, dlss-fg, engine-taa-hook, engine-taa-hook-2 ]
+    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1 ]
     tags: [ 'v*' ]
     paths:
       - 'mods/StrayDLSS/**'

@@ -12,6 +12,9 @@
 #include <doctest/doctest.h>
 
 #include <cstring>
+#include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 using namespace stray_dlss::seam;
@@ -551,4 +554,173 @@ TEST_CASE("the ring cannot overflow: the engine's clock retires before capacity 
 	// which is the counter that would have said so in a live session.
 	CHECK(l.pending() == kRetireAfterAnnouncements);
 	CHECK(l.counters().unclaimed == Ledger::kCapacity + 3 - kRetireAfterAnnouncements);
+}
+
+
+// ---------------------------------------------------------------------------------------
+// L1: the FRDGTexture -> FRHITexture -> GetNativeResource chain
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+// A synthetic object graph shaped like the engine's. `read_u64` serves it from a map, which is
+// exactly what the live reader does from real memory - so the resolver cannot tell the
+// difference, and every refusal below is the one the live path would take.
+struct FakeHeap
+{
+	std::map<std::uint64_t, std::uint64_t> mem;
+	std::uint64_t code_lo = 0x140001000ull;
+	std::uint64_t code_hi = 0x140002000ull;
+
+	static bool read(void *ctx, std::uint64_t va, std::uint64_t *out)
+	{
+		auto *self = static_cast<FakeHeap *>(ctx);
+		const auto it = self->mem.find(va);
+		if (it == self->mem.end())
+			return false;
+		*out = it->second;
+		return true;
+	}
+	static bool is_code(void *ctx, std::uint64_t va)
+	{
+		auto *self = static_cast<FakeHeap *>(ctx);
+		return va >= self->code_lo && va < self->code_hi;
+	}
+	RdgReader reader()
+	{
+		RdgReader r;
+		r.read_u64 = &FakeHeap::read;
+		r.is_code = &FakeHeap::is_code;
+		r.ctx = this;
+		return r;
+	}
+};
+
+constexpr std::uint64_t kRdg = 0x0000000031000000ull;
+constexpr std::uint64_t kRhi = 0x0000000032000000ull;
+constexpr std::uint64_t kVtableAddr = 0x0000000141000800ull;
+constexpr std::uint64_t kGetNative = 0x0000000140001500ull;
+
+FakeHeap healthy_heap()
+{
+	FakeHeap h;
+	h.mem[kRdg + kRdgResourceRhiOffset] = kRhi;                          // ResourceRHI
+	h.mem[kRhi] = kVtableAddr;                                           // the FRHITexture vptr
+	h.mem[kVtableAddr + 8ull * kRhiGetNativeResourceSlot] = kGetNative;  // the slot
+	return h;
+}
+
+} // namespace
+
+TEST_CASE("the RHI chain resolves to the GetNativeResource pointer, and never calls it")
+{
+	FakeHeap h = healthy_heap();
+	std::uint64_t rhi = 0;
+	std::uint64_t fn = 0;
+	CHECK(resolve_rhi_fn(h.reader(), kRdg, &rhi, &fn) == RhiChain::ok);
+	CHECK(rhi == kRhi);
+	CHECK(fn == kGetNative);
+}
+
+TEST_CASE("every step of the chain has its own refusal, and none of them is a fault")
+{
+	SUBCASE("the engine passed no texture at all")
+	{
+		FakeHeap h = healthy_heap();
+		std::uint64_t rhi = 1;
+		std::uint64_t fn = 1;
+		CHECK(resolve_rhi_fn(h.reader(), 0, &rhi, &fn) == RhiChain::null_rdg);
+		CHECK(rhi == 0);
+		CHECK(fn == 0);
+	}
+
+	SUBCASE("ResourceRHI is null - a graph-allocated texture, read too early")
+	{
+		// THE reason the resolve happens at claim time and not in the AddPasses thunk: at
+		// graph-setup time a transient texture has no RHI resource yet.
+		FakeHeap h = healthy_heap();
+		h.mem[kRdg + kRdgResourceRhiOffset] = 0;
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, nullptr) == RhiChain::rhi_null);
+	}
+
+	SUBCASE("the FRDGTexture field is not readable")
+	{
+		FakeHeap h = healthy_heap();
+		h.mem.erase(kRdg + kRdgResourceRhiOffset);
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, nullptr) == RhiChain::rhi_unreadable);
+	}
+
+	SUBCASE("the vptr is not readable, or is null")
+	{
+		FakeHeap h = healthy_heap();
+		h.mem.erase(kRhi);
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, nullptr) == RhiChain::rhi_unreadable);
+		h.mem[kRhi] = 0;
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, nullptr) == RhiChain::rhi_unreadable);
+	}
+
+	SUBCASE("the vtable slot is not readable")
+	{
+		FakeHeap h = healthy_heap();
+		h.mem.erase(kVtableAddr + 8ull * kRhiGetNativeResourceSlot);
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, nullptr) == RhiChain::rhi_unreadable);
+	}
+
+	SUBCASE("the slot does not point at code - the guard before the only call we make")
+	{
+		// A wrong kRhiGetNativeResourceSlot lands here, which is the point of the guard:
+		// refusing costs one fallback frame, calling it costs the process.
+		FakeHeap h = healthy_heap();
+		h.mem[kVtableAddr + 8ull * kRhiGetNativeResourceSlot] = 0x0000000200000000ull;
+		std::uint64_t fn = 1;
+		CHECK(resolve_rhi_fn(h.reader(), kRdg, nullptr, &fn) == RhiChain::fn_not_code);
+		CHECK(fn == 0);
+	}
+
+	SUBCASE("a reader with no callbacks refuses rather than dereferencing anything")
+	{
+		RdgReader empty;
+		CHECK(resolve_rhi_fn(empty, kRdg, nullptr, nullptr) == RhiChain::rhi_unreadable);
+	}
+}
+
+TEST_CASE("the L1 offsets are the ones UE 4.27's Shipping layout gives")
+{
+	// FRDGResource in Shipping (RDG_ENABLE_DEBUG == 0): vptr@0, Name@8, ResourceRHI@16.
+	CHECK(kRdgResourceRhiOffset == 16);
+	// FRHITexture with one vptr (ENABLE_RHI_VALIDATION == 0): dtor, five casts, GetSizeXYZ,
+	// then GetNativeResource.
+	CHECK(kRhiGetNativeResourceSlot == 7);
+	// Both are [derived]. If the box says otherwise, these two constants are the fix, and the
+	// `l1: fellBack=` counter in the [seam] line is what says so.
+}
+
+TEST_CASE("every refusal reason has a distinct, stable name for the [seam] line")
+{
+	// The names are read by eye out of a pasted log, so a duplicate or an empty one costs a
+	// round trip. Also pins that `none` reads as success rather than as a refusal.
+	const SeamRefusal all[] = { SeamRefusal::none, SeamRefusal::dead_inputs,
+		SeamRefusal::role_unresolved, SeamRefusal::mv_failed, SeamRefusal::create_failed,
+		SeamRefusal::eval_failed };
+	std::set<std::string> seen;
+	for (SeamRefusal r : all)
+	{
+		const char *n = seam_refusal_name(r);
+		REQUIRE(n != nullptr);
+		CHECK(std::strlen(n) > 0);
+		CHECK(std::strcmp(n, "?") != 0);
+		CHECK(seen.insert(n).second);
+	}
+	CHECK(std::strcmp(seam_refusal_name(SeamRefusal::none), "evaluated") == 0);
+
+	const RhiChain chains[] = { RhiChain::ok, RhiChain::null_rdg, RhiChain::rhi_null,
+		RhiChain::rhi_unreadable, RhiChain::fn_not_code };
+	std::set<std::string> cseen;
+	for (RhiChain c : chains)
+	{
+		const char *n = rhi_chain_name(c);
+		REQUIRE(n != nullptr);
+		CHECK(std::strcmp(n, "?") != 0);
+		CHECK(cseen.insert(n).second);
+	}
 }

@@ -36,7 +36,7 @@ namespace stray_dlss::seamhook {
 //   3 — AUTHORITATIVE, the default: DLSS SR runs only on the dispatch the engine announced.
 // `fallback_allowed` is [STRAYDLSS] EngineSeamFallback: at level 3 with no live seam, run the
 // heuristic (true, said loudly) or refuse every frame (false).
-void configure(int level, bool fallback_allowed);
+void configure(int level, bool fallback_allowed, bool inputs_enabled);
 
 seam::Mode mode();
 bool fallback_allowed();
@@ -59,8 +59,47 @@ struct Verdict
 	std::uint32_t out_width = 0;
 	std::uint32_t out_height = 0;
 	std::uint64_t sequence = 0;
+	// The engine's own FPassInputs, for L1. Identities at this point; resolve_inputs turns
+	// them into ID3D12Resource* and is the only thing allowed to dereference them.
+	std::uint64_t colour_rdg = 0;
+	std::uint64_t depth_rdg = 0;
+	std::uint64_t velocity_rdg = 0;
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
+
+// L1. The engine handed us its scene colour, depth and velocity; this turns each into the
+// ID3D12Resource the D3D12 side already speaks. Call at CLAIM time (during graph execution):
+// at AddPasses time a graph-allocated texture has no RHI resource yet.
+//
+// Every resolved pointer is validated against our own resource registry before it is returned,
+// so a wrong offset yields `registry` (a pointer nothing knows) rather than a plausible lie.
+// Anything not `ok` leaves that resource 0 and the caller falls back to the heuristic.
+struct EngineInputs
+{
+	bool enabled = false;              // [STRAYDLSS] EngineSeamInputs and the seam are on
+	std::uint64_t colour = 0;          // ID3D12Resource*, 0 when unresolved
+	std::uint64_t depth = 0;
+	std::uint64_t velocity = 0;
+	seam::RhiChain colour_status = seam::RhiChain::null_rdg;
+	seam::RhiChain depth_status = seam::RhiChain::null_rdg;
+	seam::RhiChain velocity_status = seam::RhiChain::null_rdg;
+	bool colour_registered = false;    // the resolved pointer is one our registry calls live
+	bool depth_registered = false;
+	bool velocity_registered = false;
+
+	bool depth_ok() const { return depth != 0 && depth_registered; }
+	bool velocity_ok() const { return velocity != 0 && velocity_registered; }
+	bool colour_ok() const { return colour != 0 && colour_registered; }
+};
+EngineInputs resolve_inputs(const Verdict &v);
+
+// Records what happened to a dispatch the ENGINE announced and we claimed. Continuous, not
+// once-per-pass: the rate is the diagnosis. seam::SeamRefusal::none means SR evaluated.
+void note_outcome(seam::SeamRefusal r);
+
+// One WARN per session when the engine's resource and the heuristic's disagree. The engine
+// wins; this exists so a wrong image has a first line to read.
+void note_input_disagreement(const char *which, std::uint64_t engine, std::uint64_t heuristic);
 
 // One line for the periodic report, and the same numbers for stray-dlss-status.txt.
 // Writes at most `size` bytes including the terminator; returns the bytes written.

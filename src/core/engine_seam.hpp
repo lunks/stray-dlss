@@ -92,6 +92,73 @@ constexpr std::size_t kIntRectSize = 16;
 constexpr std::uint32_t kTaaTileSize = 8;
 
 // ---------------------------------------------------------------------------------------
+// L1: FRDGTexture -> ID3D12Resource, all [derived] and UNCONFIRMED until the box
+// ---------------------------------------------------------------------------------------
+//
+// The chain, HARD from UE 4.27.2 source (docs/RESEARCH-ENGINE-TAA-HOOK.md §4.2):
+//   FRDGTextureRef == FRDGTexture*                         (RenderGraphDefinitions.h:555)
+//   FRDGResource: vptr@0, `const TCHAR* Name`@8, `FRHIResource* ResourceRHI`@16
+//                                              (RenderGraphResources.h:121, Shipping RDG_ENABLE_DEBUG=0)
+//   FRHITexture::GetNativeResource() virtual returning ID3D12Resource*  (RHIResources.h:997)
+//   D3D12: TD3D12Texture2D::GetNativeResource -> FD3D12Resource::GetResource -> ID3D12Resource*
+//
+// ResourceRHI is null at AddPasses time for a graph-allocated texture (assigned in
+// FRDGBuilder::Execute's CollectPassResources loop); it is non-null at DISPATCH time, which is
+// when the seam claims. So the resolve happens at claim time, never at the AddPasses thunk.
+constexpr std::size_t kRdgResourceRhiOffset = 16;
+
+// FRHITexture's vtable slot for GetNativeResource in a Shipping build (ENABLE_RHI_VALIDATION=0,
+// so one vptr). FRHIResource declares one virtual (its dtor); FRHITexture then declares
+// GetTexture2D, GetTexture2DArray, GetTexture3D, GetTextureCube, GetTextureReference,
+// GetSizeXYZ, GetNativeResource -> slot 7. [derived] from the MSVC ABI, not measured.
+constexpr unsigned kRhiGetNativeResourceSlot = 7;
+
+// A guarded memory reader the live half supplies; the tests supply an in-memory fake. `read`
+// returns false when the address is not safely readable, so the pure resolver never assumes a
+// dereference succeeded. `is_code` is true when the address is inside an executable section of
+// a loaded module — the guard that stops us calling a garbage `GetNativeResource` pointer.
+struct RdgReader
+{
+	bool (*read_u64)(void *ctx, std::uint64_t va, std::uint64_t *out) = nullptr;
+	bool (*is_code)(void *ctx, std::uint64_t va) = nullptr;
+	void *ctx = nullptr;
+};
+
+enum class RhiChain : std::uint8_t
+{
+	ok = 0,
+	null_rdg,      // the FRDGTexture pointer itself was 0 (the engine passed no texture)
+	rhi_null,      // ResourceRHI is 0 — the texture is transient and not yet allocated
+	rhi_unreadable,// ResourceRHI or its vtable could not be read
+	fn_not_code,   // the resolved GetNativeResource slot does not point into code
+	count
+};
+const char *rhi_chain_name(RhiChain c);
+
+// Walks FRDGTexture -> FRHITexture -> the GetNativeResource function pointer, WITHOUT calling
+// it (the call is the live half's job — a pure function cannot invoke an engine method). Every
+// dereference goes through `r.read_u64`, so a bad pointer is a status, never a fault. On `ok`,
+// `out_rhi` is the FRHITexture* and `out_fn` is the address to call with it.
+RhiChain resolve_rhi_fn(const RdgReader &r, std::uint64_t rdg,
+                        std::uint64_t *out_rhi, std::uint64_t *out_fn);
+
+// Why an engine-announced frame did not reach a DLSS evaluate. Continuous counters (not
+// once-per-pass): a rate that climbs is the "DLSS flip" the user sees, and the breakdown says
+// which gate to fix. `no_dispatch` is the ledger's `unclaimed` (the matcher rejected the real
+// dispatch, so it never claimed); the rest are a claimed engine dispatch failing downstream.
+enum class SeamRefusal : std::uint8_t
+{
+	none = 0,       // SR evaluated — the good outcome
+	dead_inputs,    // claimed, but depth/velocity not live AND the engine inputs did not resolve
+	role_unresolved,// claimed, live, but colour or output could not be identified
+	mv_failed,      // claimed, the motion-vector resolve did not record
+	create_failed,  // claimed, NGX ensure_feature failed
+	eval_failed,    // claimed, EvaluateFeature returned failure
+	count
+};
+const char *seam_refusal_name(SeamRefusal r);
+
+// ---------------------------------------------------------------------------------------
 // Mode, and the gate decision
 // ---------------------------------------------------------------------------------------
 

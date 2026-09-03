@@ -1323,11 +1323,18 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// seam is not live and the fallback is allowed; `engine` when the engine announced this
 	// exact dispatch; a named refusal otherwise. (src/core/engine_seam.hpp, seam::decide)
 	seamhook::Verdict seam_verdict;
+	seamhook::EngineInputs engine_inputs;
 	seam::Gate seam_gate = seam::Gate::heuristic;
 	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
+		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
+		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
+		// no RHI resource at AddPasses time has one now. Each is validated against our own
+		// resource registry before it is used, so a wrong offset falls back rather than lies.
+		if (seam_gate == seam::Gate::engine)
+			engine_inputs = seamhook::resolve_inputs(seam_verdict);
 
 		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)
 		{
@@ -1537,8 +1544,37 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
 		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
 		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it.
-		const bool resources_live = icept::backend()->is_resource_live(depth_resource) &&
-			icept::backend()->is_resource_live(velocity_resource);
+		// THE ENGINE'S ANSWER WINS. `AddPasses` named these three textures; a resource the
+		// engine is about to bind is alive by construction, and no register walk or
+		// view->resource map can be more authoritative than that. The heuristic's answer is
+		// kept as an assertion (one WARN per session) and as the fallback when L1 could not
+		// resolve - which is counted, never silent.
+		bool engine_depth_used = false;
+		bool engine_velocity_used = false;
+		if (engine_inputs.depth_ok())
+		{
+			if (depth_resource != 0 && depth_resource != engine_inputs.depth)
+				seamhook::note_input_disagreement("depth", engine_inputs.depth, depth_resource);
+			depth_resource = engine_inputs.depth;
+			engine_depth_used = true;
+		}
+		if (engine_inputs.velocity_ok())
+		{
+			if (velocity_resource != 0 && velocity_resource != engine_inputs.velocity)
+				seamhook::note_input_disagreement("velocity", engine_inputs.velocity,
+					velocity_resource);
+			velocity_resource = engine_inputs.velocity;
+			engine_velocity_used = true;
+		}
+
+		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
+		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
+		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it. An
+		// engine-supplied resource skips this: the registry already confirmed it live inside
+		// resolve_inputs, and this is the check that was rejecting the real pass in the menu.
+		const bool resources_live =
+			(engine_depth_used || icept::backend()->is_resource_live(depth_resource)) &&
+			(engine_velocity_used || icept::backend()->is_resource_live(velocity_resource));
 		if (depth_resource != 0 && velocity_resource != 0)
 		{
 			g_resolve_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -1605,6 +1641,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			else if (!resources_live)
 				log_gate_refusal(hash, kGateDeadInputs);
 		}
+		// The CONTINUOUS half of the same fact. The WARN above fires once per pass by design,
+		// which hid the RATE - and the rate is what makes this the user's "DLSS flip": every
+		// refused frame publishes no guides, so NR declines it (guides-stale) and the next
+		// evaluate carries a DLSSNR.Reset.
+		if (seam_gate == seam::Gate::engine && !(worth_resolving && view_ok && resources_live))
+			seamhook::note_outcome(seam::SeamRefusal::dead_inputs);
 
 		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set
 		// via is_camera_cut — so the engine's TAA never runs once DLSS engages. Skipping them
@@ -1675,6 +1717,8 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 				if (tracing && recorded)
 					g_named_recorded.fetch_add(1, std::memory_order_relaxed);
 
+				if (!recorded && seam_gate == seam::Gate::engine)
+					seamhook::note_outcome(seam::SeamRefusal::mv_failed);
 				if (recorded)
 				{
 					mark(5, "recorded");
@@ -1872,7 +1916,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 
 						std::uint64_t colour_handle = reg_colour;
 						const char *colour_reason = reg_colour != 0 ? "register t1" : "ok";
-						if (reg_colour != 0)
+						// The engine named the scene colour outright, so none of the
+						// colour-versus-history inference below has to run.
+						if (engine_inputs.colour_ok())
+						{
+							if (colour_handle != 0 && colour_handle != engine_inputs.colour)
+								seamhook::note_input_disagreement("scene colour",
+									engine_inputs.colour, colour_handle);
+							colour_handle = engine_inputs.colour;
+							colour_reason = "the engine's FPassInputs.SceneColorTexture";
+						}
+						else if (reg_colour != 0)
 						{
 							// Already decided by register; nothing to infer.
 						}
@@ -1973,6 +2027,14 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								fd.render_width, fd.render_height,
 								fd.output_width, fd.output_height);
 						}
+
+						if (seam_gate == seam::Gate::engine &&
+							(!dims_ok || colour == nullptr || output == nullptr))
+							seamhook::note_outcome(seam::SeamRefusal::role_unresolved);
+						else if (seam_gate == seam::Gate::engine && dims_ok &&
+							colour != nullptr && output != nullptr &&
+							!ngx::ensure_feature(native, fd))
+							seamhook::note_outcome(seam::SeamRefusal::create_failed);
 
 						if (dims_ok && colour != nullptr && output != nullptr &&
 							ngx::ensure_feature(native, fd))
@@ -2234,6 +2296,9 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 										ei.render_width, ei.render_height, ei.reset);
 								}
 							}
+							if (seam_gate == seam::Gate::engine)
+								seamhook::note_outcome(ok ? seam::SeamRefusal::none
+								                          : seam::SeamRefusal::eval_failed);
 							if (ok)
 							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
