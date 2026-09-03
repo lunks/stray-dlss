@@ -38,10 +38,10 @@
 //     transcribed, and tests/test_nr_mask_plan.cpp, which pins it.
 //
 // SO: "does the skin channel get DISABLED, or does it INHERIT local structure?" — the question
-// this module exists to answer — has a two-part answer, and only one half was previously written
-// down. The sign test IS an inherit (`comiss`/`jae`, so any negative and any NaN takes the local
-// value), but it lives on the AUTO path, at 0x18001aa62, and is reached only when UseAutoMask is
-// non-zero. Binding a ControlMask takes the OTHER branch, where both resolved values become the
+// this module exists to answer. CLAUDE.md already records both halves correctly; what it does not
+// do is put them next to each other, and read separately they invite the wrong conclusion. The
+// sign test IS an inherit (`comiss`/`jae`, so any negative and any NaN takes the local value), but
+// it lives on the AUTO path, at 0x18001aa62, and is reached only when UseAutoMask is non-zero. Binding a ControlMask takes the OTHER branch, where both resolved values become the
 // -1.0f sentinel and no inherit happens at all. Binding a mask therefore does not slave skin to
 // local structure; it retires the resolved pair entirely and leaves the per-pixel texture as the
 // only spatial control. (The RAW LocalStructureStrength is a separate matter: the kernel is

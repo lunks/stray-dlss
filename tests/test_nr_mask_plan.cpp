@@ -1,11 +1,11 @@
 // DLSSNR.ControlMask: the bind decision, and what binding one does to the structure pair.
 //
-// The second half is the interesting one. "Binding a mask sets UseAutoMask to 0, and the sentinel
-// test is a sign test, so any negative inherits local structure" was two true sentences that
-// together implied something false — that binding a mask slaves skin to local rather than
-// retiring the pair. The runtime's own code says otherwise (see src/core/nr_mask_plan.hpp for the
-// addresses), and these cases are that code transcribed, so the two halves can never again be
-// read as one claim.
+// The second half is the interesting one. "Binding a mask sets UseAutoMask to 0" and "the
+// sentinel test is a sign test, so any negative inherits local structure" are two separately true
+// sentences that, read apart, invite the false conclusion that binding a mask slaves skin to local
+// structure. It does not: the inherit is on the other branch, and a bound mask retires the
+// resolved pair entirely. These cases are the runtime's own code transcribed (the addresses are in
+// src/core/nr_mask_plan.hpp), so the two halves can never again be read as one claim.
 #include <doctest/doctest.h>
 
 #include "core/nr_mask_plan.hpp"

@@ -229,7 +229,7 @@ session still in effect — the same trap, avoided the same way).
 | `DLSSNR.Style` selects among conditioning constants read at feature-build time and is in the control-change reset list | **Carried over from CLAUDE.md's existing disassembly notes, NOT re-derived by this pass.** We did not re-run a disassembler against `CG2R_ResetTemporalHistoryOnControlChange` this session — attempted a light xref search with `r2`/`rabin2` against the 165 MB file, which did not complete in the time budgeted, and the string evidence in §3 was judged sufficient without it |
 | "Default (standard)/Natural/Cinematic" are the values 0/1/2 name, and what each visually does | **SOFT.** Sourced entirely from the OptiScaler_DLSSNR fork's own menu text, itself sourced from "community testing" per that fork's own admission — not independently verified against the live game by us. Nothing in the binary confirms which numeric value produces which look, only that the fork settled on this ordering |
 | The compressed cubin/PTX payload (~59 MB, per CLAUDE.md's earlier NR investigation) was searched again this session for style-related names | **NOT DONE.** The tooling that decompressed it before (`patch_dlssnr.py`, referenced from `~/Downloads/dlssnr-remix/` in CLAUDE.md) was not present on the box this session (`find` came back empty at that path). Given §1's exhaustive top-level search and §4's two independent corroborating implementations already converge on "no names exist", this was judged not worth the extra round trip — but it is the one item from the original brief not exhausted, and is where to look first if a future session wants the very last mile |
-| `DLSSNR.Backbuffer` / `DLSSNR.BidirectionalDistortionField` — what they are for | **UNCONFIRMED.** New in this census, not investigated; out of scope for the Style question |
+| `DLSSNR.Backbuffer` / `DLSSNR.BidirectionalDistortionField` — what they are for | **UNCONFIRMED here; answered in §8** (2026-09-03). Backbuffer is consumed and validated; BidirectionalDistortionField is read and then never used again |
 
 ## 7. The code change
 
@@ -245,3 +245,118 @@ forces the snippet's own temporal-history reset for one frame — the overlay co
 header doc both say to judge the result a second or two after moving the slider, never on the
 frame it changes, the same rule already in force for every other control on this runtime's reset
 list.
+
+---
+
+## 8. The five unbound parameters, settled — 2026-09-03
+
+§6 left `DLSSNR.Backbuffer` and `DLSSNR.BidirectionalDistortionField` UNCONFIRMED and out of
+scope, and §2's census flagged `ControlMask`, `UI` and `UIAlpha` alongside them as names we
+declare but never write. This pass answers, for all five, the only question that decides whether
+they are worth building: **does the runtime READ them, and does what it reads reach the kernel?**
+
+Method: the same file (`md5 eea91faf…`), disassembled locally with capstone. A linear sweep over
+`.text` (0x1000..0xabdfc, 187,527 instructions, 248 bytes unresolvable) collected every
+RIP-relative reference, which located the single call site of every `DLSSNR.*` string. `.pdata`
+gave exact function bounds — **merged across contiguous entries, which matters**: a first pass
+that trusted one `RUNTIME_FUNCTION` per function truncated `0x18001c920` at 165 bytes instead of
+2257 and produced the wrong answer for `ControlMask`. No game was launched and nothing was
+written to the box.
+
+### 8.1 All 61 names are read; they land in one 0x140-byte struct
+
+`ReadEvalParams` at **0x180019f30** (`rcx` = out struct, `rdx` = the NGX parameter block) is the
+only caller of any of them, and is itself called once, from `EvaluateFeature`
+(0x180018620..0x180019e67) at 0x1800186e4. Layout, HARD:
+
+| Offset | Parameter | Subrects |
+|---|---|---|
+| +0x00 | `Color` | +0x08/0x0c/0x10/0x14 |
+| +0x18 | `MVec` | +0x20…+0x2c |
+| +0x30 | `Depth` | +0x38…+0x44 |
+| +0x48 | `Output` | +0x50…+0x5c |
+| +0x60 | **`ControlMask`** | +0x68…+0x74 |
+| +0x78 | **`UI`** | +0x80…+0x8c |
+| +0x90 | **`UIAlpha`** | +0x98…+0xa4 |
+| +0xa8 | **`Backbuffer`** | +0xb0…+0xbc |
+| +0xc0 | **`BidirectionalDistortionField`** | +0xc8…+0xd4 |
+| +0xd8/+0xdc | `MVecScaleX/Y` (default 1.0f) | |
+| +0xe0 | `Intensity` (1.0f) | +0xe4 `LocalToneStrength` (1.0f), +0xe8 `LocalStructureStrength` (1.0f) |
+| +0xec | `Style` (0) | +0xf0 `UseAutoMask` (0), +0xf4 `SkinStructureStrength` (**-1.0f**) |
+| +0xf8/+0xfc | resolved skin / resolved local | |
+| +0x100 | `Reset` (0) | +0x104 `DepthInverted` (**1**), +0x108 `Enabled` (**1**), +0x10c `UICorrection` |
+| +0x120 | `ScalingRatio` | |
+
+**Every resource is fetched through the same parameter-block vtable slot (+0x40) and every
+subrect through the same slot (+0x58)** as `Color`/`Depth`/`MVec`/`Output` and theirs. That
+settles the TYPE question for all five new parameters without decoding the vtable: write them the
+way the four working ones are written. A failed `Get` stores a null pointer, so **writing a null
+is the supported way to UNBIND** — the parameter block persists across evaluates and nothing
+clears it.
+
+`ScalingRatio` is re-confirmed INERT: read into +0x120 at 0x18001a964, then **unconditionally**
+overwritten with `1.0f` at 0x18001a96a.
+
+### 8.2 `ControlMask`, `UI`, `UIAlpha` — genuinely consumed
+
+At **0x18001c920** (2257 bytes, `r9`/`rdi` = the struct) each non-null resource is registered
+through the cubin device's vtable slot +0xa8 — the identical call `Color` and `MVec` get, with
+the same read-only usage word — and its 24-byte descriptor is handed to the guide-rect builder at
+**0x18001c520**, which emits a float record `{baseX, baseY, activeW, activeH, 1.0f/texW,
+1.0f/texH}` into the launch array. Positions in that array: `Color` rbp+0x150, **`ControlMask`
+rbp+0x198, `UI` rbp+0x1b0, `UIAlpha` rbp+0x1c8**, plus internal textures at +0x168/+0x180/+0x1e0/
++0x1f8. A zero subrect Width/Height is filled from the resource's own extent (0x18001c596), and a
+null pointer zeroes the whole record. **HARD.**
+
+The `1.0f/texW` terms are strongly suggestive of normalised-coordinate sampling, which would make
+the mask's own resolution free — but that is inference from the record's shape, not a reading of
+the kernel, and is **UNCONFIRMED**.
+
+The runtime never inspects a caller-supplied texture's `DXGI_FORMAT` on this path: the guide-rect
+builder reads only Width and Height (vtable +0x190), and the registration call passes the resource
+and a usage word. So the format is interpreted entirely by the CUDA texture object the driver
+mints from the D3D12 descriptor, and **the kernel's assumed channel type is not discoverable from
+the host code**. That is why `src/nr_mask.hpp` ships the format as a knob with a SOFT default
+rather than a constant.
+
+### 8.3 `Backbuffer` — consumed, and dangerous
+
+Read, validated and passed on (9 accesses in `EvaluateFeature`, subrects included). It has its own
+failure string, and it is not an error return: **`DLSSNR: Skip feature evaluate: Invalid
+Backbuffer/active Output rect configuration Backbuffer=%p subrect=(%u,%u %ux%u) Output=%p
+activeRect=(%u,%u %ux%u)`** (0x1800afab0, reached from 0x180019dac). A mismatched Backbuffer rect
+therefore turns the whole evaluate into a silent no-op. At 0x180018f2b it SUBSTITUTES for `Color`
+where present, which is consistent with "the pre-composite image" — but that reading is
+**UNCONFIRMED**.
+
+### 8.4 `BidirectionalDistortionField` — DECLARED, PARSED, INERT
+
+After the reader stores it at +0xc0, the pointer is touched **exactly once** more in the entire
+module: `cmp qword ptr [rbp+0xe0], 0` at **0x180019cd8**, which ORs bit 2 into a presence bitmask
+at rbp+0x4fc in the telemetry record the runtime hands to its stats callback (bit 0 ControlMask,
+1 Backbuffer, 2 BDF, 3 UI, 4 UIAlpha). Its pointer is never registered, its four subrect fields
+are never read anywhere in `.text`, and no guide-rect record is ever built for it. A module-wide
+sweep for `lea reg, [greg + 0xc0]` finds only the reader's own out-pointer. **HARD: supplying
+forward motion vectors to this parameter would cost a texture and change nothing in this build.**
+
+### 8.5 `UICorrection` requires a `Backbuffer`, so ours has been a no-op
+
+Two consumers, and neither can arm without one:
+
+* `EvaluateFeature` 0x180019016: armed only when `UICorrection && Backbuffer && !(UI || UIAlpha)`.
+* the registration path 0x18001cbec: armed only when `UICorrection && (UI || UIAlpha) && Backbuffer`.
+
+We have written `DLSSNR.UICorrection = 1` for months and bind no Backbuffer, so it has done
+nothing. **HARD.**
+
+### 8.6 The structure sentinel, both branches
+
+`0x18001aa4b`: a non-null `ControlMask` sets `UseAutoMask = 0` unconditionally, whatever the
+caller asked for. `0x18001aa59`: with `UseAutoMask == 0` **both** resolved strengths (+0xf8, +0xfc)
+take the constant at 0x1800afc40, which is exactly **-1.0f**, and neither raw value survives.
+`0x18001aa62`: only on the auto path does the sign test run — `comiss`/`jae`, so any negative and
+any NaN inherits `LocalStructureStrength`, while local itself passes through.
+
+So binding a mask does **not** slave skin to local structure; it retires the resolved pair and
+leaves the texture as the only spatial control. Both branches are transcribed in
+`src/core/nr_mask_plan.cpp` and pinned in `tests/test_nr_mask_plan.cpp`. **HARD.**
