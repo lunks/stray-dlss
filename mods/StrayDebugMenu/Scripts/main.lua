@@ -75,9 +75,32 @@ local function show(name)
     note("OPENED " .. path)
 end
 
-LoopAsync(500, function()
-    local cmd = readCommand()
-    if cmd == nil or cmd == "" then return false end
+-- KEYBINDS. UE4SS delivers these on its own thread, so each one only queues the work; the
+-- engine calls still go through ExecuteInGameThread inside run().
+--   F7            toggle UMG_DebugMenu
+--   F8            toggle UMG_HUD_Debug
+--   Ctrl+F7       UMG_DebugInput
+--   Ctrl+F8       list what is loaded
+--   Shift+F7      close everything
+-- The file channel (stray-debug.cmd) still works and takes any widget path, so a widget these
+-- binds do not cover is one echo away.
+local function bind(key, mods, cmd, label)
+    local ok, err = pcall(function()
+        if mods then RegisterKeyBind(key, mods, function() run(cmd) end)
+        else RegisterKeyBind(key, function() run(cmd) end) end
+    end)
+    note(ok and ("keybind " .. label .. " -> " .. cmd)
+            or ("keybind " .. label .. " FAILED: " .. tostring(err)))
+end
+
+bind(Key.F7, nil,                    "UMG_DebugMenu",  "F7")
+bind(Key.F8, nil,                    "UMG_HUD_Debug",  "F8")
+bind(Key.F7, {ModifierKey.CONTROL},  "UMG_DebugInput", "Ctrl+F7")
+bind(Key.F8, {ModifierKey.CONTROL},  "list",           "Ctrl+F8")
+bind(Key.F7, {ModifierKey.SHIFT},    "close",          "Shift+F7")
+
+-- One entry point for both channels. Everything engine-facing happens on the game thread.
+function run(cmd)
     ExecuteInGameThread(function()
         local ok, err = pcall(function()
             if cmd == "close" then closeAll()
@@ -87,10 +110,26 @@ LoopAsync(500, function()
                     note(string.format("  %-16s %s  loaded=%s", k, v,
                         (o ~= nil and o:IsValid()) and "yes" or "no"))
                 end
-            else show(cmd) end
+            else
+                -- A second press closes it rather than stacking another copy on the viewport.
+                local w = open[cmd]
+                if w ~= nil then
+                    pcall(function() if w:IsValid() then w:RemoveFromViewport() end end)
+                    open[cmd] = nil
+                    note("closed " .. cmd)
+                else
+                    show(cmd)
+                end
+            end
         end)
         if not ok then note("FAILED on '" .. tostring(cmd) .. "': " .. tostring(err)) end
     end)
+end
+
+LoopAsync(500, function()
+    local cmd = readCommand()
+    if cmd == nil or cmd == "" then return false end
+    run(cmd)
     return false
 end)
 

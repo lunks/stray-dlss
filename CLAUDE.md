@@ -1544,7 +1544,10 @@ to *this* build rather than to a repo. Exhaustive printable-run extraction of
 `M_Fur_2sidedshading_backpackON` is a `MaterialInstanceConstant` whose `Parent` is
 `M_Base_GFur_2sidedshading`. Both name tables were read (method below), and in **both** the only
 `BLEND_*` name present is **`BLEND_Masked`** — alongside `BlendMode`, `EBlendMode` and (on the
-instance) `BasePropertyOverrides`. `BLEND_Translucent` appears in neither. The instance also
+instance) `BasePropertyOverrides`. `BLEND_Translucent` appears in neither. **The parent alone
+settles it**, which matters because the instance's table carries `bOverride_ShadingModel` but no
+`bOverride_BlendMode`, so its override may well be inactive and the effective blend mode inherited
+— and the inherited one is Masked too. The instance also
 overrides the shading model to `MSM_SubsurfaceProfile` (parent: `MSM_TwoSidedFoliage`) with
 `SubsurfaceProfile = SSS_profil_cat` — both deferred G-buffer shading models, which a translucent
 material cannot use, so the asset corroborates itself.
