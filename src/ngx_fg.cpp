@@ -445,7 +445,10 @@ public:
 		p->Set("DLSSG.ClipToCameraView", static_cast<void *>(g_m_clip_to_view));
 		p->Set("DLSSG.ClipToPrevClip", static_cast<void *>(g_m_clip_to_prev));
 		p->Set("DLSSG.PrevClipToClip", static_cast<void *>(g_m_prev_to_clip));
-		p->Set("DLSSG.CameraNear", c.near_plane);
+		// NVIDIA ships a CONSTANT pair here and states it need not match the engine, so a
+		// configured near overrides the measured View.NearPlane; <= 0 keeps the measurement.
+		const float near_sent = g_cfg.camera_near > 0.0f ? g_cfg.camera_near : c.near_plane;
+		p->Set("DLSSG.CameraNear", near_sent);
 		p->Set("DLSSG.CameraFar", g_cfg.camera_far);
 		p->Set("DLSSG.CameraFOV", fov);
 		p->Set("DLSSG.CameraAspectRatio", aspect);
@@ -506,7 +509,7 @@ public:
 		static std::atomic<int> s_logged{ 0 };
 		if (s_logged.fetch_add(1) == 0)
 			STRAY_LOG_WARN("fg/ngx: first DLSS-G evaluate OK: backbuffer %ux%u, guides %ux%u, jitter=%.4f,%.4f reset=%d fov=%.4f rad aspect=%.4f near=%.3f far=%.3f mvecScale=%.6f,%.6f hdr=%d",
-				width, height, c.render_width, c.render_height, c.jitter_x, c.jitter_y, reset ? 1 : 0, fov, aspect, c.near_plane, g_cfg.camera_far, sx, sy, g_feature_hdr);
+				width, height, c.render_width, c.render_height, c.jitter_x, c.jitter_y, reset ? 1 : 0, fov, aspect, near_sent, g_cfg.camera_far, sx, sy, g_feature_hdr);
 		return true;
 #endif
 	}
@@ -526,7 +529,7 @@ NgxGenerator g_generator;
 void configure(const Config &cfg)
 {
 	g_cfg = cfg;
-	STRAY_LOG_INFO("fg/ngx: hdr=%d warmup=%d cameraFar=%.3f mvecScaleMode=%d outputReal=%d", cfg.hdr, cfg.warmup_presents, cfg.camera_far, cfg.mvec_scale_mode, cfg.provide_output_real ? 1 : 0);
+	STRAY_LOG_INFO("fg/ngx: hdr=%d warmup=%d cameraNear=%.4f(0=use View.NearPlane) cameraFar=%.1f mvecScaleMode=%d outputReal=%d", cfg.hdr, cfg.warmup_presents, cfg.camera_near, cfg.camera_far, cfg.mvec_scale_mode, cfg.provide_output_real ? 1 : 0);
 }
 
 const Config &config() { return g_cfg; }

@@ -48,7 +48,8 @@ is driven exactly as SR is. Keys, all `[STRAYDLSS]` in `StrayDLSS.ini`:
   `NgxFGMode=2` (default) generates through DLSS-G.
 * `NgxFGPacing` 1 worker thread (default), 0 back to back (control), 2 game thread with
   `NgxFGWaitMs` between the presents. `NgxFGValidate=1` keeps a black or stale generated frame
-  off the screen. `NgxFGReflex` 0/1/2. `NgxFGHDR`, `NgxFGCameraFar`, `NgxFGMvecScale`,
+  off the screen. `NgxFGReflex` 0/1/2. `NgxFGHDR`, `NgxFGCameraNear`/`NgxFGCameraFar`
+  (NVIDIA's synthetic `0.01`/`75000` pair, not the engine's own planes), `NgxFGMvecScale`,
   `NgxFGOutputReal`, `NgxFGWarmupFrames` are the DLSS-G feature's knobs (`src/ngx_fg.hpp`).
 * Read the `[fg]` log line and the `fg_*` status-file keys: presents issued per game present
   (~2x), refusals by reason, the pacer's estimate, whether the issued-interval histogram is

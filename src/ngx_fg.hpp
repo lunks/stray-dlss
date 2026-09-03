@@ -33,7 +33,20 @@ struct Config
 {
 	int hdr = -1;              // [STRAYDLSS] NgxFGHDR: -1 auto (R10G10B10A2 + HDR10 colour space, or R10G10B10A2 alone), 0, 1
 	int warmup_presents = 60;  // [STRAYDLSS] NgxFGWarmupFrames: presents before the first CreateFeature (NR's lesson: never at device init)
-	float camera_far = 0.0f;   // [STRAYDLSS] NgxFGCameraFar: 0 = pass 0 (infinite, what a reversed-Z infinite projection means), >0 overrides
+	// [STRAYDLSS] NgxFGCameraFar. NVIDIA's own value on BOTH engine generations, from
+	// StreamlineViewExtension.cpp's r.Streamline.CustomCameraFarPlane, whose help text says
+	// outright that it "does not need to match corresponding value used by engine". Passing 0
+	// to mean "infinite" was OUR invention: sl_consts.h makes near/far non-optional with
+	// INVALID_FLOAT as the unset sentinel, so 0.0 is a degenerate near-zero depth RANGE, not a
+	// way of saying infinite — and DLSS-G's camera reconstruction divides by that range.
+	// (docs/RESEARCH-DLSS-UE5-PLUGIN.md §5.3, HARD.) 0 still means "send 0" for A/B.
+	float camera_far = 75000.0f;
+	// [STRAYDLSS] NgxFGCameraNear. Same source, same "need not match the engine" caveat:
+	// NVIDIA hardcodes 0.01. We previously sent the real measured View.NearPlane (row 142.x),
+	// which is more faithful to the engine and is exactly why it may be wrong here — the pair
+	// is what DLSS-G reconstructs against, and NVIDIA ships a constant pair. <= 0 keeps the
+	// measured value, so the old behaviour is one key away.
+	float camera_near = 0.01f;
 	int mvec_scale_mode = 1;   // [STRAYDLSS] NgxFGMvecScale: 1 = 1/renderW,1/renderH (pixels -> SL's [-1,1] convention, guide §7.0), 2 = 1.0
 	bool provide_output_real = true; // [STRAYDLSS] NgxFGOutputReal: also hand the snippet a DLSSG.OutputReal texture (Nukem's replacement copies the back buffer into it)
 };

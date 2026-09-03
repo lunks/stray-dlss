@@ -357,6 +357,7 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		fc.hdr = host::cfg::get_int("NgxFGHDR", fc.hdr);
 		fc.warmup_presents = host::cfg::get_int("NgxFGWarmupFrames", fc.warmup_presents);
 		fc.camera_far = host::cfg::get_float("NgxFGCameraFar", fc.camera_far);
+		fc.camera_near = host::cfg::get_float("NgxFGCameraNear", fc.camera_near);
 		fc.mvec_scale_mode = host::cfg::get_int("NgxFGMvecScale", fc.mvec_scale_mode);
 		fc.provide_output_real = host::cfg::get_bool("NgxFGOutputReal", fc.provide_output_real);
 		ngxfg::configure(fc);
