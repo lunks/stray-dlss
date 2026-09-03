@@ -1,6 +1,7 @@
 #include "backend_native/fg_present.hpp"
 
 #include "backend_native/fg_reflex.hpp"
+#include "backend_native/fg_throttle.hpp"
 #include "backend_native/native_backend.hpp"
 #include "backend_native/present_owner.hpp"
 #include "backend_native/vtable_patch.hpp"
@@ -296,6 +297,7 @@ struct Pair
 };
 
 Config g_cfg;
+core::fg::FlagVerdict g_flag_verdict = core::fg::FlagVerdict::disabled;
 Generator *g_generator = nullptr;
 std::mutex g_mutex;               // chain state touched from the hooks (game thread) and the worker
 Chain g_chain;                    // exactly one swapchain (Streamline supports exactly one too)
@@ -769,6 +771,7 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 	}
 	else
 	{
+		bool real_slot_waited = false;
 		if (p.generated != nullptr)
 		{
 			bool hurried = false;
@@ -780,6 +783,11 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 				c.sched.plan(p.t_hook, t_gen, t_real);
 				if (p.trace_slot >= 0)
 					g_trace[static_cast<unsigned>(p.trace_slot)].delay_ns = t_real - t_gen;
+				// The flip-queue slot FIRST, the schedule's deadline second. Both are waits, but
+				// wait_until() is against an ABSOLUTE time, so whatever the throttle consumed is
+				// absorbed rather than added: the pair is max(), never a sum. Reversing these two
+				// lines would double-delay every present and read as worse pacing, not better.
+				throttle::wait_for_slot(g_hurry.load() || g_stop.load());
 				wait_until(t_gen);
 				const HRESULT hr = present_one(c, p, p.generated);
 				if (SUCCEEDED(hr))
@@ -787,10 +795,13 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 					std::lock_guard<std::mutex> lock(g_smutex);
 					++g_stats.generated_presented;
 				}
+				throttle::wait_for_slot(g_hurry.load() || g_stop.load());
+				real_slot_waited = true;
 				hurried = wait_until(t_real);
 			}
 			else
 			{
+				throttle::wait_for_slot(/*hurried=*/false);
 				const HRESULT hr = present_one(c, p, p.generated);
 				if (SUCCEEDED(hr))
 				{
@@ -803,6 +814,16 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 			if (p.trace_slot >= 0)
 				g_trace[static_cast<unsigned>(p.trace_slot)].hurried = hurried;
 		}
+		// Every present WE issue takes a flip slot, so every one waits for one - once. The
+		// worker's generated pair already waited for the real frame's slot before its deadline;
+		// this covers the no-generated-frame case and the inline (sync/none) modes.
+		//
+		// One honest asymmetry: the inline modes delay with a RELATIVE sleep_for, so there the
+		// throttle really does add to the gap rather than being absorbed. Those two modes are
+		// bisection controls, not the shipped configuration (NgxFGPacing=1 is), and the schedule
+		// they would need to absorb into does not exist on that path.
+		if (!real_slot_waited)
+			throttle::wait_for_slot(on_worker && (g_hurry.load() || g_stop.load()));
 		g_last_present_hr.store(present_one(c, p, p.real));
 		c.sched.note_real_issued(now_ns());
 		if (p.trace_slot >= 0 && static_cast<unsigned>(p.trace_slot) + 1 == g_trace_count.load() &&
@@ -983,6 +1004,7 @@ void configure(const Config &cfg)
 		if (finalised)
 			start_worker();
 	}
+	throttle::configure(cfg.throttle);
 	std::snprintf(g_report, sizeof(g_report), "fg: %s mode=%s pacing=%s wait=%d band=%d validate=%d",
 		cfg.enabled ? "ENABLED" : "off", cfg.mode == Mode::experiment ? "experiment(present-twice, no NGX)" : "ngx",
 		cfg.pacing == Pacing::thread ? "thread" : cfg.pacing == Pacing::sync ? "sync" : "none", cfg.wait_ms, cfg.band ? 1 : 0, cfg.validate);
@@ -992,6 +1014,14 @@ void configure(const Config &cfg)
 
 const Config &config() { return g_cfg; }
 bool enabled() { return g_cfg.enabled; }
+
+void note_creation_flags(core::fg::FlagVerdict verdict)
+{
+	g_flag_verdict = verdict;
+}
+
+bool added_waitable_flag() { return g_flag_verdict == core::fg::FlagVerdict::added; }
+
 void set_generator(Generator *g) { g_generator = g; }
 
 void on_swapchain_recorded(IDXGISwapChain *sc, ID3D12Device *device)
@@ -1055,6 +1085,14 @@ void on_swapchain_finalised(IDXGISwapChain *sc, IDXGISwapChain3 *sc3, ID3D12Devi
 	c.finalised = true;
 	if (g_cfg.reflex != 0)
 		reflex::initialise(device, /*low_latency=*/true, /*boost=*/g_cfg.reflex >= 2);
+	// The out-of-band hint is about the QUEUE, so it belongs here, once, on the queue our
+	// generated presents are submitted to. It is independent of NgxFGReflex (fg_reflex.cpp
+	// initialises NVAPI itself if Reflex is off), and its status goes into the [fg] line.
+	if (g_cfg.out_of_band_queue != 0 && queue != nullptr)
+		reflex::notify_out_of_band_queue(queue, static_cast<reflex::OutOfBandType>(g_cfg.out_of_band_queue));
+	// The flip-queue throttle can only arm on a swapchain that was CREATED waitable, so this is
+	// the first moment it can know: the desc is readable and the object is finished.
+	throttle::arm(sc, device);
 	if (g_cfg.pacing == Pacing::thread)
 		start_worker();
 	STRAY_LOG_WARN("fg: finalised on queue %p; presenter=%s; armed=%d (GetBuffer %s)", static_cast<void *>(queue),
@@ -1098,6 +1136,11 @@ void after_reconfigure(IDXGISwapChain *sc, const char *what, bool drop_replaceme
 	c.epoch.end_reconfigure();
 	if (g_generator != nullptr)
 		g_generator->on_reconfigure();
+	// MSDN: ResizeBuffers "can reset or change all DXGI_SWAP_CHAIN_FLAG flags". We re-assert the
+	// waitable flag in the owner's resize hooks, but the handle itself is a duplicate of a
+	// per-swapchain semaphore, so it is re-taken here rather than assumed to have survived.
+	if (g_cfg.throttle.enabled)
+		throttle::arm(c.sc, c.device);
 	{
 		std::lock_guard<std::mutex> slock(g_smutex);
 		++g_stats.reconfigures;
@@ -1315,6 +1358,7 @@ bool present(const PresentArgs &args, long *hr_out)
 void uninstall()
 {
 	stop_worker();
+	throttle::disarm("fg uninstall");
 	reflex::shutdown();
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_have_chain.load())
@@ -1334,6 +1378,8 @@ Stats stats()
 	s.issued_p50_ms = g_issued_hist.percentile_ms(0.5);
 	s.issued_p99_ms = g_issued_hist.percentile_ms(0.99);
 	s.issued_second_peak_ms = g_issued_hist.second_peak_ms();
+	s.throttle = throttle::state();
+	s.flag_verdict = g_flag_verdict;
 	return s;
 }
 
@@ -1351,7 +1397,7 @@ void log_stats(const char *when)
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
 	const reflex::Status rs = reflex::status();
-	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d)",
+	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d) oob=%d(%d,type %d) | throttle %s(%s) flag=%s latency %d->%d waits=%llu slots=%llu timeouts=%llu failed=%llu skipped=%llu blocked mean %.2f ms max %.2f ms",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),
 		s.game_presents != 0 ? static_cast<double>(s.presents_issued) / static_cast<double>(s.game_presents) : 0.0,
@@ -1364,7 +1410,17 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(s.crop_ok), static_cast<unsigned long long>(s.crop_identical),
 		static_cast<unsigned long long>(s.crop_black), static_cast<unsigned long long>(s.crop_stale), static_cast<unsigned long long>(s.crop_suspect), static_cast<unsigned long long>(s.crop_dark), s.validated ? 1 : 0,
 		rs.dll_found ? 1 : 0, rs.initialised ? 1 : 0, rs.sleep_mode_set ? 1 : 0, rs.set_sleep_mode_status,
-		static_cast<unsigned long long>(rs.sleeps), rs.last_sleep_status, static_cast<unsigned long long>(rs.markers), rs.last_marker_status);
+		static_cast<unsigned long long>(rs.sleeps), rs.last_sleep_status, static_cast<unsigned long long>(rs.markers), rs.last_marker_status,
+		rs.out_of_band_called ? 1 : 0, rs.out_of_band_status, rs.out_of_band_type,
+		s.throttle.armed ? "ARMED" : "inactive", core::fg::throttle_refusal_name(s.throttle.refusal),
+		core::fg::flag_verdict_name(s.flag_verdict),
+		// ~0u means "could not read it": print it as -1 rather than 4294967295.
+		s.throttle.max_latency_before == ~0u ? -1 : static_cast<int>(s.throttle.max_latency_before),
+		s.throttle.max_latency_after == ~0u ? -1 : static_cast<int>(s.throttle.max_latency_after),
+		static_cast<unsigned long long>(s.throttle.waits), static_cast<unsigned long long>(s.throttle.slots),
+		static_cast<unsigned long long>(s.throttle.timeouts), static_cast<unsigned long long>(s.throttle.failures),
+		static_cast<unsigned long long>(s.throttle.skipped),
+		core::fg::throttle_blocked_mean_ms(s.throttle), s.throttle.blocked_max_ns / 1e6);
 }
 
 } // namespace stray_dlss::native::fg

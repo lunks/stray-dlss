@@ -51,6 +51,19 @@ is driven exactly as SR is. Keys, all `[STRAYDLSS]` in `StrayDLSS.ini`:
   off the screen. `NgxFGReflex` 0/1/2. `NgxFGHDR`, `NgxFGCameraNear`/`NgxFGCameraFar`
   (NVIDIA's synthetic `0.01`/`75000` pair, not the engine's own planes), `NgxFGMvecScale`,
   `NgxFGOutputReal`, `NgxFGWarmupFrames` are the DLSS-G feature's knobs (`src/ngx_fg.hpp`).
+* **The flip-queue throttle, all off by default** (`src/core/fg_throttle.hpp`). The pacer chooses
+  WHEN we present; nothing bounded how far the present QUEUE ran ahead, which is what
+  `issued-interval ... BIMODAL (back-to-back presents)` in the `[fg]` line reports.
+  `NgxFGWaitableSwapChain=1` adds `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` to the
+  desc the *game* hands DXGI (the object cannot be added afterwards, and the throttle refuses
+  with `not-waitable` without it); `NgxFGThrottle=1` then waits for a flip slot before each
+  present we issue, `NgxFGMaxLatency` slots deep (2 = one pair), `NgxFGThrottleTimeoutMs` per
+  wait, disarming itself after `NgxFGThrottleGiveUp` consecutive timeouts. The wait happens
+  BEFORE the pacer's deadline, so the two are `max()` and never a sum.
+  `NgxFGOutOfBandQueue=1` makes `NvAPI_D3D12_NotifyOutOfBandCommandQueue` on the present
+  owner's queue — Streamline does, we did not; tidiness, not a fix.
 * Read the `[fg]` log line and the `fg_*` status-file keys: presents issued per game present
   (~2x), refusals by reason, the pacer's estimate, whether the issued-interval histogram is
-  bimodal (= not paced), and the crop gate's verdicts.
+  bimodal (= not paced), the crop gate's verdicts, and the throttle's own section
+  (`throttle ARMED(none) flag=added latency 1->2 waits/slots/timeouts/blocked`) — an inert
+  throttle and a refused one are different lines, deliberately.

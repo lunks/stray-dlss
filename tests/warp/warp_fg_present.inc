@@ -10,6 +10,7 @@
 // D3D12 call the FG path makes runs under the debug layer here.
 
 #include "backend_native/fg_present.hpp"
+#include "backend_native/fg_throttle.hpp"
 #include "backend_native/present_owner.hpp"
 
 #include <dxgi1_4.h>
@@ -489,5 +490,137 @@ bool test_fg_present_twice(Gpu &gpu)
 	::DestroyWindow(hwnd);
 	std::printf("  window destroyed\n");
 	native::set_sink(nullptr);
+	return true;
+}
+
+// ---- the flip-queue throttle against a REAL DXGI swapchain ----
+//
+// Scope, stated so it is not over-read: this exercises the DXGI mechanics our throttle depends
+// on — that the waitable object exists only with the creation flag, that
+// IDXGISwapChain2::SetMaximumFrameLatency takes, that the handle can be waited on, and that our
+// arm/refuse/wait/give-up bookkeeping agrees with what DXGI actually did. It is Windows DXGI,
+// not vkd3d-proton, and it is not the game. Nothing here says the throttle improves pacing.
+//
+// It runs BEFORE test_fg_present_twice deliberately: it wants an unhooked factory, so the
+// swapchains it creates are its own and cannot disturb the present owner's bookkeeping.
+bool test_fg_flip_throttle(Gpu &gpu)
+{
+	std::printf("\n[test] flip-queue throttle: the waitable object, the latency knob, and the named refusal without it\n");
+	namespace fgt = stray_dlss::native::fg::throttle;
+	namespace cfg = stray_dlss::core::fg;
+	ID3D12Device *dev = real_device(gpu);
+
+	HWND hwnd = ::CreateWindowExW(0, L"STATIC", L"stray-dlss throttle harness", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, nullptr, nullptr, nullptr, nullptr);
+	ComPtr<IDXGIFactory2> factory;
+	if (hwnd == nullptr || FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
+	{
+		std::printf("  NOTE: no window or DXGI factory on this runner; the throttle is NOT exercised here\n");
+		return true;
+	}
+
+	DXGI_SWAP_CHAIN_DESC1 sd = {};
+	sd.Width = 320;
+	sd.Height = 240;
+	sd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+	sd.SampleDesc.Count = 1;
+	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sd.BufferCount = 3;
+	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	sd.Scaling = DXGI_SCALING_STRETCH;
+	sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+	cfg::ThrottleConfig tc;
+	tc.enabled = true;
+	tc.max_latency = 2;
+	tc.timeout_ms = 50;
+	tc.give_up_after = 8;
+	fgt::configure(tc);
+
+	// 1. WITHOUT the creation flag: the refusal must be named `not-waitable`, and no wait may
+	//    ever be made. This is the "armed and inert" versus "refused" distinction, which is the
+	//    whole reason the counters exist.
+	{
+		ComPtr<IDXGISwapChain1> plain;
+		if (FAILED(factory->CreateSwapChainForHwnd(gpu.queue.Get(), hwnd, &sd, nullptr, nullptr, &plain)))
+		{
+			std::printf("  NOTE: CreateSwapChainForHwnd failed on this runner; the throttle is NOT exercised here\n");
+			::DestroyWindow(hwnd);
+			return true;
+		}
+		fgt::arm(plain.Get(), dev);
+		const cfg::ThrottleState st = fgt::state();
+		check(!st.armed, "a non-waitable swapchain does NOT arm the throttle");
+		check(st.refusal == cfg::ThrottleRefusal::not_waitable, "and the refusal is named `not-waitable`, not a silent no-op");
+		fgt::wait_for_slot(false);
+		check(fgt::state().waits == 0, "a refused throttle makes no wait at all (it cannot double-delay a present)");
+		fgt::disarm("throttle harness, plain swapchain");
+	}
+
+	// 2. WITH the flag: it must arm, take the latency we ask for, and hand back a handle.
+	sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	ComPtr<IDXGISwapChain1> sc1;
+	const HRESULT hr = factory->CreateSwapChainForHwnd(gpu.queue.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
+	if (FAILED(hr))
+	{
+		std::printf("  NOTE: a FRAME_LATENCY_WAITABLE_OBJECT swapchain could not be created here (0x%08lx); the armed path is NOT exercised\n",
+			static_cast<unsigned long>(hr));
+		::DestroyWindow(hwnd);
+		return true;
+	}
+	fgt::arm(sc1.Get(), dev);
+	{
+		const cfg::ThrottleState st = fgt::state();
+		check(st.armed, "a waitable swapchain ARMS the throttle");
+		check(st.refusal == cfg::ThrottleRefusal::none, "with no standing refusal");
+		check(st.max_latency_after == 2u, "IDXGISwapChain2::SetMaximumFrameLatency(2) took, and reads back as 2");
+		std::printf("  armed: latency %u -> %u (asked %u)\n", st.max_latency_before, st.max_latency_after, st.max_latency_requested);
+	}
+
+	// 3. The initial slots are free, so the first wait must return one WITHOUT blocking for the
+	//    timeout: a throttle that always paid 50 ms would be a frame-pacing disaster and this is
+	//    the cheapest place to catch it.
+	fgt::wait_for_slot(false);
+	{
+		const cfg::ThrottleState st = fgt::state();
+		check(st.waits == 1, "one wait was made");
+		check(st.slots == 1, "and it acquired a flip slot immediately");
+		check(st.blocked_max_ns < 40'000'000ull, "without going anywhere near the 50 ms timeout");
+	}
+
+	// 4. The abandon path: a drain or a teardown must skip the wait rather than pay the timeout.
+	fgt::wait_for_slot(true);
+	{
+		const cfg::ThrottleState st = fgt::state();
+		check(st.skipped == 1, "a hurried present SKIPS the wait");
+		check(st.waits == 1, "and is not counted as a wait");
+	}
+
+	// 5. Exhaust the slots without presenting. Whether this times out depends on the runner's
+	//    compositor, so the assertion is the one that always holds and is what actually matters:
+	//    the counters account for every wait, and a throttle that stops getting slots disarms
+	//    itself instead of blocking every present forever.
+	tc.timeout_ms = 5;
+	tc.give_up_after = 2;
+	fgt::configure(tc);
+	fgt::arm(sc1.Get(), dev);
+	for (int i = 0; i < 8; ++i)
+		fgt::wait_for_slot(false);
+	{
+		const cfg::ThrottleState st = fgt::state();
+		check(st.waits == st.slots + st.timeouts + st.failures, "every wait is accounted for as a slot, a timeout or a failure");
+		check(st.armed || st.refusal == cfg::ThrottleRefusal::gave_up,
+			"the throttle is either still getting slots or has GIVEN UP - it never keeps blocking on a queue that stopped draining");
+		std::printf("  after 8 waits at a 5 ms timeout: %s\n", fgt::report());
+	}
+
+	fgt::disarm("throttle harness done");
+	check(!fgt::state().armed, "disarm releases the handle and stops waiting");
+	tc = cfg::ThrottleConfig{};
+	fgt::configure(tc); // back to the shipped default (off) for the rest of the harness
+	check(fgt::state().refusal == cfg::ThrottleRefusal::disabled, "configure(off) reports `disabled`, the shipped state");
+
+	sc1.Reset();
+	factory.Reset();
+	::DestroyWindow(hwnd);
 	return true;
 }

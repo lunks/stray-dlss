@@ -22,6 +22,7 @@
 #pragma once
 
 #include "core/fg_plan.hpp"
+#include "core/fg_throttle.hpp"
 
 #include <cstdint>
 
@@ -57,6 +58,17 @@ struct Config
 	int validate = 1;          // [STRAYDLSS] NgxFGValidate: gate ngx-mode output on the crop readback (0 = present unvalidated, logged loudly)
 	int reflex = 1;            // [STRAYDLSS] NgxFGReflex: 0 off, 1 low-latency mode + Sleep per game present + markers (fg_reflex.hpp), 2 = 1 plus boost
 	int trace = 0;             // [STRAYDLSS] NgxFGTrace: N > 0 dumps a per-present timestamp trace of N consecutive presents once the first generated frame went out (pacing diagnosis)
+	// The flip-queue throttle (fg_throttle.hpp). Bounds how far the PRESENT QUEUE runs ahead;
+	// the pacer only decides WHEN we issue. Off by default: the shipped pacing behaviour is
+	// byte-identical until NgxFGThrottle is set.
+	core::fg::ThrottleConfig throttle;
+	// [STRAYDLSS] NgxFGWaitableSwapChain: OR DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+	// into the desc the GAME hands DXGI, because the throttle's waitable object cannot be added
+	// after creation. Changes the swapchain the game is handed, so it is its own opt-in.
+	bool waitable_swapchain = false;
+	// [STRAYDLSS] NgxFGOutOfBandQueue: 0 off, 1 NvAPI OUT_OF_BAND_PRESENT (the matching type),
+	// 3 OUT_OF_BAND_RENDER_PRESENT. Tidiness with a plausible benefit, never a fix (fg_reflex.hpp).
+	int out_of_band_queue = 0;
 };
 
 // The stage-2 producer of generated frames. Records onto `list` (executes on the presenting
@@ -82,6 +94,15 @@ bool enabled();
 void set_generator(Generator *g); // null = the built-in experiment generator
 
 // ---- from the present owner's hooks ----
+
+// From the present owner's swapchain CREATION hooks: what core::fg::plan_creation_flags decided
+// about DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT for this swapchain. Recorded so the
+// [fg] line can say whether the flag we asked for was actually asked FOR, separately from
+// whether the throttle then found it on the created swapchain.
+void note_creation_flags(core::fg::FlagVerdict verdict);
+// Whether we (not the game) added the waitable flag - the resize hooks must re-assert exactly
+// what we added and nothing else.
+bool added_waitable_flag();
 
 // A swapchain was recorded (creation hook): patches GetBuffer / SetFullscreenState /
 // ResizeTarget / SetColorSpace1 on its vtable when FG is enabled. Safe mid-creation (only the
@@ -137,6 +158,10 @@ struct Stats
 	std::uint64_t worker_waits = 0;      // game-thread waits on a busy worker
 	std::uint64_t crop_black = 0, crop_stale = 0, crop_ok = 0, crop_identical = 0, crop_suspect = 0, crop_dark = 0;
 	bool validated = false;
+	core::fg::ThrottleState throttle;    // the flip-queue throttle: armed / refused / what it cost
+	// What we did to the game's creation desc, and what the throttle then found. These are two
+	// different facts and a mismatch between them is diagnostic on its own.
+	core::fg::FlagVerdict flag_verdict = core::fg::FlagVerdict::disabled;
 };
 Stats stats();
 const char *report();

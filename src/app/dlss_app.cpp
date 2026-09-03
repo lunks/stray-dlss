@@ -1115,6 +1115,16 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				std::fprintf(f, "fg_validated=%d\n", fs.validated ? 1 : 0);
 				std::fprintf(f, "fg_crop_black=%llu\n", (unsigned long long)fs.crop_black);
 				std::fprintf(f, "fg_crop_stale=%llu\n", (unsigned long long)fs.crop_stale);
+				// The flip-queue throttle: armed, refused and inert are three different states
+				// and the status file has to tell them apart without the log.
+				std::fprintf(f, "fg_throttle_armed=%d\n", fs.throttle.armed ? 1 : 0);
+				std::fprintf(f, "fg_throttle_refusal=%s\n", core::fg::throttle_refusal_name(fs.throttle.refusal));
+				std::fprintf(f, "fg_throttle_flag=%s\n", core::fg::flag_verdict_name(fs.flag_verdict));
+				std::fprintf(f, "fg_throttle_latency=%d\n", fs.throttle.max_latency_after == ~0u ? -1 : (int)fs.throttle.max_latency_after);
+				std::fprintf(f, "fg_throttle_waits=%llu\n", (unsigned long long)fs.throttle.waits);
+				std::fprintf(f, "fg_throttle_slots=%llu\n", (unsigned long long)fs.throttle.slots);
+				std::fprintf(f, "fg_throttle_timeouts=%llu\n", (unsigned long long)fs.throttle.timeouts);
+				std::fprintf(f, "fg_throttle_blocked_mean_ms=%.3f\n", core::fg::throttle_blocked_mean_ms(fs.throttle));
 				unsigned long long refused = 0;
 				for (int i = 1; i < static_cast<int>(core::fg::Refusal::count); ++i)
 					refused += fs.refused[i];

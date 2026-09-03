@@ -89,6 +89,8 @@ add_library(stray_dlss_core STATIC
     src/core/present_plan.hpp
     src/core/fg_plan.cpp
     src/core/fg_plan.hpp
+    src/core/fg_throttle.cpp
+    src/core/fg_throttle.hpp
     src/core/ring.hpp
     src/host/ini.cpp
     src/host/ini.hpp
@@ -259,6 +261,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/backend_native/fg_present.hpp
         src/backend_native/fg_reflex.cpp
         src/backend_native/fg_reflex.hpp
+        src/backend_native/fg_throttle.cpp
+        src/backend_native/fg_throttle.hpp
         src/backend_native/vtable_slots.hpp
         # Compile-time proof of the slot numbers against the SDK's C Vtbl structs; links nothing.
         src/backend_native/vtable_slots_check.c)
@@ -399,6 +403,7 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/backend_native/present_owner.cpp
         src/backend_native/fg_present.cpp
         src/backend_native/fg_reflex.cpp
+        src/backend_native/fg_throttle.cpp
         src/backend_native/vram_query_watch.cpp
         src/backend_native/vtable_patch.cpp
         src/app/diff_observer.cpp)
@@ -453,7 +458,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_ini.cpp
         tests/test_intercept_types.cpp
         tests/test_native_core.cpp
-        tests/test_fg_plan.cpp)
+        tests/test_fg_plan.cpp
+        tests/test_fg_throttle.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

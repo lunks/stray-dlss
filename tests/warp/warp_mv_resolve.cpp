@@ -1813,6 +1813,8 @@ int main(int argc, char **argv)
 	test_pso_cached_blob_passthrough(gpu); // after the hooks are installed
 	test_drive_mode_restore_is_complete(gpu);
 	// After drive mode: the frame-generation present path over a real swapchain (needs drive).
+	// The throttle first, while no factory is hooked, so its swapchains are entirely its own.
+	test_fg_flip_throttle(gpu);
 	test_fg_present_twice(gpu);
 	std::printf("[main] after the FG test\n");
 

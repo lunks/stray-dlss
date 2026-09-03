@@ -5,6 +5,7 @@
 #include "host/config.hpp"
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
+#include "core/fg_throttle.hpp"
 #include "core/present_plan.hpp"
 #include "perf.hpp"
 #include "log.hpp"
@@ -234,6 +235,44 @@ struct CreateGuard
 	bool outermost() const { return t_create_depth == 1; }
 };
 
+// [STRAYDLSS] NgxFGWaitableSwapChain. The flip-queue throttle's waitable object exists ONLY if
+// the swapchain was CREATED with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, and Stray
+// creates the swapchain, not us — so the only way to have one is to add the flag to the desc
+// the game hands DXGI. That changes the object the game is handed, which is why it is its own
+// opt-in key and why the verdict is logged once, loudly, with the flags before and after.
+//
+// What the flag does and does NOT change, read from the two implementations that will run:
+//   * MSDN: it "isn't supported in full-screen mode, unless the render API is Direct3D 12" —
+//     we are D3D12, so SetFullscreenState stays legal. The latency must then be set through
+//     IDXGISwapChain2 rather than IDXGIDevice1 (which D3D12 has no route to anyway).
+//   * vkd3d-proton (libs/vkd3d/swapchain.c): the flag makes it create a counting semaphore with
+//     initial count 1 and hand out a SYNCHRONIZE-only duplicate. NOTHING in Present consults it
+//     — an app that never waits just lets the count grow, and vkd3d logs a TRACE. So the flag on
+//     its own does not change presentation; only OUR waiting does. That is what bounds the risk.
+// The decision itself is core::fg::plan_creation_flags, tested on the Linux lane.
+bool g_flags_logged = false;
+
+template <typename Desc>
+core::fg::FlagVerdict apply_waitable_flag(Desc &desc, const char *how)
+{
+	unsigned out = desc.Flags;
+	const core::fg::FlagVerdict v = core::fg::plan_creation_flags(
+		fg::enabled() && fg::config().waitable_swapchain,
+		static_cast<unsigned>(desc.SwapEffect), desc.Flags, &out);
+	const unsigned before = desc.Flags;
+	desc.Flags = out;
+	if (v != core::fg::FlagVerdict::disabled && !g_flags_logged)
+	{
+		g_flags_logged = true;
+		STRAY_LOG_WARN("present owner: %s swapchain flags 0x%08x -> 0x%08x (%s), swap effect %d. "
+			"FRAME_LATENCY_WAITABLE_OBJECT is what [STRAYDLSS] NgxFGThrottle needs; on its own it changes no presentation behaviour "
+			"(vkd3d-proton only creates the latency semaphore), and it is re-asserted on every ResizeBuffers.",
+			how, before, out, core::fg::flag_verdict_name(v), static_cast<int>(desc.SwapEffect));
+	}
+	fg::note_creation_flags(v);
+	return v;
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory *self, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **out)
 {
 	auto orig = reinterpret_cast<PFN_CreateSwapChain>(original_for(self, slot::kFactory_CreateSwapChain));
@@ -243,6 +282,15 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory *self, IUnknown *devic
 		return E_FAIL;
 	}
 	CreateGuard guard;
+	// The game's own struct is never written: a copy carries our flag, so a caller that reads
+	// its desc back sees exactly what it asked for.
+	DXGI_SWAP_CHAIN_DESC patched = {};
+	if (desc != nullptr && guard.outermost() && !in_own_code())
+	{
+		patched = *desc;
+		apply_waitable_flag(patched, "CreateSwapChain");
+		desc = &patched;
+	}
 	const HRESULT hr = orig(self, device, desc, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
 		note_swapchain_lazy(*out, device, "CreateSwapChain");
@@ -258,6 +306,13 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForHwnd(IDXGIFactory2 *self, IUnknow
 		return E_FAIL;
 	}
 	CreateGuard guard;
+	DXGI_SWAP_CHAIN_DESC1 patched = {};
+	if (desc != nullptr && guard.outermost() && !in_own_code())
+	{
+		patched = *desc;
+		apply_waitable_flag(patched, "CreateSwapChainForHwnd");
+		desc = &patched;
+	}
 	const HRESULT hr = orig(self, device, hwnd, desc, fs, restrict_to, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
 		note_swapchain_lazy(*out, device, "CreateSwapChainForHwnd");
@@ -273,6 +328,13 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForCoreWindow(IDXGIFactory2 *self, I
 		return E_FAIL;
 	}
 	CreateGuard guard;
+	DXGI_SWAP_CHAIN_DESC1 patched = {};
+	if (desc != nullptr && guard.outermost() && !in_own_code())
+	{
+		patched = *desc;
+		apply_waitable_flag(patched, "CreateSwapChainForCoreWindow");
+		desc = &patched;
+	}
 	const HRESULT hr = orig(self, device, window, desc, restrict_to, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
 		note_swapchain_lazy(*out, device, "CreateSwapChainForCoreWindow");
@@ -288,6 +350,13 @@ HRESULT STDMETHODCALLTYPE hk_CreateSwapChainForComposition(IDXGIFactory2 *self, 
 		return E_FAIL;
 	}
 	CreateGuard guard;
+	DXGI_SWAP_CHAIN_DESC1 patched = {};
+	if (desc != nullptr && guard.outermost() && !in_own_code())
+	{
+		patched = *desc;
+		apply_waitable_flag(patched, "CreateSwapChainForComposition");
+		desc = &patched;
+	}
 	const HRESULT hr = orig(self, device, desc, restrict_to, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && guard.outermost() && !in_own_code())
 		note_swapchain_lazy(*out, device, "CreateSwapChainForComposition");
@@ -479,7 +548,8 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UIN
 		report_back_buffers(self, false);
 		fg::before_reconfigure(self, "ResizeBuffers");
 	}
-	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags) : E_FAIL;
+	const UINT use_flags = game_call ? core::fg::resize_flags(fg::added_waitable_flag(), flags) : flags;
+	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, use_flags) : E_FAIL;
 	if (game_call)
 		fg::after_reconfigure(self, "ResizeBuffers", /*drop_replacements=*/true, count, hr);
 	if (game_call)
@@ -488,7 +558,8 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UIN
 			std::lock_guard<std::mutex> lock(g_mutex);
 			++g_stats.resizes;
 		}
-		STRAY_LOG_INFO("present owner: ResizeBuffers(%u, %ux%u, fmt %d) hr=0x%08lx", count, w, h, static_cast<int>(fmt), static_cast<unsigned long>(hr));
+		STRAY_LOG_INFO("present owner: ResizeBuffers(%u, %ux%u, fmt %d, flags 0x%08x%s) hr=0x%08lx", count, w, h, static_cast<int>(fmt),
+			use_flags, use_flags != flags ? " - FRAME_LATENCY_WAITABLE_OBJECT re-asserted" : "", static_cast<unsigned long>(hr));
 		if (SUCCEEDED(hr))
 			report_back_buffers(self, true);
 	}
@@ -505,7 +576,8 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, U
 		report_back_buffers(self, false);
 		fg::before_reconfigure(self, "ResizeBuffers1");
 	}
-	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, flags, node_masks, queues) : E_FAIL;
+	const UINT use_flags = game_call ? core::fg::resize_flags(fg::added_waitable_flag(), flags) : flags;
+	const HRESULT hr = orig != nullptr ? orig(self, count, w, h, fmt, use_flags, node_masks, queues) : E_FAIL;
 	if (game_call)
 		fg::after_reconfigure(self, "ResizeBuffers1", /*drop_replacements=*/true, count, hr);
 	if (game_call)
@@ -514,7 +586,8 @@ HRESULT STDMETHODCALLTYPE hk_ResizeBuffers1(IDXGISwapChain3 *self, UINT count, U
 			std::lock_guard<std::mutex> lock(g_mutex);
 			++g_stats.resizes;
 		}
-		STRAY_LOG_INFO("present owner: ResizeBuffers1(%u, %ux%u, fmt %d) hr=0x%08lx", count, w, h, static_cast<int>(fmt), static_cast<unsigned long>(hr));
+		STRAY_LOG_INFO("present owner: ResizeBuffers1(%u, %ux%u, fmt %d, flags 0x%08x%s) hr=0x%08lx", count, w, h, static_cast<int>(fmt),
+			use_flags, use_flags != flags ? " - FRAME_LATENCY_WAITABLE_OBJECT re-asserted" : "", static_cast<unsigned long>(hr));
 		if (SUCCEEDED(hr))
 			report_back_buffers(self, true);
 	}
@@ -575,6 +648,22 @@ bool install(::ID3D12Device *device)
 		fc.validate = host::cfg::get_int("NgxFGValidate", 1);
 		fc.reflex = host::cfg::get_int("NgxFGReflex", 1);
 		fc.trace = host::cfg::get_int("NgxFGTrace", 0);
+		// The flip-queue throttle (core/fg_throttle.hpp). Every one of these defaults to the
+		// behaviour we shipped before it existed: the throttle off, the creation flag not added,
+		// the out-of-band queue hint not made. An A/B is an ini edit, never a rebuild.
+		const bool want_throttle = host::cfg::get_bool("NgxFGThrottle", false);
+		const bool want_waitable = host::cfg::get_bool("NgxFGWaitableSwapChain", false);
+		const int want_oob = host::cfg::get_int("NgxFGOutOfBandQueue", 0);
+		if ((want_throttle || want_waitable || want_oob != 0) && !fc.enabled)
+			STRAY_LOG_WARN("present owner: NgxFGThrottle=%d NgxFGWaitableSwapChain=%d NgxFGOutOfBandQueue=%d are set but NgxFG=0. "
+				"All three live on the frame-generation present path and do NOTHING without it - they are not being applied.",
+				want_throttle ? 1 : 0, want_waitable ? 1 : 0, want_oob);
+		fc.throttle.enabled = want_throttle && fc.enabled;
+		fc.throttle.max_latency = static_cast<unsigned>(host::cfg::get_int("NgxFGMaxLatency", 0) < 0 ? 0 : host::cfg::get_int("NgxFGMaxLatency", 0));
+		fc.throttle.timeout_ms = static_cast<unsigned>(host::cfg::get_int("NgxFGThrottleTimeoutMs", 50) < 1 ? 1 : host::cfg::get_int("NgxFGThrottleTimeoutMs", 50));
+		fc.throttle.give_up_after = static_cast<unsigned>(host::cfg::get_int("NgxFGThrottleGiveUp", 8) < 0 ? 0 : host::cfg::get_int("NgxFGThrottleGiveUp", 8));
+		fc.waitable_swapchain = want_waitable && fc.enabled;
+		fc.out_of_band_queue = fc.enabled ? want_oob : 0;
 		fg::configure(fc);
 	}
 

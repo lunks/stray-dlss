@@ -8,7 +8,8 @@
 // Function ids and struct layouts are NVIDIA's public NVAPI headers (github.com/NVIDIA/nvapi,
 // nvapi_interface.h / nvapi.h, fetched 2026-09-02): NvAPI_Initialize 0x0150e828,
 // NvAPI_D3D_SetSleepMode 0xac1ca9e0, NvAPI_D3D_Sleep 0x852cd1d2, NvAPI_D3D_GetSleepStatus
-// 0xaef96ca1, NvAPI_D3D_SetLatencyMarker 0xd9984c05, NvAPI_D3D12_SetAsyncFrameMarker 0x13c98f73.
+// 0xaef96ca1, NvAPI_D3D_SetLatencyMarker 0xd9984c05, NvAPI_D3D12_SetAsyncFrameMarker 0x13c98f73,
+// NvAPI_D3D12_NotifyOutOfBandCommandQueue 0x03d6e8cb.
 // HARD for the header; whether DXVK-NVAPI answers each is what the log measures.
 #pragma once
 
@@ -45,6 +46,35 @@ void sleep();
 void marker(Marker m, std::uint64_t frame_id);
 // The async (present-thread) marker on the presenting queue. Inert when unavailable.
 void async_marker(ID3D12CommandQueue *queue, Marker m, std::uint64_t frame_id, std::uint64_t present_frame_id);
+
+// NV_OUT_OF_BAND_CQ_TYPE (nvapi.h, fetched 2026-09-03): the values are NOT in the order the
+// names suggest, so they are spelled out rather than guessed.
+enum class OutOfBandType : int
+{
+	render = 0,
+	present = 1,        // the one that matches our generated-frame presents
+	ignore = 2,
+	render_present = 3,
+	explicit_copy = 4,
+};
+
+// NvAPI_D3D12_NotifyOutOfBandCommandQueue: tells the driver this queue carries work OUTSIDE
+// the application's frame cadence, which is exactly what our present owner's queue does when
+// it issues a generated frame. Streamline's sl.dlss_g makes this call and we did not; the
+// migration audit (docs/RESEARCH-STREAMLINE-INTERNALS.md, recommendation 1) calls it the ONLY
+// concrete capability Streamline has that we lack.
+//
+// HARD that Streamline makes the call, that NVIDIA's header declares it, and that DXVK-NVAPI
+// implements it for real (src/nvapi_d3d12.cpp:1088, forwarding to vkd3d-proton's
+// ID3D12DeviceExt-style vendor interface rather than stubbing).
+// UNCONFIRMED that omitting it has ANY consequence: no source read on either audit states one,
+// and nothing we have measured changes when it is absent. It is adopted as tidiness with a
+// plausible latency-accounting benefit, never as a fix for an observed symptom.
+//
+// Returns the NvAPI status (0 = ok); logs the first result and every distinct one after that.
+// Inert (and says so once) when this nvapi64.dll does not export the entry point.
+int notify_out_of_band_queue(ID3D12CommandQueue *queue, OutOfBandType type);
+
 void shutdown();
 
 struct Status
@@ -57,6 +87,10 @@ struct Status
 	bool have_sleep = false, have_marker = false, have_async_marker = false;
 	int last_sleep_status = 0, last_marker_status = 0, last_async_marker_status = 0;
 	std::uint64_t sleeps = 0, markers = 0, async_markers = 0;
+	bool have_out_of_band = false;   // the entry point resolved
+	bool out_of_band_called = false; // we made the call at least once
+	int out_of_band_status = 0;      // its last NvAPI status
+	int out_of_band_type = -1;       // the NV_OUT_OF_BAND_CQ_TYPE we sent, -1 = never called
 };
 Status status();
 
