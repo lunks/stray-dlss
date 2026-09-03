@@ -251,6 +251,11 @@ bool g_restore_heaps = true;
 bool g_restore_state = true;
 // [STRAYDLSS] MvDispatch, default on. Off records our state changes but skips the GPU work.
 int g_mv_dispatch_mode = 2;
+// [STRAYDLSS] StageFile, default ON: a tiny file rewritten on every dispatch attempt (see
+// mark() below). Turn this off when chasing a periodic hitch — it is a per-dispatch (so
+// roughly per-frame) file write and a plausible suspect, even though a single small write is
+// individually cheap.
+bool g_stage_file_enabled = true;
 
 // A crash-survivable breadcrumb. The Phase B path dies with an access violation after
 // surviving many frames, so the trigger is something that CHANGES rather than the first call.
@@ -258,6 +263,8 @@ int g_mv_dispatch_mode = 2;
 // after the crash, instead of costing another guess-and-run cycle.
 void mark(int stage, const char *what)
 {
+	if (!g_stage_file_enabled)
+		return;
 	std::FILE *f = nullptr;
 	if (fopen_s(&f, "stray-dlss-stage.txt", "w") == 0 && f != nullptr)
 	{
@@ -966,6 +973,7 @@ bool owns_temporal_history(std::uint64_t hash)
 const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
+void set_stage_file(bool enabled) { g_stage_file_enabled = enabled; }
 void set_ngx_rr(int mode) { g_ngx_rr_mode.store(mode, std::memory_order_relaxed); }
 void set_gbuffer_resolve_at(bool at_ssd)
 {

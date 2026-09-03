@@ -23,6 +23,19 @@
 -- Every engine query is wrapped in pcall and degrades to 0/"?" rather than throwing, because
 -- this file must never be the thing that takes the game down.
 
+------------------------------------------------------------------ configuration
+-- Two independent periodic writers below, each with its own switch. Both default ON
+-- (identical behaviour to before these switches existed). Turn one off when chasing a
+-- periodic hitch, to rule its write in or out without losing the other, or the mod's
+-- existing stray-probe-quiet flag file (see quiet(), below), which suppresses the engine
+-- queries but keeps the heartbeat's own liveness write going.
+local HEARTBEAT_ENABLED     = true   -- STATE (stray-game-state.txt), once a second
+local HEARTBEAT_INTERVAL_MS = 1000
+local BENCH_ENABLED         = true   -- FRAME (stray-frame.txt), 4x/s while stray-probe-bench
+                                      -- exists (benchFlag(), below) - this switch skips even
+                                      -- scheduling the poll, not just the write inside it
+local BENCH_INTERVAL_MS     = 250
+
 local UEHelpers = require("UEHelpers")
 
 local STATE = "stray-game-state.txt"
@@ -157,11 +170,15 @@ local function flush()
     end
 end
 
-LoopAsync(1000, function()
-    pcall(flush)                                                    -- async thread: file I/O
-    pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
-    return false   -- keep looping
-end)
+if HEARTBEAT_ENABLED then
+    LoopAsync(HEARTBEAT_INTERVAL_MS, function()
+        pcall(flush)                                                    -- async thread: file I/O
+        pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
+        return false   -- keep looping
+    end)
+else
+    print("[StrayProbe] HEARTBEAT_ENABLED=false: not writing " .. STATE .. "\n")
+end
 
 -- BENCH COUNTER, host-independent. While stray-probe-bench exists (stray-traverse.sh
 -- drops it for its window), write stray-frame.txt four times a second with the engine's
@@ -190,12 +207,16 @@ end
 local function flushFrame()     -- async thread: the write, atomic (see atomicWrite)
     atomicWrite(FRAME, string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time()))
 end
-LoopAsync(250, function()
-    if benchFlag() then
-        pcall(flushFrame)
-        pcall(function() ExecuteInGameThread(function() pcall(collectFrame) end) end)
-    end
-    return false
-end)
+if BENCH_ENABLED then
+    LoopAsync(BENCH_INTERVAL_MS, function()
+        if benchFlag() then
+            pcall(flushFrame)
+            pcall(function() ExecuteInGameThread(function() pcall(collectFrame) end) end)
+        end
+        return false
+    end)
+else
+    print("[StrayProbe] BENCH_ENABLED=false: not writing " .. FRAME .. "\n")
+end
 
 print("[StrayProbe] loaded; writing " .. STATE .. " every second\n")
