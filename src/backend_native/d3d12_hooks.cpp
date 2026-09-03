@@ -25,6 +25,38 @@
 using Microsoft::WRL::ComPtr;
 
 namespace stray_dlss::native::hooks {
+
+// Stream-walk result types and the forward-record live at namespace scope (not the anonymous
+// namespace) so the create hooks (anon) and walk_stream's later definition share one
+// declaration. walk_stream's BODY needs ID3D12Device2 stream types; its signature does not, so
+// the forward declaration is unguarded (unused and harmless where Device2 is absent).
+struct StreamContents
+{
+	const void *cs = nullptr;
+	std::size_t cs_len = 0;
+	const void *cached_blob = nullptr;
+	std::size_t cached_size = 0;
+	const char *why = nullptr;
+};
+
+// The last stream-create forward: the desc/stream pointer we handed the original and the
+// CachedPSO blob we OBSERVED there. The WARP test asserts these equal what the caller passed -
+// proof the hook neither copies the desc nor drops the blob, so it is NOT what defeats vkd3d's
+// pipeline cache (facts §32.12).
+struct CreateForwardRecord
+{
+	std::atomic<const void *> desc{ nullptr };
+	std::atomic<const void *> stream{ nullptr };
+	std::atomic<std::size_t> stream_size{ 0 };
+	std::atomic<const void *> cached_blob{ nullptr };
+	std::atomic<std::size_t> cached_size{ 0 };
+	std::atomic<bool> cs_found{ false };
+	std::atomic<std::uint64_t> stream_creates{ 0 };
+	std::atomic<std::uint64_t> graphics_creates{ 0 };
+};
+CreateForwardRecord g_forward;
+StreamContents walk_stream(const void *stream, std::size_t size);
+
 namespace {
 
 // ---- what the hooks collect ----
@@ -801,32 +833,6 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 }
 
 } // namespace
-
-struct StreamContents
-{
-	const void *cs = nullptr;
-	std::size_t cs_len = 0;
-	const void *cached_blob = nullptr;
-	std::size_t cached_size = 0;
-	const char *why = nullptr;
-};
-
-// The last stream-create forward: the desc/stream pointer we handed the original and the
-// CachedPSO blob we OBSERVED there. The WARP test asserts these equal what the caller passed -
-// proof the hook neither copies the desc nor drops the blob, so it is NOT what defeats vkd3d's
-// pipeline cache (facts §32.12).
-struct CreateForwardRecord
-{
-	std::atomic<const void *> desc{ nullptr };
-	std::atomic<const void *> stream{ nullptr };
-	std::atomic<std::size_t> stream_size{ 0 };
-	std::atomic<const void *> cached_blob{ nullptr };
-	std::atomic<std::size_t> cached_size{ 0 };
-	std::atomic<bool> cs_found{ false };
-	std::atomic<std::uint64_t> stream_creates{ 0 };
-	std::atomic<std::uint64_t> graphics_creates{ 0 };
-};
-CreateForwardRecord g_forward;
 
 // ---- the pipeline-state stream walk ----
 //
