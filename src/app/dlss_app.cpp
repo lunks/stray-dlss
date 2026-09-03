@@ -15,8 +15,6 @@
 #include "core/exposure_plan.hpp"
 #include "ext_unhook.hpp"
 #include "exposure_texture.hpp"
-#include "gbuffer_finder.hpp"
-#include "gbuffer_resolve.hpp"
 #include "host/config.hpp"
 #include "input_dump.hpp"
 #include "intercept/backend.hpp"
@@ -429,45 +427,26 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	}
 	native::shadow::set_mode(sm);
 
-	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = probe DLSSD existence on this
-	// stack (one CreateFeature attempt, released; SR keeps running), 2 = full RR-first
-	// evaluate with per-frame SR fallback. Both non-zero modes still require EnableNGX=1
-	// and NgxEvaluate=1 — the probe rides the SR feature-creation path and mode 2 rides
-	// the SR evaluate site.
-	int ngx_rr = 0;
-	ngx_rr = host::cfg::get_int("NgxRR", ngx_rr);
-	ngx::set_rr_mode(ngx_rr);
-	taa_hook::set_ngx_rr(ngx_rr);
-	if (ngx_rr == 1)
-		STRAY_LOG_WARN("NgxRR=1 (PROBE): one DLSSD create attempt will run at the first SR "
-			"feature creation and log every result code by name. Needs EnableNGX=1 and "
-			"NgxEvaluate=1; nvngx_dlssd.dll must be staged next to the game executable.");
-	else if (ngx_rr == 2)
-		STRAY_LOG_WARN("NgxRR=2 (FULL): Ray Reconstruction replaces the SR evaluate when "
-			"the G-buffer identification is stable; SR is the per-frame fallback. Grep for "
-			"'DLSS RR' and 'RR:' lines.");
-	else if (ngx_rr == 3)
-		STRAY_LOG_WARN("NgxRR=3 (RR-1): Ray Reconstruction PLUS suppression of the SSD "
-			"temporal-accumulation family, so RR denoises the raw screen-space signal. "
-			"Suppression ARMS only after RR runs reliably (~30 frames) and disarms on any SR "
-			"fallback; warm-up runs as RR-0. Grep for 'RR-1' lines. EXPERIMENTAL.");
-
-	// [STRAYDLSS] GBufferResolveAt: "ssd" (default) records the guide resolve at the first
-	// SSD temporal-accumulation dispatch each frame — the content-alive point (measured:
-	// at the TAA hook the G-buffer objects are alive but their CONTENT is recycled);
-	// "taa" keeps the old in-hook record for A/B measurement.
-	char resolve_at[16] = "ssd";
-	host::cfg::get_string("GBufferResolveAt", resolve_at, sizeof(resolve_at));
-	const bool resolve_at_ssd = std::strcmp(resolve_at, "taa") != 0;
-	taa_hook::set_gbuffer_resolve_at(resolve_at_ssd);
-	if (ngx_rr == 2)
-		STRAY_LOG_INFO("RR guide resolve records at the %s trigger ([STRAYDLSS] "
-			"GBufferResolveAt=%s).",
-			resolve_at_ssd ? "SSD-dispatch (content-alive)" : "TAA-hook (A/B mode)",
-			resolve_at_ssd ? "ssd" : "taa");
-	else if (ngx_rr == 3)
-		STRAY_LOG_INFO("RR-1 guide resolve records at the SSD-dispatch trigger, hoisted "
-			"ABOVE suppression (content alive; GBufferResolveAt is forced to ssd for RR-1).");
+	// [STRAYDLSS] NgxRR. RAY RECONSTRUCTION IS NOT WIRED UNDER THIS HOST, and this refuses
+	// LOUDLY rather than doing nothing. Its guide source was the heuristic G-buffer finder —
+	// GBufferA-E identified by descriptor SHAPE — which was deleted 2026-09-03 along with the
+	// resolve pass that fed it (docs/RESEARCH-ENGINE-TAA-HOOK.md §13). That was the same class
+	// of guessing the engine seam replaced for the TAA pass, and nothing on the SR, NR or FG
+	// path referenced it.
+	//
+	// THE NGX SIDE IS INTACT AND UNTOUCHED: ngx::ensure_feature_rr / evaluate_rr /
+	// release_feature_rr all take raw ID3D12Resource*, so what RR needs to come back is a GUIDE
+	// SOURCE — and the intended one is the engine's own named RDG G-buffer textures, reachable
+	// from the `const FViewInfo&` that ITemporalUpscaler::AddPasses already hands us. Identity
+	// from the engine, exactly as L1 does for depth and velocity.
+	const int ngx_rr = host::cfg::get_int("NgxRR", 0);
+	if (ngx_rr != 0)
+		STRAY_LOG_ERROR("[STRAYDLSS] NgxRR=%d IS REFUSED: DLSS Ray Reconstruction has no guide "
+			"source under this host. The heuristic G-buffer finder and its resolve pass were "
+			"deleted on 2026-09-03; the NGX side (ensure_feature_rr / evaluate_rr) is intact and "
+			"waiting for guides taken from the engine's own named G-buffer textures via the "
+			"FViewInfo that AddPasses hands us. DLSS SR runs this session, unaffected. Set NgxRR=0 "
+			"to make that the deliberate configuration and silence this line.", ngx_rr);
 
 	// [STRAYDLSS] NgxExposure = auto (default) | texture | owned.
 	//
@@ -652,22 +631,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			nr::preload();
 	}
 
-	// [STRAYDLSS] GBufferResolveOnly: record + dump guides at the SSD trigger, but skip
-	// the RR evaluate (SR carries frames) — the record-vs-evaluate fault isolator.
-	bool resolve_only = false;
-	resolve_only = host::cfg::get_bool("GBufferResolveOnly", resolve_only);
-	taa_hook::set_gbuffer_resolve_only(resolve_only);
-	if (resolve_only && ngx_rr == 2)
-		STRAY_LOG_WARN("GBufferResolveOnly=1: RR evaluate disabled; guide records (and "
-			"dumps) still run at the SSD trigger. SR carries every frame.");
-
-	// [STRAYDLSS] GBufferSwapBC: the B/C content-check flip (gbuffer_resolve.hpp). The B/C
-	// slot order is unverified by content until the guide dump says otherwise; this flips
-	// which identified resource feeds which role, no rebuild.
-	bool swap_bc = false;
-	swap_bc = host::cfg::get_bool("GBufferSwapBC", swap_bc);
-	if (swap_bc || ngx_rr == 2)
-		gbr::set_bc_swapped(swap_bc); // logs its state; skipped when RR is off and unswapped
 
 	int ngx_dry_run = 0;
 	ngx_dry_run = host::cfg::get_int("NgxDryRun", ngx_dry_run);
@@ -906,7 +869,6 @@ void DlssApp::on_command_list_reset(const icept::CommandContext &ctx)
 
 	taa_hook::forget_command_list(ctx);
 	pass_finder::forget_command_list(ctx);
-	gbuffer_finder::forget_command_list(ctx);
 }
 
 
@@ -1028,7 +990,7 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 	// recording one would enter a phantom writer into the pass finder's last-writer table.
 	pass_finder::note_dispatch(ctx, x, y, z);
 
-	if (shader_dump::enabled() || gbuffer_finder::enabled())
+	if (shader_dump::enabled())
 	{
 		std::uint64_t hash = 0;
 		{
@@ -1047,7 +1009,6 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 				shader_dump::note_dispatch(hash, x, y, z);
 			// The G-buffer finder's SSR-denoiser cross-check. It resolves bindings only
 			// for the one known denoiser hash, so this is a no-op for everything else.
-			gbuffer_finder::note_dispatch(ctx, hash);
 		}
 	}
 	// Skeleton stage: observe only. Returning true here is what will eventually suppress the
@@ -1068,13 +1029,11 @@ void DlssApp::on_render_targets(const icept::CommandContext &ctx, std::uint32_t 
 	// have to re-plumb it.
 	(void)via_render_pass;
 	pass_finder::note_render_targets(ctx, count, rtvs, dsv);
-	gbuffer_finder::note_render_targets(ctx, count, rtvs, dsv);
 }
 
 void DlssApp::on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count)
 {
 	pass_finder::note_draw(ctx, vertex_or_index_count);
-	gbuffer_finder::note_draw(ctx);
 }
 
 void DlssApp::on_copy(const icept::CommandContext &ctx, icept::ResourceId src, icept::ResourceId dst)
@@ -1190,11 +1149,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// when no tonemapper (3D LUT SRV) was seen this frame.
 	if (pass_finder::enabled())
 		pass_finder::on_present(frame, reinterpret_cast<icept::ResourceId>(pc.back_buffer));
-
-	// The G-buffer finder's frame boundary: stability accounting and the (log-only)
-	// identification report. (gbuffer_finder.hpp, DLSS-RR phase 1)
-	if (gbuffer_finder::enabled())
-		gbuffer_finder::on_present(frame);
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every StatusFileFrames presents (default 30);
@@ -1498,34 +1452,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,
 			skipped, attempts ? (100.0 * skipped / attempts) : 0.0);
 
-		std::uint32_t rr_ok = 0, rr_fallback = 0;
-		taa_hook::rr_counters(rr_ok, rr_fallback);
-		if (rr_ok + rr_fallback > 0)
-		{
-			STRAY_LOG_INFO("[%s] RR evaluates=%u SR fallbacks=%u (%.1f%% RR)", when, rr_ok,
-				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
-			// The per-reason breakdown — the starvation run proved totals without reasons
-			// cost a whole round-trip. One line, all nine reasons, by name.
-			std::uint32_t r[taa_hook::kRrRefusalCount] = {};
-			taa_hook::rr_refusal_counters(r);
-			char line[256];
-			int off = std::snprintf(line, sizeof(line), "[%s] RR refusals:", when);
-			for (int i = 0; i < taa_hook::kRrRefusalCount; ++i)
-				if (off > 0 && off < static_cast<int>(sizeof(line)))
-					off += std::snprintf(line + off, sizeof(line) - off, " %s=%u",
-						taa_hook::kRrRefusalNames[i], r[i]);
-			STRAY_LOG_INFO("%s", line);
-
-			// RR-1 suppression telemetry: armed state + how much SSD work was skipped.
-			bool rr1_armed = false;
-			std::uint64_t rr1_total = 0;
-			std::uint32_t rr1_last = 0;
-			taa_hook::rr1_counters(rr1_armed, rr1_total, rr1_last);
-			STRAY_LOG_INFO("[%s] RR-1 SSD suppression: armed=%d last-frame=%u total=%llu",
-				when, rr1_armed ? 1 : 0, rr1_last,
-				static_cast<unsigned long long>(rr1_total));
-		}
-
 		if (nr::enabled())
 		{
 			std::uint64_t nr_applied = 0, nr_refused = 0;
@@ -1625,29 +1551,8 @@ EventNeeds DlssApp::configure_events()
 	pass_finder_enabled = host::cfg::get_bool("PassFinder", pass_finder_enabled);
 	pass_finder::set_enabled(pass_finder_enabled);
 
-	// [STRAYDLSS] GBufferFinder, default OFF: log-only identification of the base pass's
-	// G-buffer targets for DLSS Ray Reconstruction (gbuffer_finder.hpp). It needs the
-	// render-target/draw events below, and the pipeline events for the SSR-denoiser
-	// cross-check's shader hash.
-	bool gbuffer_finder_enabled = false;
-	gbuffer_finder_enabled = host::cfg::get_bool("GBufferFinder", gbuffer_finder_enabled);
-	{
-		// NgxRR=2 consumes the finder's identification (taa_hook::try_evaluate_rr), so the
-		// finder must observe even when GBufferFinder was not set explicitly. Read here as
-		// well as in on_init_device because event registration happens first.
-		int ngx_rr_for_finder = 0;
-		ngx_rr_for_finder = host::cfg::get_int("NgxRR", ngx_rr_for_finder);
-		if ((ngx_rr_for_finder == 2 || ngx_rr_for_finder == 3) && !gbuffer_finder_enabled)
-		{
-			gbuffer_finder_enabled = true;
-			STRAY_LOG_WARN("GBufferFinder forced ON: NgxRR=2/3 needs the G-buffer "
-				"identification it produces.");
-		}
-	}
-	gbuffer_finder::set_enabled(gbuffer_finder_enabled);
 
-	needs.pipeline_events = hash_shaders || shader_dump::enabled() ||
-		pass_finder_enabled || gbuffer_finder_enabled;
+	needs.pipeline_events = hash_shaders || shader_dump::enabled() || pass_finder_enabled;
 
 	if (needs.pipeline_events)
 	{
@@ -1663,14 +1568,11 @@ EventNeeds DlssApp::configure_events()
 	// ReShade's own state_tracking does not register this, which is why its state_block can
 	// never replay root constants.
 
-	if (pass_finder_enabled || gbuffer_finder_enabled)
+	if (pass_finder_enabled)
 	{
 		needs.finder_rt_events = true;
-		// Logged so a pasted log PROVES the events were registered for this combination of
-		// flags — the 2026-08-31 GBufferFinder run could not distinguish "tap registered
-		// but never fired" from "tap never registered" after the fact.
-		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
-			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
+		// Logged so a pasted log PROVES the events were registered for this flag.
+		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=1).");
 	}
 	// [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which
 	// equals COMMON). D3D12 REQUIRES the back buffer to be in that state at Present and the

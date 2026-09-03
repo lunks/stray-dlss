@@ -1161,3 +1161,78 @@ a fault — it is the RHI thread's lag. `unclaimed` must stay 0.
 
 **Still UNCONFIRMED:** whether colour ever resolves, and whether the resolved depth/velocity
 survive the registry's liveness check a frame later. Both are answered by the same `l1:` line.
+
+---
+
+## 13. The heuristic G-buffer finder is DELETED, and Ray Reconstruction now refuses loudly (2026-09-03)
+
+**~3 970 lines removed, 106 added.** Whole files: `src/gbuffer_finder.{cpp,hpp}`,
+`src/gbuffer_resolve.{cpp,hpp}`, `src/core/gbuffer_classify.{cpp,hpp}`,
+`src/core/envbrdf.{cpp,hpp}`, `tests/test_gbuffer_classify.cpp`, `tests/test_envbrdf.cpp`,
+`shaders/gbuffer_resolve.hlsl`. In place: the RR half of `taa_hook.{cpp,hpp}`, its wiring in
+`dlss_app.cpp`, one perf bucket, the CMake entries and four ini keys.
+
+### 13.1 Why, in one sentence
+
+**The finder identified GBufferA-E by descriptor SHAPE, which is the same class of guessing this
+whole document exists to retire.** It scored render-target sets by format, extent and draw
+pattern — exactly the reasoning the engine seam replaced for the TAA pass, where the answer had
+been wrong often enough to cost sessions. Keeping a second heuristic identifier alive, unused,
+next to a working engine-sourced one is how a project ends up debugging the wrong oracle again.
+
+Two supporting facts made it a clean cut rather than a judgement call:
+
+* **Nothing on the SR, NR or FG path referenced any of it.** `gbr::` appears in no SR, NR or FG
+  code; the finder's only consumers were `try_evaluate_rr` and its own event taps.
+* **RR had not run in any measured session.** `NgxRR` ships 0, and the guide path had never
+  produced a confirmed image.
+
+### 13.2 What was KEPT, byte-identical, and why that is the point
+
+**`src/ngx_backend.{hpp,cpp}` needed zero changes.** `ensure_feature_rr`, `evaluate_rr`,
+`release_feature_rr`, `RRStatus`, the `SuperSamplingDenoising.*` availability query, the
+row-major matrix plumbing and the `nvsdk_ngx_helpers_dlssd.h` include all survive untouched,
+because **`EvaluateInputsRR` takes raw `ID3D12Resource*` and never named the finder in code.**
+
+That separation is the whole reason this deletion is cheap: what was deleted is a *guide source*,
+not Ray Reconstruction. **What RR needs to come back is guides, and the intended source is the
+engine's own named RDG G-buffer textures, reachable from the `const FViewInfo&` that
+`ITemporalUpscaler::AddPasses` already hands us** — identity from the engine, exactly as L1 now
+does for depth and velocity (§12.9). That is a much shorter path than the finder ever was, and it
+is written down here so nobody resurrects the heuristic instead.
+
+### 13.3 `NgxRR` refuses loudly — it does not silently no-op
+
+`dlss_app.cpp` reads the key and, for any non-zero value, logs at **ERROR** naming the reason, the
+fact that the NGX side is intact and waiting for guides, and that DLSS SR is unaffected this
+session. Prime directive 2: a feature that cannot work must say so, not quietly do nothing.
+
+`perf::kNgxRr` survives but **its only timing scope lived inside `try_evaluate_rr`**, so the
+bucket now reads **always zero**. Both the enum comment and the `[perf]` line say so — a
+permanently-zero bucket with no explanation is a thing for someone to chase in six months.
+`perf::kGBufferResolve` is gone entirely.
+
+### 13.4 Two real bugs fixed while in the file
+
+Both were reported in `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` and both check out:
+
+1. **DLSS was created for the matcher's rect, not the engine's.** `fd.output_width/height` took
+   `m.output_width`, which is `group count x 8` clamped to the UAV — i.e. **rounded up to a
+   multiple of 8**. At 3840x2160 that is 480 groups exactly and the two agree, which is why it
+   never showed; at any output rect not divisible by 8 the feature would be created a few pixels
+   too large, silently. When the engine announced the dispatch, its own `OutputViewRect` is now
+   used. The `rect_agrees` assertion already compared the two once per pass — this applies that
+   assertion's conclusion.
+2. **The colour path was still gated on the cooked-hash table.** `trust_registers` required
+   `hash_and_structural` before it would believe §2.3's register map (t1 colour, t5 history) —
+   but under `EngineSeam=3` the hash is demoted to an assertion everywhere else, and **being
+   called through `ITemporalUpscaler::AddPasses` is a STRONGER warrant for the register map than
+   a hash match**: it proves the dispatch is the primary temporal upscale, which is what the
+   cooked table only ever approximated and which it misses outright after a game update recooks
+   the shaders. An engine-announced pass with an unlisted hash was silently falling back to the
+   weaker "which buffer looks like colour" heuristics. It now trusts the registers on either
+   warrant.
+
+This one matters more than it looks: **L1 resolves colour as `rhi_null`** (it is the
+graph-allocated post-chain texture, §12.9), so the register map *is* the colour source on the
+live path.

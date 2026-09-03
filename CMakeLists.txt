@@ -77,10 +77,6 @@ add_library(stray_dlss_core STATIC
     src/core/engine_seam.hpp
     src/core/pass_walk.cpp
     src/core/pass_walk.hpp
-    src/core/gbuffer_classify.cpp
-    src/core/gbuffer_classify.hpp
-    src/core/envbrdf.cpp
-    src/core/envbrdf.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -233,10 +229,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/pass_finder.hpp
         src/perf.cpp
         src/perf.hpp
-        src/gbuffer_finder.cpp
-        src/gbuffer_finder.hpp
-        src/gbuffer_resolve.cpp
-        src/gbuffer_resolve.hpp
         src/nr_hook.cpp
         src/nr_hook.hpp
         src/nr_stage.cpp
@@ -318,8 +310,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileShaders.cmake)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
-    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
-                   main cs_5_0 g_gbuffer_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
                    main cs_5_0 g_nr_mask_dxbc)
 endif()
@@ -474,8 +464,6 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_taa_signature.cpp
         tests/test_engine_seam.cpp
         tests/test_pass_walk.cpp
-        tests/test_gbuffer_classify.cpp
-        tests/test_envbrdf.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp

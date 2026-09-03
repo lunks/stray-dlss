@@ -1408,6 +1408,19 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
   needs), and **DLSS SR does not need RT** — SR is the configuration to ship.
 * **RR WITHOUT RT IS THE UNTESTED COMBINATION, AND IT IS THE INTERESTING ONE.**
 
+> **RR IS NOT WIRED AS OF 2026-09-03, so everything below is a plan rather than a switch.** Its
+> guide source — the heuristic G-buffer finder and the resolve pass that fed it — was **deleted**
+> (report §13): it identified GBufferA-E by descriptor SHAPE, the same class of guessing the
+> engine seam retired for the TAA pass, and nothing on the SR, NR or FG path referenced it.
+> `[STRAYDLSS] NgxRR` now **refuses loudly at startup** rather than silently doing nothing, and
+> `perf::kNgxRr` reads a permanent zero.
+>
+> **The NGX side is intact and untouched** — `ensure_feature_rr` / `evaluate_rr` /
+> `release_feature_rr` all take raw `ID3D12Resource*` — so what RR needs is a GUIDE SOURCE, and
+> the intended one is the engine's own **named RDG G-buffer textures**, reachable from the
+> `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already hands us. Identity from the
+> engine, exactly as L1 does for depth and velocity (§2.3). **Do not resurrect the finder.**
+
 > **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
 > so RR is not independently usable here" and treated it as concluded. **That was never
 > verified.** It came from a single passing remark, not a measurement or a source, and it was
@@ -1415,7 +1428,7 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 >
 > **Nothing requires it.** `NVSDK_NGX_DLSSD_Create_Params` carries a denoise mode, a roughness
 > mode and a depth type, and no ray-tracing anything. Our own RR path takes its guides from the
-> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E, `src/gbuffer_finder.cpp`), which is
+> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E), which is
 > UE4's ordinary deferred output and is present with RT fully off. `grep -rn RayTracing src/`
 > finds nothing that gates it.
 

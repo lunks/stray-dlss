@@ -241,8 +241,8 @@ constexpr std::size_t kKeepAliveFrames = 6;
 struct KeepAlive
 {
 	// 8 slots: SR uses four (colour/depth/MV/output); RR adds the four guide textures.
-	// The three G-buffer INPUTS are not here — gbuffer_resolve's own keep-alive ring holds
-	// them across GPU execution with the same 6-frame policy (gbuffer_resolve.cpp).
+	// The three G-buffer INPUTS are not here: whatever future pass produces the guides owns
+	// their keep-alive. (gbuffer_resolve did, until it was deleted 2026-09-03 with the finder.)
 	ID3D12Resource *resources[8] = {};
 	std::uint64_t frame = 0;
 };
@@ -670,7 +670,7 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 	NVSDK_NGX_DLSSD_Create_Params create = {};
 	create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-	// Unpacked: gbuffer_resolve emits a standalone R16F roughness (and also packs .w of the
+	// Unpacked: the guide producer must emit a standalone R16F roughness (and also pack .w of the
 	// normals texture, so Packed is one enum flip away if the observation run prefers it).
 	create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
 	// HW reversed-Z with DepthInverted, per the staged plan (RESEARCH-RR-GBUFFER.md §4.4
@@ -790,7 +790,7 @@ bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 	}
 
 	// Keep the SR quartet AND the four guides alive past GPU execution; the G-buffer
-	// inputs are held by gbuffer_resolve's own ring.
+	// inputs are held by whatever produced the guides.
 	KeepAlive ka;
 	ka.frame = g_eval_frame;
 	ka.resources[0] = in.base.color;
