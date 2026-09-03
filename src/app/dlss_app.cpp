@@ -1129,11 +1129,15 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		// CameraCut we hand a temporal consumer is suspect - which is what flicker looks like.
 		std::uint64_t r135_ok = 0;
 		std::uint64_t r135_bad = 0;
-		taa_hook::view_row135_counters(r135_ok, r135_bad);
-		if (r135_ok != 0 || r135_bad != 0)
-			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu%s", when,
+		std::uint64_t wrong_view = 0;
+		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view);
+		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0)
+			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
+				"(candidates that were A View buffer but not THIS view - the search skipped "
+				"them; each was an unclaimed frame before facts 36.18)%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
+				static_cast<unsigned long long>(wrong_view),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"

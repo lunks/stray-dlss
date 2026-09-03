@@ -106,6 +106,9 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // `y*z == 1.0` is true by construction (SceneRendering.cpp:1563-1564) and cannot survive a wrong
 // buffer or a slipped offset. A `bad` rate near 100% means the CB search is what to fix, and
 // that every jitter / ClipToPrevClip / CameraCut we have fed a temporal consumer is suspect.
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad);
+// `wrong_view` counts candidates that decoded as A View buffer but described a DIFFERENT view
+// than the dispatch - the search skipping past them instead of stopping. Non-zero is the fix for
+// facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
 
 } // namespace stray_dlss::taa_hook

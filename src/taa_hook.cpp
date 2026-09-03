@@ -51,6 +51,10 @@ std::atomic<std::uint32_t> g_resolve_attempts{ 0 };
 // offset or a wrong buffer. CLAUDE.md §2.6.
 std::atomic<std::uint64_t> g_view_row135_ok{ 0 };
 std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
+// Candidates that decoded as A View buffer but described a DIFFERENT view than this dispatch.
+// Non-zero is the fix working: each one is a frame the old search would have taken the wrong
+// View for, and refused the real TAA dispatch over.
+std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -694,15 +698,28 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
-		if (read_view_cb(cb.second, candidate) && ue4::view_params_plausible(candidate))
+		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
+			continue;
+		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
+		// establish that a buffer IS a View uniform buffer; a shadow, cubemap-face or
+		// scene-capture view satisfies both. The search runs in slot order, so a wrong-but-
+		// plausible candidate on a lower register used to win and stop the search - MEASURED
+		// on the box as b3 carrying a 4088x4088 view beating the real one on b4, on ~1.2% of
+		// frames, which made the matcher refuse the real TAA dispatch as "downsampling" and
+		// is the visible flicker (facts §36.17-36.18). The dispatch covers the OUTPUT rect and
+		// UE 4.27's OutputViewRect is never smaller than InputViewRect, so a view claiming to
+		// be larger than the dispatch covers cannot be this one.
+		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			view = candidate;
-			view_ok = true;
-			b.view_cb = cb.second;
-			b.view_cb_valid = true;
-			b.view_cb_register = cb.first;
-			break;
+			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			continue;
 		}
+		view = candidate;
+		view_ok = true;
+		b.view_cb = cb.second;
+		b.view_cb_valid = true;
+		b.view_cb_register = cb.first;
+		break;
 	}
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
@@ -1946,10 +1963,11 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
 }
 
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad)
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view)
 {
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
+	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

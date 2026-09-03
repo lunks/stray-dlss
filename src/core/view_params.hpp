@@ -7,6 +7,7 @@
 #include "ue4_view.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace stray_dlss::ue4 {
 
@@ -66,6 +67,25 @@ bool parse_view_params(const void *data, std::size_t size, ViewParams &out);
 // catches the two realistic failure modes: reading the wrong buffer entirely, and reading the
 // right buffer at offsets that have slipped (row 131 is a (1,1,1,1) decoy).
 bool view_params_plausible(const ViewParams &p);
+
+// IS THIS VIEW THE ONE THIS DISPATCH BELONGS TO?
+//
+// `view_params_plausible` and the row-135 self-check both answer "is this A View uniform
+// buffer" — and a shadow, cubemap-face or scene-capture view satisfies both, because it IS one.
+// Neither says it is THIS view's. The CB is located by searching every bound constant buffer in
+// slot order and keeping the first plausible hit, so a wrong-but-plausible candidate on a lower
+// register wins and the search stops (MEASURED: b3 carrying a 4088x4088 view beat the real one
+// on b4, facts §36.18).
+//
+// The test that separates them uses something the dispatch already tells us. UE 4.27's
+// OutputViewRect is >= InputViewRect for every Main* config — equal at 1:1, larger when
+// upscaling, never smaller (TemporalAA.cpp SetupViewRect) — and the dispatch covers the OUTPUT
+// rect. So this view's InputViewRect (ViewSizeAndInvSize, row 130) cannot exceed what the
+// dispatch covers. A 4088x4088 view against a 3840x2160 dispatch is not a close call; it is
+// impossible.
+//
+// `covered_w`/`covered_h` are group_count * 8. Inclusive, so DLAA (view == dispatch) passes.
+bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint32_t covered_h);
 
 // Is the PreExposure / OneOverPreExposure pair (rows 135.y and 135.z) self-consistent? Separate
 // from view_params_plausible ON PURPOSE — that gate governs the whole DLSS path, and those rows
