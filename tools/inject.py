@@ -9,8 +9,9 @@ sees them — no uinput, ydotool or evemu, and nothing here EVIOCGRAB's the node
     inject.py key  <node> <code> <hold_ms>            tap a key
     inject.py hold <node> <code> <hold_ms>            hold one key/button, then release
     inject.py axis <node> <code> <value> <hold_ms>    hold an absolute axis, then centre it
-    inject.py record <node> <out_file> [seconds]      record every event from the node with
-        timestamps (no grab: the game keeps receiving them) until seconds elapse or Ctrl-C
+    inject.py record <node> <out_file> [seconds] [idle_s]   record every event from the node
+        with timestamps (no grab: the game keeps receiving them) until seconds elapse,
+        Ctrl-C, or (idle_s > 0) idle_s seconds pass with no event after the first one
     inject.py replay <node> <file> [speed]            replay a recording into the node with
         the original inter-event timing (speed 1.0); every key still down at the end is
         released, even on Ctrl-C
@@ -75,14 +76,23 @@ def _traverse(f, total_s, swap_s):
             _emit(f, EV_KEY, code, 0)
 
 
-def _record(node, out_path, seconds):
+def _record(node, out_path, seconds, idle_s=0.0):
     """Recording format: one line per event, "<t_rel_s> <type> <code> <value>", t_rel from the
-    first event. SYN_REPORT events are kept so replay reproduces the exact frames."""
+    first event. SYN_REPORT events are kept so replay reproduces the exact frames. With
+    idle_s > 0 the recording ends by itself idle_s seconds after the last key, so the
+    person recording never has to touch the box."""
+    import select
     deadline = time.monotonic() + seconds if seconds > 0 else None
     n = 0
+    last_key = None
     with open(node, "rb", buffering=0) as f, open(out_path, "w") as out:
         t0 = None
         while deadline is None or time.monotonic() < deadline:
+            if idle_s > 0 and last_key is not None and time.monotonic() - last_key > idle_s:
+                break
+            ready, _, _ = select.select([f], [], [], 0.25)
+            if not ready:
+                continue
             raw = f.read(_EVENT.size)
             if len(raw) < _EVENT.size:
                 break
@@ -91,7 +101,10 @@ def _record(node, out_path, seconds):
             if t0 is None:
                 t0 = t
             out.write("%.6f %d %d %d\n" % (t - t0, ev_type, code, value))
+            out.flush()
             n += 1
+            if ev_type == EV_KEY:
+                last_key = time.monotonic()
     return n
 
 
@@ -131,8 +144,9 @@ def main(argv):
             print(__doc__, file=sys.stderr)
             return 2
         seconds = float(argv[4]) if len(argv) > 4 else 0
+        idle_s = float(argv[5]) if len(argv) > 5 else 0
         try:
-            n = _record(node, argv[3], seconds)
+            n = _record(node, argv[3], seconds, idle_s)
         except KeyboardInterrupt:
             n = -1
         print("recorded to %s" % argv[3], file=sys.stderr)

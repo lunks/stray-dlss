@@ -29,12 +29,6 @@
 ------------------------------------------------------------------ configuration
 local TIER1 = true          -- apply the HD-screenshot material scalars
 local TIER2 = true          -- raise shell count / length
--- The fallback poll (below, under "triggers"): one FindFirstOf + reflection walk every
--- POLL_INTERVAL_MS on the game thread. Turn POLL_ENABLED off when chasing a periodic hitch —
--- NotifyOnNewObject alone may not catch every spawn (see the UNCONFIRMED note below), so
--- this is a diagnostic knob, not a safe default to ship off.
-local POLL_ENABLED     = true
-local POLL_INTERVAL_MS = 2000
 -- MEASURED on the first launch (2026-09-02): the PLAYER cat ships LayerCount=16,
 -- FurLength=1.15, ShellBias=1.0, MinScreenSize=0 - twice the companion cats' 8. So 16 was
 -- a no-op; anything that should be felt as "more fur" has to go above it.
@@ -73,6 +67,29 @@ local DISTANCE_SCALARS = {
     ["Camera Distance Blend"] = 150.0,  -- shipped 75
 }
 
+-- THE BACKPACK CLIP (user screenshot 2026-09-02: shells poking through the harness at the
+-- shoulders/neck). How the shipped fur stays short there: the material samples a painted
+-- per-vertex length map, Cat_furmesh_FurGrowth (read out of the decoded pak assets; both
+-- backpackON and backpackOff share it), and the component's FurLength multiplies the WHOLE
+-- map. Doubling FurLength therefore doubles the short harness fur too, and it grows through
+-- the mesh. The material also ships "Fur Length Power", a power curve on that map: raising
+-- it pushes the map's low (short) values toward zero while values near 1 (the long body
+-- fur) barely move. So a higher power keeps the body length and shortens the harness
+-- region, with no new textures. 1.0 is neutral; the shipped value is read by the material
+-- dump (stray-fur-materials.txt) on the next launch. UNCONFIRMED until seen on screen:
+-- start at 2.0 and dial by eye; "Avoid Short - Offset/Power" are the other two shipped
+-- knobs that act on short fur only, if the power alone is not enough.
+-- MEASURED 2026-09-02 (stray-fur-materials.txt): the SHIPPED "Fur Length Power" is 4.0, not
+-- 1.0, so the first try at 2.0 flattened the curve and made the harness fur LONGER; the user
+-- saw no change. Above 4 shortens the short regions harder. "Avoid Short" ships neutral
+-- (Offset 0, Power 1); a small positive offset subtracts a constant from the map, which
+-- kills the very short harness fur outright while long fur loses almost nothing.
+local BACKPACK_SCALARS = {
+    ["Fur Length Power"]   = 7.0,   -- shipped 4.0
+    ["Avoid Short - Offset"] = 0.05, -- shipped 0.0
+}
+local DUMP_MATERIALS = true     -- write stray-fur-materials.txt once per pawn (read-only)
+
 ------------------------------------------------------------------ plumbing
 local function log(s) print("[StrayFur] " .. tostring(s) .. "\n") end
 
@@ -94,33 +111,47 @@ end
 local done = {}
 
 local function applyMaterial(gfur)
-    -- GFurComponent keeps its materials in FurMaterials (an array); UMeshComponent's
-    -- CreateDynamicMaterialInstance is BlueprintCallable and gives us a writable instance.
+    -- MEASURED 2026-09-02 (stray-fur-materials.txt): the fur's live dynamic instance sits in
+    -- FurMaterials SLOT 1 (slot 0 is the base material), and the MID our old code made with
+    -- CreateDynamicMaterialInstance(0, ...) was a fresh instance the shells never sampled.
+    -- Every "applied N/N" line before this was a pcall succeeding on a setter that reached
+    -- nothing: no HD, plush, distance or backpack scalar ever touched the fur, which is why
+    -- only LayerCount/FurLength (component properties) ever changed the look. So: walk
+    -- FurMaterials, and for each slot write onto the MaterialInstanceDynamic the component
+    -- already holds; only if a slot is not dynamic yet, create one for THAT slot.
     local mats = get(gfur, "FurMaterials")
     if not mats then log("  no FurMaterials on the component"); return end
-    local count = 0
-    pcall(function() count = #mats end)
-    if count == 0 then pcall(function() mats:ForEach(function() count = count + 1 end) end) end
-    if count == 0 then log("  FurMaterials is empty"); return end
-    for i = 0, count - 1 do
-        -- MEASURED: the BlueprintCallable takes THREE params (ElementIndex, SourceMaterial,
-        -- OptionalName); two threw "UFunction expected 3 parameters, received 2".
-        local ok, mid = pcall(function() return gfur:CreateDynamicMaterialInstance(i, nil, FName("None")) end)
-        if not ok or not mid or not mid:IsValid() then
-            log(string.format("  material slot %d: could not create a dynamic instance (%s)", i, tostring(mid)))
+    local slots = {}
+    pcall(function() mats:ForEach(function(i, elem) slots[#slots + 1] = { index = i, mat = elem:get() } end) end)
+    if #slots == 0 then log("  FurMaterials is empty"); return end
+    for _, s in ipairs(slots) do
+        local mid = s.mat
+        local isDyn = false
+        pcall(function() isDyn = mid ~= nil and mid:IsValid() and mid:GetFullName():find("MaterialInstanceDynamic", 1, true) ~= nil end)
+        if not isDyn then
+            local ok, made = pcall(function() return gfur:CreateDynamicMaterialInstance(s.index, nil, FName("None")) end)
+            if ok and made and made:IsValid() then mid = made else mid = nil end
+        end
+        if mid == nil then
+            log(string.format("  material slot %d: no dynamic instance to write to", s.index))
         else
-            -- Three tables, three counts, so a name that stops resolving is visible per group.
+            -- Read back one value after writing, so "applied" means the instance really took it.
             local function applyTable(tbl, label, want)
-                local applied = 0
+                local applied, verified = 0, 0
                 for pname, pval in pairs(tbl) do
                     local ok2 = pcall(function() mid:SetScalarParameterValue(FName(pname), pval) end)
                     if ok2 then applied = applied + 1 end
+                    pcall(function()
+                        local got = mid:K2_GetScalarParameterValue(FName(pname))
+                        if math.abs(tonumber(got) - pval) < 1e-3 then verified = verified + 1 end
+                    end)
                 end
-                log(string.format("  material slot %d: applied %d/%d %s scalars", i, applied, want, label))
+                log(string.format("  material slot %d: applied %d/%d %s scalars, read back %d", s.index, applied, want, label, verified))
             end
             applyTable(HD_SCALARS,       "HD",       9)
             applyTable(PLUSH_SCALARS,    "plush",    2)
             applyTable(DISTANCE_SCALARS, "distance", 3)
+            applyTable(BACKPACK_SCALARS, "backpack", 2)
         end
     end
 end
@@ -185,6 +216,10 @@ local function applyTo(pawn)
     log("applying to " .. key)
     if TIER1 then applyMaterial(gfur) end
     if TIER2 then applyDensity(gfur) end
+    if DUMP_MATERIALS then
+        local ok, err = pcall(function() require("dump_fur_materials").run(gfur) end)
+        if not ok then log("material dump failed: " .. tostring(err)) end
+    end
 end
 
 ------------------------------------------------------------------ triggers
@@ -213,7 +248,15 @@ pcall(function()
 end)
 
 -- Fallback: poll for a live pawn. One FindFirstOf every POLL_INTERVAL_MS ON THE GAME THREAD,
--- idempotent via `done`. Gated by POLL_ENABLED (configuration, above).
+-- idempotent via `done`.
+--
+-- POLL_ENABLED is a DIAGNOSTIC knob, not a safe default to ship off: NotifyOnNewObject alone
+-- may not catch every spawn (see the UNCONFIRMED note above), so turning this off relies on a
+-- mechanism we have not proven. It exists so a periodic engine query can be ruled in or out
+-- when chasing a hitch, without disabling the fur itself.
+local POLL_ENABLED     = true
+local POLL_INTERVAL_MS = 2000
+
 if POLL_ENABLED then
     LoopAsync(POLL_INTERVAL_MS, function()
         pcall(function()

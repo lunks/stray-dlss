@@ -18,6 +18,11 @@
 #include "HidMode.hpp"
 #include "LoopList.hpp"
 #include "ScePad.hpp"
+#include "SubmixDiscovery.hpp"
+#include "SubmixDsp.hpp"
+#include "SubmixSink.hpp"
+#include "SubmixTap.hpp"
+#include "SubmixWatch.hpp"
 #include "TriggerEffect.hpp"
 #include "Triggers.hpp"
 
@@ -78,11 +83,61 @@ public:
     void NoteHookRegistered(const char* name);
     void NoteHookMissing(const char* name);
 
+    // BP_HKPlayerController_C.DebugPS5Haptic, reported by the glue every time it tries to open
+    // the gate. `open` is the value READ BACK after the write, so it is the gate's real state
+    // and not our intent. A gate that never opens is the single most likely reason for "the
+    // game asked for a vibration and the engine mixed nothing", so it belongs in the STATUS
+    // line rather than in one INFO line at the top of a 40 MB log.
+    void OnHapticGate(bool open, bool wrote);
+
+    // ---- the submix spike ------------------------------------------------------------
+    // True while HapticSource is measure|submix and the listener has not been registered.
+    // The UE4SS glue polls this from inside a game-thread hook and stops as soon as it is
+    // false, so a session that never binds is one WARN per attempt and not a silent nothing.
+    bool SubmixWantsBinding() const;
+    // WHO DRIVES THE COILS. The facts are gathered here and judged by the pure CoilOwner
+    // module; every status line, warning and gate asks this verdict, never the config or the
+    // tap's counters on their own (that is how a silent submix passed for a working one).
+    CoilFacts   CoilFactsNow() const;
+    CoilVerdict Coils() const { return JudgeCoils(CoilFactsNow()); }
+    bool        SubmixOwnsCoils() const { return Coils().owner == CoilOwner::Submix; }
+
+    // Called ON THE GAME THREAD by the UE4SS glue, which resolves the UObjects and the
+    // executable's image range reflectively and hands them over as raw pointers — the runtime
+    // itself stays free of every UE4SS type. `submixObject` may be null, which registers on
+    // the engine's MASTER submix (AudioMixerDevice.cpp:2350). The two reroute objects are the
+    // USoundSubmix to re-parent and its new parent, both null unless SubmixReroute is on and
+    // both resolved (the glue has already written their UPROPERTYs). Returns true when the
+    // listener has been handed to the engine; false means "not yet, or refused", and the
+    // reason has already been logged.
+    bool BindSubmixTap(const void* worldObject, const void* engineObject, void* submixObject,
+                       bool submixObjectResolved, void* rerouteMasterObject,
+                       void* rerouteParentObject, const void* imageBase, std::size_t imageSize);
+
 private:
     void PadThreadMain();
     void LogStatus();
+    void StartSubmix();
+    void SubmixStatus();     // the numbers proof: one log line and one status file line
+    void SubmixWarnIfDue(uint64_t now);
+    void StartSinkAtHandover(float peak);
+    // Config::submixLiveThreshold, clamped to something a float comparison can mean.
+    float LiveThreshold() const;
+    // One line per closed watch: what the engine mixed while the game was asking for an asset.
+    void  ReportWatch(const WatchVerdict& v);
     bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
     void LoadLoopLists();
+
+    // ---- the controller speaker's ROUTING -----------------------------------------------
+    // Selects where the pad sends the audio we stream into its endpoint. Deliberately NOT
+    // hung off AudioPlayer: the routing is orthogonal to where the samples come from, and the
+    // asset-replay path is on its way out in favour of a rerouted speaker submix. Runs on the
+    // pad thread — the only thread that owns a libScePad handle. Re-applies when the pad
+    // changes, when the settings change (hot reload), or on the optional cadence.
+    void ApplySpeakerRoute(const char* why);
+    // Everything that decides what is written, folded into one value so "has anything
+    // changed" is a comparison rather than six.
+    uint64_t SpeakerRouteSignature() const;
 
     Config        m_config;
     ScePad        m_pad;
@@ -92,6 +147,48 @@ private:
     AudioPlayer   m_speaker;
     LoopList      m_hapticLoops;
     LoopList      m_spkLoops;
+
+    // The submix spike. The taps are LEAKED on purpose (SubmixTap.hpp): the engine may still
+    // call a listener after UnregisterSubmixBufferListener returns, so they are raw pointers
+    // that are detached, never deleted.
+    submix::SubmixRing m_submixRing;
+    submix::SubmixSink m_submixSink;
+    submix::Tap*       m_tapVibration = nullptr;
+    submix::Tap*       m_tapMaster    = nullptr;
+    std::atomic<bool>  m_submixBound{false};
+    // The tap has delivered a REAL SIGNAL, not merely callbacks. Until it does, the asset path
+    // keeps driving the coils — the 2026-09-03 run left the user with no haptics at all because
+    // HapticSource=submix disabled the assets on a tap that never bound.
+    std::atomic<bool>  m_submixLive{false};
+    std::atomic<bool>  m_submixRefused{false};
+    std::atomic<bool>  m_submixRerouted{false};
+    bool               m_sinkStarted = false;      // UE4SS update thread only
+    uint64_t           m_lastSubmixWarnMs = 0;
+    std::atomic<int>   m_submixBindAttempts{0};
+    const void*        m_submixDevice = nullptr;
+    std::string        m_submixStatusPath;   // narrow, for the log; the wide one is below
+    std::wstring       m_submixStatusFile;
+    uint64_t           m_lastSubmixStatusMs = 0;
+    uint64_t           m_submixStatusWindowMs = 0;
+    uint64_t           m_lastSubmixCallbacks = 0;   // for a per-second RATE, not a total
+    // A per-window peak is 0.00000 whenever nothing is playing, so one pasted status line
+    // cannot tell "silent now" from "silent always". These two can, and they cost nothing.
+    float              m_submixPeakEver     = 0.0f;
+    uint64_t           m_lastSubmixSignalMs = 0;    // 0 = the tap has never carried a signal
+    // Opened by StartPS5Vibration on the GAME thread, sampled and closed from SubmixStatus on
+    // UE4SS's update thread — hence the mutex.
+    std::mutex         m_watchMutex;
+    SubmixWatch        m_submixWatch;
+
+    // The pad-speaker routing, all touched only by the pad thread except the atomics the
+    // STATUS line reads.
+    uint64_t                   m_speakerRouteApplied = 0;   // signature last written; 0 = never
+    int32_t                    m_speakerRouteHandle  = 0;   // the handle it was written to
+    uint64_t                   m_lastSpeakerRouteMs  = 0;
+    std::atomic<bool>          m_speakerRouteSonyOk{false};
+    std::atomic<bool>          m_speakerRouteHidOn{false};
+    std::atomic<int32_t>       m_speakerRouteLastPathResult{0};
+    std::atomic<unsigned long> m_speakerRouteApplies{0};
 
     std::wstring m_gameDir;
     std::wstring m_modDir;
@@ -120,6 +217,10 @@ private:
     std::atomic<unsigned long> m_componentStopsHonoured{0};
     std::atomic<unsigned long> m_componentStopsIgnored{0};
     std::atomic<unsigned long> m_speakerStarts{0};
+
+    std::atomic<bool>          m_hapticGateOpen{false};
+    std::atomic<unsigned long> m_hapticGateWrites{0};
+    std::atomic<unsigned long> m_hapticGateMisses{0};
 };
 
 // The single process-wide instance. UE4SS constructs the mod object; everything else reaches

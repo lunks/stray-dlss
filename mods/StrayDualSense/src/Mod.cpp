@@ -58,6 +58,7 @@
 #include <vector>
 
 #include "Log.hpp"
+#include "Platform.hpp"
 #include "Runtime.hpp"
 #include "TriggerEffect.hpp"
 #include "Version.hpp"
@@ -376,12 +377,14 @@ constexpr const wchar_t* kComp =
     L"/Game/Technical/Components/COMP_CatScratchableComponent.COMP_CatScratchableComponent_C:";
 constexpr const wchar_t* kPc =
     L"/Game/Technical/BP_HKPlayerController.BP_HKPlayerController_C:";
+constexpr const wchar_t* kInput = L"/Script/Hk_project.InputSubsystem:";
 
 struct HookInfo
 {
     RC::StringType path;              // owned: HookInfo outlives every lookup
     const char*    shortName = nullptr;
-    RC::Unreal::UnrealScriptFunctionCallable callback;
+    RC::Unreal::UnrealScriptFunctionCallable callback;   // PRE: before the body runs
+    RC::Unreal::UnrealScriptFunctionCallable post;       // POST: after it; may be empty
 
     bool                registered = false;
     std::pair<int, int> ids{};
@@ -393,6 +396,7 @@ std::vector<HookInfo> g_hooks;
 
 void RegisterAll();
 void BuildHookTable();
+void MaybeBindSubmixOnGameThread();
 
 // ---------------------------------------------------------------------------------------
 // Reads of GAME STATE. Both run ON THE GAME THREAD, INSIDE A HOOK, and nowhere else: on_update
@@ -508,6 +512,312 @@ void ReadAuthoredTriggerEffectOnGameThread()
 }
 
 // ---------------------------------------------------------------------------------------
+// BP_HKPlayerController_C.DebugPS5Haptic — the PS5 haptic gate, MEASURED 2026-09-03 with the
+// StrayAudioProbe Lua: with it false, StartPS5Vibration is entered and does nothing; with it
+// true, the Blueprint sets the ControllerVibration AudioComponent's sound and plays it
+// (AC.SetSound / AC.Play fired, IsPlaying()=true). It is a Blueprint variable, so it is a
+// whole-byte bool, but it is written through FBoolProperty regardless. Written from the START
+// pre-hooks, before the body evaluates its gate.
+//
+// THE OBJECT IS THE HOOK'S OWN CONTEXT, AND THAT IS A CORRECTION (2026-09-03).
+// It used to be `UObjectGlobals::FindFirstOf(STR("HKPlayerController"))`, which is wrong twice
+// over, both of them read out of RE-UE4SS's own source at the SHA CI pins
+// (deps/first/Unreal/src/UObjectGlobals.cpp:354-383):
+//
+//   * IT DOES NOT RETURN THE FIRST MATCH FOR A DERIVED CLASS. The loop breaks only on an
+//     EXACT class-name hit; the superstruct-chain branch assigns `ObjectFound` and then
+//     `return LoopAction::Continue`, so for `BP_HKPlayerController_C` — a subclass — it walks
+//     the WHOLE GUObjectArray and returns the LAST match. With a stale controller still alive
+//     after a level load, that is a different instance from the one the Blueprint is running
+//     on, and the gate is opened on the wrong object while the live one stays shut.
+//   * IT WALKS EVERY UOBJECT, with a superstruct walk per object, on EVERY call — the exact
+//     cost the comment here used to claim it avoided, because the per-instance cache was
+//     consulted only AFTER the search had already run.
+//
+// `context.Context` is the UObject the UFunction is executing on (UFunctionStructs.hpp:
+// `UObject* Context;`), i.e. the player controller itself. It is free, and it is right by
+// construction. FindFirstOf survives only as a fallback for a null context, and says so.
+// ---------------------------------------------------------------------------------------
+int g_gateMisses = 0;
+
+void ForcePS5HapticPathOnGameThread(UObject* controller)
+{
+    if (!sds::Rt().Cfg().forcePS5HapticPath)
+        return;
+    UObject* pc = controller;
+    if (pc == nullptr)
+    {
+        pc = RC::Unreal::UObjectGlobals::FindFirstOf(STR("HKPlayerController"));
+        if (++g_gateMisses == 1)
+            SDS_LOG_WARN("ForcePS5HapticPath: the hook gave no Context object, falling back to "
+                         "FindFirstOf(\"HKPlayerController\") - which returns the LAST derived "
+                         "match in the whole object array, not necessarily the controller this "
+                         "call is on. found=%d", pc != nullptr ? 1 : 0);
+    }
+    if (pc == nullptr)
+    {
+        sds::Rt().OnHapticGate(false, false);
+        return;
+    }
+    FProperty* prop = pc->GetPropertyByNameInChain(STR("DebugPS5Haptic"));
+    if (prop == nullptr || !prop->IsA<FBoolProperty>())
+    {
+        if (++g_gateMisses <= 2)
+            SDS_LOG_ERROR("ForcePS5HapticPath: %s has no bool property 'DebugPS5Haptic' "
+                          "(found=%d). The PS5 haptic gate cannot be opened, so the Blueprint "
+                          "will return before it plays anything.",
+                          Narrow(pc->GetName()).c_str(), prop != nullptr ? 1 : 0);
+        sds::Rt().OnHapticGate(false, false);
+        return;
+    }
+    auto* boolProp = static_cast<FBoolProperty*>(prop);
+    const bool before = boolProp->GetPropertyValueInContainer(pc);
+    if (before)
+    {
+        // Already open on THIS object. Nothing to write, and nothing to log every call.
+        sds::Rt().OnHapticGate(true, false);
+        return;
+    }
+    boolProp->SetPropertyValueInContainer(pc, true);
+    const bool after = boolProp->GetPropertyValueInContainer(pc);
+    sds::Rt().OnHapticGate(after, true);
+    SDS_LOG_INFO("ForcePS5HapticPath: %s.DebugPS5Haptic 0 -> %d (offset +0x%X)%s",
+                 Narrow(pc->GetName()).c_str(), after ? 1 : 0,
+                 static_cast<unsigned>(prop->GetOffset_ForInternal()),
+                 after ? "" : "   <- THE WRITE DID NOT TAKE");
+}
+
+// ---------------------------------------------------------------------------------------
+// Button glyphs: /Script/Hk_project.InputSubsystem:GetGameControllerType, a NATIVE UFunction
+// whose reflected shape is MEASURED from the object dump: `_forceGamepad` (bool @0) and
+// `ReturnValue` (EGameControllerType, 1 byte @1; 1 XBOX, 2 PS4, 3 PS5). UMG_KeyIcon's Set Key
+// calls it to pick the prompt texture. For a native function the return value the CALLER
+// receives is what lands in RESULT_DECL (UE4SS's own Lua post-hook writes there and its
+// comment says so: "If this was a native UFunction then changing the return value here will
+// have the desired effect"); the copy in the parameter frame is written too, so both places
+// agree whichever one a reader picks up. The observed shape is logged ONCE, before the first
+// write, so a wrong assumption is visible rather than silent — the Lua predecessor guessed
+// the arity and logged every argument for the same reason.
+// ---------------------------------------------------------------------------------------
+unsigned long g_glyphCalls  = 0;
+unsigned long g_glyphForced = 0;
+bool          g_glyphShapeLogged = false;
+
+void CbGlyphPre(UnrealScriptFunctionCallableContext&, void*)
+{
+    MaybeBindSubmixOnGameThread();
+}
+
+void CbGlyphPost(UnrealScriptFunctionCallableContext& context, void* customData)
+{
+    auto* hook = static_cast<HookInfo*>(customData);
+    if (hook == nullptr) return;
+    ++g_glyphCalls;
+
+    uint8_t* result = static_cast<uint8_t*>(context.RESULT_DECL);
+    uint8_t* locals = context.TheStack.Locals();
+    const Field* ret = nullptr;
+    for (const Field& f : hook->params)
+        if (f.isReturn) { ret = &f; break; }
+
+    const int  want        = sds::Rt().Cfg().glyphControllerType;
+    const int  beforeRes   = result != nullptr ? *result : -1;
+    const int  beforeLocal = (locals != nullptr && ret != nullptr) ? locals[ret->offset] : -1;
+
+    if (!g_glyphShapeLogged)
+    {
+        g_glyphShapeLogged = true;
+        bool forceGamepad = false;
+        const bool gotForce = ReadBool(FindByName(hook->params, "_forceGamepad"), locals, forceGamepad);
+        SDS_LOG_INFO("GetGameControllerType observed: RESULT_DECL=%p (value %d) Locals=%p "
+                     "ReturnValue@%d size %d (value %d) _forceGamepad=%s -> Glyphs=%s(%d)",
+                     static_cast<void*>(result), beforeRes, static_cast<void*>(locals),
+                     ret != nullptr ? ret->offset : -1, ret != nullptr ? ret->size : -1,
+                     beforeLocal, gotForce ? (forceGamepad ? "true" : "false") : "?",
+                     sds::Rt().Cfg().GlyphName(), want);
+        if (ret == nullptr || ret->size != 1)
+            SDS_LOG_ERROR("GetGameControllerType: the return parameter is not a 1-byte enum as "
+                          "measured; NOT overriding glyphs.");
+    }
+    if (want < 0 || ret == nullptr || ret->size != 1)
+        return;
+    // Only a GAMEPAD answer is rewritten (1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro). KeyboardMouse (5)
+    // and Unknown (0) are left alone: the point is "this Xbox-looking pad is a DualSense", not
+    // "always draw PlayStation prompts" - a keyboard user must keep keyboard prompts.
+    const int observed = result != nullptr ? beforeRes : beforeLocal;
+    if (observed < 1 || observed > 4)
+        return;
+
+    if (result != nullptr)
+        *result = static_cast<uint8_t>(want);
+    if (locals != nullptr)
+        locals[ret->offset] = static_cast<uint8_t>(want);
+    ++g_glyphForced;
+    if (g_glyphForced <= 3 || g_glyphForced % 1000 == 0)
+        SDS_LOG_INFO("GetGameControllerType -> %d (was %d/%d) [%lu of %lu calls forced]", want,
+                     beforeRes, beforeLocal, g_glyphForced, g_glyphCalls);
+}
+
+// ---------------------------------------------------------------------------------------
+// The submix tap's ONE piece of UE4SS glue: resolve three objects and hand them over as raw
+// pointers. Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know
+// nothing about UE4SS and are compiled and link-tested without it.
+//
+// ON THE GAME THREAD, ALWAYS. This is called from the top of every UFunction hook and from
+// nowhere else, for the same reason as the two reads above: on_update runs on UE4SS's own
+// event-loop jthread, and a UObject read there is an unsynchronised cross-thread read of
+// state the engine mutates and the GC can move. The cost is that binding waits for the first
+// hook to fire — which is exactly when haptics start mattering — and a session where no hook
+// ever fires says so in the status line rather than looking like a silent submix.
+// ---------------------------------------------------------------------------------------
+std::chrono::steady_clock::time_point g_lastSubmixAttempt{};
+int g_submixAttempts = 0;
+
+// The scan walks tens of thousands of pointers ON THE GAME THREAD. A second between attempts is
+// right while there is a real chance of success — the engine may still be starting its audio —
+// but a session where it will never bind must not pay that forever, so it backs off.
+constexpr int kSubmixFastAttempts   = 10;
+constexpr int kSubmixFastIntervalMs = 1000;
+constexpr int kSubmixSlowIntervalMs = 5000;
+
+void MaybeBindSubmixOnGameThread()
+{
+    if (!sds::Rt().SubmixWantsBinding())
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    const int interval = g_submixAttempts < kSubmixFastAttempts ? kSubmixFastIntervalMs
+                                                                : kSubmixSlowIntervalMs;
+    if (g_lastSubmixAttempt.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastSubmixAttempt).count() < interval)
+        return;
+    g_lastSubmixAttempt = now;
+    ++g_submixAttempts;
+
+    const void* imageBase = nullptr;
+    size_t      imageSize = 0;
+    if (!sds::MainModuleRange(imageBase, imageSize))
+    {
+        SDS_LOG_ERROR("submix: the game executable's image range could not be read; the tap "
+                      "cannot validate a vtable and will not run.");
+        return;
+    }
+
+    UObject* world  = RC::Unreal::UObjectGlobals::FindFirstOf(STR("World"));
+    UObject* engine = RC::Unreal::UObjectGlobals::FindFirstOf(STR("Engine"));
+
+    // The submix, by the exact path measured in the box's own UE4SS object dump. The literal
+    // "master" means "do not look one up" — a null submix is the engine's own shorthand for
+    // the master submix (AudioMixerDevice.cpp:2350).
+    UObject* submix = nullptr;
+    bool     submixResolved = false;
+    const std::string& path = sds::Rt().Cfg().submixPath;
+    if (path == "master")
+    {
+        submixResolved = true;
+    }
+    else
+    {
+        submix = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr,
+                                                                       Widen(path));
+        if (submix != nullptr)
+        {
+            const std::string full = Narrow(submix->GetFullName());
+            // FMixerSubmix::ProcessAudio only invokes buffer listeners when the owning object
+            // Casts to USoundSubmix (AudioMixerSubmix.cpp:1370) — an endpoint or soundfield
+            // submix would register cleanly and then never call us, which is the exact
+            // silent-null-result this spike must not produce.
+            const bool isPlainSubmix = full.rfind("SoundSubmix ", 0) == 0;
+            SDS_LOG_INFO("submix: resolved '%s' -> %s%s", path.c_str(), full.c_str(),
+                         isPlainSubmix ? ""
+                                       : "   <- NOT a plain SoundSubmix. UE 4.27 only calls "
+                                         "buffer listeners for USoundSubmix, so this will "
+                                         "register and then never fire.");
+            submixResolved = true;
+        }
+    }
+
+    // THE REROUTE's UObject half (docs/STRAY-DUALSENSE.md §14): the parent's OutputVolume goes
+    // to 0 so nothing leaks into the speakers, and the master's ParentSubmix points at it.
+    // Both are plain UPROPERTY writes through reflection; the engine only acts on them when
+    // the runtime asks it to re-register the two submixes (RebuildSubmixLinks reads
+    // ParentSubmix, InitInternal reads OutputVolume). Idempotent, so it runs every attempt
+    // and logs once.
+    UObject* rerouteMaster = nullptr;
+    UObject* rerouteParent = nullptr;
+    if (sds::Rt().Cfg().submixReroute)
+    {
+        const sds::Config& cfg = sds::Rt().Cfg();
+        rerouteMaster = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
+            nullptr, nullptr, Widen(cfg.submixRerouteMaster));
+        rerouteParent = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
+            nullptr, nullptr, Widen(cfg.submixRerouteParent));
+        static bool rerouteLogged = false;
+        bool ok = rerouteMaster != nullptr && rerouteParent != nullptr;
+        if (ok)
+        {
+            FProperty* volProp    = rerouteParent->GetPropertyByNameInChain(STR("OutputVolume"));
+            FProperty* parentProp = rerouteMaster->GetPropertyByNameInChain(STR("ParentSubmix"));
+            float    volBefore    = -1.0f;
+            UObject* parentBefore = nullptr;
+            if (volProp != nullptr && volProp->IsA<RC::Unreal::FFloatProperty>())
+            {
+                auto* fp = static_cast<RC::Unreal::FFloatProperty*>(volProp);
+                volBefore = fp->GetPropertyValueInContainer(rerouteParent);
+                fp->SetPropertyValueInContainer(rerouteParent, 0.0f);
+            }
+            else
+                ok = false;
+            if (parentProp != nullptr && parentProp->IsA<RC::Unreal::FObjectProperty>())
+            {
+                auto* op = static_cast<RC::Unreal::FObjectProperty*>(parentProp);
+                void* addr = reinterpret_cast<uint8_t*>(rerouteMaster) + op->GetOffset_ForInternal();
+                parentBefore = op->GetObjectPropertyValue(addr);
+                op->SetObjectPropertyValue(addr, rerouteParent);
+            }
+            else
+                ok = false;
+            if (!rerouteLogged)
+            {
+                rerouteLogged = true;
+                SDS_LOG_INFO("submix: REROUTE UObject writes: '%s'.OutputVolume %.3f -> 0.0 "
+                             "(prop %s), '%s'.ParentSubmix %s -> %s (prop %s)%s",
+                             Narrow(rerouteParent->GetName()).c_str(),
+                             static_cast<double>(volBefore), volProp != nullptr ? "found" : "MISSING",
+                             Narrow(rerouteMaster->GetName()).c_str(),
+                             parentBefore != nullptr ? Narrow(parentBefore->GetName()).c_str() : "null",
+                             Narrow(rerouteParent->GetName()).c_str(),
+                             parentProp != nullptr ? "found" : "MISSING",
+                             ok ? "" : "   <- INCOMPLETE, the reroute will NOT be submitted");
+            }
+        }
+        else if (!rerouteLogged)
+        {
+            rerouteLogged = true;
+            SDS_LOG_WARN("submix: REROUTE objects not loaded yet (master=%p parent=%p); retrying "
+                         "with the bind", static_cast<void*>(rerouteMaster),
+                         static_cast<void*>(rerouteParent));
+        }
+        if (!ok)
+        {
+            rerouteMaster = nullptr;
+            rerouteParent = nullptr;
+        }
+    }
+
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        SDS_LOG_INFO("submix: binding from the game thread. exe=%p+0x%zX world=%p engine=%p "
+                     "target='%s'", imageBase, imageSize, static_cast<void*>(world),
+                     static_cast<void*>(engine), path.c_str());
+    }
+
+    sds::Rt().BindSubmixTap(world, engine, submix, submixResolved, rerouteMaster, rerouteParent,
+                            imageBase, imageSize);
+}
+
+// ---------------------------------------------------------------------------------------
 // The mod object.
 // ---------------------------------------------------------------------------------------
 class StrayDualSenseMod : public RC::CppUserModBase
@@ -618,7 +928,10 @@ void RegisterAll()
             // std::bad_function_call inside the game's script VM.
             hook.ids = RC::Unreal::UObjectGlobals::RegisterHook(
                 hook.function, hook.callback,
-                [](UnrealScriptFunctionCallableContext&, void*) {}, &hook);
+                hook.post ? hook.post
+                          : RC::Unreal::UnrealScriptFunctionCallable(
+                                [](UnrealScriptFunctionCallableContext&, void*) {}),
+                &hook);
             hook.registered = true;
             sds::Rt().NoteHookRegistered(hook.shortName);
         }
@@ -641,7 +954,10 @@ void RegisterAll()
 // ---------------------------------------------------------------------------------------
 // Callbacks. Each does the minimum on the game thread: read the params, hand the intent over.
 // ---------------------------------------------------------------------------------------
+// Every hook runs on the game thread, so every hook is a chance to bind the submix tap. The
+// call is a single atomic read once bound, and rate-limited to 1 Hz before that.
 #define SDS_HOOK_PROLOGUE(varName)                                                              \
+    MaybeBindSubmixOnGameThread();                                                               \
     auto* varName = static_cast<HookInfo*>(customData);                                          \
     if (varName == nullptr) return;                                                              \
     uint8_t* base = context.TheStack.Locals()
@@ -670,11 +986,13 @@ void CbTriggerActivated(UnrealScriptFunctionCallableContext& context, void* cust
 
 void CbUseStarted(UnrealScriptFunctionCallableContext&, void*)
 {
+    MaybeBindSubmixOnGameThread();
     sds::Rt().OnUseStarted();
 }
 
 void CbAfterUseDone(UnrealScriptFunctionCallableContext&, void*)
 {
+    MaybeBindSubmixOnGameThread();
     sds::Rt().OnAfterUseDone();
 }
 
@@ -682,6 +1000,8 @@ void CbAfterUseDone(UnrealScriptFunctionCallableContext&, void*)
 void CbStartVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
+    // PRE-hook, on the object the Blueprint is running on: before the body's gate is read.
+    ForcePS5HapticPathOnGameThread(context.Context);
     ReadPadVibrationEnabledOnGameThread();   // game thread: the only sound place for it
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
@@ -702,6 +1022,7 @@ void CbStartVibration(UnrealScriptFunctionCallableContext& context, void* custom
 void CbStopVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
+    ForcePS5HapticPathOnGameThread(context.Context);
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     sds::Rt().OnStopVibration(a.fadeOut);
 }
@@ -726,6 +1047,7 @@ void CbSetVibrationLevel(UnrealScriptFunctionCallableContext& context, void* cus
 void CbStartControllerSound(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
+    ForcePS5HapticPathOnGameThread(context.Context);
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
     if (a.soundFullName.empty())
@@ -761,8 +1083,11 @@ RC::StringType Join(const wchar_t* prefix, const wchar_t* name)
 void BuildHookTable()
 {
     struct Row { const wchar_t* prefix; const wchar_t* name; const char* shortName;
-                 RC::Unreal::UnrealScriptFunctionCallable cb; };
+                 RC::Unreal::UnrealScriptFunctionCallable cb;
+                 RC::Unreal::UnrealScriptFunctionCallable post = nullptr; };
     const Row rows[] = {
+        // Button glyphs: the POST hook rewrites the native return value (Glyphs=ps5).
+        { kInput, L"GetGameControllerType", "GetGameControllerType", &CbGlyphPre, &CbGlyphPost },
         // Adaptive triggers (§13). Only the component's SetPS5TriggerActivated matters;
         // SetPS5TriggersState is never called (0 times) and is not hooked.
         { kComp, L"SetPS5TriggerActivated", "SetPS5TriggerActivated", &CbTriggerActivated },
@@ -789,6 +1114,7 @@ void BuildHookTable()
         info.path      = Join(r.prefix, r.name);
         info.shortName = r.shortName;
         info.callback  = r.cb;
+        info.post      = r.post;
         g_hooks.push_back(std::move(info));
     }
 }

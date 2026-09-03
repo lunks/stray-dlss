@@ -11,8 +11,10 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   see §8.
 * **Haptics: WORKING, as real waveforms on the voice coils** — the native DualSense
   mechanism, not motor emulation. See §12, which supersedes the envelope approach in §9.
-* **Controller speaker: WORKING**, playing the game's own `_CONTROL` assets on the pad's
-  Windows audio endpoint, with the game's own +5 dB trim. See §10.
+* **Controller speaker: REGRESSED, and the cause is identified.** It worked from the
+  `libScePad` shim, which called `scePadSetAudioOutPath(3 = SPEAKER)`; retiring the shim
+  removed the only caller, and the pad's default routing MUTES its internal speaker. The
+  plugin now makes those calls itself, with no proxy DLL. **Not yet run — see §16.**
 * **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
   would be inventing a feature, not restoring one — no evidence Stray designed a behaviour.
 
@@ -521,8 +523,24 @@ The coils were in **rumble-emulation mode the whole time**. DualSense USB output
 | 0 | `COMPATIBLE_VIBRATION` |
 | 1 | `HAPTICS_SELECT` |
 | 2 / 3 | right / left trigger FFB data is valid |
-| 4 / 5 | audio volume / audio path is valid |
-| 6 / 7 | mic LED / mute |
+| 5 | `SPEAKER_VOLUME_ENABLE` |
+| 6 | `MIC_VOLUME_ENABLE` |
+| 7 | `AUDIO_CONTROL_ENABLE` |
+
+> **CORRECTED 2026-09-03 against the Linux kernel's own DualSense driver**
+> (`drivers/hid/hid-playstation.c:154-164`, `DS_OUTPUT_VALID_FLAG0_*`). Rows 4/5 and 6/7 used
+> to read "audio volume / audio path is valid" and "mic LED / mute", and **both were wrong**.
+>
+> The one that mattered: **there is no "audio path" validity bit.** The output path lives in
+> the `audio_control` BYTE at report offset 8, bits 5:4, gated by **bit 7**. Anyone acting on
+> the old table would have claimed headphone and speaker volume while supplying zeros — the
+> two-writers trap below, in its purest form — and never selected a path, leaving the speaker
+> silent while the log said the claim went out. (The mic LED and mute controls are real, but
+> they live in `valid_flag1` bits 0 and 1, not here.)
+>
+> The full corrected layout, the report offsets, the output-path routing table and the
+> `never touch bits 0..3` invariant are in `mods/StrayDualSense/src/PadAudio.hpp`, with a unit
+> test that pins them (`tests/test_pad_audio.cpp`). **This correction is why §16 exists.**
 
 With bit 0 set, the firmware **synthesises rumble on the coils** from the two motor
 amplitude bytes — so the actuators are busy emulating motors and audio sent to them goes
@@ -702,3 +720,814 @@ Names are not a reliable signal for anything:
 real name from the pak path recorded in its `.json`, and `wavegen.sh` regenerates from a clean
 work dir (a stale one once carried the three speaker files into `haptic/`) and refuses to run
 without its `ue4_soundwave_extract.py` sibling rather than dying on an import mid-copy.
+
+---
+
+## 14. The submix spike: take the haptics from the engine's own mix — UNCONFIRMED, never run
+
+§12's coil path plays the game's VIBE **assets from disk**, and §9's "one global scale" reading
+assumes we are the mixer. Both of those exist because we reproduce what the engine already
+does. **The engine may be willing to hand us the finished mix instead.**
+
+### What is MEASURED (2026-09-02, from the box's own `ue4ss/UE4SS_ObjectDump.txt`)
+
+The haptic audio has its own submix chain, loaded and live in the PC build:
+
+```
+SoundSubmix /Game/Sound/tools/settings/Submix_vibration.Submix_vibration
+SoundSubmix /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+SoundSubmix /Game/Sound/tools/settings/Submix_controller.Submix_controller
+SoundSubmix /Game/Sound/tools/settings/Submix_controllerPre.Submix_controllerPre
+SoundSubmix /Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster
+```
+
+24 submixes exist in total, and the two sound classes `SCLASS_controllerVibration` and
+`SCLASS_controller` match the asset selection `tools/dualsense/extract_assets.sh` already
+makes pak-wide. This agrees with §9's chain
+`Submix_vibration -> Submix_vibrationMaster -> VibrationEndpointSubmix`.
+
+### Why it is worth a spike
+
+The asset path has **one playback slot**: a new waveform supersedes the current one, so the
+ambient rain dies the moment the cat is touched — `Rain_Loop_VIBE ended (stop=0 superseded=1)`,
+observed by the user. §12 already lists "concurrent haptics do not mix" as a known gap. UE's
+own mixer solves it, along with the fades, the loops, the levels and the asset extraction.
+
+### What is verified about the mechanism (UE 4.27.2 source, HARD)
+
+* `ISubmixBufferListener` (`AudioDevice.h:394-407`) has **exactly one** virtual and **no**
+  virtual destructor. `IsRenderingAudio()` is UE5 and is not present.
+* `NumSamples` is **interleaved samples**, `frames * channels` — not frames.
+* Buffer listeners are invoked LAST in `FMixerSubmix::ProcessAudio`
+  (`AudioMixerSubmix.cpp:1367-1385`), after the effect chain, after the output volume, and
+  after the mix into the parent — so the buffer we see is the parent's accumulation, not this
+  submix alone.
+* They are only invoked when the owning object `Cast`s to `USoundSubmix`
+  (`AudioMixerSubmix.cpp:1370`): an endpoint or soundfield submix registers cleanly and then
+  never calls.
+* `FMixerDevice::RegisterSubmixBufferListener` (`AudioMixerDevice.cpp:2343-2377`) is safe to
+  call from any thread (it `AsyncTask`s to the audio thread) and a **null submix means the
+  MASTER submix**. UNregistration is asynchronous, so a listener must outlive the caller.
+
+### What is NOT verified, and is the whole question
+
+* **Whether Stray's PC build renders anything into `Submix_vibration` at all.** The PS5 paths
+  are platform-gated (§12: `scePadSetTriggerEffect` is called 0 times), and the submix objects
+  being *loaded* proves only that something references them.
+* Whether `FAudioDevice::RegisterSubmixBufferListener` really sits at vtable index **16** in
+  this licensee build. The index is derived, not measured.
+* Whether the `FAudioDevice*` structural scan finds the right pointer.
+
+`mods/StrayDualSense`'s `HapticSource = measure` answers the first without letting anything new
+reach the pad, and its master-submix probe distinguishes "the game is silent here" from "our
+tap is broken". Deploy with `tools/dualsense/deploy-submix-spike.sh`; the full design,
+including why the listener's vtable lives in a leaked page, is in that mod's README.
+
+### First live run, 2026-09-02: the tap refused, and two defects it exposed
+
+`HapticSource=measure` was deployed and run. **The listener never registered**, and everything
+around it worked — the submix resolved by path, and the coil sink opened the pad's endpoint
+(`4ch 48000Hz`). Three findings:
+
+1. **The FAudioDevice search was far too loose, and its cross-check was wrong.** It looked for a
+   `{TWeakObjectPtr<UWorld>; FAudioDevice*; FDeviceId}`-shaped triple whose pointer had an
+   in-image vtable — which is really "a pointer to any polymorphic object whose class lives in
+   the exe". A `UWorld` is full of UObject pointers and **8** of them passed, against **3** in
+   the UEngine object, with none shared; the rule demanded an identical pointer in both and so
+   refused. That demand was never sound anyway: a world audio device and the main audio device
+   are allowed to be **different instances**. What IS invariant is that both are `FMixerDevice`,
+   so the cross-check is a shared **vtable**, and each candidate now has to earn its place — not
+   a UObject (`ClassPrivate` fixed-point test, self-checked against objects known to be
+   UObjects), holds a standard sample rate (`FAudioDevice::SampleRate`, `AudioDevice.h:1789`),
+   and then a decisive signal: a UWorld handle whose weak pointer names that world, a UEngine
+   handle with `FAudioDeviceManager*` immediately before it (`Engine.h:1732`), or a shared
+   vtable.
+2. **Pad discovery raced the game.** On the first launch slot 1 reported `connected=1` and the
+   triggers transmitted; on the second, every slot handed back a handle and an all-zero
+   information struct. libScePad only knows about a pad **the game has opened**, and our pad
+   thread starts as soon as the module maps — so the probe can simply be too early. The retry
+   loop existed but ran at the 2 s steady-state cadence and re-logged the same five lines each
+   time; it now polls at 1 s for the first two minutes while no pad is adopted, throttles the
+   per-slot dump, treats the first miss as expected rather than an error, and reports
+   `probes=`/`misses=` in the STATUS line.
+3. **The plugin did not look for its ini where the deploy script wrote it** (the mod root),
+   so the first run silently used the default `HapticSource=assets`. The log named the file it
+   loaded, which is how it was caught. The search now includes the mod root — the conventional
+   place for a UE4SS mod's config — every candidate is logged hit or miss, and the deploy script
+   writes beside the DLL where every version looks.
+
+**The lesson worth keeping is the first one's shape.** A structural signature that matches "the
+kind of thing we want" is not a test; it has to exclude the far more numerous kind of thing that
+merely resembles it. Eight false positives and one refusal is a better outcome than one false
+positive and a crash — but only because the refusal was loud and printed its candidates.
+
+### Second live run + a memory measurement, 2026-09-03: the search was looking in the wrong places
+
+The tap still did not bind. But this round the coordinator stopped guessing and **read the
+running game's memory through `/proc/<pid>/mem`**, which settled in one pass what three build
+cycles of offset archaeology had not. **The method is the finding worth keeping**: the box's
+`/proc/<pid>/mem` is readable as root, Wine's addresses map linearly, and the plugin already logs
+`World=` and `Engine=` on every attempt — so "guess an offset, build, deploy, launch, read the
+log" becomes a measurement taken while the game runs.
+
+**Three things it established, all HARD:**
+
+1. **`UWorld` does not point at the audio device at all.** Every pointer-shaped qword in its
+   first 4 KB was followed and none of the targets holds an aligned standard sample rate.
+   `UWorld::AudioDeviceHandle` (World.h:1243) is EMPTY on this build — the world uses the main
+   audio device rather than requesting its own, so `Device` is null and there is no handle to
+   find. Every discriminator that needed UWorld — the weak-pointer index match, a vtable shared
+   between the two objects — is therefore **dead here**, and a ladder that depended on one
+   refuses forever.
+2. **`UEngine` holds ELEVEN pointees containing an aligned standard rate**, so surviving a
+   sample-rate test cannot decide anything either.
+3. **The one shaped like an audio device is `Engine+0x0A88 -> vt at +0, 48000 at +0x0C`** — and
+   that offset is exactly what stock UE 4.27 predicts. `FAudioDevice`'s first two data members
+   are `int32 NumStoppingSources; int32 SampleRate;` (AudioDevice.h:1786-1789) and `FMixerDevice`
+   inherits `FAudioDevice` as its primary base, so vtable(8) + NumStoppingSources(4) puts
+   `SampleRate` at **+0x0C**. The other ten hold their rate hundreds or thousands of bytes in;
+   two hold 48000 AND 44100, which no single device does. **Prediction and measurement agree,
+   which is the strongest evidence available short of binding.**
+
+**Why the earlier scans missed it, and it is mundane.** `UEngine` declares **268 UPROPERTYs**
+before `MainAudioDeviceHandle` (Engine.h:1735), putting it thousands of bytes into the object;
+the scan window was 0x2000 and stopped right about there. And the scan was shape-centric — it
+looked for the whole `{TWeakObjectPtr; FAudioDevice*; FDeviceId}` triple — so a device pointer
+that is not surrounded by exactly that triple was invisible however deep the window went.
+
+**The search is now pointer-centric and the discriminator is the rate's OFFSET, not its
+presence.** Plus a second hop through plain heap blocks, which is how `FAudioDeviceManager` is
+followed without knowing its layout: it has no vtable of its own so a direct scan cannot see it,
+but the devices it owns are ordinary polymorphic objects and its pointers to them look like any
+other. A candidate found that way records the container's slot, which names the manager.
+
+**Two defects the same run exposed, both fixed:**
+
+* **`HapticSource=submix` left the user with NO haptics** when the tap did not bind — the asset
+  path was disabled on configuration alone. It now stands down only once the tap is bound AND has
+  delivered a real signal, so a tap that never binds costs nothing.
+* **The sink streamed 1,097,761 frames of pure underrun** to the pad endpoint while unbound. It
+  no longer opens the endpoint until the listener has registered.
+
+### Third live run, 2026-09-03: the tap BOUND, the submix is EMPTY, and here is exactly why
+
+`submix bound=1` for the first time — discovery through `UEngine` works — and then
+**`total=0` callbacks for a whole session, "last NEVER"**, while the master probe on the same
+machinery fired 15,739 times with real signal. So the tap is sound and `Submix_vibrationMaster`
+is genuinely never rendered on PC.
+
+**The vibration the user felt that night came from the ASSET path** (`hap[starts=2 played=2]`,
+`CatPurr2_VIBE` and `Scratch_VIBE`), which the previous build kept in charge until the tap
+carried signal, and nothing in the log said so in words. That is fixed in 0.3.0: every `SUBMIX`
+and `STATUS` line now starts with `COILS: driven by the ASSET path (FALLBACK) - what you feel is
+NOT the submix` / `COILS: driven by the SUBMIX` / `COILS: NOBODY ...`, the verdict is a pure
+function (`src/CoilOwner.cpp`, `tests/test_coil_owner.cpp`), `HapticSource=submix` is now
+STRICT (the asset path never plays, so a felt vibration proves the submix) and
+`submix-fallback` is the old behaviour with a WARN every 10 s while the fallback is in charge.
+
+#### Why it is empty — HARD, from the UE 4.27.2 source plus one probe read
+
+`mods/StrayAudioProbe` (UE4SS Lua, drivable through `stray-audio-probe.cmd`) read the live
+graph:
+
+```
+EndpointSubmix  VibrationEndpointSubmix    EndpointType = "Vibration Output"
+  SoundSubmix   Submix_vibrationMaster     OutputVolume 1.0, no effects
+    SoundSubmix Submix_vibration           OutputVolume 1.0, no effects
+EndpointSubmix  ControllerEndpointSubmix   EndpointType = "Pad Speaker Output"
+  SoundSubmix   Submix_controllerMaster -> Submix_controller -> Submix_controllerPre (SBFX_Boost)
+SoundClass      SCLASS_controllerVibration Properties.DefaultSubmix = Submix_vibration
+                                           bIsUISound = true, parent SCLASS_master_soundmix_01
+SoundAttenuation PS5VibrationAttenuation   SubmixSendSettings[0].Submix = VibrationEndpointSubmix
+HKPlayerController.m_PS5VibrationSubmix  = Submix_vibrationMaster
+HKPlayerController.ControllerVibration   = an AudioComponent, Sound null, no attenuation override
+```
+
+The root of the vibration tree is a `UEndpointSubmix`, and UE 4.27.2 does this with it:
+
+1. `UEndpointSubmix::GetAudioEndpointForSubmix()` → `IAudioEndpointFactory::Get("Vibration
+   Output")` (`SoundSubmix.cpp:888-890`). No factory of that name is registered on Windows, so
+   `Get` logs *"No endpoint implementation for %s found for this platform. Endpoint Submixes set
+   to this type will not do anything."* and **returns the DUMMY factory** (`IAudioEndpoint.cpp:
+   172-174`, `GetDummyFactory`).
+2. `FMixerSubmix::SetupEndpoint` therefore creates a dummy `IAudioEndpoint`, so
+   `EndpointData.NonSoundfieldEndpoint` is valid and `IsExternalEndpointSubmix()` is true
+   (`AudioMixerSubmix.cpp:898`) — the submix lands in `ExternalEndpointSubmixes`
+   (`AudioMixerDevice.cpp:1603`).
+3. Every render callback runs `Submix->ProcessAudioAndSendToEndpoint()` on it
+   (`AudioMixerDevice.cpp:750-757`), whose first statement is
+   `if (IsDummyEndpointSubmix()) { zero the buffer; return; }` — **before `ProcessAudio`, so
+   before the child loop.** `Submix_vibrationMaster` and `Submix_vibration` are never processed,
+   their buffer listeners are never invoked, and sources routed to them are never pulled.
+
+That is the whole explanation for `total=0`: not a broken tap, not a silent submix, a subtree the
+mixer skips by design on a platform without the endpoint. The same applies to the speaker tree
+(`"Pad Speaker Output"`).
+
+#### The Blueprint gate — HARD, measured with the probe's command file
+
+`BP_HKPlayerController_C` carries a `DebugPS5Haptic` bool (object dump, offset `0x778`) next to
+the platform check in every `StartPS5Vibration` Blueprint. Calling the Blueprint from Lua:
+
+| `DebugPS5Haptic` | `StartPS5Vibration(Scratch_VIBE)` | `ControllerVibration.IsPlaying()` | `AudioComponent:SetSound/Play` hooks |
+|---|---|---|---|
+| false | entered (our hooks fire) | false | 0 |
+| **true** | entered | **true, Sound = Scratch_VIBE** | **SetSound=2, Play=2** |
+
+So the gate is `(GetPlatform() == PS5) || DebugPS5Haptic`, and with the bool set the shipped
+Blueprint plays the `_VIBE` asset on the `ControllerVibration` AudioComponent, whose base submix
+is `Submix_vibration` through the sound class. `GetPlatform` is called ~700 times a minute by the
+UI and returns 0 (Windows); it was NOT overridden.
+
+**And the engine renders that source the moment it has a rendered submix to reach.** With the
+component playing, `ControllerVibration:SetSubmixSend(Submix_menuSliders_sfx, 1.0)` drove the
+MASTER probe's peak from ~0.03 to **1.00** (the master limiter) — the haptic waveform reached the
+speakers — while the tap on `Submix_vibrationMaster` still read zero. The source, the mixer and
+the tap all work; only the endpoint root is dead.
+
+#### The way round it, built and UNCONFIRMED (never run): `SubmixReroute=1` + `ForcePS5HapticPath=1`
+
+Re-parent `Submix_vibrationMaster` under a submix the mixer DOES process every callback
+(`Submix_unused`: ParentSubmix null → the master tree, OutputVolume 1.0, no children, no
+effects — measured), after writing that parent's `OutputVolume = 0` so nothing leaks into the
+speakers; then call `FAudioDevice::RegisterSoundSubmix(parent, true)` and `(master, true)` —
+the virtual at **slot 14**, two below the listener slot that is validated live, counted from the
+same `AudioDevice.h` table (`:854`). `RegisterSoundSubmix` → `RebuildSubmixLinks` reads the
+UObject's `ParentSubmix` and re-links the live instances (`AudioMixerDevice.cpp:1034-1060`);
+`Init(bAllowReInit)` re-reads `OutputVolume` (`InitInternal`). Listeners run after a submix's own
+output volume and before its parent's, so the tap on `Submix_vibrationMaster` (volume 1.0) sees
+the full mix and `Submix_unused` (volume 0) kills it before the speakers. The attenuation's own
+send to the dead root is simply lost; the class-default routing to `Submix_vibration` is what
+carries the sound. `ForcePS5HapticPath` writes `DebugPS5Haptic=true` from the plugin's own Start
+pre-hooks, before the Blueprint's gate runs.
+
+**What a run must show, in order:** `submix: REROUTE submitted` → the `SUBMIX` line turning from
+`NO CALLBACKS` into a steady `cb=... (46.9/s)` with `peak=0` (the subtree renders) → `peak > 0`
+during a purr/scratch (the engine mixes haptics) → `HANDOVER: the SUBMIX now drives the coils`
+in `submix-fallback`/`submix` → the user feeling it. Nothing past the first arrow has been seen.
+
+**Risks stated:** slot 14 is derived, not measured (the call refuses if the slot shares its
+address with a neighbour, the ICF signature of an empty base stub); `Submix_unused` is assumed
+unused on the strength of its name; `DebugPS5Haptic` may open more than the haptic path (the
+speaker Blueprints share the shape — harmless, their endpoint is dead too).
+
+#### Glyphs — HARD shape, UNCONFIRMED effect
+
+`/Script/Hk_project.InputSubsystem:GetGameControllerType(_forceGamepad: bool @0) ->
+EGameControllerType @1` (1 byte; `0 Unknown, 1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro,
+5 KeyboardMouse`), called by `UMG_KeyIcon_C:Set Key`. The plugin's POST hook writes 3 into
+`RESULT_DECL` and the frame copy (`Glyphs=ps5`, default) and logs the observed call shape once.
+Whether the prompts actually change on screen has not been seen on this build.
+
+#### MEASURED 2026-09-03, build 0.3.0 (`341139e`): the reroute renders, the engine mixes, the coils are on the mix
+
+Two launches, both driven from the shell through `mods/StrayAudioProbe`'s command file (the
+plugin's own Start pre-hook opened the gate before the Lua's did: `DebugPS5Haptic(before)=true`).
+
+**Run A — `measure` + `SubmixReroute=1` + `ForcePS5HapticPath=1`:**
+
+```
+submix: REROUTE UObject writes: 'Submix_unused'.OutputVolume 1.000 -> 0.0, 'Submix_vibrationMaster'.ParentSubmix VibrationEndpointSubmix -> Submix_unused
+submix: REROUTE - about to call vtable slot 14 ... (parent, bInit=true) then (master, bInit=true)
+submix: REROUTE submitted.
+COILS: driven by the ASSET path | SUBMIX measure bound=1 live=0 cb=1728 (47.0/s) ch=8 rate=48000 frames/cb=1024 peak=0.00000   <- the subtree RENDERS
+  ...vib Scratch_VIBE...
+COILS: driven by the ASSET path | SUBMIX measure ... cb=2056 (45.9/s) peak=0.70795 rms=0.29357 | master-probe peak=0.00774      <- the engine MIXES, no speaker leak
+  ...stop...
+COILS: driven by the ASSET path | SUBMIX measure ... peak=0.00000
+```
+
+Slot 14 is therefore **HARD** for this build (the game did not die, the links were rebuilt), and
+so is the whole mechanism: a submix the mixer skipped for a whole session renders at 47 callbacks
+a second the moment its parent is a rendered one, and the `_VIBE` source played by the shipped
+Blueprint lands in it at peak 0.708 while the master probe stays at ~0.007 (`Submix_unused` at
+volume 0 holds). `ch=8`: the mixer runs at the device's 7.1.
+
+**Run B — strict `submix` + reroute + gate:**
+
+```
+haptics: 'Scratch_VIBE' NOT played on the asset path: COILS: NOBODY - the pad is SILENT by configuration ...
+submix: FIRST REAL SIGNAL (peak 0.70795) - HANDOVER: the SUBMIX now drives the coils.
+submix sink: 'Speakers (DualSense Wireless Controller)' 4ch 48000 Hz buf=48000, queue-ahead 1920 frames
+COILS: driven by the SUBMIX | SUBMIX submix bound=1 live=1 cb=2191 (46.0/s) ... peak=0.70795 rms=0.29317 | rerouted=1 | ring fill=14143/16384 drop=1940480 under=0 | sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=288960 fail=0
+STATUS coils=SUBMIX (HapticSource=submix: the engine's own mix, no asset path) ...
+```
+
+The chain is complete up to the pad's endpoint: no asset played, the engine's signal caused the
+handover, the sink streamed the mix to RL/RR. **What is NOT measured: how it feels.** Nobody was
+holding the pad. The user's test is the strict configuration
+(`deploy-submix-spike.sh --strict --reroute --gate`): whatever is felt came from the engine's mix,
+and a purr on top of rain should now be a SUM rather than a supersession.
+
+**Defect found by the numbers and fixed in the next build:** before the handover the ring was
+full of silence (`16384/16384 drop=1843200`) because the tap wrote from its first callback and
+nothing drained it, and after the handover it stayed near full — ~300 ms of latency. The ring is
+now attached, empty, at the handover, so the sink's 40 ms queue-ahead is the whole budget.
+
+**Glyphs:** `GetGameControllerType observed: RESULT_DECL=... (value 1) ... ReturnValue@1 size 1
+(value 37) _forceGamepad=true`. RESULT_DECL carries the real answer (1 = XBOX); the frame copy is
+garbage (37), so the post-hook's RESULT_DECL write is the one that matters. Three calls were forced
+to 3 during the menu; the pause menu opened by KEYBOARD showed ENTER/ESC prompts, which is the
+gamepad-only rule working (KeyboardMouse is left alone). **Whether the prompts show PlayStation
+glyphs when the pad is the active device is UNCONFIRMED** — the game reads the DualSense over
+hidraw, so a pad press cannot be injected from the shell; the user has to look.
+
+**Ring fix measured (`da014c5`, strict run):** `ring fill=0/16384 drop=0` before the handover;
+after it the fill sits at 864–1344 frames (18–28 ms) with `drop=0` and a single 1153-frame
+startup underrun that never grows. With the sink's 40 ms queue-ahead that is the whole path
+latency between the engine's mix and the coils. **This is the build left on the box**, in
+`HapticSource=submix` + `SubmixReroute=1` + `ForcePS5HapticPath=1` + `Glyphs=ps5`
+(`deploy-submix-spike.sh --strict --reroute --gate`).
+
+---
+
+## 15. Fourth live run, 2026-09-03: `peak=0.00000` does NOT mean the submix is empty
+
+> **SETTLED 2026-09-03 by a later capture, and both open questions closed the same way.** The
+> instrument fixes below shipped, and with them the purr reproduces from a **single `Q`
+> press**:
+>
+> ```
+> 04:00:01.378  StartPS5Vibration 'CatPurr2_VIBE' level=1.000 fadeIn=1.00 loop=1(asset)
+> 04:00:01.426  StartPS5ControllerSound 'cat_purr_loop_01_CONTROL' level=1.000 fadeIn=1.00
+> 04:00:02.098  submix: FIRST REAL SIGNAL (peak 0.25548) - HANDOVER: the SUBMIX drives the coils
+> 04:01:04.222  COILS: driven by the SUBMIX | cb=17024 (46.9/s) peak=0.70795 rms=0.15550 bad=0
+> ```
+>
+> * **The handover was EARNED, not tripped on a noise floor.** `peak 0.25548` at the handover
+>   against the `1e-4` threshold, then sustained `0.70795` — the same figure §14 run A measured
+>   for a real VIBE asset. The "a handover at 0.0001 and a handover at 0.7 are completely
+>   different worlds" worry resolves to the second world. `SubmixLiveThreshold` does not need
+>   raising.
+> * **The `FindFirstOf` defect was real and its fix holds** — `hap[... padVibe=1]` with the
+>   gate open and the vibration felt. It remains an inference that it was the *cause* of the
+>   loading-screen symptom; what is now HARD is that the corrected build works.
+> * **The user FEELS the purr and HEARS nothing from the pad speaker.** That asymmetry is the
+>   subject of §16, and its cause is not in this section: the tap, the sink and the asset
+>   player were all doing their jobs.
+
+The user's report on the `da014c5` build: *"The scratch vibration is wrong. The vibration for
+the purr is right but it doesn't have sound. There is a loading screen that has a purr that
+should be purring in the controller, but it isn't."* The pasted evidence, strict `submix` +
+reroute + gate:
+
+```
+COILS: driven by the SUBMIX | SUBMIX submix bound=1 live=1 cb=22067 (47.0/s) ch=8 rate=48000
+  frames/cb=1024 peak=0.00000 rms=0.00000 bad=0 | master-probe cb=22073 peak=0.01482
+  | rerouted=1 | ring fill=512/16384 drop=0 under=9889
+  | sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=21202080 fail=0
+hap[starts=5 played=0 done=0 missing=0 fail=0 endpoint=0 now='' compStops ok=1 ignored=684 padVibe=1]
+```
+
+### The line does not say what it was read to say — and that is the first finding
+
+**`peak` is the LAST STATUS WINDOW ONLY.** `LevelMeter::Take()` reads *and resets*
+(`SubmixDsp.hpp`), and `SubmixStatus` runs once a second. So `peak=0.00000` means "nothing was
+in the submix during that one second", which is also exactly what a perfectly working tap
+prints whenever nothing is playing. It cannot distinguish a dead submix from a quiet second,
+and the quoted line was captured with no vibration in flight — the nearest `StartPS5Vibration`
+in the same excerpt is `Scratch_VIBE` at `03:13:32`, while `cb=22067` at 47/s puts the tap
+about 470 s into its life.
+
+**Three fields in the SAME line contradict "the submix delivers nothing":**
+
+| field | what sets it | what it proves |
+|---|---|---|
+| `live=1` | `Runtime::StartSinkAtHandover`, and NOTHING else | a status window's peak reached the live threshold at least once this session |
+| `sink open=1` | opened only inside that handover | the handover really ran |
+| `frames=21202080` | 441 s of streaming at 48 kHz | it ran ~29 s after the tap bound, not at the end |
+
+So the tap has carried *something*. **What it has not carried is a number anyone has seen**:
+the threshold is `1e-4` (−80 dBFS) and the handover's own line prints the peak that tripped it,
+which nobody has read. A real VIBE asset measures ~0.708 (§14, run A). A handover at 0.0001 and
+a handover at 0.7 are completely different worlds, and in strict mode both disable the asset
+path for the rest of the session.
+
+**Verdict: the cause of `peak=0` is NOT established, and the pasted evidence cannot establish
+it.** What is established is that the instrument was too weak to be read that way. Everything
+below is either a fix for that, a defect found while looking, or a capture that would settle it.
+
+### The instrument, fixed (0.3.1)
+
+* **`submix watch`.** Every `StartPS5Vibration` opens a correlation window
+  (`SubmixWatchSeconds`, default 3 s); every status window's peak is folded in; when it closes,
+  ONE line names the asset and says what the engine put in the submix *for that asset*:
+
+  ```
+  submix watch 'Scratch_VIBE': the engine MIXED it - peak 0.70795 over 3.0s (3 window(s))
+  submix watch 'Scratch_VIBE': the engine mixed NOTHING - peak 0.00000 over 3.0s (3 window(s))
+  ```
+
+  The negative is a WARN and names the three things upstream of the tap that can cause it. The
+  logic is pure and tested (`src/SubmixWatch.{hpp,cpp}`, `tests/test_submix_watch.cpp`),
+  including that a NaN reading can never fabricate a positive verdict and that a start during
+  an open watch reports the one it replaces rather than swallowing it.
+* **`peakEver=` and `lastSignal=`** on every SUBMIX line, so a single pasted line is
+  self-diagnosing: `peakEver=0.00000` is a submix that has never carried anything;
+  `peakEver=0.70795 lastSignal=142.3s ago` is a working submix in a quiet moment.
+* **`gate[open=N writes=N misses=N]`** on the STATUS line — see below.
+* **`SubmixLiveThreshold`** is now a setting, default unchanged at `1e-4`, with the cost of
+  that default written next to it rather than buried.
+
+### DEFECT, found in RE-UE4SS's own source: `FindFirstOf` returns the LAST derived match
+
+**HARD**, read in `deps/first/Unreal/src/UObjectGlobals.cpp:354-383` at the mirror SHA CI pins:
+
+```cpp
+UObjectGlobals::ForEachUObject([&](UObject* Object, ...) {
+    UClass* Class = Object->GetClassPrivate();
+    if (Class->GetNamePrivate().Equals(ClassName) && IsValidObjectForFindXOf(Object)) {
+        ObjectFound = Object;
+        return LoopAction::Break;          // EXACT class-name match: stops here
+    }
+    if (!IsValidObjectForFindXOf(Object)) { return LoopAction::Continue; }
+    for (UStruct* super_struct : TSuperStructRange(Class))
+        if (super_struct->GetNamePrivate().Equals(ClassName)) {
+            ObjectFound = Object;
+            break;                          // INNER break only
+        }
+    return LoopAction::Continue;            // ... and the scan carries on
+});
+```
+
+The live controller is `BP_HKPlayerController_C`, a **subclass**, so it takes the second branch —
+which never breaks the outer loop. `FindFirstOf("HKPlayerController")` therefore returns the
+**LAST** matching object in `GUObjectArray`, after walking every object in the process with a
+superstruct walk per object. Two consequences:
+
+* **Correctness.** `ForcePS5HapticPathOnGameThread` opened the `DebugPS5Haptic` gate on
+  whichever controller happened to sort last, not on the one the Blueprint was executing on.
+  With a stale controller still alive across a level load — which is exactly the shape of "the
+  loading-screen purr is not felt" — the gate is set on the wrong object and the live
+  Blueprint returns before it plays anything.
+* **Cost.** The comment claimed the per-instance cache kept the search off the 60 Hz path; the
+  cache was consulted *after* the search had already run, so the full scan happened on every
+  `StartPS5Vibration` / `StopPS5Vibration` / `StartPS5ControllerSound`.
+
+**Fixed by using the hook's own `context.Context`** — `UObject* Context` in
+`UFunctionStructs.hpp`, the object the UFunction is executing on, i.e. the controller itself.
+Free, and right by construction. `FindFirstOf` survives only as a fallback for a null context
+and logs loudly when it is used. `CDO`s were never a risk here: `IsValidObjectForFindXOf`
+excludes `RF_ClassDefaultObject | RF_ArchetypeObject`.
+
+**This is a real defect and a plausible cause of the loading-screen symptom. It is NOT proof of
+the whole report** — nothing in the pasted log shows the gate's state, which is why
+`gate[open=…]` now exists.
+
+### `Scratch_VIBE` starting at `Level=0.000` is CORRECT, and lifting it would be a bug
+
+`StartPS5Vibration 'Scratch_VIBE' level=0.000(seen=1)` on the plain (non-component) path. The
+code lifts a zero level to 1.0 only for component-attached starts. **Keep it that way:**
+
+* **The game genuinely starts the scratch at zero and drives it afterwards.** §9, measured:
+  `SetPS5VibrationLevel(Level)` runs at ~60 Hz and reads `0.0` idle, `~0.47-0.52` while
+  scratching. A start level of 0 is the *beginning of that ramp*, not a missing argument —
+  `seen=1` says the parameter was read, and its value was zero.
+* **The asset path already honours the ramp.** `AudioPlayer::PlayOne` re-reads `m_level` for
+  every WASAPI buffer (`AudioPlayer.cpp`), so `SetLevel` takes effect on a playing asset.
+  Lifting the start to 1.0 would make the scratch begin at full amplitude and then be pulled
+  down by the first `SetPS5VibrationLevel` — an audible attack the game did not author.
+* **The component path's lift has a different justification and it does not transfer.** Those
+  starts carry their level in the submix send (`PS5VibrationAttenuation`, `bAttenuate=False`,
+  constant 1.0), so a 0 there means "unset", not "silent".
+* **On the submix path our level is not used at all.** The engine applies the level upstream of
+  the tap, which is why `OnSetVibrationLevel` returns early when the submix owns the coils. So
+  this question cannot be the cause of a silent submix either way.
+
+The one thing that *is* worth knowing: if the game starts the scratch at 0 and the submix
+carries it at ~0.5 while the asset path used to play it at 1.0, **the scratch will feel weaker
+than it did on the asset path**, and "the scratch vibration is wrong" is consistent with that.
+The new `submix watch` line reports the peak, so one run says which.
+
+### The capture that settles it — run on the build ALREADY on the box, no rebuild needed
+
+Against `<gamedir>/stray-dualsense.log` (`Hk_project/Binaries/Win64/`):
+
+```sh
+L=stray-dualsense.log
+
+# 1. THE DECIDER: what peak tripped the handover?
+grep -n "FIRST REAL SIGNAL" "$L"
+
+# 2. Has the tap EVER carried a real signal? (strip the master-probe field first: it also
+#    contains "peak=", and it is the game's whole soundtrack, not the vibration submix)
+sed 's/ | master-probe.*//' "$L" | grep -o 'peak=[0-9.]*' | sort -t= -k2 -g | tail -3
+
+# 3. Is the Blueprint gate open?
+grep -n "ForcePS5HapticPath" "$L" | head -5
+
+# 4. Did the game ever ask for the SPEAKER, and did it play?
+grep -n "StartPS5ControllerSound" "$L" | head -10
+grep -o "spk\[[^]]*\]" "$L" | tail -3
+
+# 5. The submix around the scratch: the 8 lines before and after each start
+grep -nE "SUBMIX|StartPS5Vibration|FIRST REAL SIGNAL" "$L" | grep -A8 -B2 "Scratch_VIBE" | head -60
+```
+
+**How to read it:**
+
+| result | meaning |
+|---|---|
+| (1) `peak 0.7…` | the submix carried a real haptic; the handover was earned |
+| (1) `peak 0.0001…` | the handover fired on the noise floor and strict mode then silenced the pad for the session — raise `SubmixLiveThreshold` |
+| (2) max is `0.00000` | the submix has NEVER carried anything: the fault is upstream of the tap |
+| (2) max is `~0.7` | the submix works and the pasted line was a quiet second |
+| (3) `DebugPS5Haptic 0 -> 1` | the gate opened; 0.3.1's `context.Context` fix is not the cause |
+| (3) `no bool property` / `Context` fallback / nothing at all | the gate never opened — the Blueprint returned before it played anything, and THAT is the whole report |
+| (4) starts > 0, `spk[... endpoint=0 fail>0]` | the speaker path is failing to open the pad endpoint — a separate bug from the coils |
+| (4) no `StartPS5ControllerSound` at all | the game never asked for the purr's speaker sound, so the gate or the platform check is what stops it |
+
+The 0.3.1 build answers (1), (2), (3) and (5) from a **single** `submix watch` line per start
+plus `peakEver=` on any status line, which is the point of the change.
+
+### What is UNVERIFIED in all of the above
+
+Everything, on the target: the plugin has not been built by CI at the time of writing and has
+never been run. The `FindFirstOf` finding is HARD (read in the source CI pins) and the
+`peak`-is-one-window finding is HARD (read in this repo's own code), but **"this is why the
+user's pad felt wrong" is an inference from both, not a measurement.**
+
+---
+
+## 16. The pad speaker is a ROUTING choice, and we stopped making it — 2026-09-03
+
+### The symptom, and why it was so confusing
+
+One `Q` press fires both halves of the purr. The user **feels** it and **hears nothing** from
+the pad. Every counter we own says the speaker path worked:
+
+```
+spk[starts=1 played=1 missing=0 fail=0 endpoint=1 now='cat_purr_loop_01_CONTROL']
+sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=2982240 fail=0
+```
+
+The asset was found (`spk/cat_purr_loop_01_CONTROL.f32`, 3,721,460 bytes), the pad's WASAPI
+endpoint opened, samples went in, zero failures. **We were writing correct audio into the pad
+and the pad was routing it nowhere.**
+
+### The asymmetry has a structural cause
+
+**THE COILS ARE A WAVEFORM PATH THAT NEEDS NOTHING CLAIMED; THE SPEAKER IS A ROUTING CHOICE
+THAT MUST BE CLAIMED EXPLICITLY.** §12's whole finding is that the coils take audio as soon as
+*nothing re-asserts* `COMPATIBLE_VIBRATION` — an absence is sufficient. The speaker is the
+opposite: the pad's default output path sends audio to the headphone sinks and **mutes the
+internal speaker**, and no absence ever changes that. Something has to select it.
+
+### THE REGRESSION — HARD, from the repo's own history
+
+`tools/dualsense/libScePad_shim.c:476-502` (`audio_probe`, committed in `bf87d91`) called
+Sony's own audio API, and the pad speaker worked:
+
+```c
+supp = resolve("scePadIsSupportedAudioFunction");   supp(h, 0, 0, 0)
+/* scePadSetAudioOutPath(handle, path) takes the path BY VALUE; 3 = SPEAKER
+   0 STEREO_HEADSET 1 MONO_HEADSET 2 MONO_HEADSET_SPEAKER 3 SPEAKER 4 OFF */
+path = resolve("scePadSetAudioOutPath");            path(h, 3, 0, 0)
+/* s_ScePadVolumeGain { uint8 SpeakerVol, JackVol, Reserved, MicGain } */
+unsigned char g[8] = { 80, 80, 0, 0, 0, 0, 0, 0 };
+gain = resolve("scePadSetVolumeGain");              gain(h, &g, 0, 0)
+```
+
+`tools/dualsense/deploy-submix-spike.sh` retires the shim (`libScePad.dll` ←
+`libScePad_orig.dll`) — **correctly**, because two writers of `valid_flag0` is the §12 trap —
+and **nothing has called those functions since**. The pad fell back to its default routing.
+That is the whole of "it worked as-is and it is not working right now".
+
+Note the shim also **crashed the game** calling `scePadGetContainerIdInformation` on a guessed
+struct, and its own comment says we do not need it. Do not call it.
+
+### The fix needs NO proxy DLL — `scePadGetHandle` is the reason
+
+The shim obtained its handle by intercepting `scePadOpen`, which is why it had to be a proxy.
+A UE4SS plugin cannot intercept `scePadOpen` — but it does not need to. **`ScePad::SelectPad`
+already holds a live handle from `scePadGetHandle` (§11, "verified to return the same
+handles"), confirmed live tonight as `handle=0x101`.** So the whole mechanism is four
+resolutions against a module the game has already mapped:
+
+```
+GetModuleHandleW(L"libScePad.dll")     // already in the process; never LoadLibrary a copy
+GetProcAddress: scePadGetHandle  scePadIsSupportedAudioFunction
+                scePadSetAudioOutPath  scePadSetVolumeGain
+```
+
+Full `scePad*` export list of the shipped `libScePad.dll` (md5
+`7a492fe29202487f3c94fe094f135c48`), read 2026-09-03 — all four are present:
+
+```
+scePadClose  scePadGetContainerIdInformation  scePadGetControllerInformation
+scePadGetControllerType  scePadGetHandle  scePadGetJackState  scePadGetParticularMode
+scePadGetTriggerEffectState  scePadInit  scePadIsSupportedAudioFunction  scePadOpen
+scePadRead  scePadReadState  scePadResetLightBar  scePadResetOrientation
+scePadSetAngularVelocityDeadbandState  scePadSetAudioOutPath  scePadSetLightBar
+scePadSetMotionSensorState  scePadSetParticularMode  scePadSetTiltCorrectionState
+scePadSetTriggerEffect  scePadSetVibration  scePadSetVibrationMode  scePadSetVolumeGain
+```
+
+**Why plugin-level beats a proxy, and it is not merely simpler:**
+
+* **Sony's dll stays the SINGLE writer of pad output reports.** The §12 two-writers hazard
+  never arises, because we are asking it to change a setting rather than writing bytes beside
+  it.
+* **No export forwarding.** A proxy that drops or mistypes one of 25 exports breaks the pad
+  entirely; that whole failure class disappears.
+* **No deploy surgery.** No `_orig`, no `_shim`, nothing renamed — which is the drop-in goal.
+
+### Implemented, and NOT YET RUN
+
+`[StrayDualSense] PadSpeakerRoute` = `sony` | `hid` | `both` | `auto` | `off`, default
+**`auto`**. `PadSpeakerPath = 3` (Sony's enum) and `PadSpeakerGain = 80` are the shim's
+measured values, configurable rather than baked. `ScePad::ApplyAudioRoute` runs on the pad
+thread — the only thread holding a libScePad handle — when a pad is adopted, when the handle
+changes, and when the settings change (they are hot-reloadable on purpose, so `sony` versus
+`hid` is one ini edit and one keypress rather than one relaunch per arm).
+
+Every result code is logged in hex exactly as the shim logged them, and `0x80920007` is named
+in the log as the §7 device-tree refusal rather than left as a number.
+
+### The HID fallback, and the bit table that was wrong
+
+`PadSpeakerRoute = hid` writes the routing into the USB output report ourselves. It exists
+because §7 measured `scePadSetAudioOutPath` returning `0x80920007` ("this pad has no audio")
+before the GE-Proton11-6 upgrade — libScePad decides from the device tree, and Wine exposed no
+USB audio sibling interfaces. If that ever comes back, the fallback needs no rebuild.
+
+Building it required correcting §12's bit table against `drivers/hid/hid-playstation.c`; see
+the correction note there. The routing table (kernel's own comment, `:1366-1377`):
+
+| path | headphone L | headphone R | internal speaker |
+|---|---|---|---|
+| 0 | L | R | **MUTED** — the pad's default, and our bug |
+| 1 | L | L | MUTED |
+| 2 | L | L | **R** |
+| 3 | muted | muted | **R** |
+
+**The internal speaker is fed from the RIGHT channel in every path.** `kSpeakerRoute` writes
+the mono `_CONTROL` asset into both FL and FR, so the signal is already on R — but
+"optimising" that route to FL alone would silence the pad speaker completely.
+
+**Sony's enum and the kernel's are DIFFERENT and must not be mixed.** Sony's 3 = SPEAKER; the
+kernel's 3 = "headphones muted, speaker gets R". `PadSpeakerPath` is Sony's;
+`PadSpeakerHidPath` is the kernel's.
+
+### Why the coils cannot be affected
+
+* **`sony` never writes a HID byte.** It calls two Sony functions that set audio routing and
+  audio levels. `HidMode`'s report — the one thing that decides the coils' mode — is untouched.
+* **The HID claim contributes bits 5 and 7 only**, and `ComposeValidFlag0` masks bits 0..3 out
+  of it unconditionally, so the coil-mode base (`HapticValidFlag0`, the §12 measurement) is the
+  only source of those bits. It is folded into the report `HidMode` already writes, so there is
+  no second writer. `tests/test_pad_audio.cpp` pins this over every path/volume/preamp and
+  every coil base, and over a deliberately hostile `flag0 = 0xFF`.
+* **`auto` never writes the claim speculatively** — only after Sony's API has been tried and
+  refused. In the world where the speaker works, the coils never see it at all.
+
+### The platform gate is NOT what silenced the speaker — the game DID ask for the sound
+
+`tools/dualsense/StrayTriggers.lua:279` hooks `/Script/Hk_project.HKUtilities:GetPlatform` and
+rewrites the return to `PS5 = 2`, behind a `stray_platform.on` flag file. The plugin has no
+equivalent (`grep -rn "GetPlatform\|EHKPlatform\|HKUtilities" mods/StrayDualSense/src/` is
+empty) and gates on `DebugPS5Haptic` instead. It is a real lever and a more honest emulation
+than flipping individual debug booleans. **It is not, however, this bug.**
+
+**The decisive evidence is in the capture that opened this section**, and it is one line:
+
+```
+04:00:01.426  StartPS5ControllerSound 'cat_purr_loop_01_CONTROL' level=1.000 fadeIn=1.00
+```
+
+**The game asked for the pad-speaker sound.** The speaker Blueprints share the haptic
+Blueprints' gate shape (§14), `DebugPS5Haptic` had already opened it, and `spk[starts=1
+played=1 missing=0 fail=0 endpoint=1]` says we then found the asset and played it into an open
+endpoint. Nothing upstream of the routing was blocked. A platform override cannot fix a step
+that already ran.
+
+Two further reasons not to build it as part of this change:
+
+* **It was tried and it barely reached** (§7 caveat): the override "fires, but only ~6 times, so
+  the value is evidently cached early". Meanwhile `GetPlatform` is called **~700 times a minute
+  by the UI** and returned 0 throughout the 2026-09-03 runs (§14) — in which the shipped
+  Blueprint nonetheless played the `_VIBE` asset, because `DebugPS5Haptic` alone was enough.
+* **Claiming PS5 opens every platform-gated path at once** — input handling, UI, save behaviour,
+  trophies — some of which may expect a PS5 API that is not there. The Lua kept it behind a flag
+  file precisely because it was a **diagnostic, never a shipped default**.
+
+**Recommendation:** worth having later as a config key defaulting OFF, as a broader alternative
+to `ForcePS5HapticPath`; not worth adding on the strength of a symptom the evidence already
+attributes elsewhere. `GetPlatform` is a post-hook return-value rewrite, the identical shape to
+the `GetGameControllerType` glyph hook the plugin already has, so it is cheap when it is wanted.
+
+### Environmental prerequisites, so a second machine does not mystify anyone
+
+The pad's Windows audio endpoint exists at all only because of **`PROTON_SONY_WINDOWS_DEVICE_NAMES=1`**
+and **`PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE=1`**, both already set by GE-Proton (§10). If
+either is missing, the endpoint disappears and nothing in §10 or this section can work — the
+symptom would be `endpoint=0` in `spk[]`, not a routing problem.
+
+Also confirmed: **the Lua never calls any `scePad*` function.** It hooks UFunctions and wrote
+command files the shim consumed; all device work was the shim's. So there is no third source of
+pad calls to reconcile — only the plugin and Sony's dll.
+
+### `HidMode` is NOT redundant, and `scePadSetVibrationMode` does not replace it
+
+Recorded because the opposite was proposed and is wrong. **The game already calls
+`scePadSetVibrationMode` itself** — the shim only *forwarded* it
+(`libScePad_shim.c:542-555`), with a `vibmode` debug command that could override the mode
+(`:453-459`, default `-1` = no override). That override existed as an **A/B knob because nobody
+knew whether the game's chosen mode was right**, and that question is still open.
+
+So the likely reading is the reverse of "Sony's API already does this": `valid_flag0 = 0x00`
+exists because the game's chosen vibration mode does **not** leave the coils accepting
+waveforms, and we are **countermanding** the game rather than duplicating Sony. Leave `HidMode`
+alone without evidence; "can Sony's API replace it" is a separate question for a later session.
+
+Corroboration from the same function: it captured the pad handle as `g_lastPadHandle = a`, a
+second source besides `scePadOpen`. Not needed now that `scePadGetHandle` is confirmed present,
+but it does establish that the game calls this with a live handle.
+
+**What this change does to `HidMode`: nothing, in the default path.** With no claim set
+(`PadSpeakerRoute = sony` succeeding, or `off`), `ComposeValidFlag0(base, {})` returns `base`,
+`valid_flag1` stays 0, the length floor is unchanged and no extra byte is written — the report
+is **byte-identical** to the one §12 measured working.
+
+### `kSpeakerBoost` must NOT be carried across to the live tap
+
+Flagged now so step 2 does not inherit it silently. `AudioPlayer.hpp` bakes in the game's
+`SBFX_Boost` as `kSpeakerBoost = 1.7783` (+5 dB, §10) because the asset path replays a
+`SoundWave` from disk and therefore bypasses `Submix_controllerPre`, where that trim lives.
+**On a rerouted-submix path the engine applies its own submix chain, so the +5 dB is already in
+the signal and applying it again would double it.** The shim had a `spkboost` runtime A/B
+(`libScePad_shim.c:450-452`) precisely because the value was being questioned; keep it
+configurable, and re-derive it for the tap rather than porting the constant.
+
+### The target shape, and how much of this stays bespoke
+
+The end state the user has set: **a drop-in DLL, no extracted assets, ever.** The `spk/*.f32`
+and `haptic/*.f32` files, `AudioPlayer`'s replay path,
+`tools/dualsense/ue4_soundwave_extract.py` and the `SpkDir`/`HapticDir` settings are all
+**condemned** — they were a workaround for a submix that would not render, and §14's reroute is
+the actual fix. Extracted game audio in a mod directory is also redistribution of Stray's
+assets, which `CLAUDE.md` already forbids.
+
+**The speaker submix is dead for the IDENTICAL reason as the vibration one** (§14):
+`ControllerEndpointSubmix` has `EndpointType = "Pad Speaker Output"`, hits the same
+`IAudioEndpointFactory::Get` dummy factory, and `ProcessAudioAndSendToEndpoint` returns before
+touching a child. So the same reroute should work on it. Order, and do not collapse it:
+
+1. **Prove the speaker ROUTES.** Orthogonal to where the samples come from — this section.
+2. **Reroute the speaker submix** and switch the source from replayed files to the live tap.
+3. **Delete** the asset player, the extracted files, the extraction tooling and their settings.
+
+**One consequence to face rather than discover:** the asset path is currently also the fallback
+when the submix tap fails to bind. Under the target shape there is no fallback — a failed tap
+is a silent pad. That is the right trade (a silent pad that says why beats a pad that
+pretends), but it makes the tap's refusal reporting **load-bearing**: `COILS:` and `spk[]` must
+name the failure, not merely report zeros.
+
+**How generic is this really?** Honestly: mostly, but not entirely.
+
+* **Passive bridging**, and it is the bulk of it: tapping a submix the engine mixes and pushing
+  it at the channel pair the hardware expects; asking Sony's dll to select a route.
+* **Not passive**, and it cannot be: the **reroute mutates the engine's audio graph**
+  (re-parenting a submix and calling `RegisterSoundSubmix`), the `DebugPS5Haptic` gate **writes
+  a Blueprint property**, and the trigger path **translates a genuine enum permutation**
+  between the game's `EPS5TriggerEffectMode` and Sony's (§13).
+
+Those three exist because parts of the PS5 path are structurally *absent* on PC rather than
+merely switched off — **you cannot bridge a stream that was never produced.** The dead endpoint
+submixes have no factory, the Blueprint gate is false, and nothing ever sets the
+`PS5TriggerEffect` device property. Making the engine produce the stream is the minimum
+intervention, not an embellishment.
+
+### UNVERIFIED — everything in this section
+
+Per §0.3: **none of it has run.** The plugin has not been built by CI at the time of writing
+and the routing has never been applied in the game. What is HARD is the shim's source (read in
+this repo), the export list (read from the shipped DLL), the kernel's bit layout (read in
+mainline) and the pure logic (tested in CI). **"This is why the pad speaker was silent" is an
+inference from all four, not a measurement.**
+
+### The one-run test
+
+Deploy the build, press `Q` once at a checkpoint, then against
+`<gamedir>/stray-dualsense.log`:
+
+```sh
+L=stray-dualsense.log
+grep -n "pad audio:"        "$L"     # the decider
+grep -o "padaudio\[[^]]*\]" "$L" | tail -3
+grep -o "spk\[[^]]*\]"      "$L" | tail -3
+grep -n "AUDIO CLAIM"       "$L" | head -3   # only if it escalated to hid
+```
+
+| what the log says | reading |
+|---|---|
+| `scePadSetAudioOutPath(3=SPEAKER)=0x00000000` + `SONY ACCEPTED` | claimed and, if the purr is audible, **done** |
+| `SONY ACCEPTED` but still silent | routing is right and the fault is downstream — levels, the endpoint's FL/FR, or the two WASAPI clients on one endpoint |
+| `=0x80920007` | libScePad refuses: "this pad has no audio" (§7, device tree). `auto` escalates to the HID claim on its own; read the `AUDIO CLAIM` line next |
+| `=0x8092xxxx` (other) | asked wrong. `scePadIsSupportedAudioFunction`'s hex on the same line says whether the capability is there at all |
+| `(absent)` on `scePadSetAudioOutPath` | this libScePad has no such export; set `PadSpeakerRoute=hid` |
+| no `pad audio:` line at all | no pad was adopted — read `pad=NO` in STATUS, not this section |
+
+**And in every case check that `COILS: driven by the SUBMIX` and the peaks are unchanged.** If
+the coils regressed, set `PadSpeakerRoute=sony` (which never writes a HID byte) or `off`, and
+report it — that would be the first evidence against the claim's safety argument.
