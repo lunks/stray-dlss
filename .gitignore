@@ -23,3 +23,7 @@ refs/
 build-local/
 build*/
 third_party/ngx/lib/
+
+# Python bytecode caches (one was committed by accident in 517f3fb).
+__pycache__/
+*.pyc
