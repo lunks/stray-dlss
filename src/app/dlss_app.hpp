@@ -24,9 +24,9 @@ struct EventNeeds
 };
 
 // Live DLSS Neural Rendering tuning (the overlay's state, formerly NrUiState). Every value is
-// re-sent to the NGX parameter block on EVERY evaluate, and the codec's three ride in push
-// constants on every dispatch, so a change takes effect on the next frame with no feature
-// recreation. Seeded from the ini in on_device; a host may edit it and call apply_nr_live().
+// re-sent to the NGX parameter block on EVERY evaluate, so a change takes effect on the next
+// frame with no feature recreation. Seeded from the ini in on_device; a host may edit it and
+// call apply_nr_live().
 struct NrLive
 {
 	bool  enabled = false;
@@ -84,8 +84,8 @@ public:
 	{
 		on_render_targets(ctx, count, rtvs, dsv, /*via_render_pass=*/false);
 	}
-	// `via_render_pass` distinguishes begin_render_pass from OMSetRenderTargets: the finders
-	// take both, the NR pre-UI trigger only the latter (as it always did).
+	// `via_render_pass` distinguishes begin_render_pass from OMSetRenderTargets. Both finders
+	// take both kinds, so nothing reads it today — see the .cpp for why it is kept.
 	void on_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
 	                       const icept::DescriptorId *rtvs, icept::DescriptorId dsv, bool via_render_pass);
 	void on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count) override;

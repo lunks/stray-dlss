@@ -3,18 +3,17 @@
 //
 // WHY, in one line: NR is not an upscaler — same resolution in, same resolution out — and it sat
 // inside the intercepted TAA dispatch only because that is where we already had a hook. Every
-// painful thing about it follows from that one choice. The full argument, both problems it
-// removes, and what is different from the two post-tonemap sites that were built and deleted on
-// 2026-09-02, are in src/core/nr_hook_plan.hpp. Read that first.
+// painful thing about it followed from that one choice. The full argument, and both problems this
+// site removes, are in src/core/nr_hook_plan.hpp. Read that first.
 //
-// WHAT THIS FILE IS. The stage's live half: it takes the guides the TAA hook publishes, asks the
-// pure gate whether this frame may be injected into, and — if so — drives
-// src/nr_stage.hpp's copies around a `nr::apply(Site::post_tonemap)`. It owns no D3D12 resources
+// WHAT THIS FILE IS. The stage's live half, and since 2026-09-03 the ONLY site NR has: it takes
+// the guides the TAA hook publishes, asks the pure gate whether this frame may be injected into,
+// and — if so — drives src/nr_stage.hpp's copies around a `nr::apply`. It owns no D3D12 resources
 // of its own and it makes no decisions the gate could have made.
 //
-// PHASE 1 SHIPS `taa` AS THE DEFAULT. Nothing here changes the shipped image until someone sets
-// [STRAYDLSS] NgxNRHook=present. Everything this file claims is UNCONFIRMED until a run on the
-// box says otherwise.
+// Confirmed working in the game by the user on 2026-09-03, which is what retired the TAA site,
+// the HDR colour codec that site's raw linear HDR needed, and the history restore its feedback
+// node needed.
 #pragma once
 
 #include "core/nr_hook_plan.hpp"
@@ -35,11 +34,13 @@ namespace stray_dlss::nrhook {
 //
 // WHAT IT IS FOR. Our transitions name a StateBefore, and D3D12 has no way to ASK what state a
 // resource is in. Get it wrong and vkd3d-proton — which has no debug layer to object — does
-// something undefined rather than complaining. The default is not a guess in the way the
-// NgxNRRestoreState constant was: D3D12 REQUIRES the back buffer to be in PRESENT when
-// IDXGISwapChain::Present is called, and both of our triggers run inside that call, after the
-// game has submitted every list of the frame. The knob exists because "required by the API" and
-// "true on this stack" are not the same sentence, and one ini key is cheaper than a round trip.
+// something undefined rather than complaining. The default is not a guess, though: D3D12 REQUIRES
+// the back buffer to be in PRESENT when IDXGISwapChain::Present is called, and our trigger runs
+// inside that call, after the game has submitted every list of the frame. (The now-deleted
+// history restore had no such guarantee — its state constant was derived from four UE 4.27 source
+// anchors and zero measurements, which is the difference this comment used to draw.) The knob
+// exists because "required by the API" and "true on this stack" are not the same sentence, and
+// one ini key is cheaper than a round trip.
 void set_back_buffer_state(std::uint32_t d3d12_resource_states);
 std::uint32_t back_buffer_state();
 

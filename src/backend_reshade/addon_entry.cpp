@@ -374,8 +374,8 @@ void on_execute_command_list(reshade::api::command_queue *queue,
 }
 
 // Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
-// into the NGX parameter block on EVERY evaluate, and the codec's three are push constants on
-// every dispatch, so an edit lands on the next frame with no feature recreation. The values are
+// into the NGX parameter block on EVERY evaluate, so an edit lands on the next frame with no
+// feature recreation. The values are
 // NOT written back to ReShade.ini automatically — "Save to ReShade.ini" does that on demand,
 // because ReShade rewrites its config on exit and a silent autosave would make an experiment
 // permanent without the user deciding it should be.
@@ -398,10 +398,7 @@ void draw_nr_controls()
 	// The master switch only gates whether apply() runs; the runtime stays loaded either way,
 	// so this toggles cleanly in both directions without touching the GPU.
 	if (ImGui::Checkbox("Enabled", &g_nr_ui.enabled))
-	{
 		nr::set_enabled(g_nr_ui.enabled);
-	}
-
 
 	ImGui::TextUnformatted("Motion");
 	changed |= ImGui::SliderFloat("MVec scale (0=auto)", &g_nr_ui.mvec_scale, 0.0f, 4.0f, "%.2f");

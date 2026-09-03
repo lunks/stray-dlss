@@ -193,9 +193,8 @@ ID3D12Device *reshade_proxy_device(ID3D12Device *native)
 
 // Live NR tuning, owned by the overlay (see draw_nr_controls). Seeded from ReShade.ini at
 // device init and thereafter editable in-game: every one of these is re-sent to the NGX
-// parameter block on EVERY evaluate, and the codec's three ride in push constants on every
-// dispatch, so a change takes effect on the next frame with no feature recreation and no
-// restart. Only the geometry (Width/Height/ScalingRatio) is create-time, and none of that is
+// parameter block on EVERY evaluate, so a change takes effect on the next frame with no feature
+// recreation and no restart. Only the geometry (Width/Height/ScalingRatio) is create-time, and none of that is
 
 // [STRAYDLSS] hash override file state; -1: no file.
 int g_extra_hashes_loaded = -1;
@@ -896,9 +895,9 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 	g_state.dispatches_seen.fetch_add(1, std::memory_order_relaxed);
 
 	{
-		// Everything we record onto the game's list from here (the resolve, NGX, the codec
-		// passes, the restore) is OUR state, and the native shadow must not mistake it for
-		// the game's (assessment §8.3).
+		// Everything we record onto the game's list from here (the resolve and the NGX evaluate)
+		// is OUR state, and the native shadow must not mistake it for the game's
+		// (assessment §8.3).
 		native::OwnCodeScope own;
 		if (taa_hook::intercept_dispatch(ctx, x, y, z))
 			return true;
@@ -961,10 +960,13 @@ void DlssApp::on_render_targets(const icept::CommandContext &ctx, std::uint32_t 
                                 const icept::DescriptorId *rtvs, icept::DescriptorId dsv,
                                 bool via_render_pass)
 {
-	// The render-target event feeds both finders (when either is on) and, at
-	// `via_render_pass` distinguished begin_render_pass from a plain bind for the `preui` NR
-	// trigger, which was removed on 2026-09-02 and is not coming back (the present STAGE needs no
-	// render-target event at all). Each callee below is a cheap no-op when its feature is off.
+	// The render-target event feeds both finders, each a cheap no-op when its feature is off.
+	//
+	// `via_render_pass` is currently unread. It distinguished begin_render_pass from a plain
+	// OMSetRenderTargets for the `preui` NR trigger, which was removed on 2026-09-02 and is not
+	// coming back — the present stage needs no render-target event at all. The parameter stays
+	// because the two hosts already compute it and a finder that needs the distinction should not
+	// have to re-plumb it.
 	(void)via_render_pass;
 	pass_finder::note_render_targets(ctx, count, rtvs, dsv);
 	gbuffer_finder::note_render_targets(ctx, count, rtvs, dsv);
@@ -1028,13 +1030,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		}
 		nrhook::on_present(pc, nr_device);
 	}
-	// END-OF-FRAME HISTORY RESTORE. Puts the pristine, pre-NR image back into the engine's `u0`
-	// so the next frame's screen-space reflections read the history UE 4.27 would have written,
-	// not the one DLSS Neural Rendering left behind. It records onto ReShade's OWN immediate
-	// command list, which the D3D12 present path flushes at dxgi_swapchain.cpp:1009 — after this
-	// event and after the game has submitted every command list of the frame to the same queue,
-	// so the copy executes after every same-frame consumer of `u0`. (src/nr_history.hpp)
-
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
 
@@ -1179,10 +1174,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			{
 				// NR's refusal breakdown, machine-readable. The periodic log line carries the
 				// same numbers, but a log line has to be found and read; an A/B harness reads
-				// this file. `nr_refused_no-codec`, `nr_refused_exposure-unknown` and
-				// `nr_refused_degenerate-scale` are the NO CODEC, NO EVALUATE reasons — any of
-				// them climbing means frames are being declined rather than shown raw HDR, which
-				// is the intended behaviour but not a state to sit in unnoticed.
+				// this file.
 				std::uint64_t nr_applied = 0, nr_refused = 0;
 				std::uint32_t nr_reasons[nr::kNrRefusalCount] = {};
 				nr::counters(nr_applied, nr_refused, nr_reasons);
@@ -1361,15 +1353,20 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			STRAY_LOG_INFO("%s", nr_line);
 
 			// EVERY DLSSNR.Reset DISCARDS FEATURE 18'S WHOLE ACCUMULATION, so a source that
-			// fires often is a flicker source rather than a fix for one. Two of these follow
-			// continuously varying quantities — `codec-scale` follows the engine's exposure,
-			// `frame-gap` follows how reliably the TAA hook matches — and CLAUDE.md has already
-			// measured a latch on such a quantity firing 52 times and making the image WORSE.
-			// So this line is the one that says whether our own reset machinery is the problem.
-			// Read it while WALKING: a static camera moves neither exposure nor the hook rate.
+			// fires often is a flicker source rather than a fix for one. `frame-gap` is the one
+			// that still follows a continuously varying quantity — how reliably the TAA hook
+			// matches — and CLAUDE.md has already measured a latch on such a quantity firing 52
+			// times and making the image WORSE. So this line is the one that says whether our own
+			// reset machinery is the problem. Read it while WALKING: a static camera moves
+			// neither exposure nor the hook rate.
+			//
+			// A sixth source, `codec-scale`, went with the HDR colour codec on 2026-09-03. Its
+			// field outlived its argument here for one commit, which is a printf with more
+			// conversions than values — so if a source is ever removed again, remove the field in
+			// the same edit.
 			const nr::ResetCounts rc = nr::reset_counters();
 			STRAY_LOG_INFO("[%s] NR RESETS: total=%u  from: frame-gap=%u guide-grid=%u "
-				"codec-scale=%u camera-cut=%u new-feature=%u", when,
+				"camera-cut=%u new-feature=%u", when,
 				rc.frame_gap + rc.guide_grid + rc.camera_cut + rc.new_feature,
 				rc.frame_gap, rc.guide_grid, rc.camera_cut, rc.new_feature);
 
@@ -1587,8 +1584,8 @@ void DlssApp::load_hash_override_file()
 }
 
 // Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
-// into the NGX parameter block on EVERY evaluate, and the codec's three are push constants on
-// every dispatch, so an edit lands on the next frame with no feature recreation. The values are
+// into the NGX parameter block on EVERY evaluate, so an edit lands on the next frame with no
+// feature recreation. The values are
 // NOT written back to ReShade.ini automatically — "Save to ReShade.ini" does that on demand,
 // because ReShade rewrites its config on exit and a silent autosave would make an experiment
 

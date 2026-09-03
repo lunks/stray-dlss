@@ -67,7 +67,7 @@ constexpr std::uint32_t kStagingRestState = 0x40;
 // (`_has_commands`, d3d12_impl_command_list_immediate.cpp:122), and its `barrier()` is what sets
 // that. Both are `icept::Backend::present_barrier`. So the back buffer's transitions go through
 // the caller's function, and only the copies and our own staging texture's transitions are
-// recorded natively — exactly the split src/nr_history.cpp already runs on.
+// recorded natively.
 using BarrierFn = void (*)(void *ctx, ID3D12Resource *res, std::uint32_t before,
                            std::uint32_t after);
 

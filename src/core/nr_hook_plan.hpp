@@ -17,8 +17,6 @@
 
 namespace stray_dlss::nrplan {
 
-
-
 // Why a present-stage frame was, or was not, injected into. Every one is counted and named, for
 // the same reason the TAA path's gate refusals are: a stage that never fires must never be
 // indistinguishable from a stage that fired and did nothing.
@@ -100,7 +98,7 @@ struct Plan
 	//
 	// CONTESTED, and that is why it is computed here and carried as data rather than baked in. A
 	// live A/B on the user's machine (CLAUDE.md, 2026-09-01) found 1.0 visibly more stable than
-	// the ratio at the TAA site, and ngx_nr.cpp sends 1.0 there for that reason — we already
+	// the ratio back when NR ran at the TAA site, and ngx_nr.cpp sends 1.0 for that reason — we
 	// declare the guides' own rect through DLSSNR.MVecSubrectWidth/Height, so a runtime that
 	// normalises by the subrect would apply the ratio twice. The stage therefore leaves
 	// nr::ApplyInputs::mvec_scale_* at 0 ("derive"), which reaches the same 1.0, and this field is
@@ -162,11 +160,12 @@ bool take_evaluate_reset(EvaluateGapLatch &latch);
 //
 // note_evaluate_gap() is reached only from inside nr::apply(), so it covers exactly the frames NR
 // was ASKED about and declined. It cannot cover the frames NR was never asked about at all, and
-// those are not rare: apply() is called only when the TAA pass was intercepted AND the SR/RR
-// evaluate succeeded (src/taa_hook.cpp), and NgxNR=0 -> 1 deliberately KEEPS the existing feature
-// and its accumulated history across a gap of arbitrary length (nr::set_enabled). On every one of
-// those frames feature 18's history stands still while the world moves, and the next evaluate
-// reprojects across the whole gap with motion vectors that describe one frame.
+// those are not rare: the stage declines any present whose guides are absent or stale (a loading
+// screen, a frame in which the TAA pass was never matched), and NgxNR=0 -> 1 deliberately KEEPS
+// the existing feature and its accumulated history across a gap of arbitrary length
+// (nr::set_enabled). On every one of those frames feature 18's history stands still while the
+// world moves, and the next evaluate reprojects across the whole gap with motion vectors that
+// describe one frame.
 //
 // The sibling port does not need this because its pass is a fixed pipeline stage that runs every
 // frame, so its sticky flag sees every frame by construction:

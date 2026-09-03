@@ -54,8 +54,8 @@ void set_sink(icept::Sink *sink);
 icept::Sink *sink();
 
 // While held on this thread, every hook passes straight through: our own recording onto
-// the game's list (resolve, NGX evaluate, codec passes, the restore) must not enter the
-// shadow, or it would replace the game's state with ours (assessment §8.3).
+// the game's list (the resolve and the NGX evaluate) must not enter the shadow, or it would
+// replace the game's state with ours (assessment §8.3).
 struct OwnCodeScope
 {
 	OwnCodeScope();

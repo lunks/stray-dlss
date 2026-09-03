@@ -34,7 +34,6 @@ struct ID3D12Resource;
 
 namespace stray_dlss::nr {
 
-
 // [STRAYDLSS] NgxNR, and the overlay checkbox. Callable from ANY thread, and 1 -> 0 destroys
 // nothing on the caller's: it queues a teardown that on_present() executes once the GPU has
 // passed the last evaluate. Flipping back to 1 before that teardown has run cancels it, so a
@@ -51,7 +50,7 @@ void set_tuning(float intensity, float local_tone_strength, float local_structur
 // Defaults are RenoDX's own shipped [RenoDX.DLSS5] values.
 void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
 	unsigned int use_auto_mask, unsigned int ui_correction);
-// Overrides the motion-vector scale handed to NR; <= 0 means "derive from the topology".
+// Overrides the motion-vector scale handed to NR; <= 0 means "derive" (which reaches 1.0).
 void set_mvec_scale_override(float scale);
 
 // DLSSNR.Style — confirmed present in the 310.8.0 runtime by exact string search (one
@@ -97,9 +96,6 @@ void set_warmup_frames(unsigned int frames);
 
 
 
-
-
-
 struct ApplyInputs
 {
 	// The image to improve: our staging copy of the back buffer. It is NR's Color directly —
@@ -115,9 +111,10 @@ struct ApplyInputs
 	// Camera cut, the same OR of three signals SR gets (CLAUDE.md §2.8: View.CameraCut row
 	// 145.x, TemporalAAJitter.zw == .xy, or a 1x1 history/velocity SRV). Feature 18 keeps its OWN
 	// temporal accumulation — it consumes motion vectors and depth, and DLSSNR.Reset is
-	// `settings.resetAccumulation` in the reference — so this must reach it at BOTH sites. A
-	// camera cut that does not reset NR's history is the "flicker between a frozen image and fog"
-	// class of bug this project has already been bitten by once.
+	// `settings.resetAccumulation` in the reference — so it must travel with the guides from the
+	// TAA hook all the way to the present stage. A camera cut that does not reset NR's history is
+	// the "flicker between a frozen image and fog" class of bug this project has been bitten by
+	// once.
 	bool reset = false;
 
 	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive", which is what the present
@@ -141,10 +138,9 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 // `queue` is the swapchain's own command queue (icept::PresentContext::queue) and may be null
 // under a host that does not report one. It is used for exactly one thing: signalling our own
 // fence, so that "the CPU stopped using this" and "the GPU stopped reading it" can be told apart.
-// Every deferred free — the neural output texture on a resolution change, the codec's proxy and
-// descriptor heap on an NgxNR 1->0 toggle, the validation readback buffers, and ReleaseFeature
-// itself — happens here and only once that fence has passed the last evaluate that used the
-// resource. With no queue the decision falls back to a conservative present ring
+// Every deferred free — the neural output texture on a resolution change, the validation readback
+// buffers, and ReleaseFeature itself — happens here and only once that fence has passed the last
+// evaluate that used the resource. With no queue the decision falls back to a conservative present ring
 // (core/nr_lifetime.hpp).
 //
 // Also drains the deferred validation readback. MUST be called every present, INCLUDING while NR
@@ -157,7 +153,7 @@ const char *last_error();
 
 // Telemetry for the periodic report: how often NR replaced the image versus refused, and why.
 // NOTE: the count is duplicated in src/ngx_nr.cpp's kNrRefusalNames — change both together.
-constexpr int kNrRefusalCount = 15;
+constexpr int kNrRefusalCount = 10;
 extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();
