@@ -44,6 +44,11 @@
 > in `sl.dlss_g.dll`; (b) we would be replacing a system measured at **2.00× steady state** with
 > an untested one; (c) the gains are all worth zero on a single-viewport UE 4.27 title on Ada.
 > **§7.6 names a one-launch experiment that could still overturn it, and it should be run.**
+> **§7.2b is the honest counterweight**: a line-by-line inventory of our own FG path found
+> twelve structural defects — VSync unhandled, device removal unhandled, the mirror
+> desynchronising on a fullscreen toggle without a resize, and two outright bugs. The verdict
+> survives, but only on the narrower claim that ours is correct *for the user's configuration*
+> and that its defects are in code we can reach.
 
 We deliberately do not use Streamline. `src/ngx_fg.cpp` drives NGX feature 11
 (`NVSDK_NGX_Feature_FrameGeneration`) directly through the NGX core; `src/backend_native/present_owner.*`
@@ -710,10 +715,12 @@ Sources: `NVIDIA-RTX/Streamline` @ **v2.12.0** (`e8aaa6eaac`, public) for the SD
 | **Resource tagging** | `setTag` with a lifecycle enum; `eValidUntilPresent` (pointer only) or `eOnlyValidNow` (SL makes a GPU copy) | `GuideSet g_guides[2]` — we always make our own owned copies, double-buffered | **Equivalent, and ours is the stricter mode** — the same one NVIDIA's own plugin chose. Confirmed in §2 |
 | **Reflex** | **Mandatory.** `eFailReflexNotDetectedAtRuntime`; the 8.7.2 plugin `checkf`s the status **every frame** | Best-effort and **non-gating**: we call the five NVAPI entry points, log the result, and proceed regardless (`fg_reflex.cpp`, 215 lines) | **Ours is weaker in principle and more robust here.** Facts §32.7: the calls return `NVAPI_OK` through DXVK-NVAPI 0.9.2, but *what they do* under vkd3d/gamescope is **UNCONFIRMED**. Streamline would gate on a subsystem whose real behaviour on this stack is unknown |
 | **Camera-cut / reset** | UE plugin: `bReset = View.bCameraCut`, with an open `// TODO STREAMLINE check for other conditions` on **both** branches | 3-signal OR (cut flag ∥ jitter `zw==xy` ∥ 1×1 history/velocity) | **Ours is ahead of NVIDIA's shipped code.** Unchanged from the first pass |
-| **Output validation** | Auto Scene Change Detection inside the closed snippet (input-side) | **Crop readback gate**: 3 consecutive good looks to validate, and it **revokes** on a bad one, with per-reason refusal counters (`fg_present.cpp:642-662`) | **We have something Streamline does not**: an output-correctness check at the integration level. It is how we know FG is working at all |
+| **Output validation** | Auto Scene Change Detection inside the closed snippet (input-side) | **Crop readback gate**: 3 consecutive good looks to validate, and it **revokes** on a bad one, with per-reason refusal counters (`fg_present.cpp:642-662`) | **We have something Streamline does not** at the integration level — but it is a 64×64 centre crop, and a generated frame byte-identical to the real one (a pure copy, not an interpolation) is weighted *good* and validates the feature. It proves "something plausible reached the screen", not "a frame was interpolated". **See §7.2b** |
 | **Back-buffer index** | **Requires** `GetCurrentBackBufferIndex`; `eFailGetCurrentBackBufferIndexNotCalled` is a documented failure bit | `GameIndexMirror` models the engine's `++ % N` counter | Ours is correct **only against an engine that manually increments** — true for stock 4.27, false for UE 5.6+. A stated precondition, not a bug |
 | **Resolution / fullscreen** | Teardown + recreate | Drain the worker, idle the GPU, bump an **epoch**, drop and re-arm replacements | Ours is measured through `SetFullscreenState(TRUE)` + `ResizeBuffers` and three checkpoint reloads (facts §32.7, §32.10) — **deliberately, because that is where OptiScaler died** |
-| **Multi-viewport / multi-swapchain** | Supported, view-id keyed | **Assumes one** | A real simplification. Correct for Stray; would not survive a title with a second swapchain |
+| **Multi-viewport / multi-swapchain** | Supported, view-id keyed | **Assumes one** (`fg_present.cpp:301`; a second logs an error and is passed through untouched) | A real simplification. Correct for Stray; would not survive a second swapchain |
+| **VSync** | Handled; `bIsVsyncSupportAvailable` is part of the API | **Unhandled.** Both presents reuse the game's sync interval verbatim; nothing forces `sync=0` on the generated one | **A genuine weakness that would bite on a config change.** Validated only at VSync off on a VRR panel. §7.2b |
+| **Device removal / TDR** | Handled | **Zero handling** — no `DXGI_ERROR_DEVICE_REMOVED` anywhere in the native backend, and an internal failure returns `E_FAIL`, which UE4's `PresentChecked` does not treat as fatal | §7.2b |
 | **MFG (>2×)** | Supported | `MultiFrameCount=1` | Not applicable — Ada's ceiling is 2×. Same outcome |
 | **Diagnostics / knobs** | Debug overlay in non-shipping builds; `onErrorCallback` | 12 `NgxFG*` knobs including `NgxFGPacing`, `NgxFGTrace` (per-present timestamp trace), `NgxFGValidate`, plus per-reason refusal counters | **Ours is substantially better for this project's actual workflow** — a round trip to the user's box is expensive, and these are what make one launch diagnostic |
 
@@ -758,21 +765,91 @@ But the asymmetry is real and it does not require the hypothesis to be exactly r
 pacing defect in a closed component is unfixable, and we have already demonstrated that this
 platform produces pacing defects that a Windows-developed component would not have anticipated.
 
+
+### 7.2b Where ours is genuinely weaker — the honest defect list
+
+**This subsection exists because the first draft of §7 was too kind to our own code.** It called
+our implementation "a working, measured system" and left it there. It *is* that — but a
+line-by-line inventory of the FG path (this tree, `3224c46`) turns up a specific defect list,
+and an argument for keeping our own code is worthless if it will not look at it. Everything
+below is **HARD**, read from our own source. None of it is flagged in-code: a scan for
+`TODO`/`FIXME`/`XXX`/`HACK` across the whole FG and present path returns **zero hits**, so these
+are structural, not known-and-deferred.
+
+**Would bite on a configuration change — the class the question asks about:**
+
+| # | Defect | What triggers it |
+|---|---|---|
+| 1 | **VSync is unhandled.** Both presents reuse the game's sync interval verbatim (`fg_present.cpp:1239`, `p.sync = args.sync`). Nothing forces `sync=0` for the generated present. The entire pacer was validated only at `bUseVSync=False` on a 165 Hz VRR panel | **Turning VSync on.** Both presents block on vblank, the phase-locked schedule becomes meaningless, and the game is throttled toward half rate |
+| 2 | **`SetFullscreenState` without a following `ResizeBuffers` desynchronises the mirror silently.** `fg_plan.hpp:22` asserts a Resize follows every fullscreen change, but `after_reconfigure(drop_replacements=false)` does not reset the mirror (`fg_present.cpp:1092-1095`). The WARP test states the gap explicitly (`warp_fg_present.inc:385-386`) | A fullscreen toggle that does not resize. **Failure mode is a stale presented frame, with no detector** |
+| 3 | **Device removal is unhandled and can be masked.** Grep for `DXGI_ERROR_DEVICE_REMOVED` across the whole native backend: **zero hits.** Worse, `present_one` returns `E_FAIL` without calling the original `Present` when `GetBuffer` or the list ring fails (`fg_present.cpp:693-701`) — and `E_FAIL` is *not* one of the three codes UE4's `PresentChecked` treats as fatal | A device reset / TDR. UE4 ignores the code and continues against a dead device |
+| 4 | **The HRESULT the game receives is one frame stale** in the default threaded mode (`fg_present.cpp:1299` returns `g_last_present_hr`, the *previous* frame's result; on the first present it is the `S_OK` initialiser) | Any fatal present error is reported at least one frame late |
+| 5 | **A reconfiguration silently drops the game's frame.** `run_pair` (`:763-769`) presents the real swapchain without copying the replacement the game just rendered into — the displayed frame is whatever an earlier copy left there, and `note_issued_present()` is skipped so the counters under-report | Every resize/fullscreen transition drops one frame |
+| 6 | **`GetCurrentBackBufferIndex` (slot 36) is not hooked.** Anything that queries it sees the *real* ring, which advances **twice** per game frame | Any code — engine, overlay, or a future UE patch — that asks DXGI instead of counting |
+| 7 | **Exactly one swapchain.** `fg_present.cpp:301`, `Chain g_chain;`. A second logs an error and is passed through untouched | A video player, a second window, an overlay with its own chain |
+
+**Latent bugs, independent of configuration:**
+
+| # | Defect |
+|---|---|
+| 8 | **The FG worker thread bypasses the own-code guard.** `in_own_code()` is `thread_local` (`native_backend.cpp:25,71-73`) and `fg_present.cpp` never establishes an `OwnCodeScope` on the worker. The worker calls `ListRing::begin()` → `list->Reset(...)`, and `Reset` **is** vtable-patched (`d3d12_hooks.cpp:1087`), so `hk_List_Reset` delivers **our own FG present list into the root-signature shadow and the application sink as if it were the game's**. Unguarded, untested |
+| 9 | **`ReleaseFeature` runs without a GPU idle.** `NgxGenerator::g_queue` (`ngx_fg.cpp:519`) is **never assigned**; `release_feature(queue)` → `wait_idle(nullptr)` returns immediately (`:167-168`). So `ngx_fg.hpp:70`'s documented contract — "Releases the feature and every texture. GPU idle first." — **is not met**, on every size change and at shutdown |
+| 10 | **`g_cfg.enabled` is mutated from inside hooks without synchronisation** (`fg_present.cpp:899,1046,1052`) and read lock-free from six places. One failure permanently disables FG for the session with **no re-arm path** |
+| 11 | **Every barrier `StateBefore` in the FG path is an assumed constant**, never queried. `PRESENT` and `COMMON` are both `0`, so the real-back-buffer assumption is invisible until it is wrong. This is the same gap `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §7.4 identifies — NVIDIA asks the engine's resource-state tracker; we cannot |
+| 12 | **Config is startup-only.** Every `NgxFG*` knob is read once, in `install()` (`present_owner.cpp:578`), despite `configure()` containing live worker start/stop logic that only the WARP test exercises |
+
+**And the crop gate is narrower than §7.1 gives it credit for.** It is a **64×64 centre crop**, so
+a generated frame that is black everywhere except the centre passes. More pointedly,
+`CropVerdict::identical` — the generated crop being *byte-identical* to the real one, i.e. a pure
+copy rather than an interpolation — is weighted **good** (`fg_plan.cpp:269`) and will **validate
+the feature**. So the gate proves "something plausible reached the screen", not "a frame was
+interpolated". That is still more than Streamline offers at the integration level, but the §7.1
+row overstated it.
+
+**Costs Streamline's design would not pay:** a **1.5 ms busy-spin on a dedicated core, every
+present** (`fg_present.cpp:731` — the Wine workaround), **two full back-buffer `CopyResource`s per
+game frame**, three separate command-list rings plus three fences, and a `Map` + reduce of two
+64×64 readbacks **on the game thread** every present.
+
+**Our own docs already record the deepest uncertainty.** `docs/STRAY-RENDERING-FACTS.md:1383`,
+verbatim: *"HARD that the names are read; the **VALUES' conventions (MvecScale, matrices'
+handedness, CameraFar=0) are UNCONFIRMED until an interpolated frame is judged on the box**"* —
+and `:1330` calls the sign convention *"the design bet of this branch"*. So the parameter
+correctness that §7.4 says Streamline would not improve is, strictly, **not yet established for
+ours either**; what is established is that the pipeline runs and the output passes a coarse gate.
+
+**Does this change the verdict? No — and the reason is the point.** Every defect above is in code
+**we own and can fix**, most of them cheaply (force `sync=0` on the generated present; reset the
+mirror on any reconfigure; propagate the real HRESULT; add an `OwnCodeScope` on the worker; assign
+`g_queue`). Item 8 and item 9 are real bugs that should be filed regardless of this decision.
+The argument for keeping our implementation was never that it is flawless — it is that **its
+flaws are reachable**. §7.2's pacer argument is the same argument in its strongest form.
+
+**What this does change: the confidence with which §7.5 can say "a working, measured system."**
+It works, and is measured, *in one configuration* — windowed-fullscreen, VSync off, VRR, one
+swapchain, three back buffers, no device resets. That is exactly the configuration the user
+runs, which is why it has never bitten. It is not a general implementation and should not be
+described as one.
+
 ### 7.3 What replacing it would actually cost
 
-**Deleted or reduced to a shim** (line counts from the tree at `3224c46`):
+**Deleted or reduced to a shim** (exact line counts, tree at `3224c46`):
 
 | File | Lines | Fate |
 |---|---|---|
-| `src/backend_native/fg_present.cpp/.hpp` | ~1370 | **Deleted** — replacement ring, pacer, worker, validation gate, epochs |
-| `src/backend_native/present_owner.cpp/.hpp` | ~693 | **Mostly deleted**; SL owns present |
-| `src/core/fg_plan.cpp/.hpp` | ~628 | **Deleted** — `Schedule`, `GameIndexMirror`, `CropJudge`, `IntervalHistogram`, `Epoch` |
-| `tests/test_fg_plan.cpp` | 8 test cases | **Deleted** — the entire CI-testable surface of our FG work |
-| `src/backend_native/fg_reflex.cpp` | 215 | Deleted; SL drives Reflex |
-| `src/ngx_fg.cpp` | 588 | **Rewritten** — `DLSSG.*` parameters become `slDLSSGSetOptions` + tags |
+| `fg_present.cpp` + `.hpp` | 1516 | **Deleted** — replacement ring, pacer, worker, crop gate, epochs |
+| `ngx_fg.cpp` + `.hpp` | 679 | **Rewritten** — `DLSSG.*` becomes `slDLSSGSetOptions` + tags |
+| `core/fg_plan.cpp` + `.hpp` | 628 | **Deleted** — `Schedule`, `GameIndexMirror`, `CropJudge`, `IntervalHistogram`, `Epoch` |
+| `fg_reflex.cpp` + `.hpp` | 278 | Deleted; SL drives Reflex |
+| `present_owner.cpp` + `.hpp` | 757 | **Partially** — it is *not* FG-only; its header calls it "the frame boundary the seam's `on_present` needs — without ReShade", which the SR path also uses. Only the FG branches go |
+| `core/present_plan.cpp` + `.hpp` | 42 | Deleted |
+| `tests/test_fg_plan.cpp` | 310 (8 cases, 107 checks) | **Deleted** — the entire CI-testable surface of our FG work |
+| `tests/warp/warp_fg_present.inc` | 493 | **Deleted** — the WARP present-twice harness |
 
-Roughly **3,500 lines deleted, ~600 rewritten**, and the only unit-tested part of the FG system
-goes with it.
+**Honest figure: ~3,100 production lines are FG-only** (`fg_present` + `ngx_fg` + `fg_plan` +
+`fg_reflex` + `present_plan`), plus the FG branches inside `present_owner`, plus **803 lines of
+tests**. The commonly-quoted "3,500" over-counts by treating `present_owner` as FG-only; it is
+not, and the SR path needs it either way.
 
 **Added:**
 
@@ -810,10 +887,13 @@ schedule and present it differently.
 
 ### 7.5 What we would lose
 
-1. **A working, measured system.** 2.00× steady-state, correct 6.0-6.2 ms cadence on the
-   user's panel, surviving the fullscreen transition and three checkpoint reloads, zero
-   `[ERROR]` lines, no Xid. **HARD** (facts §32.7-§32.11). Replacing this with something
-   untested on this stack is the core of the trade.
+1. **A working, measured system — in one configuration.** 2.00× steady-state, correct
+   6.0-6.2 ms cadence on the user's panel, surviving the fullscreen transition and three
+   checkpoint reloads, zero `[ERROR]` lines, no Xid. **HARD** (facts §32.7-§32.11). Replacing
+   this with something untested on this stack is the core of the trade — **but read §7.2b before
+   weighting this too heavily**: "working and measured" holds for windowed-fullscreen, VSync
+   off, VRR, one swapchain, three back buffers and no device resets, which is precisely the
+   user's configuration and precisely why the defect list has never bitten.
 2. **The ability to fix pacing at all** (7.2).
 3. **The validation gate and the per-reason refusal counters.** These are how a single launch
    tells us *why* a frame was not generated (`source-missing`, `not-validated`,
@@ -914,6 +994,15 @@ a second swapchain or viewport appearing; a move to Blackwell where MFG >2× has
 7.6 experiment showing Streamline working *and* pacing correctly under gamescope. The last of
 those is the only one that is cheap to check, which is why it is worth running anyway.
 
+**One caveat on how this verdict was reached, stated because it nearly went the other way by
+default.** The first draft of §7 argued "keep ours" while describing our implementation only in
+terms of what it achieves. §7.2b was added after a line-by-line inventory turned up twelve
+structural defects, two of them real bugs, none flagged in-code. **The verdict survives that —
+but the argument had to be rebuilt to survive it**, and it now rests on a narrower claim: not
+that our implementation is good in general, but that it is correct *for this configuration* and
+that its defects are in code we can reach. An argument for keeping your own code that has not
+looked at your own code is not an argument.
+
 ---
 
 ## Recommendations, ranked — RE-RANKED 2026-09-03
@@ -978,6 +1067,25 @@ those is the only one that is cheap to check, which is why it is worth running a
    Either outcome is worth having: it convicts or acquits a suspect this project has been
    quoting a verdict on without a trial. **It does not change the §7.7 verdict either way** —
    it changes what we are allowed to say. §7.6.
+
+### Fix these regardless of the Streamline question — found while writing §7.2b
+
+0a. **Two real bugs, neither flagged in-code, both cheap.** (i) The FG **worker thread never
+   establishes an `OwnCodeScope`** (`in_own_code()` is `thread_local`), so its
+   `ID3D12GraphicsCommandList::Reset` is delivered into the root-signature shadow and the
+   application sink **as if it were the game's** (`fg_present.cpp` ↔ `d3d12_hooks.cpp:1087`).
+   (ii) **`NgxGenerator::g_queue` is never assigned**, so `release_feature()` → `wait_idle(nullptr)`
+   returns immediately and `NVSDK_NGX_D3D12_ReleaseFeature` runs **without the GPU idle its own
+   header promises** (`ngx_fg.cpp:167-168, 519`; `ngx_fg.hpp:70`), on every size change and at
+   shutdown. **HARD**, both read from source. §7.2b.
+
+0b. **Three cheap robustness fixes** that close the configuration-change gaps: force `sync=0`
+   on the generated present (VSync is currently unhandled and would throttle the game); reset
+   the `GameIndexMirror` on **any** reconfigure, not only one that drops replacements (a
+   `SetFullscreenState` without a following `ResizeBuffers` desynchronises it silently, and the
+   failure mode is a stale frame with no detector); and propagate the real present `HRESULT`
+   rather than the previous frame's, so a device-removed code is not delayed or masked as
+   `E_FAIL`. §7.2b.
 
 ### Explains a bug we have measured — DOWNGRADED, and partly overtaken
 
