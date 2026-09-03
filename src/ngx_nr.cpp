@@ -199,9 +199,11 @@ bool g_new_feature_reset = false;
 // 18's whole accumulation, so a reset source that fires often is itself a flicker source — and
 // CLAUDE.md has already been caught once by exactly that ("a reset latch is right for a rare
 // discrete change and wrong for a quantity that varies continuously — there it is a metronome",
-// measured at 52 fires making the image worse). Whether our shipped NgxNRExposureSmoothing=0.05
-// plus NgxNRScaleResetTolerance=0.15 is a metronome or a rarity is a question ONE log line
-// answers and no amount of argument does. Build the counter before you need it.
+// measured at 52 fires making the image worse). The latch that did that — the codec-scale one
+// tuned by NgxNRExposureSmoothing and NgxNRScaleResetTolerance — went with the HDR codec on
+// 2026-09-03, so the surviving sources are the four below. Whether `frame_gap` is a metronome or
+// a rarity is a question ONE log line answers and no amount of argument does. Build the counter
+// before you need it.
 std::atomic<std::uint32_t> g_reset_frame_gap{0};
 std::atomic<std::uint32_t> g_reset_guide_grid{0};
 std::atomic<std::uint32_t> g_reset_camera_cut{0};

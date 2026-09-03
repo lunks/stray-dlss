@@ -187,6 +187,11 @@ next, not acted on:
   track engine exposure at all, and how fast. Relevant to the unresolved flicker/ringing
   discussion in CLAUDE.md's "Exposure tracking" section. [SOFT — their commit message and diff,
   not verified by us]
+  **DATED 2026-09-03: `NgxNRTrackExposure` no longer exists.** It was part of the HDR colour
+  codec, which went with the TAA hook site when NR became a present stage — the back buffer is
+  display-referred and carries no pre-exposure to track. Their commit therefore has no analogue
+  in our tree any more; the open question it addressed is closed by placement rather than by
+  tuning.
 * **`a5e4c5c2` "Stop detail strength above 1 from extrapolating"`** — fixes an `lerp` that
   extrapolates past 1.0 in **their own post-composition blend shader** (`transfer`, their
   "Detail strength" slider, 0-2 range in their menu). **This is a different knob from

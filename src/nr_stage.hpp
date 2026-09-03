@@ -53,7 +53,7 @@ TypedUavSupport probe_typed_uav(ID3D12Device *device, int format);
 // The state our staging copy rests in between frames, and the state NVIDIA's guide wants an NGX
 // input in (docs/RESEARCH.md §3.5). Keeping the resting state equal to the NGX state means the
 // steady-state frame records two transition pairs and no more — and it is the state
-// nr::Site::post_tonemap documents `image` arriving in and being left in.
+// nr::apply documents `image` arriving in and being left in.
 // D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, spelled as a number so this header stays free
 // of <d3d12.h>.
 constexpr std::uint32_t kStagingRestState = 0x40;

@@ -2,6 +2,13 @@
 
 Assessment written 2026-09-01. Read-only investigation; nothing in `src/` was changed.
 
+> **DATED 2026-09-03.** Written before NR moved to a present stage. Every reference below to
+> `src/nr_history.cpp`, `src/nr_codec_pass.cpp`, `src/core/nr_codec.*` or `[STRAYDLSS] NgxNRHook`
+> names something that no longer exists — the codec, the history restore and the site choice were
+> deleted with the TAA hook site. The migration reasoning is unaffected (if anything it gets
+> easier: NR no longer needs ReShade's `reshade_begin_effects`, an effect file loaded, or the
+> `_has_commands` workaround at all), but the file inventory and the line counts are stale.
+
 Provenance labels follow CLAUDE.md §0.5: **HARD** = read from source, measured, or read out of this
 repo's own code; **SOFT** = reasoned from HARD facts; **UNCONFIRMED** = not established, do not
 build on it.

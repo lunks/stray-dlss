@@ -621,6 +621,13 @@ confirmed correct on target per staging (CLAUDE.md §3).
 
 ## 9. The Kim2091 / "Sparkles" DLSS-NR implementation, diffed against ours — a temporal-stability audit
 
+> **DATED 2026-09-03: item 2 of the table below no longer exists.** `NgxNRExposureSmoothing`,
+> `NgxNRScaleResetTolerance` and `NgxNRTrackExposure` were deleted with the HDR colour codec when
+> NR became a present stage (§10, now BUILT). The section's ranking of our exposure-tracked reset
+> latch as the most likely remaining flicker source is preserved because it is what motivated the
+> move; the latch itself is gone rather than tuned. §9's other implemented fixes — the frame-gap
+> latch and the new-feature reset — are unaffected and still live.
+
 **Why this section exists.** On 2026-08-31 the shipping mod `xoxor4d/gta4-rtx` v1.5.2 replaced the
 user's own DLSS 5 integration — the one our NR path is a port of — with a different one, saying:
 *"Dropped the initial DLSS 5 integration from lunks; squashed and cherry-picked Sparkles'
@@ -751,6 +758,15 @@ in the periodic report:
 ---
 
 ## 10. Can we run NR as a STAGE rather than a HOOK? — verdict: YES, at present, and it outranks §9
+
+> **BUILT AND CONFIRMED 2026-09-03.** This section was a proposal; it is now what ships, and the
+> user confirmed a correct image in the game. Everything §10.2 predicted would be *deleted* was
+> deleted: the HDR codec and its keys, the whole exposure feedback loop, the codec-scale reset
+> latch, `NgxNRRestoreHistory`/`NgxNRRestoreState`, and NR's dependence on pass identification.
+> `NgxNRHook` and `NgxNRTopology` went too — one site leaves no mode to choose. The file
+> references below (`src/core/nr_codec.*`, `src/nr_codec_pass.cpp`, `nr_history.cpp`) name files
+> that no longer exist; the present stage lives in `src/nr_hook.{hpp,cpp}` and
+> `src/nr_stage.{hpp,cpp}`, and the typed-UAV probe §10 asks for is `nrstage::probe_typed_uav`.
 
 **This is the recommendation, stated first.** A present-time NR stage is feasible, and if it works
 it deletes more of our NR machinery than every difference in §9 combined fixes. It should be

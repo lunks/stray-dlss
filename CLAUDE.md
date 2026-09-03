@@ -1420,6 +1420,47 @@ than RenoDX, whose behaviour is effectively 1; set 0 to match them exactly). `ap
 reached after a successful SR/RR evaluate, so the warmup counts frames in which the device,
 queue and swapchain demonstrably worked.
 
+### NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE (2026-09-03)
+
+**Confirmed working in the game by the user.** DLSS Neural Rendering now runs on our own
+present-time command list, over a staging copy of the **back buffer**, and its result is copied
+back there. The old site — inside the intercepted TAA compute dispatch, writing the engine's `u0`
+— is **gone**, and so is everything that existed only to make that site survivable.
+
+**Three things went with it, and each was expensive to build:**
+
+* **The HDR colour codec** (`nr_codec_pass`, `core/nr_codec`, `nr_encode.hlsl`, `nr_decode.hlsl`).
+  Feature 18 is display-referred; the TAA site carried raw unbounded pre-exposed linear HDR, so
+  the soft-clip + sRGB proxy + residual transfer WAS that site's input contract. The back buffer
+  is `R10G10B10A2_UNORM` with no `SetColorSpace1` (facts §33) — already the network's domain — so
+  at Present there is nothing to convert. Keys gone: `NgxNRPaperWhiteScale`, `NgxNRColorStrength`,
+  `NgxNRTransferStrength`, `NgxNRTrackExposure`, `NgxNRSmoothExposure`, `NgxNRExposureSmoothing`,
+  `NgxNRScaleResetTolerance`. With them go five refusal reasons and one reset source.
+* **The history restore** (`nr_history`, `core/nr_history_plan`). It stopped NR's residual
+  re-entering the engine's temporal state through `u0`. **Post-tonemap has no feedback path by
+  construction** (§5: every `QueueTextureExtraction` into `PrevFrameViewInfo` sits above
+  `AddTonemapPass`), so there is no loop left to break. Keys gone: `NgxNRRestoreHistory`,
+  `NgxNRRestoreState`.
+* **`NgxNRHook` and `NgxNRTopology`.** One site leaves no mode to choose; and the binary audit
+  settled the topology question outright — `DLSSNR.ScalingRatio` is read and then unconditionally
+  overwritten with `1.0f`, so feature 18 cannot upscale in this runtime and the `sr` shape could
+  never have worked.
+
+**What is KEPT, and why it is not an oversight.** The TAA hook still runs: DLSS **SR** lives
+there, and it is the only place in the frame where depth and motion vectors are both known-good
+and known-fresh. It calls `nrhook::note_guides(...)` every frame to publish them, together with
+the camera-cut `reset` (§2.8), for the present stage to consume. **Deleting that call breaks NR
+even though nothing in NR's own files mentions it.**
+
+**The general lesson, and it is the one worth carrying to the next feature.** Roughly 4,900 lines
+— two compute shaders, a codec with its own CI suite, a history-restore path with a state
+constant derived from four UE 4.27 source anchors and zero measurements, five refusal reasons, a
+reset source, eleven config keys — existed to make ONE wrong hook point survivable. None of it
+was wrong; all of it was work the hook point created. **When a feature keeps growing machinery
+to compensate for where it runs, the placement is the bug.** This project spent sessions
+diagnosing the codec, the exposure loop and the feedback node as properties of NR, and every one
+of them was a property of `u0`.
+
 ### DLSS Neural Rendering WORKS — the missing piece was an HDR colour codec (2026-09-01)
 
 **Confirmed on the user's machine: a correct image.** Feature 18 initialises, creates, evaluates
@@ -1612,6 +1653,12 @@ resists every explanation in the temporal machinery itself, check what you are f
 
 ### Exposure tracking: needed, but only with a LONG time constant (measured 2026-09-01)
 
+> **SUPERSEDED 2026-09-03 — see "NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE"
+> above.** Every key this section tunes (`NgxNRTrackExposure`, `NgxNRExposureSmoothing`,
+> `NgxNRScaleResetTolerance`) belonged to the HDR colour codec and is gone: the back buffer
+> carries no pre-exposure to follow. The reasoning is kept because it is the record of how the
+> placement problem was found, one compensating mechanism at a time.
+
 Three findings that only make sense together, and the third is the one that settles it:
 
 1. **Tracking creates a feedback loop and it rings.** With `NgxNRTrackExposure` on, the measured
@@ -1759,6 +1806,11 @@ role in the frame graph.
 
 ### The drift, fixable WITHOUT moving the hook: `[STRAYDLSS] NgxNRRestoreHistory` (default **OFF**)
 
+> **SUPERSEDED 2026-09-03 — see "NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE"
+> above.** The hook DID move, and `NgxNRRestoreHistory` / `NgxNRRestoreState` went with it: a
+> post-tonemap site has no feedback path to close. The reasoning is kept because it is the
+> record of how the placement problem was found, one compensating mechanism at a time.
+
 **Built, CI-green on all three lanes, and SHIPPED OFF.** Read the two paragraphs under "Why it
 is off" before turning it on, and read the state ledger before trusting it.
 
@@ -1857,6 +1909,11 @@ OFF so a future session flipping it does so knowingly.
 The last four are what a live run would settle, in that order.
 
 ### NR is now a PRESENT STAGE too: `[STRAYDLSS] NgxNRHook = taa | present` (phase 1, 2026-09-02)
+
+> **SUPERSEDED 2026-09-03 — see "NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE"
+> above.** There is no `NgxNRHook` any more: `present` won and `taa` was deleted. The reasoning
+> is kept because it is the record of how the placement problem was found, one compensating
+> mechanism at a time.
 
 > **This supersedes "The NR hook site is ONE site again", written earlier the same day.** That
 > section is kept below verbatim, because *why the earlier sites failed* is what makes this one
@@ -2032,6 +2089,11 @@ Corollary already in force but worth restating: the camera-cut OR (§2.8) must r
 at **every** site. It travels with the published guides for exactly that reason.
 
 ### `NgxNRTrackExposure`: the codec's knee has to follow the scene, and the user found this by hand
+
+> **SUPERSEDED 2026-09-03 — see "NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE"
+> above.** There is no codec and no knee at the present stage, so `NgxNRTrackExposure` no longer
+> exists. The reasoning is kept because it is the record of how the placement problem was found,
+> one compensating mechanism at a time.
 
 **USER MEASUREMENT:** on the `taa` path the best-looking `NgxNRPaperWhiteScale` is about **0.1**,
 an effective scale near 10x. That is not a quirk — it is the reciprocal of UE4's pre-exposure,
@@ -2222,6 +2284,12 @@ the snippet itself. We leave them unset — guessing an RVA into a leaked DLL is
 risk — and at least one working third-party integration omits them too.
 
 ### The near-black NR output has a ROOT CAUSE: we fed a display-referred network raw HDR
+
+> **SUPERSEDED 2026-09-03 — see "NR IS A PRESENT STAGE, AND THAT DELETED HALF THE FEATURE"
+> above.** Correct, and the fix was a codec at a site that needed one. Moving the site removed
+> the raw HDR instead, so the codec is gone rather than superseded by a better one. The
+> reasoning is kept because it is the record of how the placement problem was found, one
+> compensating mechanism at a time.
 
 **Feature 18 is a DISPLAY-REFERRED image network.** It expects a [0,1], sRGB-encoded signal, and
 we were handing it Stray's raw unbounded pre-exposed linear HDR straight off the TAA hook. That

@@ -16,7 +16,7 @@ TEST_CASE("IniFile parses sections, comments, and keeps unknown keys")
 	const char *path = "test_ini_tmp.ini";
 	std::FILE *f = std::fopen(path, "w");
 	REQUIRE(f != nullptr);
-	std::fputs("; comment\n# another\n[STRAYDLSS]\nNgxRR = 2\nNgxNRHook=preui\nHashShaders=false\n"
+	std::fputs("; comment\n# another\n[STRAYDLSS]\nNgxRR = 2\nNgxNRIdentity=nvngx\nHashShaders=false\n"
 	           "NgxPassHash = 0xd2e4d8c23c362ed1 \nEmpty=\n[OTHER]\nNgxRR=9\n", f);
 	std::fclose(f);
 
@@ -24,7 +24,7 @@ TEST_CASE("IniFile parses sections, comments, and keeps unknown keys")
 	REQUIRE(ini.load(path));
 	std::string v;
 	CHECK(ini.get("STRAYDLSS", "NgxRR", v)); CHECK(v == "2");
-	CHECK(ini.get("STRAYDLSS", "NgxNRHook", v)); CHECK(v == "preui");
+	CHECK(ini.get("STRAYDLSS", "NgxNRIdentity", v)); CHECK(v == "nvngx");
 	CHECK(ini.get("STRAYDLSS", "HashShaders", v)); CHECK(v == "false");
 	CHECK(ini.get("STRAYDLSS", "NgxPassHash", v)); CHECK(v == "0xd2e4d8c23c362ed1");
 	CHECK(ini.get("STRAYDLSS", "Empty", v)); CHECK(v.empty());
