@@ -2520,9 +2520,26 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §32. The parts that decide everything:
   Stage 3 (HUD-less) is deferred until the user has inspected stage 2 on the box.
 * **Unverified conventions, in the order a wrong one would show:** `DLSSG.MvecScaleX/Y =
   1/renderW, 1/renderH` for our pixel-space vectors (SL guide §7.0), UE4's row-major
-  row-vector matrices passed as SL's "row-major" ones, `CameraFar = 0` for the infinite
-  reversed-Z projection, `ColorBuffersHDR` from the swapchain format + colour space. Each is a
-  knob (`NgxFGMvecScale`, `NgxFGCameraFar`, `NgxFGHDR`) so the box can A/B without a rebuild.
+  row-vector matrices passed as SL's "row-major" ones, the camera plane pair,
+  `ColorBuffersHDR` from the swapchain format + colour space. Each is a knob
+  (`NgxFGMvecScale`, `NgxFGCameraNear`/`NgxFGCameraFar`, `NgxFGHDR`) so the box can A/B
+  without a rebuild.
+
+  > **CORRECTED 2026-09-03.** This line used to read "`CameraFar = 0` for the infinite
+  > reversed-Z projection". **`0` was never a way of saying "infinite" — it was our
+  > invention.** `sl_consts.h` makes `cameraNear`/`cameraFar` non-optional with
+  > `INVALID_FLOAT` as the unset sentinel (only `clipToLensClip`, `cameraPinholeOffset` and
+  > `motionVectorsInvalidValue` are Optional), and Streamline has a status bit for the fault,
+  > `eFailCommonConstantsInvalid`. So `0.0` is a degenerate near-zero depth RANGE that DLSS-G's
+  > camera reconstruction divides by. NVIDIA, facing the same infinite far plane, does not try
+  > to signal infinity at all: `r.Streamline.CustomCameraFarPlane` is a literal `75000.0f`,
+  > byte-identical on the UE 4.27 plugin (our exact engine version) and on UE 5.8's 8.7.2, and
+  > its help text says it "does not need to match corresponding value used by engine".
+  > **Defaults are now NVIDIA's PAIR — near `0.01`, far `75000.0`** — because they are shipped
+  > as a matched synthetic pair and mixing our measured `View.NearPlane` with their far is a
+  > combination they never test. "More faithful to the engine" is not a virtue for a value the
+  > vendor documents as not needing to match it. HARD on what NVIDIA sends; **UNCONFIRMED that
+  > it changes an interpolated frame**, since `nvngx_dlssg.dll` is closed.
 * **Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` by function id** (`src/backend_native/
   fg_reflex.cpp`), never `sl.reflex`; every status is logged and nothing gates on it. On the
   box all five entry points exist and `SetSleepMode`/`Sleep`/`SetLatencyMarker` return
