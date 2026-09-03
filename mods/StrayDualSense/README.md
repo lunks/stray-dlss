@@ -118,6 +118,11 @@ pointer from that same page and tail-jumps to it, or returns immediately when it
 reach nothing but a `ret`. The precedent is `src/backend_native/resource_registry.cpp`'s
 sentinel — an object whose lifetime the other side controls.
 
+`Detach()` also waits (bounded, 250 ms, and it says so if it expires) for a callback already
+*inside* the handler to leave. Nulling the target stops new calls but says nothing about one in
+flight, and the ring it may be mid-write into belongs to the `Runtime`, which is about to be
+destroyed.
+
 ### The numbers proof, and where to read it
 
 Once a second, to the log and to **`<gamedir>/stray-dualsense-submix.txt`** (one line,

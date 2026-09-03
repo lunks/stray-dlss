@@ -116,9 +116,24 @@ void Tap::Detach()
     // One aligned 8-byte store, atomic on x64. From here the trampoline returns immediately
     // and nothing in this DLL is ever reached again.
     *m_targetPtr = nullptr;
-    SDS_LOG_INFO("submix tap '%s': detached after %llu callback(s); the leaked trampoline now "
-                 "returns immediately.", m_tag,
-                 static_cast<unsigned long long>(m_callbacks.load(std::memory_order_relaxed)));
+
+    // Wait for a callback that is ALREADY inside OnBuffer. The ring it may be writing into
+    // belongs to the Runtime and is about to be destroyed; the target store above stops new
+    // calls but says nothing about one in flight.
+    int waited = 0;
+    while (m_inFlight.load(std::memory_order_acquire) > 0 && waited < kTapDetachWaitMs)
+    {
+        ::Sleep(5);
+        waited += 5;
+    }
+    const int stuck = m_inFlight.load(std::memory_order_acquire);
+
+    SDS_LOG_INFO("submix tap '%s': detached after %llu callback(s) (waited %d ms; in flight "
+                 "at the end: %d%s); the leaked trampoline now returns immediately.",
+                 m_tag,
+                 static_cast<unsigned long long>(m_callbacks.load(std::memory_order_relaxed)),
+                 waited, stuck,
+                 stuck > 0 ? " - TIMED OUT, the audio render thread did not leave" : "");
 }
 
 TapStats Tap::Stats() const
@@ -155,6 +170,16 @@ void Tap::OnBuffer(const void* owningSubmix, const float* audioData, std::int32_
     // THE AUDIO RENDER THREAD. No lock, no allocation, no I/O, no logging: the engine holds
     // BufferListenerCriticalSection across this call, so stalling here stalls the game's own
     // audio (AudioMixerSubmix.cpp:1376).
+    //
+    // The in-flight count is what Detach() waits on. Its scope must cover every use of the
+    // borrowed ring pointer, so it is raised first and dropped last, on every path.
+    struct InFlight
+    {
+        std::atomic<int>& n;
+        explicit InFlight(std::atomic<int>& c) : n(c) { n.fetch_add(1, std::memory_order_acq_rel); }
+        ~InFlight() { n.fetch_sub(1, std::memory_order_acq_rel); }
+    } inFlight(m_inFlight);
+
     m_callbacks.fetch_add(1, std::memory_order_relaxed);
     m_lastNumSamples.store(numSamples, std::memory_order_relaxed);
     m_lastNumChannels.store(numChannels, std::memory_order_relaxed);

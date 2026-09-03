@@ -89,6 +89,12 @@ public:
     void SetRing(SubmixRing* ring);
 
     // Stop doing anything, forever, without freeing the object the engine still holds.
+    //
+    // Also WAITS for any callback already inside OnBuffer to leave. That matters because the
+    // ring belongs to the Runtime, not to us: at shutdown the audio render thread can be
+    // mid-buffer with a pointer to a ring that is about to be destroyed. The wait is bounded
+    // and reports if it expires, because hanging the game's exit would be a worse bug than the
+    // one it prevents.
     void Detach();
 
     TapStats     Stats() const;
@@ -128,7 +134,12 @@ private:
     std::atomic<std::uint64_t> m_lastCallbackMs{0};
     std::atomic<const void*>   m_lastSubmix{nullptr};
     std::atomic<std::uint64_t> m_lastClockBits{0};
+    std::atomic<int>           m_inFlight{0};   // callbacks currently inside OnBuffer
 };
+
+// How long Detach() waits for an in-flight callback to leave. The engine's default callback is
+// ~21 ms (1024 frames at 48 kHz), so this is an order of magnitude of headroom.
+constexpr int kTapDetachWaitMs = 250;
 
 // The scratch size, in stereo frames. 16384 is 16x the engine's default callback and 128 KB
 // of memory; a bigger callback is chunked, never allocated for.
