@@ -1381,6 +1381,52 @@ kernel's 3 = "headphones muted, speaker gets R". `PadSpeakerPath` is Sony's;
 * **`auto` never writes the claim speculatively** — only after Sony's API has been tried and
   refused. In the world where the speaker works, the coils never see it at all.
 
+### The platform gate is NOT what silenced the speaker — the game DID ask for the sound
+
+`tools/dualsense/StrayTriggers.lua:279` hooks `/Script/Hk_project.HKUtilities:GetPlatform` and
+rewrites the return to `PS5 = 2`, behind a `stray_platform.on` flag file. The plugin has no
+equivalent (`grep -rn "GetPlatform\|EHKPlatform\|HKUtilities" mods/StrayDualSense/src/` is
+empty) and gates on `DebugPS5Haptic` instead. It is a real lever and a more honest emulation
+than flipping individual debug booleans. **It is not, however, this bug.**
+
+**The decisive evidence is in the capture that opened this section**, and it is one line:
+
+```
+04:00:01.426  StartPS5ControllerSound 'cat_purr_loop_01_CONTROL' level=1.000 fadeIn=1.00
+```
+
+**The game asked for the pad-speaker sound.** The speaker Blueprints share the haptic
+Blueprints' gate shape (§14), `DebugPS5Haptic` had already opened it, and `spk[starts=1
+played=1 missing=0 fail=0 endpoint=1]` says we then found the asset and played it into an open
+endpoint. Nothing upstream of the routing was blocked. A platform override cannot fix a step
+that already ran.
+
+Two further reasons not to build it as part of this change:
+
+* **It was tried and it barely reached** (§7 caveat): the override "fires, but only ~6 times, so
+  the value is evidently cached early". Meanwhile `GetPlatform` is called **~700 times a minute
+  by the UI** and returned 0 throughout the 2026-09-03 runs (§14) — in which the shipped
+  Blueprint nonetheless played the `_VIBE` asset, because `DebugPS5Haptic` alone was enough.
+* **Claiming PS5 opens every platform-gated path at once** — input handling, UI, save behaviour,
+  trophies — some of which may expect a PS5 API that is not there. The Lua kept it behind a flag
+  file precisely because it was a **diagnostic, never a shipped default**.
+
+**Recommendation:** worth having later as a config key defaulting OFF, as a broader alternative
+to `ForcePS5HapticPath`; not worth adding on the strength of a symptom the evidence already
+attributes elsewhere. `GetPlatform` is a post-hook return-value rewrite, the identical shape to
+the `GetGameControllerType` glyph hook the plugin already has, so it is cheap when it is wanted.
+
+### Environmental prerequisites, so a second machine does not mystify anyone
+
+The pad's Windows audio endpoint exists at all only because of **`PROTON_SONY_WINDOWS_DEVICE_NAMES=1`**
+and **`PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE=1`**, both already set by GE-Proton (§10). If
+either is missing, the endpoint disappears and nothing in §10 or this section can work — the
+symptom would be `endpoint=0` in `spk[]`, not a routing problem.
+
+Also confirmed: **the Lua never calls any `scePad*` function.** It hooks UFunctions and wrote
+command files the shim consumed; all device work was the shim's. So there is no third source of
+pad calls to reconcile — only the plugin and Sony's dll.
+
 ### `HidMode` is NOT redundant, and `scePadSetVibrationMode` does not replace it
 
 Recorded because the opposite was proposed and is wrong. **The game already calls
