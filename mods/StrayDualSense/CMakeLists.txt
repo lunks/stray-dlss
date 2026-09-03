@@ -155,8 +155,17 @@ target_compile_definitions(StrayDualSense PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 set_property(TARGET StrayDualSense PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# UE4SS loads <Mods>/<ModName>/dlls/main.dll, falling back to <ModName>.dll
-# (UE4SS/src/Mod/CppMod.cpp). CI stages it under the former name.
+# THE FILENAME IS THE MODULE'S IDENTITY IN A CRASH DUMP, so it is StrayDualSense.dll and CI stages it
+# under exactly this name. UE4SS tries <Mods>/<ModName>/dlls/main.dll first and falls back to
+# dlls/<ModName>.dll (CppMod.cpp:24-35 at the pinned SHA 68caddcf, "dlls folder must contain
+# either main.dll or {}"), where <ModName> is the mod DIRECTORY name verbatim
+# (UE4SSProgram.cpp:1422, path().stem()) and is still intact at that point because Mod::Mod
+# COPIES it (Mod.cpp:45, `m_mod_name(mod_name)`) rather than moving it. Under Mods/StrayDualSense/ the
+# fallback therefore resolves, and a UE4 dump says `StrayDualSense 0x<base> + <rva>` rather than the
+# `main` that no dump could attribute while both C++ plugins were deployed.
+#
+# main.dll WINS whenever both files exist, and silently. Every install path must DELETE a stale
+# dlls/main.dll and dlls/main.pdb rather than write this beside them.
 set_target_properties(StrayDualSense PROPERTIES OUTPUT_NAME "StrayDualSense")
 
 if(MSVC)
@@ -173,12 +182,10 @@ if(MSVC)
     # `D:\a\stray-dlss\stray-dlss\build\StrayDualSense\StrayDualSense.pdb`. That string is what a symbolizer
     # looks for, so it has to be a name the shipped tree actually has.
     #
-    # It matters here because both C++ plugins in this repository are deployed as
-    # <Mods>/<Name>/dlls/main.dll (CppMod.cpp:24-35 at UE4SS 68caddcf prefers main.dll and only
-    # falls back to <ModName>.dll), so both load as a module named `main` and a UE4 dump can only
-    # say `main 0x... + 771f6`. The recorded PDB name is then the one thing left in the file that
-    # says which mod it is - and on 2026-09-03 symbolizing only worked after the shipped
-    # main.pdb was renamed by hand to the basename recorded here.
+    # It matters here because a dump gives a module name, a base and an offset and nothing else;
+    # the DLL's own filename now carries the name (above), and this record is what turns the
+    # offset into a symbol. On 2026-09-03 symbolizing only worked after the shipped main.pdb was
+    # renamed by hand to the basename recorded here.
     #
     # So: record a BARE basename (resolved next to the DLL, on any machine) and have CI ship the
     # PDB under exactly that name rather than as main.pdb. `tools/pe_debug_dir.py --expect

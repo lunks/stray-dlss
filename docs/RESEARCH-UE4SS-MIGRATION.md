@@ -250,6 +250,15 @@ The glue itself is tiny: a `CppUserModBase` subclass plus two exported C functio
 `start_mod()` / `uninstall_mod(CppUserModBase*)`, resolved by `GetProcAddress`
 (`UE4SS/src/Mod/CppMod.cpp:52-53`), shipped as `Mods/StrayDLSS/dlls/main.dll`. (HARD.)
 
+> **CORRECTED 2026-09-03: it ships as `Mods/StrayDLSS/dlls/StrayDLSS.dll`, and `main.dll` was
+> never required.** `CppMod.cpp:24-35` tries `dlls/main.dll` first and falls back to
+> `dlls/<ModName>.dll` — the mod DIRECTORY name verbatim (`UE4SSProgram.cpp:1422`), still intact
+> there because `Mod::Mod` copies rather than moves it (`Mod.cpp:45`). The name matters because a
+> UE4 crash dump identifies a module by its FILENAME, so `main.dll` made both C++ plugins in this
+> repository answer to `main` and no dump could say which had crashed. **`main.dll` still wins
+> whenever both exist**, so every install path deletes a stale one. See
+> `docs/STRAY-RENDERING-FACTS.md` §20.
+
 **The build is the expensive part, and it is worse than it looks.** All HARD, from the UE4SS repo
 and the shipped release archives:
 

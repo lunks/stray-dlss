@@ -28,11 +28,12 @@ std::wstring GameBinariesDir();
 std::wstring ModuleDir(const void* addressInsideThisModule);
 
 // The module an address belongs to: its load address (an HMODULE IS the base address) and its
-// full path. Both plugins in this repository are loaded by UE4SS, which hardcodes
-// `Mods/<Name>/dlls/main.dll`, so a UE4 crash dump names every one of them `main` and cannot
-// say which. The dump line carries the base (`main 0x00006ffff4720000 + 771f6`), so logging
-// the base once makes the module identifiable by matching it. False (and both outputs left
-// empty) if the address belongs to no loaded module.
+// full path. A UE4 crash dump line is `<module> 0x<base> + <offset>` and nothing more, so both
+// halves are what makes a dump readable: the path's filename is the name the dump prints, and
+// the base is what a dump's base must match for the crash to be ours. Logging the pair once at
+// startup also catches the one silent failure of the naming scheme - a stale dlls/main.dll,
+// which UE4SS loads in preference to dlls/<ModName>.dll. False (and both outputs left empty) if
+// the address belongs to no loaded module.
 bool ModuleIdentity(const void* addressInsideThisModule, const void*& base, std::wstring& path);
 
 // The game executable's loaded image: base address and SizeOfImage, read from its own PE

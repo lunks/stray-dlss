@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 """Print (and optionally assert) the PDB path a PE records in its debug directory.
 
-WHY THIS EXISTS. Every C++ mod this repository ships is deployed as `Mods/<Name>/dlls/main.dll`
-and therefore loads as a module literally named `main`. A UE4 crash dump prints that module name
-and an offset:
+WHY THIS EXISTS. A UE4 crash dump names a module by its FILENAME and prints a base and an
+offset:
 
     main    0x00006ffff4720000 + 771f6
 
-which is ambiguous the moment two of our plugins are deployed. The only thing in the shipped
-file that still names the module is the CodeView (RSDS) record in the debug directory - the
-PDB path the linker stamped in. A symbolizer resolves symbols by looking for a file with
-EXACTLY that basename next to the binary, so if the DLL says `StrayDLSS.pdb` and the artifact
-ships `main.pdb`, symbolization silently finds nothing until somebody renames the file by
-hand. That happened on 2026-09-03 and cost real time.
+Until 2026-09-03 both C++ plugins here were deployed as `Mods/<Name>/dlls/main.dll`, so both
+answered to `main` and a dump could not say which had crashed - working that out cost real time,
+and symbolizing then only worked after the shipped `main.pdb` was renamed by hand to the basename
+the DLL's debug directory recorded. Two things changed, and the first is the real fix:
 
-Both plugin CMakeLists therefore pass `/PDBALTPATH:<Name>.pdb` (which changes the recorded
-string only, never the file on disk) and both workflows ship the PDB under that same name.
-This script is the check that the two halves agree, run in CI against the built DLL.
+1. The DLL ships under its own name. UE4SS does NOT require `main.dll`: at the pinned SHA
+   68caddcf, `CppMod.cpp:24-35` tries `dlls/main.dll` first and falls back to
+   `dlls/<ModName>.dll` ("dlls folder must contain either main.dll or {}"), where `<ModName>`
+   is the mod DIRECTORY name verbatim (`UE4SSProgram.cpp:1422`, `path().stem()`) and is still
+   intact at that point because `Mod::Mod` COPIES it (`Mod.cpp:45`, `m_mod_name(mod_name)`)
+   rather than moving it. So `dlls/StrayDLSS.dll` under `Mods/StrayDLSS/` loads, and the dump
+   says `StrayDLSS`.
 
-The deeper fix would be not to be called `main` at all, and it is available: at the UE4SS SHA
-this project pins (68caddcf), `CppMod.cpp:24-35` tries `dlls/main.dll` FIRST and falls back to
-`dlls/<ModName>.dll`, warning "dlls folder must contain either main.dll or {}". So shipping
-`dlls/StrayDLSS.dll` with NO main.dll beside it would make the dump say `StrayDLSS` outright.
-That is a deployment change touching every install path on the box, so it is recorded here
-rather than taken; the PDB name is the fix that changes nothing about how the mod loads.
+   **`main.dll` still WINS whenever both files exist**, and it would win silently. Every install
+   path must therefore delete a stale `dlls/main.dll` (and `dlls/main.pdb`) as part of
+   installing, not merely write the new file beside it.
 
-    tools/pe_debug_dir.py <pe-file> [--expect StrayDLSS.pdb]
+2. The PDB keeps the module's name too, because a symbolizer resolves symbols by looking for a
+   file with EXACTLY the basename in the CodeView (RSDS) record next to the binary. Both plugin
+   CMakeLists pass `/PDBALTPATH:<Name>.pdb` - the only lever that changes the recorded STRING,
+   which by default is the linker's absolute build-machine path - and both workflows ship the
+   PDB under that same name.
 
-`--expect` compares the recorded BASENAME and exits non-zero on a mismatch; it additionally
+This script is the check that all of it agrees, run in CI against the built DLL and again
+against the staged artifact.
+
+    tools/pe_debug_dir.py <pe-file> [--expect StrayDLSS.pdb] [--expect-dll StrayDLSS.dll]
+
+`--expect` compares the recorded PDB BASENAME and exits non-zero on a mismatch; it additionally
 requires the recorded path to be a bare basename (no directory part), because an absolute
 build-machine path is what sends a symbolizer looking on a machine that does not exist.
+`--expect-dll` asserts the FILENAME of the PE being examined, so a regression to `main.dll`
+fails the job that stages it.
 """
 
 from __future__ import annotations
@@ -115,12 +124,28 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pe")
     ap.add_argument("--expect", help="required PDB basename, e.g. StrayDLSS.pdb")
+    ap.add_argument("--expect-dll", help="required filename of the PE itself, e.g. StrayDLSS.dll")
     args = ap.parse_args()
 
     guid, recorded = read_codeview(args.pe)
     print(f"{args.pe}")
     print(f"  CodeView : {guid}")
     print(f"  PDB path : {recorded}")
+
+    if args.expect_dll:
+        # A UE4 crash dump names the module by this filename, so the deployed name IS the
+        # module identity. `main.dll` loads too and takes precedence, which is exactly why a
+        # regression to it has to fail here rather than on the box.
+        actual = args.pe.replace("\\", "/").rsplit("/", 1)[-1]
+        if actual != args.expect_dll:
+            print(
+                f"FAIL: this PE is named {actual!r}, expected {args.expect_dll!r}. A crash dump "
+                f"names the module by its filename, so shipping it as anything else - `main.dll` "
+                f"above all - throws away the identity this whole check exists to preserve.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"  OK: filename {actual!r}, which is the name a crash dump will print (minus .dll).")
 
     if not args.expect:
         return 0

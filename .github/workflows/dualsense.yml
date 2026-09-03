@@ -408,12 +408,11 @@ jobs:
           "dll=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         id: verify
 
-      # Both C++ plugins in this repository ship as <Mods>/<Name>/dlls/main.dll, so a UE4 crash
-      # dump can only say `main 0x... + 771f6` and both answer to that name. The PDB
-      # path stamped into the PE's debug directory is what a symbolizer resolves against, so it
-      # must be a bare `StrayDualSense.pdb` (the name the artifact ships) rather than the linker's
-      # default absolute build path. Assert it on the BUILT DLL: a change that renamed only the
-      # file on disk would look fixed and would still symbolize to nothing.
+      # A UE4 crash dump names a module by its FILENAME, so the deployed name IS the identity.
+      # The PDB path stamped into the PE's debug directory is what a symbolizer then resolves
+      # against, so it must be a bare `StrayDualSense.pdb` (the name the artifact ships) rather
+      # than the linker's default absolute build path. Assert it on the BUILT DLL: a change that
+      # renamed only the file on disk would look fixed and would still symbolize to nothing.
       - name: Verify the module identity the DLL records
         shell: pwsh
         run: python repo/tools/pe_debug_dir.py "${{ steps.verify.outputs.dll }}" --expect StrayDualSense.pdb
@@ -422,16 +421,23 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/StrayDualSense/dlls | Out-Null
-          # UE4SS loads <Mods>/<ModName>/dlls/main.dll, so ship it pre-named.
-          Copy-Item "${{ steps.verify.outputs.dll }}" dist/StrayDualSense/dlls/main.dll
+          # SHIPPED AS StrayDualSense.dll, NOT main.dll. UE4SS tries <Mods>/<ModName>/dlls/main.dll
+          # first and falls back to dlls/<ModName>.dll (CppMod.cpp:24-35 at UE4SS 68caddcf), where
+          # <ModName> is the mod DIRECTORY name verbatim (UE4SSProgram.cpp:1422) and is still
+          # intact there because Mod::Mod COPIES it (Mod.cpp:45). So this loads under
+          # Mods/StrayDualSense/, and a UE4 crash dump then says `StrayDualSense 0x<base> + <rva>`
+          # instead of `main`, which no dump could attribute while both plugins were deployed.
+          #
+          # main.dll WINS whenever both exist, and silently. An install must therefore DELETE a
+          # stale dlls/main.dll and dlls/main.pdb, never just write these beside them - see
+          # mods/StrayDualSense/README.md and tools/dualsense/deploy-submix-spike.sh.
+          Copy-Item "${{ steps.verify.outputs.dll }}" dist/StrayDualSense/dlls/StrayDualSense.dll
           $pdb = [IO.Path]::ChangeExtension("${{ steps.verify.outputs.dll }}", '.pdb')
           if (-not (Test-Path $pdb)) { throw "StrayDualSense.pdb was not produced next to the DLL ($pdb)" }
           # Shipped as StrayDualSense.pdb, NOT main.pdb: that is the name the DLL's own debug
           # directory records (/PDBALTPATH, asserted in the step above), and a symbolizer looks for
           # exactly that name next to the binary. It used to ship as main.pdb, which no dump could
-          # resolve until somebody renamed it by hand - and since UE4SS forces the DLL itself to be
-          # main.dll, the PDB name is also the only thing in the deployed folder that says which of
-          # the two C++ plugins this is.
+          # resolve until somebody renamed it by hand.
           Copy-Item $pdb dist/StrayDualSense/dlls/StrayDualSense.pdb
           Copy-Item StrayDualSense/StrayDualSense.ini dist/StrayDualSense/
           Copy-Item StrayDualSense/README.md dist/
@@ -440,6 +446,25 @@ jobs:
             '; Add this line to <game>/ue4ss/Mods/mods.txt, ABOVE the Keybinds line.',
             'StrayDualSense : 1')
           Get-ChildItem -Recurse dist
+
+      # The staged tree is what the user installs, so assert the identity ON IT: the DLL's own
+      # filename (a regression to main.dll fails here rather than on the box) and the PDB name
+      # its debug directory records. And no main.* may be in the artifact at all - main.dll takes
+      # precedence over StrayDualSense.dll, so one shipped by accident would silently restore the
+      # ambiguity this whole change removes.
+      - name: Verify the staged layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python repo/tools/pe_debug_dir.py dist/StrayDualSense/dlls/StrayDualSense.dll `
+            --expect-dll StrayDualSense.dll --expect StrayDualSense.pdb
+          if ($LASTEXITCODE -ne 0) { throw "the staged DLL does not carry its own identity" }
+          foreach ($stale in 'dist/StrayDualSense/dlls/main.dll', 'dist/StrayDualSense/dlls/main.pdb') {
+            if (Test-Path $stale) {
+              throw "$stale is in the artifact: main.dll takes precedence over StrayDualSense.dll, " +
+                    "so shipping it would silently restore the ambiguous module name."
+            }
+          }
 
       - uses: actions/upload-artifact@v4
         with:
