@@ -1824,3 +1824,94 @@ with no write cache), heaps/resources created, fence waits, and time inside the 
 present plus timing around the already-rare create calls. This is instrumentation only — no
 behaviour change — so the culprit names itself in one box session (SR only, 3-minute menu idle,
 where the stall reproduces). Attribution table to follow from that run.
+
+## 32.14 The blink stall ATTRIBUTED: it is outside every hook we own, on an 11 s clock (2026-09-02 21:33-21:37)
+
+One session, plugin host, **SR only** (`NgxNR=0`, `NgxFG=0`, `EnableNGX=1`, `NgxEvaluate=1`,
+`StallWatch=1`), `--no-drive` so it idled in the MAIN MENU for ~4 minutes / 59 000 presents at a
+flat 164.8 fps (6.07 ms). Proxmox host quiet throughout (load1 2.10 on 32 cores = 0.07, well
+under the 0.3 bar); no Xid, no NVRM line, no GSP error inside the window.
+
+**86 `[stall]` lines. 84 of them are the user's blink; 2 are startup compiles.** The split is
+`PSO created`, and it is clean:
+
+| | startup (n=2) | **the blink (n=84)** |
+|---|---|---|
+| frame time, median | 240.1 ms | **25.8 ms** (min 12.6, max 808) |
+| PSO created | 32 each | **0** |
+| forwarded `CreatePipelineState` | 37.61 ms total | **0.00 ms** |
+| fence waits | 0.00 ms | **0.00 ms** |
+| forwarded `Present` | 0.06 ms | **0.07 ms max** |
+| resources / heaps created | 0 / 0 | **0 / 0** |
+| NGX evaluate ran | 2/2 | **80/84** |
+| our CPU, whole frame | 5.79 ms | **2.75 ms** median |
+| worst single call of ours | — | **1.05 ms** median (always the `dispatch` bucket) |
+| **unaccounted for** | 234 ms (98%) | **23.1 ms (89%)** |
+
+Verbatim, a typical one:
+
+```
+[stall] frame 25.00 ms (median 6.07, 4.1x) #38 | PSO created=0 (compute=0) origCompile sum=0.00
+max=0.00 ms | eval=1 | res +0 -0 heaps +0 | fenceWait=0.00 ms | orig exec=0.00 present=0.06 ms |
+ourCPU sum=2.62 ms worst-call=1.01 ms (dispatch) | dispatchPath=1.61 resolve=0.44 rootBind=0.18
+shadowCopy=0.16 restore=0.01 ms
+```
+
+**Every suspect the instrument can see is RULED OUT, and each by a number rather than by
+argument:**
+
+* **vkd3d pipeline compiles on first sight.** `PSO created=0` and `origCompile=0.00 ms` on all
+  84. The two frames that DID compile are 240 ms monsters at startup and look nothing like the
+  blink. (Consistent with §32.12.2: the disk cache is warm, so there is nothing left to compile.)
+* **A synchronous path inside the NGX evaluate.** The evaluate RAN on 80 of the 84, and the whole
+  `ngx_sr` bucket is 0.17 ms/frame in the same session's perf report. It is also not the
+  *absence* of an evaluate: the earlier reading that the indicator vanishes because no evaluate
+  happened that frame is **wrong** — the evaluate is there on 95% of blink frames.
+* **The forwarded `Present`** (compositor, vsync, driver): 0.07 ms worst, out of 25 ms.
+* **GPU fence waits:** exactly 0.00 ms, on all 84.
+* **Resource or heap creation:** zero of both, on all 84.
+* **Our own CPU:** 2.75 ms median of a 25.8 ms frame, and our worst *single call* is ~1 ms. Our
+  cost does not rise on a stall frame in any way that could explain it.
+
+**So ~23 ms — 89% of the stall frame — elapses somewhere no hook of ours can see.** That is a
+positive result, not a null one: it says the stall is not in the D3D12 path at all, and every
+fix aimed at our render work is aimed at the wrong place.
+
+### The clock: exactly 1800 frames, and it is not the probe and not us
+
+The per-600-frame perf windows make the structure unmistakable — **three stalled frames in one
+window, then two completely clean windows, repeating for the entire session** (99 windows):
+
+```
+start    fps   worst  >16ms       burst window starts: 39600 42000 43800 45600 47400 49200
+ 45000  164.8    9.4  .                                51000 52800 54600 55200 57000 58800
+ 45600  164.6   23.1  ###         gaps, frames: 1800 2400 1800 1800 1800 1800 1800 1800 1800 ...
+ 46200  164.8    9.6  .
+ 46800  164.8    9.6  .           median gap 1800 frames at 164.0 fps = 10.97 s
+ 47400  161.9   51.2  ###
+ 48000  164.8   10.1  .
+```
+
+**A burst every 1800 frames = every 10.97 s**, dead regular. Three stalls of ~25 ms is ~75 ms of
+lost time in one place — one visible hitch, which is exactly what a "blink" plus an audio
+underrun looks like.
+
+**Two cadences are thereby excluded outright, and one of them was the specific worry:**
+
+* **StrayProbe ticks at 1 Hz** = every ~165 frames. Were it the culprit, every 600-frame window
+  would carry 3-4 stalls; instead two windows in three are perfectly clean (`worst 9.4 ms`,
+  `frames>16ms 0`). **The probe is not it**, and it could not have hidden inside this measurement.
+* **Our own status heartbeat writes every 30 frames** (`dlss_app.cpp:1094`, an fopen/fprintf/
+  fclose onto the external mount, on the present thread). Same argument, 60x over: it cannot
+  produce a burst every 1800 frames.
+
+**What has an 11 s period is UNCONFIRMED and is the next question.** Nothing in our code does.
+Worth noting the number is suspiciously round in FRAMES (1800 exactly, repeatedly) rather than in
+seconds, though at a pinned 164.8 fps this session cannot separate the two — a run at a different
+frame rate would, and that is the cheapest next measurement. The instrument's own gap is that a
+`[stall]` line carries neither a frame number nor a timestamp, so whether the three stalls in a
+burst are CONSECUTIVE frames or spread across the window is not yet known; adding both to the
+line is a two-line change and would settle it in one session.
+
+**Do not attribute this to anything in this branch.** It reproduces under the plugin and under
+the ReShade add-on, with SR only, and the user reports it predates all of this work.
