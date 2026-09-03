@@ -129,7 +129,12 @@ void set_view_cb_audit(bool enabled);
 // `ambiguous` is any dispatch with two distinguishable survivors, and `ambiguous_claimed`
 // restricts that to dispatches that claimed the engine's own announcement. **That last number is
 // the residue**: it is how often slot order, rather than evidence, chose the view DLSS SR ran on.
+//
+// `cb_reads` is the search's own cost: every bound root CBV it TRIED, i.e. one describe_resource
+// plus one 2448-byte buffer read each. Divided by the dispatch count it is candidates-per-dispatch,
+// which is what identity from the engine would replace - so "deleting the search saves X" becomes
+// arithmetic over a measurement instead of over a guess.
 void view_ambiguity_counters(std::uint64_t &single, std::uint64_t &ambiguous,
-                             std::uint64_t &ambiguous_claimed);
+                             std::uint64_t &ambiguous_claimed, std::uint64_t &cb_reads);
 
 } // namespace stray_dlss::taa_hook

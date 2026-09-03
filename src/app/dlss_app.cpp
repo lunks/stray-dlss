@@ -1143,18 +1143,20 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		std::uint64_t v_single = 0;
 		std::uint64_t v_ambig = 0;
 		std::uint64_t v_ambig_claimed = 0;
-		taa_hook::view_ambiguity_counters(v_single, v_ambig, v_ambig_claimed);
+		std::uint64_t v_cb_reads = 0;
+		taa_hook::view_ambiguity_counters(v_single, v_ambig, v_ambig_claimed, v_cb_reads);
 		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0)
 			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
 				"(candidates that were A View buffer but not THIS view - the search skipped "
 				"them; each was an unclaimed frame before facts 36.18) | single=%llu "
-				"ambiguous=%llu ambiguousClaimed=%llu%s%s", when,
+				"ambiguous=%llu ambiguousClaimed=%llu cbReads=%llu%s%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
 				static_cast<unsigned long long>(wrong_view),
 				static_cast<unsigned long long>(v_single),
 				static_cast<unsigned long long>(v_ambig),
 				static_cast<unsigned long long>(v_ambig_claimed),
+				static_cast<unsigned long long>(v_cb_reads),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"
