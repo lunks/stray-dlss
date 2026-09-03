@@ -3373,3 +3373,84 @@ loudly** — that is the 1.2%. A wrong view whose rect was *smaller* passed the 
 another view's jitter, `ClipToPrevClip` and `CameraCut` **silently**. How often that happened on
 the real TAA dispatch specifically is not measured here, but it is the same class of error as the
 wrong velocity (§36.13.1) and it is now impossible by construction.
+
+### 36.20 The quiet residue is REAL: 0.33% of claimed dispatches take a GUESSED View (2026-09-03)
+
+DLL `645c16de…` (`e3e0763`), menu, no injected input. The instrument is investigation-only —
+nothing is gated on it and the pick is unchanged.
+
+```
+[view] frame 10800: row135 ok=20398 bad=0 | wrongView=19939 | suspectSmall=0
+                    ambClaimed=36 ambOther=4
+[seam] frame 9000:  announced=9003 claimed=9003 unclaimed=0 orphans=0
+```
+
+* **`suspectSmall=0`.** No accepted View is below the engine's own
+  `kMinTAAUpsampleResolutionFraction`. The "impostor too small to catch" shape does **not**
+  occur — that hypothesis is refuted.
+* **`ambClaimed=36` of ~10 800 claimed dispatches (~0.33%).** On those, a second surviving View
+  would have given **different `ClipToPrevClip` / jitter / `CameraCut`**, so the slot-order search
+  guessed and DLSS SR took the guess. `ambOther=4`: essentially none on look-alikes, which is why
+  splitting the counter mattered — undifferentiated it would have read 40 and meant nothing.
+
+#### And the WARN names the shape, which is not what anyone predicted
+
+```
+VIEW CB AMBIGUITY ON A CLAIMED DISPATCH: 480x270 groups (covers 3840x2160 px). ... We used
+b3 = 1920x1080 (fraction 0.500 of the dispatch, engine minimum 0.5 -> OK).
+All plausible candidates: b3=1920x1080 b4=1920x1080.
+```
+
+**Both candidates are 1920x1080 — the real render rect — and both pass every structural test.**
+They are not a shadow or capture view; they are two buffers describing the *same view shape* that
+**disagree on the motion fields**. The overwhelmingly likely reading is that one is **STALE**: UE4
+sub-allocates the View uniform buffer from a constant ring (§2.6), and a previous frame's copy can
+still be bound on a lower root parameter. **We take the lower register, so we take the stale one.**
+
+That is precisely the error class this file keeps warning about: a wrong `ClipToPrevClip` and
+jitter do not cost one frame, they **compound through the accumulation** and read as instability
+on small bright high-contrast content — menu light shafts being the ideal case.
+
+#### Why no structural test can fix this, and what can
+
+Every discriminator we have is structural — extent, plausibility, row 135, the fraction bound —
+and **all of them are satisfied by both candidates**, because both really are the same view's
+uniform buffer. There is nothing left to measure the difference *with*.
+
+**So the answer is identity, not shape** — the same move that retired the TAA-pass heuristic and
+the G-buffer finder. `ITemporalUpscaler::AddPasses` hands us the `const FViewInfo&`; its
+`ViewUniformBuffer` resolved to a D3D12 resource and offset, matched against the bound CBV, names
+the buffer outright and makes "which of these two" unanswerable-by-search into a fact.
+**This measurement is what justifies that work** (report §14.4 had demoted it to a performance
+change on the strength of §36.14's clean row-135 record; §36.18 already narrowed that reading, and
+this narrows it further).
+
+#### Scale, stated honestly
+
+0.33% is **a quarter** of the loud 1.2% that turned out to be the whole visible flicker, and it is
+one event per ~300 frames (~0.18/s at 53 fps) against the loud one's ~0.64/s. So it is real, it is
+the right shape to produce the symptom, and it is **not established that it accounts for all the
+residual flicker** — only that it exists and is worth removing.
+
+#### What the elimination arms could NOT settle
+
+Four arms (baseline / `NgxNR=0` / `NgxFG=0` / both off), n=8 screenshots each, median
+frame-to-frame difference over a crop of the light shafts:
+
+| arm | median |
+|---|---|
+| baseline, long-running session | 2712 |
+| **baseline, fresh launch** | **1421** |
+| `NgxNR=0` | 3169 |
+| `NgxFG=0` | 1605 |
+| both off | 1443 |
+
+**The same configuration measured 2712 and 1421**, so the within-config spread exceeds every
+between-arm difference. **This instrument cannot separate the arms** and no attribution should be
+read out of it — the menu's own animation (drifting motes, pulsing shafts) dominates, and the
+capture rate (~2 s) is far below the phenomenon. Recorded as a **clean negative on the method**,
+because the tempting misreading — "FG off halves it" — is exactly the single-draw error this file
+has already paid for twice.
+
+**NR is separately ruled out on its own counters**, which are not subject to that noise:
+`guides-stale=0` and 4 resets total across a 27 600-frame session.
