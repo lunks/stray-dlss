@@ -517,41 +517,72 @@ void ReadAuthoredTriggerEffectOnGameThread()
 // true, the Blueprint sets the ControllerVibration AudioComponent's sound and plays it
 // (AC.SetSound / AC.Play fired, IsPlaying()=true). It is a Blueprint variable, so it is a
 // whole-byte bool, but it is written through FBoolProperty regardless. Written from the START
-// pre-hooks — before the body evaluates its gate — and cached per controller instance so the
-// FindFirstOf does not run on the 60 Hz level hook.
+// pre-hooks, before the body evaluates its gate.
+//
+// THE OBJECT IS THE HOOK'S OWN CONTEXT, AND THAT IS A CORRECTION (2026-09-03).
+// It used to be `UObjectGlobals::FindFirstOf(STR("HKPlayerController"))`, which is wrong twice
+// over, both of them read out of RE-UE4SS's own source at the SHA CI pins
+// (deps/first/Unreal/src/UObjectGlobals.cpp:354-383):
+//
+//   * IT DOES NOT RETURN THE FIRST MATCH FOR A DERIVED CLASS. The loop breaks only on an
+//     EXACT class-name hit; the superstruct-chain branch assigns `ObjectFound` and then
+//     `return LoopAction::Continue`, so for `BP_HKPlayerController_C` — a subclass — it walks
+//     the WHOLE GUObjectArray and returns the LAST match. With a stale controller still alive
+//     after a level load, that is a different instance from the one the Blueprint is running
+//     on, and the gate is opened on the wrong object while the live one stays shut.
+//   * IT WALKS EVERY UOBJECT, with a superstruct walk per object, on EVERY call — the exact
+//     cost the comment here used to claim it avoided, because the per-instance cache was
+//     consulted only AFTER the search had already run.
+//
+// `context.Context` is the UObject the UFunction is executing on (UFunctionStructs.hpp:
+// `UObject* Context;`), i.e. the player controller itself. It is free, and it is right by
+// construction. FindFirstOf survives only as a fallback for a null context, and says so.
 // ---------------------------------------------------------------------------------------
-UObject* g_gateWrittenOn = nullptr;
-int      g_gateMisses    = 0;
+int g_gateMisses = 0;
 
-void ForcePS5HapticPathOnGameThread()
+void ForcePS5HapticPathOnGameThread(UObject* controller)
 {
     if (!sds::Rt().Cfg().forcePS5HapticPath)
         return;
-    UObject* pc = RC::Unreal::UObjectGlobals::FindFirstOf(STR("HKPlayerController"));
+    UObject* pc = controller;
     if (pc == nullptr)
     {
+        pc = RC::Unreal::UObjectGlobals::FindFirstOf(STR("HKPlayerController"));
         if (++g_gateMisses == 1)
-            SDS_LOG_WARN("ForcePS5HapticPath: no HKPlayerController instance yet");
+            SDS_LOG_WARN("ForcePS5HapticPath: the hook gave no Context object, falling back to "
+                         "FindFirstOf(\"HKPlayerController\") - which returns the LAST derived "
+                         "match in the whole object array, not necessarily the controller this "
+                         "call is on. found=%d", pc != nullptr ? 1 : 0);
+    }
+    if (pc == nullptr)
+    {
+        sds::Rt().OnHapticGate(false, false);
         return;
     }
     FProperty* prop = pc->GetPropertyByNameInChain(STR("DebugPS5Haptic"));
     if (prop == nullptr || !prop->IsA<FBoolProperty>())
     {
-        if (++g_gateMisses == 1)
-            SDS_LOG_ERROR("ForcePS5HapticPath: the player controller has no bool property "
-                          "'DebugPS5Haptic' (found=%d). The PS5 haptic gate cannot be opened.",
-                          prop != nullptr ? 1 : 0);
+        if (++g_gateMisses <= 2)
+            SDS_LOG_ERROR("ForcePS5HapticPath: %s has no bool property 'DebugPS5Haptic' "
+                          "(found=%d). The PS5 haptic gate cannot be opened, so the Blueprint "
+                          "will return before it plays anything.",
+                          Narrow(pc->GetName()).c_str(), prop != nullptr ? 1 : 0);
+        sds::Rt().OnHapticGate(false, false);
         return;
     }
     auto* boolProp = static_cast<FBoolProperty*>(prop);
     const bool before = boolProp->GetPropertyValueInContainer(pc);
-    if (before && g_gateWrittenOn == pc)
+    if (before)
+    {
+        // Already open on THIS object. Nothing to write, and nothing to log every call.
+        sds::Rt().OnHapticGate(true, false);
         return;
+    }
     boolProp->SetPropertyValueInContainer(pc, true);
     const bool after = boolProp->GetPropertyValueInContainer(pc);
-    g_gateWrittenOn = pc;
-    SDS_LOG_INFO("ForcePS5HapticPath: %s.DebugPS5Haptic %d -> %d (offset +0x%X)%s",
-                 Narrow(pc->GetName()).c_str(), before ? 1 : 0, after ? 1 : 0,
+    sds::Rt().OnHapticGate(after, true);
+    SDS_LOG_INFO("ForcePS5HapticPath: %s.DebugPS5Haptic 0 -> %d (offset +0x%X)%s",
+                 Narrow(pc->GetName()).c_str(), after ? 1 : 0,
                  static_cast<unsigned>(prop->GetOffset_ForInternal()),
                  after ? "" : "   <- THE WRITE DID NOT TAKE");
 }
@@ -969,7 +1000,8 @@ void CbAfterUseDone(UnrealScriptFunctionCallableContext&, void*)
 void CbStartVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    ForcePS5HapticPathOnGameThread();        // PRE-hook: before the Blueprint's gate runs
+    // PRE-hook, on the object the Blueprint is running on: before the body's gate is read.
+    ForcePS5HapticPathOnGameThread(context.Context);
     ReadPadVibrationEnabledOnGameThread();   // game thread: the only sound place for it
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
@@ -990,7 +1022,7 @@ void CbStartVibration(UnrealScriptFunctionCallableContext& context, void* custom
 void CbStopVibration(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    ForcePS5HapticPathOnGameThread();
+    ForcePS5HapticPathOnGameThread(context.Context);
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     sds::Rt().OnStopVibration(a.fadeOut);
 }
@@ -1015,7 +1047,7 @@ void CbSetVibrationLevel(UnrealScriptFunctionCallableContext& context, void* cus
 void CbStartControllerSound(UnrealScriptFunctionCallableContext& context, void* customData)
 {
     SDS_HOOK_PROLOGUE(hook);
-    ForcePS5HapticPathOnGameThread();
+    ForcePS5HapticPathOnGameThread(context.Context);
     const ResolvedArgs a = ResolveArgs(hook->params, base);
     SDS_LOG_INFO("%s args:%s", hook->shortName, a.description.c_str());
     if (a.soundFullName.empty())

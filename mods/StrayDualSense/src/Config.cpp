@@ -145,6 +145,8 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixqueueaheadms")     submixQueueAheadMs     = std::clamp(std::atoi(val.c_str()), 5, 500);
         else if (key == "submixringms")           submixRingMs           = std::clamp(std::atoi(val.c_str()), 20, 2000);
         else if (key == "submixstatusseconds")    submixStatusSeconds    = ParseFloat(val, submixStatusSeconds);
+        else if (key == "submixwatchseconds")     submixWatchSeconds     = ParseFloat(val, submixWatchSeconds);
+        else if (key == "submixlivethreshold")    submixLiveThreshold    = std::clamp(ParseFloat(val, submixLiveThreshold), 0.0f, 1.0f);
         else if (key == "submixstatusfile")       submixStatusFile       = val;
         else if (key == "speaker")                speaker                = ParseBool(val, speaker);
         else if (key == "endpointmatch")          endpointMatch          = val;
@@ -214,6 +216,8 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     speaker               = fresh.speaker;
     submixGain            = fresh.submixGain;      // live: it is one atomic on the sink
     submixStatusSeconds   = fresh.submixStatusSeconds;
+    submixWatchSeconds    = fresh.submixWatchSeconds;
+    submixLiveThreshold   = fresh.submixLiveThreshold;
     submixWarnSeconds     = fresh.submixWarnSeconds;
     forcePS5HapticPath    = fresh.forcePS5HapticPath;   // read on the game thread per hook
     glyphControllerType   = fresh.glyphControllerType;  // read on the game thread per call
@@ -238,12 +242,14 @@ void Config::LogSummary(const char* what) const
                  hapticLoopsFile.c_str(), spkLoopsFile.c_str());
     SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
                  "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d "
-                 "warnEvery=%.1fs",
+                 "warnEvery=%.1fs watch=%.1fs liveThreshold=%.5f",
                  what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
                  submixRegisterSlot, submixDeviceSource.c_str(),
                  static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs,
                  static_cast<unsigned>(submixScanBytes), submixDumpWords,
-                 static_cast<double>(submixWarnSeconds));
+                 static_cast<double>(submixWarnSeconds),
+                 static_cast<double>(submixWatchSeconds),
+                 static_cast<double>(submixLiveThreshold));
     SDS_LOG_INFO("config %s: SubmixReroute=%d (master='%s' -> parent='%s', registerSlot=%d) "
                  "ForcePS5HapticPath=%d Glyphs=%s(%d)",
                  what, submixReroute ? 1 : 0, submixRerouteMaster.c_str(),

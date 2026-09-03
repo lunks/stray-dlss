@@ -106,6 +106,25 @@ struct Config
     int   submixQueueAheadMs = 40;     // WASAPI lead on the coil stream; raise if it crackles
     int   submixRingMs       = 250;    // ring capacity; ~12 engine callbacks at the default
     float submixStatusSeconds = 1.0f;  // how often the numbers proof is written
+
+    // THE CORRELATION INSTRUMENT (src/SubmixWatch.hpp). Every StartPS5Vibration opens a watch
+    // this many seconds wide; when it closes, ONE line says whether the engine put anything in
+    // the submix for that asset. Without it the only reading available is a per-second peak,
+    // which is 0.00000 whenever nothing happens to be playing - and on 2026-09-03 exactly one
+    // such line was read as "the submix delivers nothing" on a session that had already
+    // handed the coils over on a real signal. 0 disables the watch.
+    float submixWatchSeconds = 3.0f;
+
+    // What counts as a REAL SIGNAL: the peak, in the tap's own units, at or above which the
+    // submix takes the coils over from the asset path (Runtime::StartSinkAtHandover).
+    //
+    // 1e-4 is -80 dBFS. It is deliberately low so a quiet asset cannot be missed, and the
+    // cost of that choice is stated rather than hidden: in STRICT `submix` the handover
+    // DISABLES the asset path for the rest of the session, so a single -80 dBFS tail is
+    // enough to make `live=1` while the pad is, in practice, silent. If a session reports
+    // `live=1` with a `FIRST REAL SIGNAL` peak that is a small fraction of the ~0.7 a real
+    // VIBE asset measures, raise this rather than believing the handover.
+    float submixLiveThreshold = 1.0e-4f;
     // One line, rewritten in place, next to the log — so the numbers can be read with `cat`
     // over ssh without the game overlay.
     std::string submixStatusFile = "stray-dualsense-submix.txt";

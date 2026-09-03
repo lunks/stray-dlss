@@ -22,6 +22,7 @@
 #include "SubmixDsp.hpp"
 #include "SubmixSink.hpp"
 #include "SubmixTap.hpp"
+#include "SubmixWatch.hpp"
 #include "TriggerEffect.hpp"
 #include "Triggers.hpp"
 
@@ -82,6 +83,13 @@ public:
     void NoteHookRegistered(const char* name);
     void NoteHookMissing(const char* name);
 
+    // BP_HKPlayerController_C.DebugPS5Haptic, reported by the glue every time it tries to open
+    // the gate. `open` is the value READ BACK after the write, so it is the gate's real state
+    // and not our intent. A gate that never opens is the single most likely reason for "the
+    // game asked for a vibration and the engine mixed nothing", so it belongs in the STATUS
+    // line rather than in one INFO line at the top of a 40 MB log.
+    void OnHapticGate(bool open, bool wrote);
+
     // ---- the submix spike ------------------------------------------------------------
     // True while HapticSource is measure|submix and the listener has not been registered.
     // The UE4SS glue polls this from inside a game-thread hook and stops as soon as it is
@@ -113,6 +121,10 @@ private:
     void SubmixStatus();     // the numbers proof: one log line and one status file line
     void SubmixWarnIfDue(uint64_t now);
     void StartSinkAtHandover(float peak);
+    // Config::submixLiveThreshold, clamped to something a float comparison can mean.
+    float LiveThreshold() const;
+    // One line per closed watch: what the engine mixed while the game was asking for an asset.
+    void  ReportWatch(const WatchVerdict& v);
     bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
     void LoadLoopLists();
 
@@ -148,6 +160,14 @@ private:
     uint64_t           m_lastSubmixStatusMs = 0;
     uint64_t           m_submixStatusWindowMs = 0;
     uint64_t           m_lastSubmixCallbacks = 0;   // for a per-second RATE, not a total
+    // A per-window peak is 0.00000 whenever nothing is playing, so one pasted status line
+    // cannot tell "silent now" from "silent always". These two can, and they cost nothing.
+    float              m_submixPeakEver     = 0.0f;
+    uint64_t           m_lastSubmixSignalMs = 0;    // 0 = the tap has never carried a signal
+    // Opened by StartPS5Vibration on the GAME thread, sampled and closed from SubmixStatus on
+    // UE4SS's update thread — hence the mutex.
+    std::mutex         m_watchMutex;
+    SubmixWatch        m_submixWatch;
 
     std::wstring m_gameDir;
     std::wstring m_modDir;
@@ -176,6 +196,10 @@ private:
     std::atomic<unsigned long> m_componentStopsHonoured{0};
     std::atomic<unsigned long> m_componentStopsIgnored{0};
     std::atomic<unsigned long> m_speakerStarts{0};
+
+    std::atomic<bool>          m_hapticGateOpen{false};
+    std::atomic<unsigned long> m_hapticGateWrites{0};
+    std::atomic<unsigned long> m_hapticGateMisses{0};
 };
 
 // The single process-wide instance. UE4SS constructs the mod object; everything else reaches

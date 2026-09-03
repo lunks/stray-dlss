@@ -299,6 +299,15 @@ SubmixGain = 1.0
 SubmixQueueAheadMs = 40
 SubmixRingMs = 250
 SubmixStatusSeconds = 1.0
+
+; Every StartPS5Vibration opens a correlation window this wide; one line per start says
+; whether the engine put anything in the submix FOR THAT ASSET. The per-second peak alone
+; cannot answer that — it reads 0.00000 whenever nothing happens to be playing.
+SubmixWatchSeconds = 3.0
+; The peak at or above which the submix takes the coils over. 1e-4 is -80 dBFS; a real VIBE
+; asset measures ~0.7. Raise it if "FIRST REAL SIGNAL" ever reports a peak near the floor.
+SubmixLiveThreshold = 0.0001
+
 SubmixStatusFile = stray-dualsense-submix.txt
 
 ; The triggers keep working from the plugin; the shim is gone.

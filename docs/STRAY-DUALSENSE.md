@@ -1020,3 +1020,188 @@ startup underrun that never grows. With the sink's 40 ms queue-ahead that is the
 latency between the engine's mix and the coils. **This is the build left on the box**, in
 `HapticSource=submix` + `SubmixReroute=1` + `ForcePS5HapticPath=1` + `Glyphs=ps5`
 (`deploy-submix-spike.sh --strict --reroute --gate`).
+
+---
+
+## 15. Fourth live run, 2026-09-03: `peak=0.00000` does NOT mean the submix is empty
+
+The user's report on the `da014c5` build: *"The scratch vibration is wrong. The vibration for
+the purr is right but it doesn't have sound. There is a loading screen that has a purr that
+should be purring in the controller, but it isn't."* The pasted evidence, strict `submix` +
+reroute + gate:
+
+```
+COILS: driven by the SUBMIX | SUBMIX submix bound=1 live=1 cb=22067 (47.0/s) ch=8 rate=48000
+  frames/cb=1024 peak=0.00000 rms=0.00000 bad=0 | master-probe cb=22073 peak=0.01482
+  | rerouted=1 | ring fill=512/16384 drop=0 under=9889
+  | sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=21202080 fail=0
+hap[starts=5 played=0 done=0 missing=0 fail=0 endpoint=0 now='' compStops ok=1 ignored=684 padVibe=1]
+```
+
+### The line does not say what it was read to say — and that is the first finding
+
+**`peak` is the LAST STATUS WINDOW ONLY.** `LevelMeter::Take()` reads *and resets*
+(`SubmixDsp.hpp`), and `SubmixStatus` runs once a second. So `peak=0.00000` means "nothing was
+in the submix during that one second", which is also exactly what a perfectly working tap
+prints whenever nothing is playing. It cannot distinguish a dead submix from a quiet second,
+and the quoted line was captured with no vibration in flight — the nearest `StartPS5Vibration`
+in the same excerpt is `Scratch_VIBE` at `03:13:32`, while `cb=22067` at 47/s puts the tap
+about 470 s into its life.
+
+**Three fields in the SAME line contradict "the submix delivers nothing":**
+
+| field | what sets it | what it proves |
+|---|---|---|
+| `live=1` | `Runtime::StartSinkAtHandover`, and NOTHING else | a status window's peak reached the live threshold at least once this session |
+| `sink open=1` | opened only inside that handover | the handover really ran |
+| `frames=21202080` | 441 s of streaming at 48 kHz | it ran ~29 s after the tap bound, not at the end |
+
+So the tap has carried *something*. **What it has not carried is a number anyone has seen**:
+the threshold is `1e-4` (−80 dBFS) and the handover's own line prints the peak that tripped it,
+which nobody has read. A real VIBE asset measures ~0.708 (§14, run A). A handover at 0.0001 and
+a handover at 0.7 are completely different worlds, and in strict mode both disable the asset
+path for the rest of the session.
+
+**Verdict: the cause of `peak=0` is NOT established, and the pasted evidence cannot establish
+it.** What is established is that the instrument was too weak to be read that way. Everything
+below is either a fix for that, a defect found while looking, or a capture that would settle it.
+
+### The instrument, fixed (0.3.1)
+
+* **`submix watch`.** Every `StartPS5Vibration` opens a correlation window
+  (`SubmixWatchSeconds`, default 3 s); every status window's peak is folded in; when it closes,
+  ONE line names the asset and says what the engine put in the submix *for that asset*:
+
+  ```
+  submix watch 'Scratch_VIBE': the engine MIXED it - peak 0.70795 over 3.0s (3 window(s))
+  submix watch 'Scratch_VIBE': the engine mixed NOTHING - peak 0.00000 over 3.0s (3 window(s))
+  ```
+
+  The negative is a WARN and names the three things upstream of the tap that can cause it. The
+  logic is pure and tested (`src/SubmixWatch.{hpp,cpp}`, `tests/test_submix_watch.cpp`),
+  including that a NaN reading can never fabricate a positive verdict and that a start during
+  an open watch reports the one it replaces rather than swallowing it.
+* **`peakEver=` and `lastSignal=`** on every SUBMIX line, so a single pasted line is
+  self-diagnosing: `peakEver=0.00000` is a submix that has never carried anything;
+  `peakEver=0.70795 lastSignal=142.3s ago` is a working submix in a quiet moment.
+* **`gate[open=N writes=N misses=N]`** on the STATUS line — see below.
+* **`SubmixLiveThreshold`** is now a setting, default unchanged at `1e-4`, with the cost of
+  that default written next to it rather than buried.
+
+### DEFECT, found in RE-UE4SS's own source: `FindFirstOf` returns the LAST derived match
+
+**HARD**, read in `deps/first/Unreal/src/UObjectGlobals.cpp:354-383` at the mirror SHA CI pins:
+
+```cpp
+UObjectGlobals::ForEachUObject([&](UObject* Object, ...) {
+    UClass* Class = Object->GetClassPrivate();
+    if (Class->GetNamePrivate().Equals(ClassName) && IsValidObjectForFindXOf(Object)) {
+        ObjectFound = Object;
+        return LoopAction::Break;          // EXACT class-name match: stops here
+    }
+    if (!IsValidObjectForFindXOf(Object)) { return LoopAction::Continue; }
+    for (UStruct* super_struct : TSuperStructRange(Class))
+        if (super_struct->GetNamePrivate().Equals(ClassName)) {
+            ObjectFound = Object;
+            break;                          // INNER break only
+        }
+    return LoopAction::Continue;            // ... and the scan carries on
+});
+```
+
+The live controller is `BP_HKPlayerController_C`, a **subclass**, so it takes the second branch —
+which never breaks the outer loop. `FindFirstOf("HKPlayerController")` therefore returns the
+**LAST** matching object in `GUObjectArray`, after walking every object in the process with a
+superstruct walk per object. Two consequences:
+
+* **Correctness.** `ForcePS5HapticPathOnGameThread` opened the `DebugPS5Haptic` gate on
+  whichever controller happened to sort last, not on the one the Blueprint was executing on.
+  With a stale controller still alive across a level load — which is exactly the shape of "the
+  loading-screen purr is not felt" — the gate is set on the wrong object and the live
+  Blueprint returns before it plays anything.
+* **Cost.** The comment claimed the per-instance cache kept the search off the 60 Hz path; the
+  cache was consulted *after* the search had already run, so the full scan happened on every
+  `StartPS5Vibration` / `StopPS5Vibration` / `StartPS5ControllerSound`.
+
+**Fixed by using the hook's own `context.Context`** — `UObject* Context` in
+`UFunctionStructs.hpp`, the object the UFunction is executing on, i.e. the controller itself.
+Free, and right by construction. `FindFirstOf` survives only as a fallback for a null context
+and logs loudly when it is used. `CDO`s were never a risk here: `IsValidObjectForFindXOf`
+excludes `RF_ClassDefaultObject | RF_ArchetypeObject`.
+
+**This is a real defect and a plausible cause of the loading-screen symptom. It is NOT proof of
+the whole report** — nothing in the pasted log shows the gate's state, which is why
+`gate[open=…]` now exists.
+
+### `Scratch_VIBE` starting at `Level=0.000` is CORRECT, and lifting it would be a bug
+
+`StartPS5Vibration 'Scratch_VIBE' level=0.000(seen=1)` on the plain (non-component) path. The
+code lifts a zero level to 1.0 only for component-attached starts. **Keep it that way:**
+
+* **The game genuinely starts the scratch at zero and drives it afterwards.** §9, measured:
+  `SetPS5VibrationLevel(Level)` runs at ~60 Hz and reads `0.0` idle, `~0.47-0.52` while
+  scratching. A start level of 0 is the *beginning of that ramp*, not a missing argument —
+  `seen=1` says the parameter was read, and its value was zero.
+* **The asset path already honours the ramp.** `AudioPlayer::PlayOne` re-reads `m_level` for
+  every WASAPI buffer (`AudioPlayer.cpp`), so `SetLevel` takes effect on a playing asset.
+  Lifting the start to 1.0 would make the scratch begin at full amplitude and then be pulled
+  down by the first `SetPS5VibrationLevel` — an audible attack the game did not author.
+* **The component path's lift has a different justification and it does not transfer.** Those
+  starts carry their level in the submix send (`PS5VibrationAttenuation`, `bAttenuate=False`,
+  constant 1.0), so a 0 there means "unset", not "silent".
+* **On the submix path our level is not used at all.** The engine applies the level upstream of
+  the tap, which is why `OnSetVibrationLevel` returns early when the submix owns the coils. So
+  this question cannot be the cause of a silent submix either way.
+
+The one thing that *is* worth knowing: if the game starts the scratch at 0 and the submix
+carries it at ~0.5 while the asset path used to play it at 1.0, **the scratch will feel weaker
+than it did on the asset path**, and "the scratch vibration is wrong" is consistent with that.
+The new `submix watch` line reports the peak, so one run says which.
+
+### The capture that settles it — run on the build ALREADY on the box, no rebuild needed
+
+Against `<gamedir>/stray-dualsense.log` (`Hk_project/Binaries/Win64/`):
+
+```sh
+L=stray-dualsense.log
+
+# 1. THE DECIDER: what peak tripped the handover?
+grep -n "FIRST REAL SIGNAL" "$L"
+
+# 2. Has the tap EVER carried a real signal? (strip the master-probe field first: it also
+#    contains "peak=", and it is the game's whole soundtrack, not the vibration submix)
+sed 's/ | master-probe.*//' "$L" | grep -o 'peak=[0-9.]*' | sort -t= -k2 -g | tail -3
+
+# 3. Is the Blueprint gate open?
+grep -n "ForcePS5HapticPath" "$L" | head -5
+
+# 4. Did the game ever ask for the SPEAKER, and did it play?
+grep -n "StartPS5ControllerSound" "$L" | head -10
+grep -o "spk\[[^]]*\]" "$L" | tail -3
+
+# 5. The submix around the scratch: the 8 lines before and after each start
+grep -nE "SUBMIX|StartPS5Vibration|FIRST REAL SIGNAL" "$L" | grep -A8 -B2 "Scratch_VIBE" | head -60
+```
+
+**How to read it:**
+
+| result | meaning |
+|---|---|
+| (1) `peak 0.7…` | the submix carried a real haptic; the handover was earned |
+| (1) `peak 0.0001…` | the handover fired on the noise floor and strict mode then silenced the pad for the session — raise `SubmixLiveThreshold` |
+| (2) max is `0.00000` | the submix has NEVER carried anything: the fault is upstream of the tap |
+| (2) max is `~0.7` | the submix works and the pasted line was a quiet second |
+| (3) `DebugPS5Haptic 0 -> 1` | the gate opened; 0.3.1's `context.Context` fix is not the cause |
+| (3) `no bool property` / `Context` fallback / nothing at all | the gate never opened — the Blueprint returned before it played anything, and THAT is the whole report |
+| (4) starts > 0, `spk[... endpoint=0 fail>0]` | the speaker path is failing to open the pad endpoint — a separate bug from the coils |
+| (4) no `StartPS5ControllerSound` at all | the game never asked for the purr's speaker sound, so the gate or the platform check is what stops it |
+
+The 0.3.1 build answers (1), (2), (3) and (5) from a **single** `submix watch` line per start
+plus `peakEver=` on any status line, which is the point of the change.
+
+### What is UNVERIFIED in all of the above
+
+Everything, on the target: the plugin has not been built by CI at the time of writing and has
+never been run. The `FindFirstOf` finding is HARD (read in the source CI pins) and the
+`peak`-is-one-window finding is HARD (read in this repo's own code), but **"this is why the
+user's pad felt wrong" is an inference from both, not a measurement.**

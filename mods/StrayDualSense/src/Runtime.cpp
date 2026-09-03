@@ -49,6 +49,9 @@ std::wstring ResolveDir(const std::string& configured, const std::wstring& gameD
 // minutes, which comfortably covers a load into gameplay.
 // The peak that counts as "the engine really is rendering haptics into this submix". Well above
 // dither and well below anything audible/feelable.
+// The DEFAULT for Config::submixLiveThreshold, kept here as the documented constant the
+// handover was originally written against. See Config.hpp for why it is low and what that
+// costs in strict mode.
 constexpr float        kSubmixLiveThreshold = 1.0e-4f;
 constexpr float        kFastPadPollSeconds = 1.0f;
 constexpr unsigned long kFastPadProbes     = 120;
@@ -558,6 +561,37 @@ void Runtime::SubmixWarnIfDue(uint64_t now)
     SDS_LOG_WARN("%s | %s | HapticSource=%s", v.headline, v.detail, m_config.HapticSourceName());
 }
 
+float Runtime::LiveThreshold() const
+{
+    const float t = m_config.submixLiveThreshold;
+    // A threshold of 0 would make every callback "a real signal", including a buffer of
+    // exact zeros — which is precisely the state this test exists to detect.
+    if (!(t > 0.0f) || t > 1.0f)
+        return kSubmixLiveThreshold;
+    return t;
+}
+
+// THE ANSWER TO "did the engine mix the asset the game asked for". One line, per start,
+// naming the asset — as opposed to a per-second peak, which is 0.00000 whenever nothing
+// happens to be playing and therefore cannot distinguish a dead submix from a quiet moment.
+void Runtime::ReportWatch(const WatchVerdict& v)
+{
+    if (v.carried)
+    {
+        SDS_LOG_INFO("submix watch '%s': the engine MIXED it - peak %.5f over %.1fs (%d window(s)). "
+                     "This asset reaches the coils.",
+                     v.asset.c_str(), static_cast<double>(v.peak),
+                     static_cast<double>(v.ms) / 1000.0, v.windows);
+        return;
+    }
+    SDS_LOG_WARN("submix watch '%s': the engine mixed NOTHING - peak %.5f over %.1fs (%d window(s)). "
+                 "The game ASKED for this asset and '%s' stayed silent, so the fault is upstream "
+                 "of the tap: the Blueprint gate (ForcePS5HapticPath / DebugPS5Haptic), the level "
+                 "the game passed, or the routing - not the listener, which is being called.",
+                 v.asset.c_str(), static_cast<double>(v.peak),
+                 static_cast<double>(v.ms) / 1000.0, v.windows, m_config.submixPath.c_str());
+}
+
 // The handover. Callbacks alone are not enough: a submix that renders pure silence would
 // take the coils away from the asset path and give nothing back. Only a real signal proves
 // the engine is putting haptics in there, so that is the trigger - and it is when the sink
@@ -608,7 +642,23 @@ void Runtime::SubmixStatus()
 
     const CoilVerdict verdict = Coils();
 
-    char line[1100];
+    // The watch is folded in BEFORE the line is built, so a start and its verdict cannot be
+    // separated by a status line that says nothing about either.
+    const uint64_t nowMs = NowMs();
+    {
+        WatchVerdict closed;
+        bool         haveClosed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_watchMutex);
+            if (level.frames != 0)
+                m_submixWatch.Sample(level.peak);
+            haveClosed = m_submixWatch.Poll(nowMs, closed);
+        }
+        if (haveClosed)
+            ReportWatch(closed);
+    }
+
+    char line[1200];
     if (level.frames == 0)
     {
         const uint64_t now  = NowMs();
@@ -632,9 +682,27 @@ void Runtime::SubmixStatus()
     }
     else
     {
+        if (level.peak > m_submixPeakEver)
+            m_submixPeakEver = level.peak;
+        if (level.peak >= LiveThreshold())
+            m_lastSubmixSignalMs = nowMs;
+
+        // `peak` is the LAST WINDOW ONLY, so on its own it says nothing about the session.
+        // These two make one pasted line self-diagnosing: peakEver 0.00000 means the engine
+        // has never put anything in this submix, and a lastSignal of minutes ago against a
+        // peakEver near the ~0.7 a VIBE asset measures means it did and this second is quiet.
+        char ever[120];
+        if (m_lastSubmixSignalMs == 0)
+            std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=NEVER",
+                          static_cast<double>(m_submixPeakEver));
+        else
+            std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=%.1fs ago",
+                          static_cast<double>(m_submixPeakEver),
+                          static_cast<double>(nowMs - m_lastSubmixSignalMs) / 1000.0);
+
         std::snprintf(line, sizeof(line),
                       "%s | SUBMIX %s bound=%d live=%d cb=%llu (%.1f/s) ch=%d rate=%d "
-                      "frames/cb=%d peak=%.5f rms=%.5f bad=%llu",
+                      "frames/cb=%d peak=%.5f rms=%.5f bad=%llu%s",
                       verdict.headline,
                       m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0,
                       m_submixLive.load() ? 1 : 0,
@@ -642,12 +710,13 @@ void Runtime::SubmixStatus()
                       vib.lastNumChannels, vib.lastSampleRate,
                       vib.lastNumChannels > 0 ? vib.lastNumSamples / vib.lastNumChannels : 0,
                       static_cast<double>(level.peak), static_cast<double>(level.rms),
-                      static_cast<unsigned long long>(vib.badCallbacks));
+                      static_cast<unsigned long long>(vib.badCallbacks), ever);
+
         // Learned from the engine, never assumed: a project ini can change the rate.
         if (vib.lastSampleRate > 0)
             m_submixSink.SetSourceRate(static_cast<uint32_t>(vib.lastSampleRate));
 
-        if (level.peak >= kSubmixLiveThreshold)
+        if (level.peak >= LiveThreshold())
             StartSinkAtHandover(level.peak);
     }
 
@@ -700,6 +769,7 @@ void Runtime::LogStatus()
                  "trig[events=%lu tx=%lu ok=%lu fail=%lu L=%d R=%d effect=%d/%u/%u/%u %s] "
                  "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
                  "compStops ok=%lu ignored=%lu padVibe=%d] "
+                 "gate[open=%d writes=%lu misses=%lu] "
                  "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s']",
                  CoilOwnerName(coils.owner), coils.detail,
                  m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
@@ -713,6 +783,8 @@ void Runtime::LogStatus()
                  m_haptics.Missing(), m_haptics.Failures(), m_haptics.EndpointFound() ? 1 : 0,
                  m_haptics.CurrentName().c_str(), m_componentStopsHonoured.load(),
                  m_componentStopsIgnored.load(), m_padVibrationEnabled.load() ? 1 : 0,
+                 m_hapticGateOpen.load() ? 1 : 0, m_hapticGateWrites.load(),
+                 m_hapticGateMisses.load(),
                  m_speakerStarts.load(), m_speaker.Started(), m_speaker.Missing(),
                  m_speaker.Failures(), m_speaker.EndpointFound() ? 1 : 0,
                  m_speaker.CurrentName().c_str());
@@ -796,6 +868,24 @@ void Runtime::OnStartVibration(const VibrationStart& s)
     {
         std::lock_guard<std::mutex> lock(m_componentMutex);
         m_playingComponent = s.componentFullName;   // empty on the plain path
+    }
+
+    // Open the correlation window BEFORE the verdict, and in every mode: "the game asked and
+    // the submix stayed silent" is the measurement that matters whether or not the submix is
+    // what currently drives the coils.
+    if (m_tapVibration != nullptr && m_config.submixWatchSeconds > 0.0f && !name.empty())
+    {
+        WatchVerdict closed;
+        bool         haveClosed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_watchMutex);
+            haveClosed = m_submixWatch.Start(
+                name, NowMs(),
+                static_cast<uint64_t>(m_config.submixWatchSeconds * 1000.0f),
+                LiveThreshold(), closed);
+        }
+        if (haveClosed)
+            ReportWatch(closed);
     }
 
     // The verdict decides. The call is still LOGGED above, because the log is how a null
@@ -909,6 +999,18 @@ void Runtime::OnPadVibrationEnabled(bool enabled)
     if (m_config.SubmixDrivesCoils())
         m_submixSink.SetGain(enabled ? m_config.submixGain : 0.0f);
     SDS_LOG_INFO("%s", Coils().headline);
+}
+
+void Runtime::OnHapticGate(bool open, bool wrote)
+{
+    const bool was = m_hapticGateOpen.exchange(open, std::memory_order_relaxed);
+    if (wrote)
+        m_hapticGateWrites.fetch_add(1, std::memory_order_relaxed);
+    else
+        m_hapticGateMisses.fetch_add(1, std::memory_order_relaxed);
+    if (was != open)
+        SDS_LOG_INFO("haptics: the PS5 Blueprint gate (DebugPS5Haptic) is now %s",
+                     open ? "OPEN" : "SHUT");
 }
 
 void Runtime::NoteHookRegistered(const char* name)
