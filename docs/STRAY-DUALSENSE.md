@@ -20,6 +20,11 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   then silent for a whole session in `03_Slums`. Two defects found: the watch could not tell
   "no data" from "silence", and the reroute was only ever submitted once so a level load ended
   it. Both fixed, neither run. See §17.
+* **0.4.0 (2026-09-03): the plugin is a THIN SHIM, and the speaker comes from the engine's own
+  submix too.** `Submix_controllerMaster` gets the identical reroute + tap as the vibration
+  master and lands on FL/FR of the one stream that carries the coils on RL/RR; the asset
+  replay path, its extraction tooling, `HapticSource` and its fallback, and the HID
+  speaker-route claim are all deleted. **The speaker lane is UNCONFIRMED — never run.** See §18.
 * **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
   would be inventing a feature, not restoring one — no evidence Stray designed a behaviour.
 
@@ -509,6 +514,11 @@ trigger data from constants to the game's authored struct with an enum translati
 * **Still not done in either:** concurrent haptics do not mix (one playback slot per route;
   a new waveform supersedes the current one, where PS5 sums rain + purr + footstep).
 
+> **SUPERSEDED 2026-09-03 by §18.** The plugin no longer plays anything itself: fades, loops,
+> levels and concurrency are the engine's, through the rerouted submixes. The shim's
+> `hap_play` / `spk_play` and the Lua's argument discovery stay the reference for the hook
+> half and the DLL half; the asset-replay half of the plugin is gone.
+
 
 ---
 
@@ -787,6 +797,9 @@ own mixer solves it, along with the fades, the loops, the levels and the asset e
 reach the pad, and its master-submix probe distinguishes "the game is silent here" from "our
 tap is broken". Deploy with `tools/dualsense/deploy-submix-spike.sh`; the full design,
 including why the listener's vtable lives in a leaked page, is in that mod's README.
+
+> **`HapticSource` and its modes were deleted in 0.4.0 (§18).** The tap is the only source now;
+> the master-submix probe (`SubmixProbeMaster`) survives as the diagnostic it always was.
 
 ### First live run, 2026-09-02: the tap refused, and two defects it exposed
 
@@ -1339,6 +1352,12 @@ scePadSetTriggerEffect  scePadSetVibration  scePadSetVibrationMode  scePadSetVol
 
 ### Implemented, and NOT YET RUN
 
+> **SUPERSEDED 2026-09-03.** Sony's call was confirmed on the pad
+> (`scePadSetAudioOutPath(3=SPEAKER)=0x00000000`, `SONY ACCEPTED the route`, `db83a32`), and
+> 0.4.0 deleted `PadSpeakerRoute`, the `hid`/`both`/`auto` escalation and the raw HID audio
+> claim (§18). What follows is the record of the design that was built; only the `sony` arm
+> of it exists now, unconditionally, with `PadSpeakerPath` / `PadSpeakerGain` kept.
+
 `[StrayDualSense] PadSpeakerRoute` = `sony` | `hid` | `both` | `auto` | `off`, default
 **`auto`**. `PadSpeakerPath = 3` (Sony's enum) and `PadSpeakerGain = 80` are the shim's
 measured values, configurable rather than baked. `ScePad::ApplyAudioRoute` runs on the pad
@@ -1479,8 +1498,11 @@ assets, which `CLAUDE.md` already forbids.
 touching a child. So the same reroute should work on it. Order, and do not collapse it:
 
 1. **Prove the speaker ROUTES.** Orthogonal to where the samples come from — this section.
+   **DONE, user-confirmed on the pad.**
 2. **Reroute the speaker submix** and switch the source from replayed files to the live tap.
+   **BUILT in 0.4.0 (§18), UNCONFIRMED.**
 3. **Delete** the asset player, the extracted files, the extraction tooling and their settings.
+   **DONE in 0.4.0.**
 
 **One consequence to face rather than discover:** the asset path is currently also the fallback
 when the submix tap fails to bind. Under the target shape there is no fallback — a failed tap
@@ -1694,3 +1716,134 @@ grep -o  "gate\[[^]]*\]" "$L" | tail -3
 Everything here. The watch fix and the watchdog are CI-green and have not run in the game; "a
 level load drops the reroute" remains the leading **hypothesis**, and the watchdog is
 instrumented to confirm or kill it in one run rather than to assume it.
+
+---
+
+## 18. 0.4.0: the thin shim — the speaker through the same tap, and the deletions — 2026-09-03
+
+Built from `9553b9e` on branch `dualsense-thin`, in three commits: (a) the speaker via the tap,
+(b) the deletions, (c) this documentation. **Nothing in it has run on the box**, which was under
+test with `9553b9e` at the time; CI is the only build.
+
+### The shape, which is now a constraint
+
+```
+UNREAL SIDE (hooks)                          SONY SIDE (game's libScePad.dll)
+  DebugPS5Haptic gate (pre-hook, per call)     scePadGetHandle
+  reroute dead endpoint submixes:              scePadSetAudioOutPath(3)  + scePadSetVolumeGain
+    Submix_vibrationMaster  -> Submix_unused   scePadSetTriggerEffect
+    Submix_controllerMaster -> Submix_unused
+  tap both (RegisterSubmixBufferListener)    TRANSPORT
+  trigger hooks -> enum translation            ONE WASAPI client on the pad's 4-ch endpoint:
+                                                 FL/FR <- speaker tap   RL/RR <- vibration tap
+                                               HidMode valid_flag0 (§12, measured necessary)
+```
+
+The engine does the mixing, the fades, the levels, the looping and the boost chain. The plugin
+moves samples from where the engine put them to where the pad reads them, and makes Sony's DLL
+select the route. Every remaining source file is a hook, the reroute, the tap, the sink, a Sony
+call, HidMode, triggers, config or log (`mods/StrayDualSense/README.md`, "Source layout").
+
+### The speaker: the coil code generalised to two submixes
+
+`Submix_controllerMaster` is dead on PC for the identical reason `Submix_vibrationMaster` was
+(§16: `ControllerEndpointSubmix` is a `UEndpointSubmix` of type "Pad Speaker Output", no
+factory on Windows, dummy endpoint, subtree skipped). So it gets the identical treatment, in
+the same code: a `Lane` — tap, ring, live flag, per-second meters, its own three-state watch —
+used twice; ONE sink pulling both rings into one 4-channel stream (`InterleaveLanes`, pure,
+tested); ONE reroute submission that registers the parent and then EVERY master; ONE watchdog
+(`StallWatchdog`, pure, tested over N lanes: never before a lane's first callback, any lane
+that once rendered and then stalls, one re-arm at a time, capped). No second ring type, no
+second WASAPI client, no second watchdog, no new abstraction beyond `Lane`.
+
+The speaker's own `submix watch [speaker]` line opens on every `StartPS5ControllerSound`, and
+its status line carries `SPEAKER:` beside `COILS:`, with the same three-state verdict
+(`NoData` / `Silent` / `Mixed`) and the same "NOBODY, and why" reasons.
+
+**What is DIFFERENT about the speaker submix tree, and what each difference means** (all read
+from §14's probe dump and §10; none measured against the tap):
+
+| difference | vibration tree | speaker tree | consequence |
+|---|---|---|---|
+| depth and effects | `vibrationMaster -> vibration`, no effects | `controllerMaster -> controller -> controllerPre (SBFX_Boost)` | the tap on the master is post-effects, so the +5 dB is IN the samples. `SpeakerGain = 1.0`; carrying `kSpeakerBoost` over would double it |
+| class routing | `SCLASS_controllerVibration.DefaultSubmix = Submix_vibration`, **measured** | `SCLASS_controller` referenced by the `_CONTROL` assets, its `DefaultSubmix` **not read** | whether a `_CONTROL` sound lands in the tapped tree is [derived] from the chain existing. A `Silent` verdict with frames > 0 is what a wrong default submix looks like |
+| the gate | `DebugPS5Haptic` measured flipping `ControllerVibration.IsPlaying()` (§14) | the speaker Blueprints "share the gate shape" (§14) and DO call `StartPS5ControllerSound` when it is open (§15/§16) — but that the engine then PLAYS the `_CONTROL` asset was never observed: the `played=1` in those logs was OUR asset player | the speaker `submix watch` answers it in one run |
+| asset format | stereo 48 kHz | mono 44.1 kHz (§12) | the engine resamples to the mixer rate before the submix; the tap sees 48 kHz either way. A mono source panned centre arrives equal on FL and FR, which matters because the pad feeds its speaker from R (§16 table) |
+| the handle on the controller | `HKPlayerController.m_PS5VibrationSubmix = Submix_vibrationMaster` (§14) | no speaker equivalent seen in the dump | nothing of ours depends on it |
+
+**One deliberate change to the coil sequence, stated so it is not discovered:** the reroute
+now registers `parent`, then the vibration master, then the speaker master, in one pass, and
+refuses to bind until ALL THREE objects resolve. The reason is UE 4.27's own order of
+operations: `RegisterSoundSubmix(parent, bInit=true)` re-inits the parent, and it is each
+master's own `RebuildSubmixLinks` that puts it back under it — so binding one lane now and the
+other later would re-init the parent underneath the first lane's link. Both masters are
+siblings in the same settings package and were both in the object dump, so "all three resolve"
+is expected to hold on the first attempt exactly as "both resolve" did before. The sink opens
+on the first lane to carry a real signal and drains both rings from then on; each ring is
+attached, empty, at its own lane's handover (the §14 latency fix, unchanged).
+
+### The deletions
+
+Gone, in full: `AudioPlayer`, `Fade.hpp`, `LoopList`, `HapticDir`/`SpkDir` and the `haptic/`
+and `spk/` directories, `extract_assets.sh`, `wavegen.sh`, `ue4_soundwave_extract.py`,
+`uasset_props.py`, `HapticSource` and every mode of it, `CoilOwner` (it reduced to "the submix
+or nothing"; the lane verdict in `SubmixWatch` judges both pairs by the same rule), the
+`PadSpeakerRoute` `auto`/`hid`/`both` escalation and the `PadSpeakerHid*` keys with the raw HID
+audio claim behind them, the `SubmixReroute` and `ForcePS5HapticPath` switches (both always on:
+without them there is nothing to tap and no other source exists), and the deploy script's mode
+flags. **No fallback anywhere. No extracted assets anywhere.** Retired ini keys are named and
+ignored at load, so the ini on the box keeps working.
+
+Per file, lines before (`9553b9e`) → after: `Runtime.cpp` 1309 → 1115, `Runtime.hpp` 240 → 258,
+`Config.cpp` 297 → 289, `Config.hpp` 251 → 183, `HidMode.cpp` 318 → 253, `HidMode.hpp` 115 →
+95, `PadAudio.hpp` 249 → 69, `PadAudio.cpp` 160 → 33, `SubmixSink.cpp` 255 → 262, `SubmixSink.hpp`
+95 → 106, `SubmixDsp.cpp` 317 → 358, `SubmixDsp.hpp` 181 → 225, `SubmixWatch.cpp` 76 → 195,
+`SubmixWatch.hpp` 103 → 206, `Mod.cpp` 1138 → 1141, `Platform` 165 → 149; deleted 1 001 lines
+of source (`AudioPlayer` 464, `CoilOwner` 199, `LoopList` 59, `Fade` 39, and the HID half of
+`PadAudio`) plus 507 lines of asset tooling. The `src/` tree is 8 984 → 7 896 lines in all;
+the tests grew 1 445 → 1 249 net of the three deleted files, with 249 new lines of cases for
+the interleave, the N-lane watchdog and the lane verdict.
+
+### What stays, and why — `HidMode` in particular
+
+`HidMode` writes USB output report `0x02` with `valid_flag0 = 0x00` every 2 s and on the coil
+lane's silence → signal edge, and that is the one non-Sony write to the pad the plugin makes.
+It is NOT redundant with the game's own `scePadSetVibrationMode`, and the reason is measured
+rather than argued (§12, §16): the game already calls `scePadSetVibrationMode` itself — the
+shim only forwarded it, with a `vibmode` debug override that existed because nobody knew
+whether the game's chosen mode was right — and with the game's own mode in force the coils were
+demonstrably in rumble emulation, every audio path silent, until a report that does not
+re-assert `COMPATIBLE_VIBRATION` went out. So the byte is countermanding the game, not
+duplicating Sony; "can Sony's API replace it" is a separate question that has never been run,
+and the rule stands: leave it alone without evidence. With the HID audio claim gone the report
+is byte-identical to the one §12 measured working — id, flag byte, zeros — and there is exactly
+one writer of it.
+
+### The one-run test
+
+Deploy, press `Q` once at a checkpoint, then against `<gamedir>/stray-dualsense.log`:
+
+```sh
+L=stray-dualsense.log
+grep -n "REROUTE submitted\|registration submitted\|REFUSED" "$L"               # 1
+grep -o "SUBMIX [a-z]* bound=[0-9] live=[0-9] cb=[0-9]* ([0-9.]*/s)" "$L" | tail -4   # 2
+grep -n "submix watch \[" "$L" | tail -8                                          # 3
+grep -n "FIRST REAL SIGNAL" "$L"                                                  # 4
+grep -n "pad audio: scePad\|SONY ACCEPTED" "$L" | head -3                         # 5
+```
+
+| what it says | reading |
+|---|---|
+| (3) `[vibration] 'CatPurr2_VIBE': the engine MIXED it - peak 0.7…` | **the coils are unchanged** from `9553b9e` — the first thing to check, before the speaker |
+| (3) `[speaker] 'cat_purr_loop_01_CONTROL': the engine MIXED it` + (4) `on 'speaker'` + (5) `SONY ACCEPTED` | **the speaker works** if the purr is audible from the pad. Inaudible: the fault is downstream of the tap — `SpeakerGain`, `PadSpeakerGain`, or the endpoint's FL/FR |
+| (3) `[speaker] …: NO DATA FROM THE TAP` while `[vibration]` mixes; (2) `SUBMIX speaker … NO CALLBACKS` | **kills the hypothesis** that the same reroute renders the speaker tree. `Submix_controllerMaster` is not being rendered; read the `REROUTE` lines and the `resolved speaker` line (a plain `SoundSubmix`?) |
+| (3) `[speaker] …: the engine mixed NOTHING` with `frames` > 0 | rendered but silent: the `_CONTROL` sound is not landing in that tree — `SCLASS_controller`'s default submix, or the gate opens the vibration Blueprint and not the speaker one (`gate[open=…]`) |
+| (1) `REFUSED` | a vtable/slot check failed; the ERROR names which. Nothing plays, by design, and `COILS:`/`SPEAKER:` both say `NOBODY` with that reason |
+| (5) `=0x80920007` | libScePad believes the pad has no audio (§7): the Proton device tree, not ours |
+| (3) the vibration verdicts differ from `9553b9e`'s | the reroute order change above is the suspect; report it before anything else |
+
+### UNVERIFIED
+
+Everything in this section beyond the pure functions (`InterleaveLanes`, `StallWatchdog`,
+`JudgeLane`, unit-tested) and the two CI lanes (unit, mingw) that ran locally. The MSVC lane is
+CI's. The speaker lane has never delivered a sample to a pad.
