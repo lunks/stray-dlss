@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <string>
 
+#include "CoilOwner.hpp"
 #include "Log.hpp"
 
 namespace sds {
@@ -52,15 +53,23 @@ struct Config
     float hapticReassertSeconds = 2.0f;
 
     // ---- haptics: where the waveform COMES FROM (the submix spike) ---------------------
-    // assets  the shipped behaviour: <gamedir>/haptic/<name>.f32, one playback slot, so a
-    //         second haptic supersedes the first (measured: touching the cat kills the rain).
-    // measure tap the engine's own vibration submix and REPORT THE NUMBERS, but leave the
-    //         coils entirely to the asset path. This is the honest first step: it answers
-    //         "is the engine mixing haptics for us" without risking the pad.
-    // submix  tap the submix and feed the coils from it; the asset haptic path is disabled.
-    //         The speaker path is untouched in every mode.
-    enum class HapticSource : uint8_t { Assets = 0, Measure = 1, Submix = 2 };
+    // The modes and the rule each imposes are defined ONCE, in CoilOwner.hpp, next to the pure
+    // function that turns them plus the tap's facts into "who drives the coils". Read that.
+    //
+    //   assets           the shipped behaviour: <gamedir>/haptic/<name>.f32, one playback slot
+    //   measure          tap the engine's vibration submix and REPORT; assets drive the coils
+    //   submix-fallback  assets drive the coils until the tap carries a real signal, and every
+    //                    status line and a periodic WARN say so - the 2026-09-03 session read
+    //                    `bound=1` plus a vibrating pad as "the submix works" when it was this
+    //                    fallback, and that must never be possible again
+    //   submix           the submix or NOTHING: the asset path never plays, so anything felt
+    //                    in this mode came from the submix. A silent submix is a silent pad.
     HapticSource hapticSource = HapticSource::Assets;
+
+    // How often the WARN repeats while a submix mode is configured and the submix is not
+    // delivering (unbound, never called, or silent). 0 disables the cadence (the status line
+    // still says who drives the coils).
+    float submixWarnSeconds = 10.0f;
 
     // The submix to listen on. The path measured in the box's own UE4SS object dump; the
     // literal "master" registers on the engine's MASTER submix instead, which needs no
@@ -101,6 +110,42 @@ struct Config
     // over ssh without the game overlay.
     std::string submixStatusFile = "stray-dualsense-submix.txt";
 
+    // ---- the reroute: make the engine RENDER the vibration submix on PC --------------------
+    // MEASURED 2026-09-03 (docs/STRAY-DUALSENSE.md §14): VibrationEndpointSubmix is a
+    // UEndpointSubmix whose EndpointType is "Vibration Output". UE 4.27 has no factory for
+    // that name on Windows, so IAudioEndpointFactory::Get hands it the DUMMY factory
+    // (IAudioEndpoint.cpp:174) and FMixerSubmix::ProcessAudioAndSendToEndpoint returns before
+    // processing a single child (AudioMixerSubmix.cpp, IsDummyEndpointSubmix) - the whole
+    // vibration subtree is never rendered, which is why the tap saw ZERO callbacks.
+    //
+    // The reroute re-parents Submix_vibrationMaster under a submix that IS rendered every
+    // callback (SubmixRerouteParent), whose OutputVolume is first set to 0 so nothing leaks
+    // into the speakers, and asks the engine to rebuild the links by calling
+    // FAudioDevice::RegisterSoundSubmix(submix, true) - a virtual two slots below the one the
+    // tap already calls (AudioDevice.h:854, slot 14). The listener on Submix_vibrationMaster
+    // then sees the full mix (listeners run after the submix's OWN volume, which stays 1.0,
+    // and before the parent's). Default OFF: it writes two UPROPERTYs and calls one more
+    // derived vtable slot.
+    bool        submixReroute       = false;
+    std::string submixRerouteMaster = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
+    std::string submixRerouteParent = "/Game/Sound/tools/settings/Submix_unused.Submix_unused";
+    int         submixRegisterSoundSubmixSlot = 14;
+
+    // BP_HKPlayerController_C.DebugPS5Haptic (MEASURED in the object dump, offset 0x778):
+    // a bool beside the PS5 platform gate in every StartPS5Vibration Blueprint. When on, the
+    // plugin sets it TRUE on the player controller from inside its own hooks (game thread),
+    // so the Blueprint body past the gate runs on PC. Default OFF until the probe proves
+    // what the gate is.
+    bool forcePS5HapticPath = false;
+
+    // ---- button glyphs -------------------------------------------------------------------
+    // /Script/Hk_project.InputSubsystem:GetGameControllerType(_forceGamepad: bool) returns
+    // EGameControllerType (MEASURED: 0 Unknown, 1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro,
+    // 5 KeyboardMouse). UMG_KeyIcon's Set Key calls it to pick the prompt texture. With the
+    // pad presented as an X360 device the game answers XBOX; a post-hook rewrites the return.
+    // -1 = leave the game's answer alone.
+    int glyphControllerType = 3;
+
     // ---- controller speaker ----------------------------------------------------------
     bool speaker = true;
 
@@ -131,9 +176,10 @@ struct Config
     bool ReloadIfChanged(const std::wstring& path);
 
     void LogSummary(const char* what) const;
-    const char* HapticSourceName() const;
-    bool SubmixTapWanted() const { return hapticSource != HapticSource::Assets; }
-    bool SubmixDrivesCoils() const { return hapticSource == HapticSource::Submix; }
+    const char* HapticSourceName() const { return ::sds::HapticSourceName(hapticSource); }
+    bool SubmixTapWanted() const { return TapWanted(hapticSource); }
+    bool SubmixDrivesCoils() const { return SubmixMayDriveCoils(hapticSource); }
+    const char* GlyphName() const;
 
 private:
     uint64_t m_lastWriteTime = 0;

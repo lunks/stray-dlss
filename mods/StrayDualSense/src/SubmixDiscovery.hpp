@@ -183,6 +183,15 @@ bool CallRegisterSubmixBufferListener(const void* device, int slot, void* listen
                                       void* submix, const void* imageBase,
                                       std::size_t imageSize, const char** whyNot);
 
+// Calls `device->vtable[slot](submix, bInit)` — FAudioDevice::RegisterSoundSubmix
+// (AudioDevice.h:854, slot 14 by the same count as the listener slot above: two below it).
+// The engine reloads the submix if it is missing, re-inits it when bInit, and REBUILDS ITS
+// PARENT/CHILD LINKS from the UObject's ParentSubmix (AudioMixerDevice.cpp,
+// RegisterSoundSubmix -> RebuildSubmixLinks). That is what turns a ParentSubmix UPROPERTY write
+// into a live re-parenting. Same validation as the listener call; `whyNot` names a refusal.
+bool CallRegisterSoundSubmix(const void* device, int slot, void* submix, bool bInit,
+                             const void* imageBase, std::size_t imageSize, const char** whyNot);
+
 // Committed memory that allows reads. Used before every dereference in this file.
 bool Readable(const void* p, std::size_t bytes);
 

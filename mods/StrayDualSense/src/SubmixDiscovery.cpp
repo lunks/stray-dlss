@@ -678,5 +678,50 @@ bool CallRegisterSubmixBufferListener(const void* device, int slot, void* listen
     return true;
 }
 
+bool CallRegisterSoundSubmix(const void* device, int slot, void* submix, bool bInit,
+                             const void* imageBase, std::size_t imageSize, const char** whyNot)
+{
+    const char* dummy = nullptr;
+    if (whyNot == nullptr)
+        whyNot = &dummy;
+    *whyNot = nullptr;
+
+    if (device == nullptr)                       { *whyNot = "no device";            return false; }
+    if (submix == nullptr)                       { *whyNot = "no submix object";     return false; }
+    if (slot < 0 || slot >= kVtableProbeSlots)   { *whyNot = "slot outside the validated range"; return false; }
+    if (!Readable(device, sizeof(void*)))        { *whyNot = "the device is not readable"; return false; }
+
+    const void* vtable = ReadPtr(device);
+    if (!LooksLikeVtable(vtable, imageBase, imageSize))
+    {
+        *whyNot = "the device's vtable no longer validates";
+        return false;
+    }
+    const void* const* slots = static_cast<const void* const*>(vtable);
+    const void* fn = slots[slot];
+    if (!InImage(fn, imageBase, imageSize))
+    {
+        *whyNot = "the slot does not point into the game executable";
+        return false;
+    }
+    // FMixerDevice overrides RegisterSoundSubmix, UnregisterSoundSubmix AND
+    // RegisterSubmixBufferListener, so the three adjacent slots must all be distinct real
+    // functions. Two slots sharing an address is what MSVC's /OPT:ICF does to the EMPTY base
+    // stubs (FAudioDevice's own `{}` bodies) - and calling one of those would silently do
+    // nothing, which is the failure this project exists to avoid.
+    if (slot + 2 < kVtableProbeSlots && (slots[slot] == slots[slot + 1] || slots[slot] == slots[slot + 2]))
+    {
+        *whyNot = "the slot shares its address with a neighbour (an ICF-folded empty stub, not "
+                  "FMixerDevice's override)";
+        return false;
+    }
+
+    using Fn = void (*)(const void*, void*, bool);
+    Fn call = nullptr;
+    std::memcpy(&call, &fn, sizeof(call));
+    call(device, submix, bInit);
+    return true;
+}
+
 } // namespace submix
 } // namespace sds

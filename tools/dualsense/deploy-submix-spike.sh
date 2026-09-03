@@ -1,7 +1,8 @@
 #!/bin/bash
 # Deploy the SUBMIX SPIKE build of StrayDualSense, and be able to undo it.
 #
-#   tools/dualsense/deploy-submix-spike.sh [GAMEDIR] [--dll PATH] [--measure] [--revert]
+#   tools/dualsense/deploy-submix-spike.sh [GAMEDIR] [--dll PATH] [--measure|--fallback|--strict]
+#                                          [--reroute] [--gate] [--revert]
 #
 # WHAT IT CHANGES, and why each one is necessary:
 #
@@ -13,9 +14,12 @@
 #     whichever opened last wins. Leaving the shim in place would make the spike unreadable.
 #  3. Sets `StrayDualSense : 1` in mods.txt and installs the plugin at
 #     ue4ss/Mods/StrayDualSense/dlls/main.dll.
-#  4. Writes ue4ss/Mods/StrayDualSense/StrayDualSense.ini with HapticSource = submix
-#     (--measure writes `measure` instead: the tap reports numbers and the ASSET path keeps
-#     driving the coils, which is the safer first run).
+#  4. Writes ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.ini. The default is
+#     HapticSource = measure (the tap reports numbers, the ASSET path keeps driving the coils:
+#     the safe diagnostic run). --fallback writes `submix-fallback` (assets until the tap
+#     carries signal, LOUDLY), --strict writes `submix` (the submix or nothing - the only mode
+#     in which a felt vibration proves the submix). --reroute turns SubmixReroute on and
+#     --gate turns ForcePS5HapticPath on; together they are the 2026-09-03 experiment.
 #  5. chown deck:deck on everything it writes.
 #
 # It does NOT launch the game. Launch it yourself (tools/launch-stray-safe.sh), then read:
@@ -37,13 +41,19 @@ set -uo pipefail
 GAME_DEFAULT=/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64
 GAME=""
 DLL=""
-MODE=submix
+MODE=measure
+REROUTE=0
+GATE=0
 REVERT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --revert)  REVERT=1 ;;
-    --measure) MODE=measure ;;
+    --measure)  MODE=measure ;;
+    --fallback) MODE=submix-fallback ;;
+    --strict)   MODE=submix ;;
+    --reroute)  REROUTE=1 ;;
+    --gate)     GATE=1 ;;
     --dll)     DLL="${2:-}"; shift ;;
     -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     -*)        echo "unknown option: $1" >&2; exit 2 ;;
@@ -229,11 +239,25 @@ cat > "$INI_NEW" <<INI_EOF
 Enabled = 1
 LogLevel = Info
 
-; assets  = the shipped one-slot asset player (unchanged behaviour)
-; measure = tap the engine's vibration submix and report numbers; the ASSET path still drives
-;           the coils, so nothing new reaches the pad
-; submix  = feed the coils from the engine's own mix; the asset haptic path is disabled
+; assets          = the shipped one-slot asset player (unchanged behaviour)
+; measure         = tap the engine's vibration submix and report numbers; the ASSET path still
+;                   drives the coils, so nothing new reaches the pad
+; submix-fallback = assets drive the coils until the tap carries a real signal; LOUD meanwhile
+; submix          = STRICT: the submix or nothing; anything felt came from the submix
+; Every status line starts with "COILS: ..." - read that, not bound=.
 HapticSource = $MODE
+SubmixWarnSeconds = 10
+
+; The 2026-09-03 finding: the vibration subtree is never rendered on PC (dummy endpoint), and
+; the Blueprints do nothing until DebugPS5Haptic is true. These two switch both on.
+SubmixReroute = $REROUTE
+SubmixRerouteMaster = /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+SubmixRerouteParent = /Game/Sound/tools/settings/Submix_unused.Submix_unused
+SubmixRegisterSoundSubmixSlot = 14
+ForcePS5HapticPath = $GATE
+
+; PS glyphs on the prompts (the game sees an X360 pad and draws Xbox ones otherwise).
+Glyphs = ps5
 
 ; Measured in the box's own ue4ss/UE4SS_ObjectDump.txt. The literal "master" taps the engine's
 ; MASTER submix instead, which needs no USoundSubmix object at all — use it to prove the tap
@@ -305,9 +329,11 @@ say "  cat $GAME/stray-dualsense-submix.txt"
 say "  grep -E 'submix|SUBMIX' $GAME/stray-dualsense.log | tail -40"
 say ""
 say "What to look for, in order:"
-say "  1. 'submix: FAudioDevice ... found in UWorld+0x... AND UEngine+0x...'  the pointer is real"
-say "  2. 'submix: about to call vtable slot 16 ...'                          the risky line"
-say "  3. SUBMIX ... cb=N (46.9/s) ch=2 rate=48000 peak=...                   THE TAP FIRES"
-say "  4. peak rises when the rain and a purr overlap                         THE ENGINE MIXES"
+say "  0. every SUBMIX/STATUS line starts with 'COILS: ...' - that is who drives the pad"
+say "  1. 'submix: FAudioDevice ... found ...'                                the pointer is real"
+say "  2. 'submix: REROUTE submitted' (with --reroute)                        the links were rebuilt"
+say "  3. SUBMIX ... cb=N (46.9/s) ch=2 rate=48000 peak=...                   THE SUBTREE RENDERS"
+say "  4. peak > 0 while a haptic plays (with --gate)                          THE ENGINE MIXES"
+say "  5. 'HANDOVER: the SUBMIX now drives the coils' (fallback/strict)        the pad is on the mix"
 say ""
 say "Undo everything: $0 $GAME --revert"

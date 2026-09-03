@@ -35,14 +35,29 @@ bool ParseBool(const std::string& v, bool fallback)
     return fallback;
 }
 
-Config::HapticSource ParseHapticSource(const std::string& v, Config::HapticSource fallback)
+HapticSource ParseHapticSource(const std::string& v, HapticSource fallback)
 {
     const std::string l = Lower(Trim(v));
-    if (l == "assets"  || l == "asset")   return Config::HapticSource::Assets;
-    if (l == "measure" || l == "measure-only" || l == "probe") return Config::HapticSource::Measure;
-    if (l == "submix")                    return Config::HapticSource::Submix;
-    SDS_LOG_WARN("config: HapticSource='%s' is not one of assets|measure|submix; keeping the "
-                 "previous value.", v.c_str());
+    if (l == "assets"  || l == "asset")   return HapticSource::Assets;
+    if (l == "measure" || l == "measure-only" || l == "probe") return HapticSource::Measure;
+    if (l == "submix-fallback" || l == "fallback" || l == "submix_fallback")
+        return HapticSource::SubmixFallback;
+    if (l == "submix")                    return HapticSource::Submix;
+    SDS_LOG_WARN("config: HapticSource='%s' is not one of assets|measure|submix-fallback|submix; "
+                 "keeping the previous value.", v.c_str());
+    return fallback;
+}
+
+// ps5 | ps4 | xbox | game. The numbers are EGameControllerType, read from the object dump.
+int ParseGlyphs(const std::string& v, int fallback)
+{
+    const std::string l = Lower(Trim(v));
+    if (l == "ps5" || l == "playstation" || l == "3") return 3;
+    if (l == "ps4" || l == "2")                       return 2;
+    if (l == "xbox" || l == "1")                      return 1;
+    if (l == "game" || l == "off" || l == "none" || l == "-1" || l == "0") return -1;
+    SDS_LOG_WARN("config: Glyphs='%s' is not one of ps5|ps4|xbox|game; keeping the previous "
+                 "value.", v.c_str());
     return fallback;
 }
 
@@ -113,6 +128,13 @@ bool Config::Load(const std::wstring& path)
         else if (key == "hapticvalidflag0")       hapticValidFlag0       = ParseByte(val, hapticValidFlag0);
         else if (key == "hapticreassertseconds")  hapticReassertSeconds  = ParseFloat(val, hapticReassertSeconds);
         else if (key == "hapticsource")           hapticSource           = ParseHapticSource(val, hapticSource);
+        else if (key == "submixwarnseconds")      submixWarnSeconds      = ParseFloat(val, submixWarnSeconds);
+        else if (key == "submixreroute")          submixReroute          = ParseBool(val, submixReroute);
+        else if (key == "submixreroutemaster")    submixRerouteMaster    = val;
+        else if (key == "submixrerouteparent")    submixRerouteParent    = val;
+        else if (key == "submixregistersoundsubmixslot") submixRegisterSoundSubmixSlot = std::clamp(std::atoi(val.c_str()), 0, 31);
+        else if (key == "forceps5hapticpath")     forcePS5HapticPath     = ParseBool(val, forcePS5HapticPath);
+        else if (key == "glyphs")                 glyphControllerType    = ParseGlyphs(val, glyphControllerType);
         else if (key == "submixpath")             submixPath             = val;
         else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
         else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
@@ -169,11 +191,14 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     if (fresh.hapticSource != hapticSource || fresh.submixPath != submixPath ||
         fresh.submixRegisterSlot != submixRegisterSlot ||
         fresh.submixDeviceSource != submixDeviceSource ||
-        fresh.submixProbeMaster != submixProbeMaster)
+        fresh.submixProbeMaster != submixProbeMaster || fresh.submixReroute != submixReroute ||
+        fresh.submixRerouteMaster != submixRerouteMaster ||
+        fresh.submixRerouteParent != submixRerouteParent ||
+        fresh.submixRegisterSoundSubmixSlot != submixRegisterSoundSubmixSlot)
     {
         SDS_LOG_WARN("config: HapticSource / SubmixPath / SubmixRegisterSlot / "
-                     "SubmixDeviceSource / SubmixProbeMaster changed but are NOT "
-                     "hot-reloadable - the listener is registered once and the engine keeps "
+                     "SubmixDeviceSource / SubmixProbeMaster / SubmixReroute* changed but are "
+                     "NOT hot-reloadable - the listener is registered once and the engine keeps "
                      "it. Relaunch the game.");
     }
 
@@ -189,6 +214,9 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     speaker               = fresh.speaker;
     submixGain            = fresh.submixGain;      // live: it is one atomic on the sink
     submixStatusSeconds   = fresh.submixStatusSeconds;
+    submixWarnSeconds     = fresh.submixWarnSeconds;
+    forcePS5HapticPath    = fresh.forcePS5HapticPath;   // read on the game thread per hook
+    glyphControllerType   = fresh.glyphControllerType;  // read on the game thread per call
     statusSeconds         = fresh.statusSeconds;
     configReloadSeconds   = fresh.configReloadSeconds;
     m_lastWriteTime       = fresh.m_lastWriteTime;
@@ -209,21 +237,29 @@ void Config::LogSummary(const char* what) const
                  endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
                  hapticLoopsFile.c_str(), spkLoopsFile.c_str());
     SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
-                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d",
+                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d "
+                 "warnEvery=%.1fs",
                  what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
                  submixRegisterSlot, submixDeviceSource.c_str(),
                  static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs,
-                 static_cast<unsigned>(submixScanBytes), submixDumpWords);
+                 static_cast<unsigned>(submixScanBytes), submixDumpWords,
+                 static_cast<double>(submixWarnSeconds));
+    SDS_LOG_INFO("config %s: SubmixReroute=%d (master='%s' -> parent='%s', registerSlot=%d) "
+                 "ForcePS5HapticPath=%d Glyphs=%s(%d)",
+                 what, submixReroute ? 1 : 0, submixRerouteMaster.c_str(),
+                 submixRerouteParent.c_str(), submixRegisterSoundSubmixSlot,
+                 forcePS5HapticPath ? 1 : 0, GlyphName(), glyphControllerType);
 }
 
-const char* Config::HapticSourceName() const
+const char* Config::GlyphName() const
 {
-    switch (hapticSource)
+    switch (glyphControllerType)
     {
-    case HapticSource::Measure: return "measure";
-    case HapticSource::Submix:  return "submix";
-    case HapticSource::Assets:
-    default:                    return "assets";
+    case 3:  return "ps5";
+    case 2:  return "ps4";
+    case 1:  return "xbox";
+    case -1: return "game";
+    default: return "?";
     }
 }
 

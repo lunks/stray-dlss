@@ -87,24 +87,32 @@ public:
     // The UE4SS glue polls this from inside a game-thread hook and stops as soon as it is
     // false, so a session that never binds is one WARN per attempt and not a silent nothing.
     bool SubmixWantsBinding() const;
-    // Is the submix ACTUALLY driving the coils right now? Config intent AND proven signal.
-    // Everything that would silence the asset path asks this, never the config alone.
-    bool SubmixOwnsCoils() const;
+    // WHO DRIVES THE COILS. The facts are gathered here and judged by the pure CoilOwner
+    // module; every status line, warning and gate asks this verdict, never the config or the
+    // tap's counters on their own (that is how a silent submix passed for a working one).
+    CoilFacts   CoilFactsNow() const;
+    CoilVerdict Coils() const { return JudgeCoils(CoilFactsNow()); }
+    bool        SubmixOwnsCoils() const { return Coils().owner == CoilOwner::Submix; }
 
-    // Called ON THE GAME THREAD by the UE4SS glue, which resolves the three UObjects and the
+    // Called ON THE GAME THREAD by the UE4SS glue, which resolves the UObjects and the
     // executable's image range reflectively and hands them over as raw pointers — the runtime
     // itself stays free of every UE4SS type. `submixObject` may be null, which registers on
-    // the engine's MASTER submix (AudioMixerDevice.cpp:2350). Returns true when the listener
-    // has been handed to the engine; false means "not yet, or refused", and the reason has
-    // already been logged.
+    // the engine's MASTER submix (AudioMixerDevice.cpp:2350). The two reroute objects are the
+    // USoundSubmix to re-parent and its new parent, both null unless SubmixReroute is on and
+    // both resolved (the glue has already written their UPROPERTYs). Returns true when the
+    // listener has been handed to the engine; false means "not yet, or refused", and the
+    // reason has already been logged.
     bool BindSubmixTap(const void* worldObject, const void* engineObject, void* submixObject,
-                       bool submixObjectResolved, const void* imageBase, std::size_t imageSize);
+                       bool submixObjectResolved, void* rerouteMasterObject,
+                       void* rerouteParentObject, const void* imageBase, std::size_t imageSize);
 
 private:
     void PadThreadMain();
     void LogStatus();
     void StartSubmix();
     void SubmixStatus();     // the numbers proof: one log line and one status file line
+    void SubmixWarnIfDue(uint64_t now);
+    void StartSinkAtHandover(float peak);
     bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
     void LoadLoopLists();
 
@@ -129,6 +137,10 @@ private:
     // keeps driving the coils — the 2026-09-03 run left the user with no haptics at all because
     // HapticSource=submix disabled the assets on a tap that never bound.
     std::atomic<bool>  m_submixLive{false};
+    std::atomic<bool>  m_submixRefused{false};
+    std::atomic<bool>  m_submixRerouted{false};
+    bool               m_sinkStarted = false;      // UE4SS update thread only
+    uint64_t           m_lastSubmixWarnMs = 0;
     std::atomic<int>   m_submixBindAttempts{0};
     const void*        m_submixDevice = nullptr;
     std::string        m_submixStatusPath;   // narrow, for the log; the wide one is below

@@ -38,6 +38,8 @@ endif()
 #   Fade           the FadeInTime / FadeOutTime gain ramps
 #   SubmixChoice   the submix spike's FAudioDevice acceptance ladder - the part that got it
 #                  wrong in the game on 2026-09-02, and is pure, so CI can prove the fix
+#   CoilOwner      WHO DRIVES THE COILS, from the facts - the sentence whose absence let a
+#                  silent submix pass for a working one on 2026-09-03
 #   SubmixDsp      the submix spike's signal path: channel fold, soft clip, resampler, the
 #                  level meter that IS the proof, and the lock-free ring the audio render
 #                  thread writes into
@@ -45,6 +47,8 @@ endif()
 add_library(straydualsense_core STATIC
     src/AssetName.cpp
     src/AssetName.hpp
+    src/CoilOwner.cpp
+    src/CoilOwner.hpp
     src/Fade.hpp
     src/LoopList.cpp
     src/LoopList.hpp
@@ -59,7 +63,7 @@ target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
 enable_testing()
-foreach(t asset_name trigger_effect loop_list fade submix_dsp submix_choice)
+foreach(t asset_name trigger_effect loop_list fade submix_dsp submix_choice coil_owner)
     add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
     target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
     target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
@@ -88,6 +92,8 @@ add_library(StrayDualSense SHARED
     src/AssetName.hpp
     src/AudioPlayer.cpp
     src/AudioPlayer.hpp
+    src/CoilOwner.cpp
+    src/CoilOwner.hpp
     src/Config.cpp
     src/Config.hpp
     src/Fade.hpp
