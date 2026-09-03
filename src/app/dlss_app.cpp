@@ -529,44 +529,17 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	g_nr_ui.mv_invert_y = mv_iy != 0;
 	const float nr_mvec_scale = g_nr_ui.mvec_scale;
 
-	// The HDR colour codec (src/core/nr_codec.hpp). NOT optional and not a quality knob: feature
-	// 18 is a display-referred image network, our hook point carries raw unbounded pre-exposed
-	// linear HDR, and the runtime has no colour-space or exposure parameter anywhere in it. Fed
-	// raw HDR it answered near-black (neural output max luminance 0.0026) and drew red noise.
-	//
-	// NgxNRPaperWhiteScale is the post-exposure value treated as display white; the shader's
-	// multiplier is 1/paperWhite ("calcProxyScale" in the reference tree, where the user-facing
-	// knob has this same name and RenoDX calls it NRPaperWhiteScale). The reference multiplies
-	// it by its tonemapper's auto-exposure texture — we have no such texture at a TAA dispatch,
-	// so this is the WHOLE scale, with nothing scene-adaptive underneath it.
-	//
-	// Default 1.0, and values BELOW 1.0 are legal and are the likely direction here: scale =
-	// 1/paperWhite, so raising it multiplies the colour DOWN, and Stray's scene colour already
-	// carries UE4's pre-exposure (CLAUDE.md §2.6 row 135.y, ~0.056 measured live) — already
-	// small, which is the direction our failure points. Do not guess: the codec logs the colour
-	// input, the encoded proxy and the neural output luminance over one crop on one line, and
-	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
-	// [STRAYDLSS] NgxNRTrackExposure, default ON: multiply the codec's proxy scale by the
-	// engine's OneOverPreExposure so the soft-clip knee follows scene brightness. We dropped this
-	// in the port; without it there is no single paper white that is right in both a dark room
-	// and a bright street, because UE4's pre-exposure moves with the scene. (ngx_nr.hpp)
-	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
-	// the escape hatch for a colour cast. 1 takes the network's colour too.
-	// A global lerp back toward the untouched original; 0 is an EXACT bit-for-bit bypass, which
-	// makes it the honest A/B against "NR off" without changing anything else.
 	g_nr_ui.enabled = ngx_nr;
 	apply_nr_live_impl();
 
 	if (ngx_nr)
 	{
-		STRAY_LOG_WARN("NgxNR=1: DLSS Neural Rendering (feature 18) topology=%s "
-			"intensity=%.2f localTone=%.2f localStructure=%.2f mvecScaleOverride=%.3f "
-			"paperWhite=%.4f trackExposure=%d colorStrength=%.2f transferStrength=%.2f. "
-			"Grep 'NR' lines, 'NR codec scale' for the paperWhite x exposure decomposition, and "
-			"'NR CODEC LUMINANCE' for the one that picks paperWhite.",
-			nr_sr_shaped ? "sr-shaped" : "post-process",
-			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale,
-		if (nr_sr_shaped)
+		STRAY_LOG_WARN("NgxNR=1: DLSS Neural Rendering (feature 18) runs as a PRESENT STAGE "
+			"over the back buffer. intensity=%.2f localTone=%.2f localStructure=%.2f "
+			"mvecScaleOverride=%.3f. The image is display-referred there, so there is no HDR "
+			"codec and no exposure term. Grep 'NR' lines, and 'NR STAGE' for the stage's own "
+			"gate.",
+			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale);
 		// [STRAYDLSS] NgxNRPreload, default ON: LoadLibrary + export resolution + the
 		// identity IAT patch at device init — matching RenoDX's "signed NR runtime
 		// (nvngx_dlssnr.dll) pre-loaded at device init". All of it is pure memory work with
