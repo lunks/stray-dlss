@@ -37,9 +37,9 @@ Ranked by **measured cost or bug risk**, biggest first. "After item 2" means: as
 
 | # | What is inferred | Where | Measured cost / risk | Engine truth, and the route | After item 2 | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | **Which resource every descriptor slot views**, and every root argument, rebuilt from `Create*View` / `CopyDescriptors` / `SetComputeRoot*` hooks | `src/backend_native/descriptor_shadow.cpp`, `root_shadow.cpp`, `resource_registry.cpp`, `d3d12_hooks.cpp` | **2.913 ms/frame, 14% of a 20.2 ms frame**; 33 826 436 shadow slots at frame 7800; the Config-B flicker (1 frame in 5 undriven, facts §29) and the 52→104 fps hitch recovery (facts §30) both came from this machinery | The TAA hook's share is replaced by `FPassInputs` (`TemporalAA.h:150-157`); the rest has no engine route | **Partly.** Three consumers keep it alive: the View-CB search (#3), the `u0` identity (#2b), the state restore | **Shrink, do not delete.** §1 |
+| 1 | **Which resource every descriptor slot views**, and every root argument, rebuilt from `Create*View` / `CopyDescriptors` / `SetComputeRoot*` hooks | `src/backend_native/descriptor_shadow.cpp`, `root_shadow.cpp`, `resource_registry.cpp`, `d3d12_hooks.cpp` | **2.913 ms/frame, 14% of a 20.2 ms frame**; 33 826 436 shadow slots at frame 7800; the Config-B flicker (1 frame in 5 undriven, facts §29) and the 52→104 fps hitch recovery (facts §30) both came from this machinery | The TAA hook's share is replaced by `FPassInputs` (`TemporalAA.h:150-157`); the rest has no engine route | **Partly, and LESS than this table used to say.** The `u0` identity, colour-by-register and the state restore keep it alive; the View-CB search (#3) is **not** what holds it — see the correction below | **Shrink, do not delete — and expect very little.** §1 |
 | 2 | **The output rect DLSS is created for** is the matcher's `group_count × 8`, not the engine's announced rect — *while the log says the engine's is used* | `src/taa_hook.cpp:1916-1917` against `:1396-1401` | **A false diagnostic on the shipping path.** They agree today; the log would not say so if they stopped | `*OutSceneColorViewRect`, already captured in `seam_verdict.out_width/height` and in scope at the call site | No — this is orthogonal | **Fix.** ~4 lines. §2 |
-| 3 | **Which bound constant buffer is `View`** — "try every one, keep the first that parses plausibly" | `src/taa_hook.cpp:1268-1290`, `:895-922` | The last hard dependency the TAA hook has on the descriptor shadow's *write* side | `FSceneView::ViewUniformBuffer` (`SceneView.h:901`) — but that is a [derived] offset into an ENGINE_API class and then an RHI-buffer chain | No | **Keep. Revisit only as part of §1.** §3 |
+| 3 | **Which bound constant buffer is `View`** — "try every one, keep the first that parses plausibly" | `src/taa_hook.cpp:1268-1290`, `:895-922` | ~~The last hard dependency the TAA hook has on the descriptor shadow's *write* side~~ **CORRECTED 2026-09-03 — see the note under this table.** It is a **correctness** risk, not a perf blocker: it took a different view's buffer on ~1.2% of frames and that was the visible flicker (facts §36.18) | `FSceneView::ViewUniformBuffer` (`SceneView.h:901`) — and the chain past it is worse than this row implies: `FRHIUniformBuffer` has **no** native-resource virtual, and `FD3D12UniformBuffer`'s `ResourceLocation` offset is gated on the unobservable `USE_STATIC_ROOT_SIGNATURE` (`docs/RESEARCH-ENGINE-TAA-HOOK.md` §15.1) | No | **Keep. Replace only if the ambiguity measurement says the search ever chose wrongly** — §15.4 there |
 | 4 | **The cooked-hash table still decides which colour-identification path runs**, though it was demoted from a gate to an assertion | `src/taa_hook.cpp:1817-1818` | An engine-announced pass whose hash is not cooked silently falls back to the weaker heuristics | `FPassInputs::SceneColorTexture` (`TemporalAA.h:153`) | **Yes, wholly** | **Subsumed by item 2.** §4 |
 | 5 | **The camera-cut OR's third signal** — "the history or velocity SRV is a 1×1 texture" standing in for `!InputHistory.IsValid()` | `src/core/view_params.cpp:179-190`, `taa_signature.cpp:284-312` | Every missed cut is a temporal-history error that compounds; every false cut is a discarded accumulation | `bCameraCut = !InputHistory.IsValid() \|\| View.bCameraCut` — **HARD**, `TemporalAA.cpp:644`. Half of it (`View.bCameraCut`) we already read exactly, as View row 145.x | Partly — the dummy test moves onto the engine's own velocity texture identity | **Keep, assert against the engine.** §5 |
 | 6 | **The pin, the history round-trip, the aspect-ratio band and the 3.5× upscale ceiling** | `src/taa_hook.cpp:179-192, 1691-1722, 1942-1967, 2358-2382`; `core/taa_signature.cpp:251-282` | Dead under `EngineSeam=3` but **still executed every dispatch**, and still the whole gate under `EngineSeamFallback=1` | The announcement, already live | Independent of item 2 | **Delete after one clean level-3 session.** §6 |
@@ -52,6 +52,40 @@ Ranked by **measured cost or bug risk**, biggest first. "After item 2" means: as
 *identification* any more — that is solved — it is the **descriptor shadow that exists to answer
 questions the engine could answer**, and it survives item 2 for exactly three reasons (§1.3). Every
 other finding is small, and two of them (§2, §4) are bugs rather than architecture.
+
+> ### CORRECTION 2026-09-03: the View-CB search is NOT what keeps the descriptor shadow in the hot path
+>
+> **This document's central perf claim is wrong, and it was shaping decisions.** §1.3 and §3 rank
+> the View-CB search first on the grounds that it is the last consumer standing between us and
+> deleting the shadow's 2.287 ms/frame write side, and §11's step 6 tells the reader not to start on
+> the shadow until §3 is solved. Read against `native_backend.cpp:174-308`, the search does not hold
+> what this document says it holds.
+>
+> * The search consumes only `DispatchBindings::constant_buffers`, built from the **root** shadow's
+>   `compute_root_cbv` map plus `registry::buffer_for_va`. Removing it frees **one of nine root
+>   hooks** and the per-dispatch candidate reads — now counted as `cbReads` on the `[view]` line, so
+>   the figure stops being an estimate.
+> * It frees **none of `shadow-copy`, 1.644 ms, which is 56% of the measured 2.913 ms**. That is
+>   `CopyDescriptors` tracking for the **SRV/UAV table walk**, and the walk is required by two things
+>   the engine does not hand us: **scene colour by register** — which
+>   `docs/RESEARCH-ENGINE-TAA-HOOK.md` §14.4 establishes as the *intended end state*, because L1
+>   resolves colour as `rhi_null` — and the **output UAV `u0`**, which is not in `FPassInputs` at
+>   all. `SetComputeRootDescriptorTable` stays for the same reason, and `restore_game_compute_state`
+>   (§1.3's third consumer) stays regardless.
+>
+> **So the three-consumer list loses one of three, and the two expensive halves are driven by the two
+> that remain. Expected saving from replacing the search: well under 0.5 ms of 2.9 ms.**
+>
+> **What this does NOT retract:** the search is still an inference, and since this document was
+> written it has been *measured* choosing a different view's buffer on ~1.2% of frames — the visible
+> flicker (facts §36.18-36.19). So item 3 goes UP in importance and CHANGES CATEGORY: it is a
+> correctness item, not a performance one. The wall in front of replacing it, the one route through,
+> and the measurement that decides whether to take it are `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15.
+>
+> **The transferable part:** this document ranked by "measured cost or bug risk" and then attributed
+> a measured cost to the wrong consumer, because the *number* was measured and the *attribution* was
+> not. A ranking is only as good as the weakest link in each row's causal story, and that link is
+> usually the unmeasured one.
 
 ---
 
@@ -116,7 +150,14 @@ alive on the shipping path:**
 1. **The View constant buffer.** `taa_hook.cpp:1273-1285` iterates `b.constant_buffers` — which the
    native backend fills from the root-CBV addresses via `registry::buffer_for_va`
    (`native_backend.cpp:289-305`) — and keeps the first that parses as a plausible `View`. Without
-   the shadow there is no list to iterate. This is §3, and it is the load-bearing one.
+   the shadow there is no list to iterate. ~~This is §3, and it is the load-bearing one.~~
+   **CORRECTED 2026-09-03 (see the correction under §0's table): it is the LIGHTEST of the three.**
+   It needs the **root** shadow's `compute_root_cbv` map and the registry's GPU-VA lookup, and
+   nothing else — one of nine root hooks. It does **not** need `CopyDescriptors` tracking, which is
+   where 1.644 ms of the 2.913 ms lives. Consumers 2 and 3 below are what hold the write side, and
+   §14.4 of `docs/RESEARCH-ENGINE-TAA-HOOK.md` has since made consumer 2's sibling — **scene colour
+   by register** — the intended end state rather than a stopgap, so that side is *growing*, not
+   shrinking.
 2. **The output UAV `u0`.** `taa_hook.cpp:1791-1796` and `:1906-1911` find the output by register
    from `b.uavs`. **The engine states this too** and item 2 may not cover it: `AddPasses`'s
    `FRDGTextureRef* OutSceneColorTexture` (`TemporalAA.h:174`) is written by
@@ -238,9 +279,25 @@ upload allocation is another undocumented hop.
 
 ### 3.3 Recommendation
 
-**KEEP the row parsing (it self-validates). KEEP the search.** Revisit only if §1's write side is
+**KEEP the row parsing (it self-validates). KEEP the search.** ~~Revisit only if §1's write side is
 being deleted, at which point the search is the blocker and the cost/benefit changes. Rank it third
-because it is the *reason* §1 cannot shrink, not because it is itself wrong.
+because it is the *reason* §1 cannot shrink, not because it is itself wrong.~~
+
+> **CORRECTED 2026-09-03, on both halves.** The search is **not** the reason §1 cannot shrink (see
+> the correction under §0's table: it holds one of nine root hooks and none of `shadow-copy`), and
+> it is **not** "not itself wrong" — it was measured taking a different view's buffer on ~1.2% of
+> frames, which was the visible flicker (facts §36.18-36.19). Both errors point the same way: this
+> row was under-ranked for the reason that actually matters and over-ranked for the reason it does
+> not.
+>
+> **The revised recommendation.** Keep the search until the ambiguity measurement says whether it
+> ever chose wrongly on a *claimed* dispatch — the quiet half `view_fits_dispatch` cannot catch.
+> Zero means the answer was forced and there is nothing to fix; non-zero means slot order has been
+> choosing a temporal consumer's jitter, `ClipToPrevClip` and `CameraCut`, and the replacement in
+> `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15.2 is worth its two discovered offsets. §15.1 there also
+> corrects this section's engine-route sketch: `FRHIUniformBuffer` has **no** native-resource
+> virtual, so the chain is strictly harder than "an `ENGINE_API` offset and then an RHI-buffer
+> chain" implies.
 
 ---
 
@@ -560,12 +617,26 @@ else wants it. Independent of everything above.
 **Adds ~30 lines, deletes none.** One counter for the jitter-only camera cut; one startup line when
 the observed base-pass shape contradicts the baked `r.*` premises. Both log-only.
 
-### Step 6 — the descriptor shadow (§1), and only if §3 is solved first
+### Step 6 — the descriptor shadow (§1) ~~, and only if §3 is solved first~~
 
-The 2.287 ms/frame write side. **Do not start this before the View-CB search has an answer** —
+~~The 2.287 ms/frame write side. **Do not start this before the View-CB search has an answer** —
 without it the shadow cannot be gated and nothing measurable changes. If §3 stays unsolved, the
 correct outcome of this sweep is that the shadow **stays**, and that is not a failure: it is the
-price of reading a constant buffer the engine will not hand us.
+price of reading a constant buffer the engine will not hand us.~~
+
+> **CORRECTED 2026-09-03.** Solving §3 does not unblock this step, because §3 was never the block.
+> The 2.287 ms write side is held by `CopyDescriptors` tracking for the **SRV/UAV table walk**,
+> which serves scene-colour-by-register (the intended end state per
+> `docs/RESEARCH-ENGINE-TAA-HOOK.md` §14.4) and the output UAV `u0` (absent from `FPassInputs`), plus
+> `restore_game_compute_state`. Replacing the View-CB search frees one root hook and the per-dispatch
+> candidate reads — **well under 0.5 ms of 2.9 ms**, and now countable directly as `cbReads` on the
+> `[view]` line rather than estimated.
+>
+> **The honest conclusion of this sweep is therefore stronger than it was, not weaker:** the shadow
+> **stays**, and it stays for reasons that have nothing to do with the constant buffer. Anyone
+> proposing to delete it should start from `u0` and colour-by-register, and should read §14.2 there
+> first — it enumerates every candidate hook point inside the window where a transient RDG texture
+> has an RHI resource, and every one of them fails.
 
 ---
 

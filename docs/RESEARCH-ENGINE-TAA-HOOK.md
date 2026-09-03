@@ -1327,3 +1327,199 @@ same two pieces of work we built by hand as D3D12 compute. That is independent v
 architecture, and it says where the deleted finder's replacement belongs: **not a descriptor-shape
 search, but the engine's own named G-buffer textures**, taken from the `const FViewInfo&` that
 `AddPasses` already hands us (§13.2). If RR is ever rewired, that is the shape to copy.
+
+
+---
+
+## 15. The View constant buffer by IDENTITY: the wall, the one route through it, and the arithmetic that says wait (2026-09-03)
+
+**The question.** The View CB is still located by SEARCH — try every bound root CBV, keep the
+first that decodes as a plausible `View` (`taa_hook.cpp`, and CLAUDE.md §2.6). That search has now
+been the proximate cause of the visible flicker once (facts §36.18: a 4088×4088 shadow view on a
+lower root parameter beat the real one on b4, on ~1.2% of frames), and the fix — `view_fits_dispatch`
+— closes only the half of the bug that fails LOUDLY. This section asks whether the search can be
+replaced by asking the engine which buffer is `View`, and answers: **yes, but not the way it looks,
+and not yet.**
+
+Everything here is UE 4.27.2 source plus derivation against the mirror `AlexMercer-MA/UnrealEngine-4.27`
+@ `306a7e9`. **Nothing in this section has run.** No code was written for it.
+
+### 15.1 Why the obvious design is not L1-shaped, and this is the load-bearing finding
+
+The design that suggests itself is the one L1 used: take the engine's own handle, walk two hops,
+compare the answer against something we already know. For textures that worked because of one fact —
+`FRHITexture::GetNativeResource()` is a **virtual** returning the `ID3D12Resource*` directly, so the
+chain is one derived field offset (`FRDGResource::ResourceRHI @16`) plus one vtable slot index, and
+the slot index is validated by the answer landing in our own resource registry (§12.9, facts §36.13).
+
+**Uniform buffers have no such virtual. HARD, `RHIResources.h`:**
+
+* `FRHIResource` declares exactly **one** virtual, its destructor.
+* `FRHIUniformBuffer` adds exactly **two**: `GetPatchingFrameNumber` and `SetPatchingFrameNumber`.
+  Neither returns a native resource. There is nothing to call.
+
+So reaching the D3D12 allocation means reading `FD3D12UniformBuffer`'s members, and **HARD,
+`D3D12Resources.h`:**
+
+```cpp
+class FD3D12UniformBuffer : public FRHIUniformBuffer, public FD3D12DeviceChild,
+                            public FD3D12LinkedAdapterObject<FD3D12UniformBuffer>
+{
+public:
+#if USE_STATIC_ROOT_SIGNATURE
+    class FD3D12ConstantBufferView* View;
+#endif
+    FD3D12ResourceLocation ResourceLocation;
+    TArray<TRefCountPtr<FRHIResource>> ResourceTable;
+    const EUniformBufferUsage UniformBufferUsage;
+```
+
+Two things about that declaration decide the whole design:
+
+1. **`ResourceLocation`'s offset is gated on `USE_STATIC_ROOT_SIGNATURE`** — a build define, chosen
+   when the licensee built the game, which we cannot observe from outside. A derivation that is
+   right or wrong depending on an unobservable flag is not a derivation.
+2. **`FD3D12ResourceLocation` has ~11 members and `GPUVirtualAddress` is the seventh**, behind two
+   unions (`FD3D12BaseAllocatorType*`/`FD3D12SegListAllocator*`, and `PrivateAllocatorData`) and an
+   enum whose underlying type is itself a derivation.
+
+**So the endorsed shape needs two nested layout derivations into RHI-private types, one of them
+unobservable, with no self-validating constant anywhere in the chain.** That is precisely what §9's
+rule forbids and what `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §3.2 concluded independently ("there is
+no cheap engine route to the View CB"). **Do not build it as a pair of constants.** The wall is real
+and it is the reason this section exists rather than a patch.
+
+### 15.2 The route through: DISCOVER the offsets, validated the way the vtable was
+
+The vtable scan is safe not because its offsets are known but because **a wrong candidate cannot
+reproduce three independent constants of three different kinds** (§4.1). The same move works here,
+and `FD3D12ResourceLocation`'s own member order is what makes it work — `GPUVirtualAddress`,
+`OffsetFromBaseOfResource` and `Size` are **consecutive**:
+
+```
+FViewInfo*  --(scan O1)-->  FRHIUniformBuffer*  --(scan O2)-->  { GPUVirtualAddress,
+                                                                  OffsetFromBaseOfResource,
+                                                                  Size }
+```
+
+A candidate `(O1, O2)` pair must satisfy **five independent predictions**:
+
+| # | Prediction | Kind |
+|---|---|---|
+| 1 | `*(view+O1)` is a readable heap pointer whose `*P` is a vtable inside the game module with executable slots | pointer topology — the check L1 already implements |
+| 2 | `registry::buffer_for_va(VA)` resolves, and the buffer is an **upload heap** | our own bookkeeping |
+| 3 | the engine's `OffsetFromBaseOfResource` at `+8` **equals our registry's offset, bit for bit** | **two independent bookkeepers agreeing** |
+| 4 | `Size` at `+16` is ≥ `kViewPrefixBytes` (2448) and within the buffer | engine self-consistency |
+| 5 | the 2448-byte prefix there parses as a plausible `View` **and passes row 135** (`y*z == 1.0`, `x` denormal, `w == 0`) | contents, self-validating |
+
+Prediction 3 is the one that does the work the `0.5`/`2.0` constants did: it is an exact 64-bit
+equality between a value the engine wrote and a value our resource registry computed from a GPU
+virtual address, by two entirely separate routes. A wrong `(O1, O2)` reproducing all five is not a
+thing that happens.
+
+**Ambiguity is a refusal, never a coin flip.** `FViewInfo` holds several uniform-buffer references,
+so more than one `O1` may survive predictions 1-4; prediction 5 is what separates the View buffer
+from the forward-lighting one. If two pairs still survive on the same frame, the mechanism **declines
+to latch** and logs both, in the discipline the seam scan already uses (`candidates: name=1
+getDebugName=1 vtable=1`). Latch only after N consecutive announcements agree on one pair, and log
+both constants loudly so a later session can pin or re-verify them.
+
+### 15.3 Where it must run, and the guards
+
+**Inside `AddPasses`, on the render thread — the same site L1 was forced to (§12.9), for two
+reasons rather than one.**
+
+* **Lifetime.** `FViewInfo` lives in the scene renderer's `Views` array, not in the RDG arena, so it
+  is not freed by `Allocator.ReleaseAll()` — but the RHI thread lags graph setup by a frame, so at
+  claim time the scene renderer for that frame may be gone. The same hazard, one level up.
+* **And a second one the texture path does not have: the CONTENTS.** UE4's
+  `FD3D12FastConstantAllocator` sub-allocates from a ring the CPU writer advances past later in the
+  frame (CLAUDE.md §5 records the mirror-image trap). Reading the 2448-byte prefix at *announce* is
+  reading it while it is provably current; reading it a frame later at claim is reading a ring slot
+  that may have been rewritten. So the announcement should carry a **decoded `ViewParams`**, not a
+  pointer and not a buffer range.
+
+That is also *more* correct than what ships: `claim()` returns the oldest matching announcement,
+which §12.9 establishes is the one the dispatch actually belongs to, so the View the dispatch gets
+would be its own frame's by construction rather than by the ring having not moved yet.
+
+Guards are L1's, verbatim and non-negotiable: `VirtualQuery` before every read (page-cached within a
+scan, so a 1024-qword window costs two queries and not 1024); SEH around the read; **a fault latches
+the mechanism off for the session at ERROR naming the address and both constants**; every failure is
+a named, counted fallback to the search. Discovery is budgeted — a bounded window and a bounded
+number of announcements — so it cannot hitch the render thread.
+
+**Ladder, the shape `EngineSeam` already proved:** `EngineSeamView` = 0 off / 1 discover-and-log
+(nothing gated, image byte-identical) / 2 observe (search still authoritative, agree/disagree
+counted, one WARN on the first disagreement) / 3 authoritative (identity wins, search a counted
+fallback). `unclaimed` and `nearMiss` staying **0** gates every promotion.
+
+One SOFT item worth naming: `read_buffer` maps the upload heap, and would be doing so from the
+render thread rather than the recording thread. D3D12 `Map` is refcounted and documented safe for
+concurrent read of the same subresource; it has not been exercised from two threads here.
+
+### 15.4 The criterion that decides whether to build it — and the arithmetic that removed the other one
+
+**The performance case for this work is REFUTED. Record that plainly, because it has been repeated
+as the justification.** `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §1.3 ranks the View-CB search first on
+the grounds that it is what keeps the descriptor shadow's write side (2.287 ms/frame) alive. Read
+against `native_backend.cpp:174-308`, it is not:
+
+* The search consumes only `DispatchBindings::constant_buffers`, which is built from the **root**
+  shadow's `compute_root_cbv` map plus `registry::buffer_for_va`. Deleting it frees **one of nine
+  root hooks** and the per-dispatch candidate reads (now counted as `cbReads` on the `[view]` line).
+* It frees **none of `shadow-copy`, 1.644 ms — 56% of the measured 2.913 ms** — because that is
+  `CopyDescriptors` tracking for the **SRV/UAV table walk**. That walk still identifies scene colour
+  by register (§14.4 makes colour-by-register the *intended* end state, since L1 resolves colour
+  `rhi_null`) and the output UAV `u0`, which is not in `FPassInputs` at all.
+  `SetComputeRootDescriptorTable` stays for the same reason, and `restore_game_compute_state` stays
+  regardless (§1.3's third consumer, legitimately D3D12-level).
+
+So the sweep's three-consumer list loses one of three, and the two expensive halves are driven by the
+two that remain. **Expected saving: well under 0.5 ms of 2.9 ms, not the write side.**
+
+**Which leaves exactly one justification, and it is correctness:** does the search ever actually feed
+DLSS SR the wrong view on a claimed dispatch? `view_fits_dispatch` can only reject an impostor whose
+rect is LARGER than the dispatch covers; one that is SMALLER passes plausibility, row 135 and the fit
+bound alike, and on a lower root parameter it still wins. `wrongView` ran at ~1.8 per candidate
+dispatch (facts §36.19), so impostors are offered constantly and only the loud subset has ever been
+measured.
+
+**That number is being measured now** (`2790b5c`, `suspectSmall` and `ambiguous` on the `[view]`
+line). It decides this section's fate, and the decision rule should be written down before the
+result arrives rather than after:
+
+* **Ambiguity on claimed dispatches at zero** → the search's answer was FORCED, the class of bug is
+  already closed by `view_fits_dispatch`, and discovering two offsets into RHI-private types would be
+  risk with no return. **Do not build it.**
+* **Non-zero** → slot order has been choosing which view's jitter, `ClipToPrevClip` and `CameraCut`
+  reach a temporal consumer, which is the error class CLAUDE.md §5 says compounds through the
+  accumulation rather than costing one frame. **Build §15.2.**
+
+**Two refinements the instrument needs to answer the question honestly**, both cheap:
+
+1. **Count DISTINGUISHABLE survivors, not survivors.** Two root parameters onto one suballocation, or
+   two byte-identical copies of one view's uniform buffer, are not a choice the search can get wrong.
+   The test is an exact comparison of the fields that reach a temporal consumer — view size, buffer
+   size, view rect min, both jitter rows, camera cut, pre-exposure, and `ClipToPrevClip` element by
+   element.
+2. **Restrict to CLAIMED dispatches.** A session offers ~10 000 look-alikes beside ~9 000 real
+   upscales, so an undifferentiated count is diluted by an order of magnitude and cannot answer "was
+   DLSS SR itself ever fed the wrong view". `seam_verdict.announced` is in scope at that point.
+
+### 15.5 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| `FRHIResource` declares exactly one virtual (its destructor) | **HARD**, `RHIResources.h` |
+| `FRHIUniformBuffer` adds only `GetPatchingFrameNumber` / `SetPatchingFrameNumber`, and has **no** native-resource virtual | **HARD**, `RHIResources.h` |
+| `FD3D12UniformBuffer`'s `ResourceLocation` sits behind a `#if USE_STATIC_ROOT_SIGNATURE` member | **HARD**, `D3D12Resources.h` |
+| `USE_STATIC_ROOT_SIGNATURE`'s value in Stray's build | **UNOBSERVABLE from outside.** This is why the offset is discovered, not derived |
+| `FD3D12ResourceLocation` orders `GPUVirtualAddress`, `OffsetFromBaseOfResource`, `Size` consecutively | **HARD**, `D3D12Resources.h` — and it is what makes prediction 3 possible |
+| `FSceneView::ViewUniformBuffer` exists and is the View uniform buffer's identity | **HARD** that the field exists, `SceneView.h:901`; **[derived] and unmeasured** that any particular offset reaches it |
+| `FViewInfo` is not RDG-arena-allocated, so it outlives `Execute()` | **[derived]** from `FSceneRenderer::Views`; the RHI-thread lag hazard is unchanged |
+| The fast constant allocator's ring is rewritten later in the frame | **HARD** in effect (CLAUDE.md §5 records the deferred-read trap); the announce-time read is the mitigation |
+| `read_buffer`'s `Map` is safe from the render thread | **SOFT.** D3D12 `Map` is refcounted and read-safe per subresource; not exercised cross-thread here |
+| The shadow's `shadow-copy` 1.644 ms is driven by the SRV/UAV table walk, not the CB search | **HARD** by inspection, `native_backend.cpp:174-308` + `perf.cpp:373-374`'s live line |
+| `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §1.3's ranking of the CB search as the shadow's blocker | **REFUTED**, see §15.4 and the correction in that file |
+| Anything in §15.2 working on this executable | **UNCONFIRMED.** Not built, not run |
