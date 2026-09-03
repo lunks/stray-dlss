@@ -1,6 +1,5 @@
 #include "core/nr_hook_plan.hpp"
 
-#include "core/nr_codec.hpp"
 
 #include <cmath>
 #include <cstring>

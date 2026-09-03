@@ -4,9 +4,7 @@
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_snippet.hpp"
-#include "nr_codec_pass.hpp"
 
-#include "core/nr_codec.hpp"
 #include "core/nr_hook_plan.hpp"
 #include "core/nr_lifetime.hpp"
 #include "core/nr_params.hpp"

@@ -7,7 +7,6 @@
 // logic lives in src/core/.
 #include <doctest/doctest.h>
 
-#include "core/nr_codec.hpp"
 #include "core/nr_hook_plan.hpp"
 
 #include <cstring>

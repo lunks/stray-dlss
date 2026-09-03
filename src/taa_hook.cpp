@@ -3,7 +3,6 @@
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
 #include "ngx_nr.hpp"
-#include "nr_history.hpp"
 #include "nr_hook.hpp"
 #include "perf.hpp"
 
