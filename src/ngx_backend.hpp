@@ -232,7 +232,9 @@ struct EvaluateInputsRR
 	// TemporalAAParams.zw, render rect, reset, pre-exposure).
 	EvaluateInputs base;
 
-	// The four RR guides, from gbuffer_resolve's outputs (formats documented there):
+	// The four RR guides. Their producer (gbuffer_resolve) was deleted 2026-09-03 with the
+	// heuristic finder; these formats are the contract a future engine-sourced guide pass must
+	// meet, and nothing on the SR/NR/FG path touches them:
 	ID3D12Resource *diffuse_albedo = nullptr;    // RGBA8_UNORM, linear
 	ID3D12Resource *specular_albedo = nullptr;   // RGBA8_UNORM, linear
 	ID3D12Resource *normals_roughness = nullptr; // RGBA16F, xyz signed world normal

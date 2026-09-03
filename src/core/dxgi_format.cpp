@@ -28,7 +28,7 @@ TexFormat tex_format_from_dxgi(std::uint32_t f)
 	case dxgi::kR8G8B8A8UnormSrgb:    return TexFormat::r8g8b8a8_unorm;
 	// UE4's PF_B8G8R8A8, the stock GBufferB/C format — created typeless, viewed unorm or
 	// srgb. The gbuffer classifier needs to see all three as one thing.
-	// (core/gbuffer_classify.hpp)
+	// (was core/gbuffer_classify.hpp, deleted 2026-09-03)
 	case dxgi::kB8G8R8A8Typeless:
 	case dxgi::kB8G8R8A8Unorm:
 	case dxgi::kB8G8R8A8UnormSrgb:    return TexFormat::b8g8r8a8_unorm;

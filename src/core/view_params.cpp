@@ -108,6 +108,18 @@ bool view_params_plausible(const ViewParams &p)
 	return true;
 }
 
+bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint32_t covered_h)
+{
+	const float w = p.view_size_and_inv_size.x;
+	const float h = p.view_size_and_inv_size.y;
+	// A view with no extent tells us nothing; let the ordinary plausibility gate judge it.
+	if (!(w > 0.0f) || !(h > 0.0f))
+		return false;
+	if (covered_w == 0 || covered_h == 0)
+		return true; // nothing to compare against — do not invent a refusal
+	return w <= static_cast<float>(covered_w) && h <= static_cast<float>(covered_h);
+}
+
 bool pre_exposure_plausible(const ViewParams &p)
 {
 	// DELIBERATELY NOT part of view_params_plausible, which gates the ENTIRE DLSS path: rows

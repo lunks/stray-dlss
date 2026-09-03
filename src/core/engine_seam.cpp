@@ -388,6 +388,80 @@ Discovery discover(const Image &image)
 }
 
 // ---------------------------------------------------------------------------------------
+// L1: the FRDGTexture -> FRHITexture -> GetNativeResource chain
+// ---------------------------------------------------------------------------------------
+
+const char *rhi_chain_name(RhiChain c)
+{
+	switch (c)
+	{
+	case RhiChain::ok:             return "ok";
+	case RhiChain::null_rdg:       return "null-rdg";
+	case RhiChain::rhi_null:       return "rhi-null";
+	case RhiChain::rhi_unreadable: return "rhi-unreadable";
+	case RhiChain::fn_not_code:    return "fn-not-code";
+	case RhiChain::count:          break;
+	}
+	return "?";
+}
+
+const char *seam_refusal_name(SeamRefusal r)
+{
+	switch (r)
+	{
+	case SeamRefusal::none:            return "evaluated";
+	case SeamRefusal::view_unreadable: return "viewUnreadable";
+	case SeamRefusal::dead_inputs:     return "deadInputs";
+	case SeamRefusal::role_unresolved: return "roleUnresolved";
+	case SeamRefusal::mv_failed:       return "mvFailed";
+	case SeamRefusal::create_failed:   return "createFailed";
+	case SeamRefusal::eval_failed:     return "evalFailed";
+	case SeamRefusal::count:           break;
+	}
+	return "?";
+}
+
+RhiChain resolve_rhi_fn(const RdgReader &r, std::uint64_t rdg,
+                        std::uint64_t *out_rhi, std::uint64_t *out_fn)
+{
+	if (out_rhi != nullptr)
+		*out_rhi = 0;
+	if (out_fn != nullptr)
+		*out_fn = 0;
+	if (r.read_u64 == nullptr || r.is_code == nullptr)
+		return RhiChain::rhi_unreadable;
+	if (rdg == 0)
+		return RhiChain::null_rdg;
+
+	// FRDGResource::ResourceRHI. Null is the ordinary answer for a texture the graph has not
+	// allocated yet, and it is NOT an error — it is why this runs at dispatch time rather than
+	// at AddPasses time.
+	std::uint64_t rhi = 0;
+	if (!r.read_u64(r.ctx, rdg + kRdgResourceRhiOffset, &rhi))
+		return RhiChain::rhi_unreadable;
+	if (rhi == 0)
+		return RhiChain::rhi_null;
+
+	// The FRHITexture's vtable, then the GetNativeResource slot in it.
+	std::uint64_t vtable = 0;
+	if (!r.read_u64(r.ctx, rhi, &vtable) || vtable == 0)
+		return RhiChain::rhi_unreadable;
+	std::uint64_t fn = 0;
+	if (!r.read_u64(r.ctx, vtable + 8ull * kRhiGetNativeResourceSlot, &fn) || fn == 0)
+		return RhiChain::rhi_unreadable;
+	// The last guard before the live half calls it. A wrong offset that survived every read
+	// above almost always lands here, and a refusal costs one fallback frame.
+	if (!r.is_code(r.ctx, fn))
+		return RhiChain::fn_not_code;
+
+	if (out_rhi != nullptr)
+		*out_rhi = rhi;
+	if (out_fn != nullptr)
+		*out_fn = fn;
+	return RhiChain::ok;
+}
+
+// ---------------------------------------------------------------------------------------
 // Mode and gate
 // ---------------------------------------------------------------------------------------
 
@@ -435,6 +509,58 @@ Gate decide(const GateInputs &in)
 // ---------------------------------------------------------------------------------------
 // Ledger
 // ---------------------------------------------------------------------------------------
+
+const char *l1_gate_name(L1Gate g)
+{
+	switch (g)
+	{
+	case L1Gate::off:     return "off";
+	case L1Gate::faulted: return "faulted";
+	case L1Gate::resolve: return "resolve";
+	}
+	return "?";
+}
+
+L1Gate l1_gate(const L1GateInputs &in)
+{
+	// The off-switch first and unconditionally, so EngineSeamInputs=0 can never reach a
+	// dereference by any other route — including the fault latch.
+	if (!in.inputs_enabled || in.mode != Mode::authoritative || !in.hooked || !in.announced)
+		return L1Gate::off;
+	if (in.faulted)
+		return L1Gate::faulted;
+	return L1Gate::resolve;
+}
+
+bool announcement_is_fresh(const Freshness &f)
+{
+	// Newest: any newer announcement means a newer FRDGBuilder exists, and the older one's
+	// allocator has been (or is about to be) reset under us.
+	if (f.announce_sequence == 0 || f.announce_sequence != f.ledger_sequence)
+		return false;
+	// Same frame: a present between announce and claim means the graph completed.
+	if (f.announce_frame != f.current_frame)
+		return false;
+	// AND NOTHING ABOUT THE THREAD. The first version of this predicate also demanded
+	// `announce_thread == current_thread`, and it was WRONG — structurally, not marginally.
+	// It made L1 inert on the box: `stale=4147` of 4147 claims, `resolved=0`, every claim
+	// declined with a stable pair (announced on 1400, claimed on 1152) all session. UE 4.27
+	// calls `ITemporalUpscaler::AddPasses` during RDG graph SETUP and issues the dispatch
+	// during graph EXECUTION, and those are not required to be the same thread.
+	//
+	// The reasoning error is worth naming because it is easy to repeat: thread identity
+	// governs OWNERSHIP, not VALIDITY. `FRDGBuilder` being a stack object means the
+	// ANNOUNCING thread's frame must not have returned — it does not mean only that thread
+	// may read what the allocator holds. Memory owned by a live stack frame is readable from
+	// any thread, and if the engine can read `ResourceRHI` on the recording thread (it must,
+	// to bind the texture) then so can we. The two conditions above are the lifetime, and
+	// they are sufficient: a newer announcement means a newer graph, and a present between
+	// announce and claim means the announcing graph has completed. Neither is about threads.
+	//
+	// The thread ids stay in this struct because the CALLER reports them — the pair is
+	// latched and a change is worth one WARN — but nothing is gated on them.
+	return true;
+}
 
 std::uint32_t Ledger::expected_groups(std::uint32_t extent)
 {
@@ -510,6 +636,22 @@ const Announcement *Ledger::claim(std::uint32_t group_x, std::uint32_t group_y)
 	}
 	++m_counters.rect_mismatch;
 	return nullptr;
+}
+
+bool Ledger::note_unmatched(std::uint32_t group_x, std::uint32_t group_y)
+{
+	for (std::size_t i = 0; i < m_count; ++i)
+	{
+		const Announcement &a = m_slots[i];
+		if (a.consumed)
+			continue;
+		if (expected_groups(a.out_width) == group_x && expected_groups(a.out_height) == group_y)
+		{
+			++m_counters.near_misses;
+			return true;
+		}
+	}
+	return false;
 }
 
 std::size_t Ledger::pending() const

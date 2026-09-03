@@ -217,7 +217,7 @@ void stall_check_and_reset(std::uint64_t frame_ns, std::uint64_t frame_no)
 			const double bmax = static_cast<double>(g_fr_bucket_max[i].load());
 			if (bmax > our_max) { our_max = bmax; worst_bucket = i; }
 		}
-		static const char *bn[kBucketCount] = { "dispatch", "mv", "gbuf", "ngx_sr", "ngx_rr", "ngx_nr",
+		static const char *bn[kBucketCount] = { "dispatch", "mv", "ngx_sr", "ngx_rr", "ngx_nr",
 			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve" };
 		STRAY_LOG_WARN("[stall] f=%llu t=%.6f frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
 			static_cast<unsigned long long>(frame_no), wall_clock_s(),
@@ -329,13 +329,13 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	// outside intercept_dispatch would otherwise print a wrapped unsigned.
 	const double per_frame_ms = 1.0 / (1e6 * static_cast<double>(frames));
 	const double mv_ms = static_cast<double>(bucket_ns[kMvResolve]) * per_frame_ms;
-	const double gbuf_ms = static_cast<double>(bucket_ns[kGBufferResolve]) * per_frame_ms;
 	const double sr_ms = static_cast<double>(bucket_ns[kNgxSr]) * per_frame_ms;
+	// Always 0.0 until RR is rewired: kNgxRr has no scope any more (perf.hpp).
 	const double rr_ms = static_cast<double>(bucket_ns[kNgxRr]) * per_frame_ms;
 	const double nr_ms = static_cast<double>(bucket_ns[kNgxNr]) * per_frame_ms;
 	const double restore_ms = static_cast<double>(bucket_ns[kRestore]) * per_frame_ms;
 	const double total_ms = static_cast<double>(bucket_ns[kDispatchPath]) * per_frame_ms;
-	double intercept_ms = total_ms - (mv_ms + gbuf_ms + sr_ms + rr_ms + nr_ms + restore_ms);
+	double intercept_ms = total_ms - (mv_ms + sr_ms + rr_ms + nr_ms + restore_ms);
 	if (intercept_ms < 0.0)
 		intercept_ms = 0.0;
 
@@ -344,15 +344,14 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	};
 
 	STRAY_LOG_INFO("[perf] our CPU/frame: intercept %.2fms (%.0f%%), mv_resolve %.2fms, "
-		"gbuf_resolve %.2fms, ngx_sr %.2fms (%.0f%%), ngx_rr %.2fms (%.0f%%), ngx_nr %.2fms "
-		"(%.0f%%), restore %.2fms - total %.2fms (%.0f%% of %.1fms)",
-		intercept_ms, pct(intercept_ms), mv_ms, gbuf_ms,
+		"ngx_sr %.2fms (%.0f%%), ngx_rr %.2fms (%.0f%%, always 0 - RR is not wired), "
+		"ngx_nr %.2fms (%.0f%%), restore %.2fms - total %.2fms (%.0f%% of %.1fms)",
+		intercept_ms, pct(intercept_ms), mv_ms,
 		sr_ms, pct(sr_ms), rr_ms, pct(rr_ms), nr_ms, pct(nr_ms), restore_ms,
 		total_ms, pct(total_ms), avg_frame_ms);
 
 	STRAY_LOG_INFO("[perf] counts/frame: %.0f dispatches, %.1f size-gated (only these are "
-		"timed). CPU-side only: GPU time is NOT measured here, and the finder event taps sit "
-		"outside these buckets.",
+		"timed). CPU-side only: GPU time is NOT measured here.",
 		static_cast<double>(dispatches) / static_cast<double>(frames),
 		static_cast<double>(large) / static_cast<double>(frames));
 

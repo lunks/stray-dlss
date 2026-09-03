@@ -540,6 +540,159 @@ Config and saves live in the **Proton prefix**:
 > readable from the main menu — the seam fires on frame 0 — and the periodic `[seam]` line's
 > `unclaimed` must stay 0 (`lookalikesRefused` is expected to grow: that is the two passes above
 > being told no, every frame). Nothing below is deleted yet; under level 3 it is bypassed.
+>
+> **AND LEVEL 3 EXPOSED THE OTHER HALF (2026-09-03, facts §36.6-36.8).** Identity was solved and
+> the frames still flipped: `unclaimed` ~ NR `guides-stale` ~ NR `frame-gap` resets at every
+> checkpoint, accelerating, because the heuristic still gated **acceptance of the INPUTS** — the
+> register walk for the roles and ReShade's `view->resource` map for liveness — on a dispatch the
+> engine had already named. The one refusal logged for the real pass was *"depth or velocity SRV
+> missing or not known live"*, printed **once by design**, so the rate was invisible. **L1 fixes
+> it**: `AddPasses` hands us `FPassInputs`, and those three `FRDGTexture*` are resolved at CLAIM
+> time (`ResourceRHI`@16 -> the `FRHITexture` vptr -> `GetNativeResource` at slot 7 ->
+> `ID3D12Resource*`) and REPLACE the role guesses and the liveness verdict — a resource the engine
+> is about to bind is alive by construction. The heuristic stays as an assertion and as a counted
+> fallback (`[STRAYDLSS] EngineSeamInputs`, default 1). The `[seam]` line now carries
+> continuous per-reason counters (`notClaimed` / `claimedButNoSR` / `evaluated` / `l1:`) — the
+> WARN says *which* gate, the counters say *how often*, and conflating them cost a round trip.
+>
+> **BOTH OFFSETS ARE NOW HARD, AND L1 STILL CRASHED THE GAME (2026-09-03, facts §36.9, report
+> §12).** The first resolve returned all three pointers `(ok, registered=1)` — three independent
+> hits in our own resource registry, which chance does not produce — so `ResourceRHI@16` and slot
+> 7 are right. The game then died at frame ~600 with `EXCEPTION_ACCESS_VIOLATION reading
+> 0x0000021c000003c0`, seven frames deep in `l1_read_u64`'s own `memcpy`. That address is two
+> int32s, **960 and 540** — an `FIntPoint`, a half-res extent — sitting where `ResourceRHI` was
+> expected, i.e. **recycled RDG arena memory**. A bisect on `EngineSeamInputs` alone confirmed
+> it: `0` ran 16 200 frames clean (and gave back `unclaimed=159`), `1` crashed at 600.
+>
+> **The lesson, and it generalises past this feature: the ledger claims IDENTITY with deliberate
+> slack, and L1 read POINTERS through it.** `Ledger::claim` returns the oldest unconsumed rect
+> match and `retire_stale` keeps an announcement for 4 newer announcements or 8 presents — right
+> for correlation, because a late dispatch still names the right pass and `unclaimed` stays
+> honest. But `FRDGTexture` is allocated from the frame's `FRDGAllocator`, which the builder
+> resets at the end of `Execute`, so the moment a newer graph exists the pointer addresses
+> somebody else's allocation. One frame whose dispatch misses `claim()` — which is the exact
+> failure L1 exists to work around — puts the ledger permanently one graph behind, invisibly:
+> `claimed` still increments and `unclaimed` stays 0. **An identity that survives a frame
+> boundary is not a lifetime.** Ask which one you are relying on before dereferencing anything
+> the engine handed you.
+>
+> **Fixed by:** `seam::announcement_is_fresh` — dereference only the newest announcement, and
+> only before the frame has turned over — leaving `claim()` and every correlation counter
+> untouched; a `VirtualQuery` readability check where `plausible_heap_ptr` was only ever a numeric
+> RANGE test; **SEH around both the read and the `GetNativeResource` call**, explicitly and by
+> name, because those two sites dereference and call through offsets no test outside the engine
+> can prove; and a fault latching L1 off for the session at ERROR rather than re-rolling every
+> frame. Read `l1: stale=` and `faults=` in the `[seam]` line first — `stale=` is the counter
+> whose absence cost this round trip.
+>
+> **AND THE FIRST FIX SHIPPED A THIRD CONDITION — same thread — WHICH WAS WRONG AND MADE L1
+> INERT (2026-09-03, facts §36.10, report §12.8).** The crash stayed fixed (`faults=0 off=0`,
+> 4200+ frames), and `stale=4147` of 4147 claims with `resolved=0`: the build behaved as
+> `EngineSeamInputs=0` while every other counter said L1 was on, and the blips came back. **HARD,
+> and new: `AddPasses` announces on one thread and the D3D12 `Dispatch` is recorded on another**
+> — 1400 and 1152 on this build, stable all session, because UE 4.27 runs RDG graph SETUP and
+> graph EXECUTION separately.
+>
+> **The reasoning error is the durable part, and it is a sibling of the one above. THREAD
+> IDENTITY GOVERNS OWNERSHIP, NOT VALIDITY.** "`FRDGBuilder` is a stack object" means the
+> announcing thread's frame must not have returned; it does not mean only that thread may read
+> what its allocator holds. Memory held by a live stack frame is readable from any thread — and
+> the engine itself reads `ResourceRHI` on the recording thread in order to bind the texture. The
+> lifetime argument only ever needed *newest announcement* and *the frame has not turned over*,
+> each independently sufficient.
+>
+> **And the process lesson, which this file has now paid for twice in one day: a defensive
+> condition needs the same HARD / SOFT / UNCONFIRMED discipline as a functional one.** A wrong
+> guard does not fail loudly — it silently never fires the thing it guards, and reads as "the
+> feature does not help" rather than "the feature never ran". The same-thread test was
+> UNCONFIRMED, presented as reasoning, and shipped as a gate; only the fact that the decline was
+> COUNTED and NAMED turned it into a one-line diagnosis instead of another bisect. The thread
+> pair is now latched and reported — one INFO, and one WARN if it ever moves — and gated on
+> nothing.
+>
+> **THEN THE NARROWER GATE MADE L1 INERT TOO, AND THAT FINALLY NAMED THE REAL BUG: THE SITE
+> (2026-09-03, facts §36.11, report §12.9).** `resolved` froze at 164 while `stale` grew every
+> frame — the claim is **one announcement and one frame behind, in steady state**. Two source
+> facts explain it and end the argument: **`FRDGBuilder::Execute()` ends with `Clear()` →
+> `Allocator.ReleaseAll()`**, freeing every `FRDGTexture`, and it neither flushes nor waits for
+> the RHI thread; while **`FRHICommandList` is "definitions for queueing up & executing later"**
+> and a pass lambda's `DispatchComputeShader` does `ALLOC_COMMAND` rather than calling the RHI.
+> **So the D3D12 dispatch we intercept happens on another thread AFTER the arena is freed, and
+> resolving there reads freed memory by construction.** No gate on the claim side could ever have
+> worked; the two inert builds were empirically proving that.
+>
+> **The fix is the SITE.** The chain walk moved into `AddPasses`, on the render thread, inside the
+> builder's own setup, where the textures are provably alive — and `GetSceneTextureParameters`
+> registers depth and velocity with `RegisterExternalTexture`, which calls `SetRHI` immediately,
+> so exactly the two guides that matter resolve there. The announcement now carries plain
+> `ID3D12Resource*` that no allocator owns; the claim only checks them against our registry.
+> `announcement_is_fresh` is demoted to a pipeline-depth diagnostic.
+>
+> **The rule to carry: when a guard keeps having to be narrowed, the guard is not the problem —
+> the placement is.** This file already learned that once, from NR growing 4,900 lines of
+> machinery to survive `u0`. L1 rediscovered it in three builds. **And the corollary that saved
+> `claim()`: with the RHI thread a frame behind, returning the OLDEST rect match returns the
+> announcement the dispatch actually belongs to — the correlation was right the whole time, and
+> only the pointer was dead.** Ask which of identity and lifetime you are relying on, and then ask
+> where each is still true.
+>
+> **CONFIRMED ON THE BOX, frame 16800, 53.3 fps, no crash (facts §36.13).** `partial == claimed`
+> exactly — every claimed dispatch takes depth and velocity from the engine — with
+> **`deadInputs=0`**, `fellBack=0`, `faults=0`, `off=0`. Colour comes back `rhi_null` exactly as
+> predicted (it is the graph-allocated post-chain texture), so `resolved` stays 0 by design and
+> **`partial` is the success state, not a degraded one**. `ResourceRHI @16` and
+> `GetNativeResource` slot 7 are **HARD**.
+>
+> **And L1 caught a real defect on its first frame, which is the reason it was worth building:**
+> `ENGINE SEAM L1 ASSERTION: the engine's velocity is …5323DD00 and the heuristic's register walk
+> says …52FB62F0.` The register walk was feeding DLSS SR a velocity resource **the engine did not
+> bind**. A wrong velocity is a motion-vector error, and §5's rule is that those compound through
+> the accumulation and read as drift and instability rather than as a motion-vector bug — so this
+> is a real defect, and L1 replaces it with the engine's answer.
+>
+> **IT IS NOT THE FLICKER (retracted 2026-09-03, facts §36.13.1).** This line called it the
+> leading candidate; the user has since judged the image with the engine's velocity in use and
+> the flicker persists. **`unclaimed` is the flicker** — see the note below on it.
+>
+> **`unclaimed` (~1.2%, all `noDispatch`) IS THE VISIBLE FLICKER**, on the user's own judgement
+> and corroborated by arithmetic: 204 events over ~317 s is **0.64/s, one every ~1.6 s**, which is
+> the cadence they have reported since before the seam existed. On such a frame the engine's own
+> TAA runs instead of DLSS SR, so the image changes hands for one frame. **Success is
+> `unclaimed = 0`, judged by eye, not by reading the counter.**
+>
+> **ROOT-CAUSED 2026-09-03 (facts §36.18), and it was NOT the gate.** `nearMiss` tracks
+> `unclaimed` exactly, so the real dispatch — the announced 480x270 groups — IS arriving and our
+> matcher refuses it with *"dispatch covers less than the view rect"*. The enriched line said
+> why: **the matcher was reading a render rect of 4088x4088, from a View CB at b3**, while the
+> healthy frames read b4. On ~1.2% of frames a DIFFERENT view's buffer — a shadow or capture
+> view — is bound on a lower register, and the search **walks slot order and keeps the FIRST
+> plausible hit**, so it stops before reaching the real one.
+>
+> **The obvious reading was wrong and would have made things worse.** "A heuristic still gating
+> what the engine answered, the same shape as `trust_registers`" is seductive, and bypassing the
+> gate would have run DLSS with a 4088x4088 view's jitter, `ClipToPrevClip` and `CameraCut` —
+> and §5's rule is that bad motion inputs compound through the accumulation rather than costing
+> one frame. **The matcher was right; it was fed the wrong view. Fix the input, not the check.**
+>
+> The search now skips a candidate that describes a different view than this dispatch:
+> `OutputViewRect >= InputViewRect` always and the dispatch covers the output rect, so a view
+> larger than the dispatch covers cannot be this one (`ue4::view_fits_dispatch`, inclusive so
+> DLAA passes, and 200% downsampling still rejected). Read **`wrongView=`** on the `[view]` line.
+>
+> **CONFIRMED ON THE BOX (facts §36.19): `announced=9003 claimed=9003 unclaimed=0 orphans=0
+> nearMiss=0`**, every refusal reason zero, 53.0 fps, no errors. Two downstream counters agree
+> independently: NR's `frame-gap` resets fell **23 -> 1**, and `l1: stale` fell from ~90% of
+> claims to **0** — which refines §12.9's account of the lag (it was mostly the refusal backlog
+> rolling the ledger one behind, not pure RHI-thread pipelining) without touching the
+> announce-time argument, which rests on `Execute()` freeing the allocator and on the two
+> threads, neither of which is expressed in presents. **Whether the flicker is gone is for the
+> user's eyes; `unclaimed = 0` is met.**
+>
+> **And it narrows row 135.** §36.14's `ok=64044 bad=0` was read as exonerating the CB search;
+> it does not. Row 135 proves the buffer IS a View uniform buffer — a shadow view satisfies all
+> three predictions, because it is one. **A self-validating check tells you what KIND of thing
+> you have, never WHICH one.** Identity needs something that separates the candidates, and here
+> that was the dispatch, available at that point all along.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -809,6 +962,40 @@ Measured in the same session, PreExposure moved **1.000 -> 4.881 -> 0.051 -> 0.4
 menu, camera cut and gameplay. That is a ~95x swing, and it is independent support for keeping
 `NgxNRTrackExposure` on with a long time constant: no fixed codec scale can be right across
 that range.
+
+#### THE VIEW CB IS FOUND BY SEARCH, AND UNTIL 2026-09-03 NOTHING CHECKED WHICH BUFFER IT WAS
+
+`taa_hook` tries every bound constant buffer and keeps the first that `view_params_plausible`
+accepts — and that is a **shape** test the WRONG buffer can satisfy. A wrong View means wrong
+jitter, wrong `ClipToPrevClip` and a wrong `CameraCut`, fed to every temporal consumer we have:
+DLSS SR, feature 18, and the engine's own accumulation. **That is what flicker looks like**, and
+this file's own rule already applies — *bad motion vectors do not produce one bad frame, they
+compound through the accumulation* (§5).
+
+Measured in the menu (facts §36.12): `View CB: NOT READABLE or implausible (cb valid=0 reg=b0)`,
+then `View CB at b4, offset 4921600`, with `NearPlane` exactly `1.0000`, `DeltaTime` exactly
+`0.000000` and `PreExposure` jumping `1.0 -> 32.1`. Consistent with a wrong buffer; proof of
+nothing either way.
+
+**Row 135 settles it for free, and the check already shipped** — it just was not being printed.
+The row must read `(denormal, P, 1/P, 0.0)` and `y*z == 1.0` is true BY CONSTRUCTION, so it
+cannot survive a wrong buffer or a slipped offset. All four components from one read, the three
+predictions and a verdict now print beside the `View CB at b…` line, with a running `ok=/bad=`
+tally on the periodic `[view]` line.
+
+> **MEASURED THE SAME DAY: `ok=64044 bad=0`. THE SEARCH IS RIGHT (facts §36.14).** So
+> `NearPlane` exactly `1.0000` and `DeltaTime` exactly `0.000000` in the menu are the engine's
+> real values, not a wrong buffer, and the `1.0 -> 32.1` PreExposure swing is the menu's genuine
+> exposure range. **The flicker is not a wrong View CB** — look at the velocity disagreement in
+> §2.3's L1 note instead. And the View-CB-by-identity idea
+> (`FSceneView::ViewUniformBuffer` matched against the bound CBV) is demoted from a correctness
+> fix to a **performance** change: it is what would let the descriptor shadow leave the hot path.
+> No urgency, and no reason to take risk for it.
+
+**The method is the transferable part, and it cost nothing.** The predicate already existed; only
+the log line was missing. One line settled a question that would otherwise have justified a new
+[derived] offset into `FViewInfo`. **Reach for the check the data already contains before
+building the identity path.**
 
 
 Traps:
@@ -1260,6 +1447,19 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
   needs), and **DLSS SR does not need RT** — SR is the configuration to ship.
 * **RR WITHOUT RT IS THE UNTESTED COMBINATION, AND IT IS THE INTERESTING ONE.**
 
+> **RR IS NOT WIRED AS OF 2026-09-03, so everything below is a plan rather than a switch.** Its
+> guide source — the heuristic G-buffer finder and the resolve pass that fed it — was **deleted**
+> (report §13): it identified GBufferA-E by descriptor SHAPE, the same class of guessing the
+> engine seam retired for the TAA pass, and nothing on the SR, NR or FG path referenced it.
+> `[STRAYDLSS] NgxRR` now **refuses loudly at startup** rather than silently doing nothing, and
+> `perf::kNgxRr` reads a permanent zero.
+>
+> **The NGX side is intact and untouched** — `ensure_feature_rr` / `evaluate_rr` /
+> `release_feature_rr` all take raw `ID3D12Resource*` — so what RR needs is a GUIDE SOURCE, and
+> the intended one is the engine's own **named RDG G-buffer textures**, reachable from the
+> `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already hands us. Identity from the
+> engine, exactly as L1 does for depth and velocity (§2.3). **Do not resurrect the finder.**
+
 > **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
 > so RR is not independently usable here" and treated it as concluded. **That was never
 > verified.** It came from a single passing remark, not a measurement or a source, and it was
@@ -1267,7 +1467,7 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 >
 > **Nothing requires it.** `NVSDK_NGX_DLSSD_Create_Params` carries a denoise mode, a roughness
 > mode and a depth type, and no ray-tracing anything. Our own RR path takes its guides from the
-> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E, `src/gbuffer_finder.cpp`), which is
+> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E), which is
 > UE4's ordinary deferred output and is present with RT fully off. `grep -rn RayTracing src/`
 > finds nothing that gates it.
 

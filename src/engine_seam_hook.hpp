@@ -36,7 +36,7 @@ namespace stray_dlss::seamhook {
 //   3 — AUTHORITATIVE, the default: DLSS SR runs only on the dispatch the engine announced.
 // `fallback_allowed` is [STRAYDLSS] EngineSeamFallback: at level 3 with no live seam, run the
 // heuristic (true, said loudly) or refuse every frame (false).
-void configure(int level, bool fallback_allowed);
+void configure(int level, bool fallback_allowed, bool inputs_enabled);
 
 seam::Mode mode();
 bool fallback_allowed();
@@ -59,8 +59,92 @@ struct Verdict
 	std::uint32_t out_width = 0;
 	std::uint32_t out_height = 0;
 	std::uint64_t sequence = 0;
+	// The engine's own FPassInputs, for L1. The FRDGTexture pointers are IDENTITIES ONLY and
+	// must never be dereferenced here — by claim time `FRDGBuilder::Execute()` has run
+	// `Allocator.ReleaseAll()` and the objects are gone (report §12.9). They are kept only so
+	// the first-resolve line can print what produced each resource.
+	std::uint64_t colour_rdg = 0;
+	std::uint64_t depth_rdg = 0;
+	std::uint64_t velocity_rdg = 0;
+	// The resolved ID3D12Resource*, taken inside AddPasses on the render thread. Plain
+	// pointers no allocator owns; `resolve_inputs` checks each against our resource registry.
+	std::uint64_t colour_res = 0;
+	std::uint64_t depth_res = 0;
+	std::uint64_t velocity_res = 0;
+	seam::RhiChain colour_status = seam::RhiChain::null_rdg;
+	seam::RhiChain depth_status = seam::RhiChain::null_rdg;
+	seam::RhiChain velocity_status = seam::RhiChain::null_rdg;
+	// May those three pointers be dereferenced? Only while the announcing FRDGBuilder lives:
+	// newest announcement, same frame, same thread (seam::announcement_is_fresh). The ledger
+	// claims IDENTITY with slack on purpose; POINTERS get none. False is a normal, counted
+	// decline - L1 sits the frame out and the heuristic supplies the inputs.
+	bool fresh = false;
+	std::uint64_t announce_frame = 0;
+	std::uint64_t current_frame = 0;
+	// REPORTED, never gated on. Requiring these two to be equal is what made L1 inert on the
+	// box (report §12.8): UE 4.27 announces during RDG setup and dispatches during graph
+	// execution, on different threads by design.
+	std::uint64_t announce_thread = 0;
+	std::uint64_t current_thread = 0;
+	bool threads_first_seen = false; // this claim latched the announce/claim thread pair
+	bool threads_changed = false;    // the pair moved mid-session — worth one WARN
+	std::uint64_t ledger_sequence = 0;
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
+
+// THE INSTRUMENT FOR `unclaimed`. Call for a dispatch the matcher REFUSED, with the verdict and
+// the matcher's own reason. If a pending announcement expects exactly these group counts then
+// the engine's own primary upscale arrived and one of OUR gates turned it away — which is a
+// fixable bug with a named cause. If no such announcement is pending, the dispatch is unrelated
+// and nothing is counted. Splitting those two is the whole point: `unclaimed` alone cannot tell
+// "we rejected the real pass" from "the engine announced an upscale no dispatch followed".
+struct UnmatchedContext
+{
+	std::uint32_t view_width = 0;    // what the matcher used as the RENDER rect
+	std::uint32_t view_height = 0;
+	std::uint32_t output_width = 0;  // the output UAV it measured against
+	std::uint32_t output_height = 0;
+	std::uint32_t cb_register = 0;   // which b# the View CB was found on
+	bool view_ok = false;            // a View CB decoded at all this dispatch
+	bool row135_ok = false;          // ...and row 135 validated it as A View buffer
+};
+void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
+                             const char *verdict, const char *reason,
+                             const UnmatchedContext &ctx);
+
+// L1. The engine handed us its scene colour, depth and velocity; this turns each into the
+// ID3D12Resource the D3D12 side already speaks. Call at CLAIM time (during graph execution):
+// at AddPasses time a graph-allocated texture has no RHI resource yet.
+//
+// Every resolved pointer is validated against our own resource registry before it is returned,
+// so a wrong offset yields `registry` (a pointer nothing knows) rather than a plausible lie.
+// Anything not `ok` leaves that resource 0 and the caller falls back to the heuristic.
+struct EngineInputs
+{
+	bool enabled = false;              // [STRAYDLSS] EngineSeamInputs and the seam are on
+	std::uint64_t colour = 0;          // ID3D12Resource*, 0 when unresolved
+	std::uint64_t depth = 0;
+	std::uint64_t velocity = 0;
+	seam::RhiChain colour_status = seam::RhiChain::null_rdg;
+	seam::RhiChain depth_status = seam::RhiChain::null_rdg;
+	seam::RhiChain velocity_status = seam::RhiChain::null_rdg;
+	bool colour_registered = false;    // the resolved pointer is one our registry calls live
+	bool depth_registered = false;
+	bool velocity_registered = false;
+
+	bool depth_ok() const { return depth != 0 && depth_registered; }
+	bool velocity_ok() const { return velocity != 0 && velocity_registered; }
+	bool colour_ok() const { return colour != 0 && colour_registered; }
+};
+EngineInputs resolve_inputs(const Verdict &v);
+
+// Records what happened to a dispatch the ENGINE announced and we claimed. Continuous, not
+// once-per-pass: the rate is the diagnosis. seam::SeamRefusal::none means SR evaluated.
+void note_outcome(seam::SeamRefusal r);
+
+// One WARN per session when the engine's resource and the heuristic's disagree. The engine
+// wins; this exists so a wrong image has a first line to read.
+void note_input_disagreement(const char *which, std::uint64_t engine, std::uint64_t heuristic);
 
 // One line for the periodic report, and the same numbers for stray-dlss-status.txt.
 // Writes at most `size` bytes including the terminator; returns the bytes written.

@@ -329,3 +329,53 @@ TEST_CASE("a zero or inconsistent pre-exposure pair is rejected")
 	mismatched.one_over_pre_exposure = 3.0f;
 	CHECK_FALSE(ue4::pre_exposure_plausible(mismatched));
 }
+
+TEST_CASE("view_fits_dispatch separates THIS view from A view")
+{
+	// The measured case (facts §36.18): the CB search runs in slot order and used to keep the
+	// first plausible hit, so b3 carrying a 4088x4088 view beat the real one on b4 on ~1.2% of
+	// frames. Both are real View uniform buffers - plausibility and row 135 pass on both - so
+	// the only thing that tells them apart is the dispatch itself.
+	ue4::ViewParams p{};
+
+	SUBCASE("the measured wrong view is rejected against the measured dispatch")
+	{
+		p.view_size_and_inv_size = { 4088.0f, 4088.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fits_dispatch(p, 3840, 2160));  // 480x270 groups x 8
+	}
+	SUBCASE("the real 50%-screen-percentage view is accepted")
+	{
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fits_dispatch(p, 3840, 2160));
+	}
+	SUBCASE("DLAA passes - the bound is inclusive")
+	{
+		// At 1:1 OutputViewRect == InputViewRect, so view == dispatch coverage exactly. An
+		// exclusive bound here would reject every DLAA frame.
+		p.view_size_and_inv_size = { 3840.0f, 2160.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fits_dispatch(p, 3840, 2160));
+	}
+	SUBCASE("200% downsampling is still rejected, which is what the old gate was for")
+	{
+		p.view_size_and_inv_size = { 7680.0f, 4320.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fits_dispatch(p, 3840, 2160));
+	}
+	SUBCASE("only ONE axis needs to disagree")
+	{
+		p.view_size_and_inv_size = { 1920.0f, 4320.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fits_dispatch(p, 3840, 2160));
+		p.view_size_and_inv_size = { 7680.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fits_dispatch(p, 3840, 2160));
+	}
+	SUBCASE("a view with no extent is not accepted on this test's word")
+	{
+		p.view_size_and_inv_size = { 0.0f, 0.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fits_dispatch(p, 3840, 2160));
+	}
+	SUBCASE("with no dispatch extent to compare against, invent no refusal")
+	{
+		// The caller has nothing to judge with; the ordinary plausibility gate still applies.
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fits_dispatch(p, 0, 0));
+	}
+}

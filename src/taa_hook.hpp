@@ -57,35 +57,17 @@ void set_ngx_evaluate(bool enabled);
 // (stray-dlss-stage.txt, taa_hook.cpp's mark()) — six file writes per dispatch, so it is a
 // crash-naming tool to switch on deliberately, never something to leave running.
 void set_stage_file(bool enabled);
-// [STRAYDLSS] NgxRR: 0 off (SR unchanged), 1 probe (ngx_backend runs it), 2 full — the
-// RR-first evaluate with per-frame SR fallback. Mirrors ngx::set_rr_mode; the hook keeps
-// its own copy so the dispatch path never calls into ngx for a flag.
-void set_ngx_rr(int mode);
-// How often the RR path actually evaluated versus fell back to SR — the one number that
-// says whether RR is carrying frames. Reported periodically by the add-on.
-void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks);
-// RR-1 ([STRAYDLSS] NgxRR=3) telemetry: whether SSD suppression is currently armed, the
-// session total of suppressed SSD dispatches, and how many the last frame suppressed.
-void rr1_counters(bool &armed, std::uint64_t &suppressed_total,
-                  std::uint32_t &suppressed_last_frame);
-
-// WHY the fallbacks happened, per reason — the starvation run (2026-08-31, 0% RR with a
-// reasonless log) proved totals alone cost a whole round-trip. Indexed; order matches
-// kRrRefusalNames. Each reason also logs a first-occurrence line with specifics.
-constexpr int kRrRefusalCount = 11;
-extern const char *const kRrRefusalNames[kRrRefusalCount];
-void rr_refusal_counters(std::uint32_t out[kRrRefusalCount]);
-
-// [STRAYDLSS] GBufferResolveAt: true = "ssd" (record the guide resolve at the first SSD
-// temporal-accumulation dispatch each frame — the content-alive point, the default under
-// NgxRR=2), false = "taa" (record at the TAA hook; kept for A/B measurement of the
-// measured content-death-at-TAA finding).
-void set_gbuffer_resolve_at(bool at_ssd);
-
-// [STRAYDLSS] GBufferResolveOnly: isolation instrument — the guide resolve records (and
-// dumps) at the SSD trigger, the RR evaluate is skipped, SR carries every frame. One run
-// with this on separates record-side faults from evaluate-side faults.
-void set_gbuffer_resolve_only(bool resolve_only);
+// DLSS RAY RECONSTRUCTION IS NOT WIRED UNDER THIS HOST. The heuristic G-buffer finder and
+// the guide-resolve pass that fed it were deleted 2026-09-03 (docs/RESEARCH-ENGINE-TAA-HOOK.md
+// §13): they identified GBufferA-E by descriptor SHAPE, which is the same class of guessing the
+// engine seam replaced for the TAA pass, and nothing on the SR, NR or FG path referenced them.
+// The NGX side survives byte-identical in src/ngx_backend.{hpp,cpp} — `ensure_feature_rr`,
+// `evaluate_rr`, `release_feature_rr` all take raw ID3D12Resource* and never named the finder.
+// What RR needs to come back is a GUIDE SOURCE, and the intended one is the named RDG G-buffer
+// textures reachable from the `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already
+// hands us — identity from the engine, exactly as L1 does for depth and velocity.
+// `[STRAYDLSS] NgxRR` is refused loudly at startup (src/app/dlss_app.cpp) rather than silently
+// doing nothing.
 
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the
@@ -117,5 +99,16 @@ void note_present(std::uint64_t frame);
 void named_pass_counters(std::uint32_t out[5]);
 
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
+
+// Row 135's self-check, tallied over every frame that located a View CB. The buffer is found by
+// SEARCH, and `view_params_plausible` is a shape test the WRONG buffer can satisfy — so this is
+// the number that says whether the search is right. Row 135 must read (denormal, P, 1/P, 0.0);
+// `y*z == 1.0` is true by construction (SceneRendering.cpp:1563-1564) and cannot survive a wrong
+// buffer or a slipped offset. A `bad` rate near 100% means the CB search is what to fix, and
+// that every jitter / ClipToPrevClip / CameraCut we have fed a temporal consumer is suspect.
+// `wrong_view` counts candidates that decoded as A View buffer but described a DIFFERENT view
+// than the dispatch - the search skipping past them instead of stopping. Non-zero is the fix for
+// facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
 
 } // namespace stray_dlss::taa_hook

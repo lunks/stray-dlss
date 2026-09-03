@@ -4,8 +4,6 @@
 #include "engine_seam_hook.hpp"
 #include "exposure_texture.hpp"
 
-#include "gbuffer_finder.hpp"
-#include "gbuffer_resolve.hpp"
 #include "ngx_nr.hpp"
 #include "nr_hook.hpp"
 #include "perf.hpp"
@@ -46,53 +44,22 @@ bool g_stale_resource_logged = false;
 // A skip is safe but not free: that frame contributes no motion vectors, and a high rate would
 // mean our view->resource lookups are unreliable in general, not just occasionally.
 std::atomic<std::uint32_t> g_resolve_attempts{ 0 };
+// Row 135's self-check, counted over every frame that found a View CB. The buffer is located by
+// SEARCH (`view_params_plausible` is a shape test that the wrong buffer can satisfy), so this is
+// the one cheap thing that says whether the search is right: row 135 must read
+// (denormal, P, 1/P, 0.0) and `y*z == 1.0` is true BY CONSTRUCTION, so it cannot survive a wrong
+// offset or a wrong buffer. CLAUDE.md §2.6.
+std::atomic<std::uint64_t> g_view_row135_ok{ 0 };
+std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
+// Candidates that decoded as A View buffer but described a DIFFERENT view than this dispatch.
+// Non-zero is the fix working: each one is a frame the old search would have taken the wrong
+// View for, and refused the real TAA dispatch over.
+std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
 // player sees, so it is opt-in and separate from EnableNGX (which only brings NGX up).
 bool g_ngx_evaluate = false;
-// [STRAYDLSS] NgxRR (taa_hook.hpp). Mode 2 turns the evaluate below RR-first.
-std::atomic<int> g_ngx_rr_mode{ 0 };
-std::atomic<std::uint32_t> g_rr_evaluates{ 0 };
-std::atomic<std::uint32_t> g_rr_fallbacks{ 0 };
-// Refusal reasons, indexed per kRrRefusalNames (taa_hook.hpp). Bumped by try_evaluate_rr
-// on every false return so the periodic line can say WHY frames fell back to SR.
-enum RrRefusalIndex
-{
-	kRrNotArmed = 0,
-	kRrNoCandidate = 1,
-	kRrStaleBind = 2,
-	kRrRolesMissing = 3,
-	kRrLiveness = 4,
-	kRrRowsImplausible = 5,
-	kRrResolveFailed = 6,
-	kRrCreateFailed = 7,
-	kRrEvaluateFailed = 8,
-	kRrGuidesStale = 9, // GBufferResolveAt=ssd: no guide record landed this frame
-	kRrResolveOnly = 10, // GBufferResolveOnly=1: the evaluate is deliberately skipped
-};
-std::atomic<std::uint32_t> g_rr_refusals[kRrRefusalCount] = {};
-// Successful gbuffer_resolve records under RR — the guide-dump key. Keyed on RECORDS, not
-// the shared evaluate-attempt counter: a session where create/evaluate fails still
-// resolves guides, and they must still dump (the whole point of the offline B/C check).
-std::atomic<std::uint64_t> g_rr_records{ 0 };
-
-// RR-1 ([STRAYDLSS] NgxRR=3): SSD temporal-accumulation suppression, COUPLED to RR success.
-// The SSD dispatch we suppress runs BEFORE the TAA-point RR evaluate, so we cannot know at
-// suppression time whether RR will succeed THIS frame. Resolution: an ARMED latch, set only
-// after RR has evaluated successfully for kRr1ArmFrames consecutive frames and cleared on any
-// RR failure/fallback (updated at each TAA evaluate). The SSD suppression reads that latch —
-// i.e. it acts on the PREVIOUS frame's RR outcome, an excellent predictor since armed RR is
-// ~100% stable. A rare post-arm failure costs a single frame of noisy SR and self-corrects
-// (the failure disarms, so the next frame's SSD is not suppressed). Suppression additionally
-// requires the guides to have been captured THIS frame (the frame RR will consume), so a
-// frame RR cannot carry never loses its denoiser. Warm-up (before arming) runs as RR-0.
-constexpr std::uint32_t kRr1ArmFrames = 30;
-std::atomic<bool> g_rr1_armed{ false };
-std::atomic<std::uint32_t> g_rr_success_streak{ 0 };
-std::atomic<std::uint64_t> g_rr1_suppressed_total{ 0 };
-std::atomic<std::uint32_t> g_rr1_suppressed_this_frame{ 0 };
-std::atomic<std::uint32_t> g_rr1_last_frame_suppressed{ 0 };
 // [STRAYDLSS] NgxDryRun. Suppresses the pinned pass's engine dispatch WITHOUT running DLSS, so
 // nothing writes u0 at all.
 //
@@ -366,527 +333,11 @@ const char *hook_format_name(TexFormat f)
 // 2026-08-31 (guide dumps 600/900): at the TAA dispatch the identified A/B/C resources are
 // ALIVE — liveness passes, bind-age 0 — but their CONTENT is already recycled: GBufferA
 // read near-black (normals mean = normalized(-1,-1,-1)), ShadingModelID decoded 0, and the
-// unlit fallback covered ~95% of every guide. The pool reuses the targets' MEMORY within
-// the frame; the end-of-Render refcount release (RESEARCH-RR-GBUFFER.md §1.1) holds for
-// the resource OBJECT, not its content. So the resolve records at a point where content is
-// alive BY CONSTRUCTION: the first FSSDTemporalAccumulationCS dispatch of the frame, a
-// pass that READS the G-buffers as SRVs at that instant.
-
-// [STRAYDLSS] GBufferResolveAt (set_gbuffer_resolve_at): true = record at the first SSD
-// temporal-accumulation dispatch each frame (the content-alive default under NgxRR=2);
-// false = record at the TAA hook, kept for A/B measurement of the content-death finding.
-std::atomic<bool> g_resolve_at_ssd{ true };
-
-// The handoff between the two halves, all under one mutex: which present-frame the guides
-// were recorded for, whether they currently sit in NON_PIXEL_SHADER_RESOURCE (the record
-// needs them back in UAV; the evaluate needs SRV), and the identification that fed them —
-// kept for the evaluate log line. Recording threads differ (the SSD and TAA dispatches can
-// be on different command lists), but the evaluate only proceeds after observing
-// g_guides_frame == this frame under the mutex, which orders the state transitions the
-// same way queue submission orders the GPU work.
-// Consume-side ordering basis (why list B may read what list A produced, with no fence of
-// our own): the TAA dispatch's colour input transitively depends on the SSD pass's output
-// (lighting composites the denoised signal), so UE has already ordered the SSD list's
-// execution — whatever queue it recorded on — before the TAA list runs; on one queue,
-// submission order does the same. The evaluate additionally consumes ONLY guides whose
-// record completed THIS frame (frame tag + ready flag below), so a torn or failed record
-// can never be read.
-std::mutex g_rr_guides_mutex;
-std::uint64_t g_guides_frame = ~0ull;
-bool g_guides_ready = false;  // set when THIS frame's record fully completed
-bool g_guides_in_srv = false;
-gbuffer_finder::Identification g_guides_id;
 
 // [STRAYDLSS] GBufferResolveOnly: the isolation instrument — record (and dump) the guides
 // at the SSD trigger but skip the RR evaluate entirely, SR carrying every frame. One run
 // with this on isolates record-side faults from evaluate-side faults.
-std::atomic<bool> g_rr_resolve_only{ false };
 
-// One first-occurrence line per refusal reason, with specifics — plus the indexed
-// counters, so the periodic line carries rates and the log carries the story.
-bool g_rr_reason_logged[kRrRefusalCount] = {};
-bool rr_refuse(int reason)
-{
-	g_rr_refusals[reason].fetch_add(1, std::memory_order_relaxed);
-	const bool first = !g_rr_reason_logged[reason];
-	g_rr_reason_logged[reason] = true;
-	return first; // the caller logs its specifics on the first occurrence only
-}
-
-// Defined below; the SSD trigger needs it before its definition point.
-bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out);
-
-// Records the guide resolve onto `native` and leaves the four guides in
-// NON_PIXEL_SHADER_RESOURCE, reporting the identification that fed them. Shared by both
-// trigger points. Every failure path names its reason through rr_refuse and returns false
-// — the caller falls back to SR, never guesses.
-bool record_guides(ID3D12Device *native_device, ID3D12GraphicsCommandList *native,
-                   std::uint32_t render_w, std::uint32_t render_h,
-                   const ue4::ViewParams &view, gbuffer_finder::Identification &out_id)
-{
-	// The identification is re-captured EVERY record (pointer rotation measured on 29 of
-	// 30 stable frames) and served role-keyed from the freshest accepted candidate of any
-	// accepted shape — the shape-locked rule starved RR to 0%. (gbuffer_finder.hpp)
-	gbuffer_finder::Identification id;
-	std::uint32_t stale_age = 0;
-	switch (gbuffer_finder::current_identification(id, &stale_age))
-	{
-	case gbuffer_finder::IdentRefusal::ok:
-		break;
-	case gbuffer_finder::IdentRefusal::not_enabled:
-	case gbuffer_finder::IdentRefusal::not_armed:
-		if (rr_refuse(kRrNotArmed))
-			STRAY_LOG_INFO("RR: identification not ARMED yet (no candidate shape has held "
-				"30 frames); SR carries the frames. First occurrence only; the periodic "
-				"line carries the rate.");
-		return false;
-	case gbuffer_finder::IdentRefusal::no_candidate:
-		if (rr_refuse(kRrNoCandidate))
-			STRAY_LOG_INFO("RR: armed but no accepted G-buffer bind recorded yet this "
-				"session; SR carries the frame. First occurrence only.");
-		return false;
-	case gbuffer_finder::IdentRefusal::stale_bind:
-		if (rr_refuse(kRrStaleBind))
-			STRAY_LOG_WARN("RR: freshest accepted G-buffer bind is %u presents old (max 2) "
-				"- the base pass stopped binding, or the finder's tap missed this frame. "
-				"SR carries the frame. First occurrence only.", stale_age);
-		return false;
-	case gbuffer_finder::IdentRefusal::roles_missing:
-		if (rr_refuse(kRrRolesMissing))
-			STRAY_LOG_WARN("RR: the freshest candidate has an unknown A/B/C slot (licensee "
-				"format?) - refusing to guess. SR carries the frames. First occurrence "
-				"only.");
-		return false;
-	}
-
-	// Liveness BEFORE any dereference, per the §5 discipline — the pool can have destroyed
-	// a G-buffer between its bind and this dispatch (save-load transitions measured doing
-	// exactly this to depth/velocity).
-	if (!icept::backend()->is_resource_live(id.gbuffer_a) || !icept::backend()->is_resource_live(id.gbuffer_b) ||
-		!icept::backend()->is_resource_live(id.gbuffer_c))
-	{
-		if (rr_refuse(kRrLiveness))
-			STRAY_LOG_WARN("RR: a G-buffer resource died between bind and dispatch "
-				"(A=%p live=%d, B=%p live=%d, C=%p live=%d, bind age %u frames); SR "
-				"carries the frame. First occurrence only.",
-				reinterpret_cast<void *>(id.gbuffer_a),
-				icept::backend()->is_resource_live(id.gbuffer_a) ? 1 : 0,
-				reinterpret_cast<void *>(id.gbuffer_b),
-				icept::backend()->is_resource_live(id.gbuffer_b) ? 1 : 0,
-				reinterpret_cast<void *>(id.gbuffer_c),
-				icept::backend()->is_resource_live(id.gbuffer_c) ? 1 : 0, id.age_frames);
-		return false;
-	}
-
-	// The identified extent must COVER the render rect (suspect (b) of the wedge round):
-	// the resolve indexes A/B/C at ViewRectMin + thread id across the render rect, and a
-	// smaller texture turns those loads into out-of-bounds reads — zeros, i.e. unlit-
-	// decoded garbage guides. Menu and gameplay measured equal so far (1920x1080), but a
-	// mismatch must refuse loudly, not resolve garbage.
-	if (id.extent_width < render_w || id.extent_height < render_h)
-	{
-		if (rr_refuse(kRrResolveFailed))
-			STRAY_LOG_WARN("RR: identified G-buffer extent %ux%u does not cover the render "
-				"rect %ux%u - refusing to resolve (would read out of bounds). First "
-				"occurrence only.", id.extent_width, id.extent_height, render_w, render_h);
-		return false;
-	}
-
-	// View rows 12-15 (TranslatedWorldToView, mirror-verified after the first guess of
-	// row 8 turned out to be ClipToWorld — ue4_view.hpp) must actually hold a rotation
-	// before anything trusts them. A wrong matrix biases specular albedo silently — the
-	// §0.2 class of failure — so implausible rows mean SR, loudly, once. Every diagnostic
-	// line carries the RR token: a values line without it was lost to a filtered log once.
-	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
-	{
-		if (rr_refuse(kRrRowsImplausible))
-		{
-			STRAY_LOG_ERROR("RR: View rows 12-15 (TranslatedWorldToView) do not hold a "
-				"rotation - SR carries the frames while this holds. All 16 floats follow.");
-			const float *m = view.translated_world_to_view.m;
-			for (int r = 0; r < 4; ++r)
-				STRAY_LOG_ERROR("RR: row %d: [%.6f %.6f %.6f %.6f]", 12 + r,
-					m[r * 4 + 0], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
-			// The member-order measurement: orthonormality verdict for every slice of the
-			// seven-matrix block. Expected pattern for the mirror-verified order is
-			// no,no,no,YES,YES,YES,YES (the four view<->world transforms are rigid; the
-			// three clip-involved ones never are). Any other pattern names the licensee's
-			// actual member order in one line.
-			char verdicts[256];
-			int off = std::snprintf(verdicts, sizeof(verdicts), "RR: block verdicts:");
-			for (int i = 0; i < 7; ++i)
-				if (off > 0 && off < static_cast<int>(sizeof(verdicts)))
-					off += std::snprintf(verdicts + off, sizeof(verdicts) - off,
-						" %s=%s", ue4::view_matrix_block_name(i),
-						ue4::world_to_view_rotation_plausible(view.view_matrix_block[i])
-							? "YES" : "no");
-			STRAY_LOG_ERROR("%s", verdicts);
-		}
-		return false;
-	}
-
-	if (!gbr::initialise(native_device, render_w, render_h))
-	{
-		if (rr_refuse(kRrResolveFailed))
-			STRAY_LOG_ERROR("RR: gbuffer_resolve initialise failed (%s); SR carries the "
-				"frames. First occurrence only.", gbr::last_error());
-		return false;
-	}
-
-	gbr::ResolveInputs gi;
-	gi.gbuffer_a = id.gbuffer_a;
-	gi.gbuffer_b = id.gbuffer_b;
-	gi.gbuffer_c = id.gbuffer_c;
-	gi.render_width = render_w;
-	gi.render_height = render_h;
-	gi.view_rect_min[0] = view.view_rect_min.x;
-	gi.view_rect_min[1] = view.view_rect_min.y;
-	// ViewToClipNoAA diagonal (row 32, measured): the jitter-free projection terms the
-	// NoV ray math needs. Row-major m[r*4+c].
-	gi.proj00 = view.view_to_clip_no_aa.m[0];
-	gi.proj11 = view.view_to_clip_no_aa.m[5];
-	// The TRANSPOSED upper 3x3: UE stores row-vector matrices while the resolve shader
-	// computes dot(row, n). The untransposed rows apply the INVERSE rotation — silently
-	// wrong NoV — which is why the extraction is a tested core helper, not inline math.
-	ue4::nov_rotation_rows(view.translated_world_to_view, gi.world_to_view);
-
-	// The guides must be in UAV state for the record. A frame whose evaluate never ran
-	// (SR fallback after a successful record) leaves them in SRV state; fix that here, on
-	// this list, before the dispatch that writes them.
-	{
-		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		if (g_guides_in_srv)
-		{
-			gbr::transition_outputs(native, /*to_shader_resource=*/false);
-			g_guides_in_srv = false;
-		}
-	}
-
-	bool gbr_recorded;
-	{
-		perf::Scope perf_gbuf(perf::kGBufferResolve);
-		gbr_recorded = gbr::record(native, gi, /*dispatch_mode=*/2);
-	}
-	if (!gbr_recorded)
-	{
-		if (rr_refuse(kRrResolveFailed))
-			STRAY_LOG_ERROR("RR: gbuffer_resolve record failed (%s); SR carries the frames. "
-				"First occurrence only.", gbr::last_error());
-		return false;
-	}
-
-	// Written as UAVs; NGX (and the dump copies) read them as shader resources.
-	gbr::transition_outputs(native, /*to_shader_resource=*/true);
-	{
-		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		g_guides_in_srv = true;
-	}
-
-	// The guide-dump channel keys on successful RESOLVE RECORDS, not the shared
-	// evaluate-attempt counter: a session where the RR create or evaluate fails still
-	// produced guides, and dumping them is the whole point of the offline B/C check —
-	// under the old keying a 0%-RR session could never produce a guide file.
-	const std::uint64_t rr_rec_no = g_rr_records.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (input_dump::wants(rr_rec_no))
-	{
-		input_dump::capture(native_device, native, gbr::normals_roughness(),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_normals", rr_rec_no);
-		input_dump::capture(native_device, native, gbr::roughness(),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_roughness", rr_rec_no);
-		input_dump::capture(native_device, native, gbr::diffuse_albedo(),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_diffuse", rr_rec_no);
-		input_dump::capture(native_device, native, gbr::specular_albedo(),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "guide_specular", rr_rec_no);
-	}
-
-	out_id = id;
-	return true;
-}
-
-// The SSD-dispatch trigger: called from intercept_dispatch for every large dispatch whose
-// hash is in the FSSDTemporalAccumulationCS family. That pass reads the G-buffers as SRVs,
-// so their CONTENT is alive at this instant by construction — the property the TAA-point
-// record measurably lacks. Records on the SSD pass's own command list, BEFORE its dispatch
-// proceeds (RR-0 never suppresses it); first sighting per frame only.
-//
-// RR-1 LOOKAHEAD (comment only): when the SSD family is suppressed via DryRunHash, the
-// suppression return in intercept_dispatch fires BEFORE this trigger is reached, so the
-// trigger disappears with the pass. The candidate replacements for that phase are (a) the
-// first dispatch after the last base-pass RT unbind (the finder already sees every RT
-// bind), or (b) the deferred-lighting pass's first draw — both sit between base-pass
-// completion and the pool's content reuse. Alternatively, hoist this call above the
-// dry-run suppression so a suppressed SSD dispatch still donates its bindings.
-// RR-1: update the suppression arm latch from an RR evaluate outcome. Called at the TAA
-// evaluate point every frame; only mode 3 arms. Arming needs kRr1ArmFrames consecutive
-// successes; any failure disarms immediately so the denoiser comes straight back.
-void update_rr1_arm(bool ok)
-{
-	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 3)
-		return;
-	if (ok)
-	{
-		const std::uint32_t streak =
-			g_rr_success_streak.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (streak >= kRr1ArmFrames &&
-			!g_rr1_armed.exchange(true, std::memory_order_relaxed))
-			STRAY_LOG_WARN("RR-1 suppression ARMED after %u consecutive RR evaluates: the "
-				"SSD temporal-accumulation family will now be SUPPRESSED so RR denoises the "
-				"raw screen-space signal reaching scene colour. SR stays the per-frame "
-				"safety net; a fallback disarms this.", kRr1ArmFrames);
-	}
-	else
-	{
-		g_rr_success_streak.store(0, std::memory_order_relaxed);
-		if (g_rr1_armed.exchange(false, std::memory_order_relaxed))
-			STRAY_LOG_WARN("RR-1 suppression DISARMED: RR fell back to SR, so the denoiser is "
-				"re-enabled to avoid noisy SR. Re-arms after %u more consecutive RR "
-				"evaluates.", kRr1ArmFrames);
-	}
-}
-
-// RR-1: whether this SSD temporal-accumulation dispatch should be skipped so its noise
-// reaches scene colour raw. Coupled to (a) the armed latch (RR reliably running) and (b)
-// guides captured THIS frame — if either is false the SSD runs, so a frame RR cannot carry
-// keeps its denoiser (never noisy SR by our choice).
-bool should_suppress_ssd_for_rr1(std::uint64_t hash)
-{
-	if (g_ngx_rr_mode.load(std::memory_order_relaxed) != 3 || !is_ssd_temporal_hash(hash))
-		return false;
-	if (!g_rr1_armed.load(std::memory_order_relaxed))
-		return false;
-	const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
-	std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-	return g_guides_frame == frame && g_guides_ready;
-}
-
-void maybe_record_guides_at_ssd(const icept::CommandContext &ctx, std::uint64_t hash)
-{
-	// Mode 2 captures at the SSD trigger only when GBufferResolveAt=ssd; mode 3 (RR-1)
-	// ALWAYS captures here — the TAA-hook alternative reads dead content (measured), which
-	// is fatal when we are about to suppress the very passes that keep it alive.
-	const int mode = g_ngx_rr_mode.load(std::memory_order_relaxed);
-	const bool want = (mode == 2 && g_resolve_at_ssd.load(std::memory_order_relaxed)) ||
-		mode == 3;
-	if (!want)
-		return;
-	if (!is_ssd_temporal_hash(hash))
-		return;
-
-	// First sighting per frame only — the family dispatches several times (SSR/SSGI/AO
-	// instances), and one record per frame is both sufficient and cheapest. The frame is
-	// CLAIMED here, before any recording: two family dispatches on concurrently-recording
-	// lists would otherwise both pass a check-at-success latch and interleave two sets of
-	// state transitions across two lists — undefined transition ordering, the Xid-109
-	// shape. Claiming first means a failed record forfeits the frame (guides_ready stays
-	// false and the evaluate refuses) rather than risking a second, racing attempt.
-	const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
-	{
-		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		if (g_guides_frame == frame)
-			return;
-		g_guides_frame = frame;
-		g_guides_ready = false;
-	}
-
-	DispatchBindings b;
-	if (!icept::backend()->resolve_compute_bindings(ctx, b))
-	{
-		if (rr_refuse(kRrResolveFailed))
-			STRAY_LOG_ERROR("RR: could not resolve the SSD dispatch's bindings for the View "
-				"CB; guides cannot record at the SSD trigger. First occurrence only.");
-		return;
-	}
-
-	// The View CB, exactly as the TAA path finds it: try every bound CB, keep the one
-	// that parses plausibly. The SSD pass carries the same View buffer.
-	ue4::ViewParams view{};
-	bool view_ok = false;
-	for (const auto &cb : b.constant_buffers)
-	{
-		ue4::ViewParams candidate{};
-		if (read_view_cb(cb.second, candidate) && ue4::view_params_plausible(candidate))
-		{
-			view = candidate;
-			view_ok = true;
-			break;
-		}
-	}
-	if (!view_ok)
-	{
-		if (rr_refuse(kRrResolveFailed))
-			STRAY_LOG_ERROR("RR: no plausible View CB on the SSD dispatch; guides cannot "
-				"record at the SSD trigger. First occurrence only.");
-		return;
-	}
-
-	const float vw = view.view_size_and_inv_size.x;
-	const float vh = view.view_size_and_inv_size.y;
-	const auto render_w = static_cast<std::uint32_t>(vw);
-	const auto render_h = static_cast<std::uint32_t>(vh);
-
-	ID3D12GraphicsCommandList *native = ctx.native;
-	gbuffer_finder::Identification id;
-	if (!record_guides(ctx.device, native, render_w, render_h, view, id))
-		return; // the reason was counted and logged inside; the frame stays claimed-not-ready
-
-	// THE WEDGE FIX (attempt 4, Xid 109 minutes into an RR menu session): record_guides
-	// just changed root signature, PSO, heaps and root parameters on the GAME'S list — and
-	// unlike the TAA site, the game's dispatch here is NOT suppressed: the SSD pass
-	// proceeds on this list. Without restoring, it ran with OUR compute state — our shader
-	// under its group counts, its own output never written, its root state corrupted for
-	// everything downstream of it on this list. Restore replays the game's captured root
-	// state natively, exactly as the TAA site does after NGX clobbers it.
-	{
-		perf::Scope perf_restore(perf::kRestore);
-		icept::backend()->restore_game_compute_state(ctx);
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		g_guides_id = id;
-		g_guides_ready = true;
-	}
-
-	static std::atomic<int> s_trigger_logged{ 0 };
-	if (s_trigger_logged.fetch_add(1, std::memory_order_relaxed) == 0)
-		STRAY_LOG_INFO("RR: guide resolve recorded at the SSD trigger (hash=0x%016llx, "
-			"frame %llu, %ux%u) - the content-alive point; the TAA-hook evaluate consumes "
-			"these guides later this frame. First occurrence only.",
-			static_cast<unsigned long long>(hash),
-			static_cast<unsigned long long>(frame), render_w, render_h);
-}
-
-// The RR-first evaluate ([STRAYDLSS] NgxRR=2). Consumes the guides recorded at the SSD
-// trigger (or records them here under GBufferResolveAt=taa — the A/B mode that measures
-// the content-death finding), then evaluates DLSSD. Every missing precondition returns
-// false so the caller falls back to the SR evaluate — SR is the safety net EVERY frame,
-// never just at startup.
-bool try_evaluate_rr(ID3D12Device *native_device, ID3D12GraphicsCommandList *native,
-                     const ngx::EvaluateInputs &ei, const ngx::FeatureDesc &fd,
-                     const ue4::ViewParams &view)
-{
-	static bool s_rr_ok_logged = false;
-
-	// The isolation instrument: guides record (and dump) at the SSD trigger, the evaluate
-	// is skipped, SR carries every frame. Counted under its own reason so the periodic
-	// line stays self-consistent.
-	if (g_rr_resolve_only.load(std::memory_order_relaxed))
-	{
-		if (rr_refuse(kRrResolveOnly))
-			STRAY_LOG_WARN("GBufferResolveOnly=1: guides record at the SSD trigger and "
-				"dump as usual; the RR evaluate is SKIPPED and SR carries every frame. "
-				"Isolation instrument - record-side faults reproduce, evaluate-side "
-				"faults cannot.");
-		return false;
-	}
-
-	gbuffer_finder::Identification id;
-	if (g_resolve_at_ssd.load(std::memory_order_relaxed))
-	{
-		bool have_guides = false;
-		const std::uint64_t frame = g_present_frame.load(std::memory_order_relaxed);
-		{
-			std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-			// Frame tag AND ready AND state: a claimed-but-failed record (ready false), a
-			// stale frame, or guides not left in SRV all refuse — the evaluate can never
-			// consume a torn record.
-			if (g_guides_frame == frame && g_guides_ready && g_guides_in_srv)
-			{
-				id = g_guides_id;
-				have_guides = true;
-			}
-		}
-		if (!have_guides)
-		{
-			if (rr_refuse(kRrGuidesStale))
-				STRAY_LOG_WARN("RR: no guide record this frame (no SSD temporal-accumulation "
-					"dispatch seen yet this frame, or its record refused - see any earlier "
-					"RR lines); SR carries the frame. First occurrence only. "
-					"GBufferResolveAt=taa restores the in-hook record for A/B.");
-			return false;
-		}
-	}
-	else
-	{
-		if (!record_guides(native_device, native, ei.render_width, ei.render_height, view, id))
-			return false; // the reason was counted and logged inside
-	}
-
-	bool ok = false;
-	if (!ngx::ensure_feature_rr(native, fd))
-	{
-		// ngx_backend logged the create failure (latched, once per size); the counter
-		// carries the per-frame rate.
-		rr_refuse(kRrCreateFailed);
-	}
-	else
-	{
-		ngx::EvaluateInputsRR er;
-		er.base = ei;
-		er.diffuse_albedo = gbr::diffuse_albedo();
-		er.specular_albedo = gbr::specular_albedo();
-		er.normals_roughness = gbr::normals_roughness();
-		er.roughness = gbr::roughness();
-		// WorldToView = rows 12-15 (mirror-verified, rotation-checked at record time);
-		// ViewToClip = ViewToClipNoAA rows 32-35 (measured) — jitter reaches NGX
-		// separately, so the unjittered projection is the consistent pairing. Both
-		// row-major, as stored.
-		std::memcpy(er.world_to_view, view.translated_world_to_view.m,
-			sizeof(er.world_to_view));
-		std::memcpy(er.view_to_clip, view.view_to_clip_no_aa.m, sizeof(er.view_to_clip));
-		er.have_matrices = true;
-		er.frame_time_delta_ms = view.delta_time * 1000.0f;
-
-		{
-			perf::Scope perf_rr(perf::kNgxRr);
-			ok = ngx::evaluate_rr(native, er);
-			if (ok) perf::stall_note_evaluate();
-		}
-
-		if (ok)
-		{
-			// The serving shape is worth a line the first time and on every flip (rate
-			// limited): it says WHICH accepted candidate fed the guides.
-			static int s_last_shape = -1;
-			static int s_shape_flips_logged = 0;
-			const int shape = id.velocity_in_set ? 1 : 0;
-			if (!s_rr_ok_logged)
-			{
-				s_rr_ok_logged = true;
-				STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u with guides "
-					"(A=%p B=%p C=%p swapBC=%d shape=%s bind-age=%u resolve-at=%s). SR "
-					"remains the per-frame fallback.",
-					ei.render_width, ei.render_height, fd.output_width, fd.output_height,
-					reinterpret_cast<void *>(id.gbuffer_a),
-					reinterpret_cast<void *>(id.gbuffer_b),
-					reinterpret_cast<void *>(id.gbuffer_c), gbr::bc_swapped() ? 1 : 0,
-					id.velocity_in_set ? "with-velocity" : "velocity-free", id.age_frames,
-					g_resolve_at_ssd.load(std::memory_order_relaxed) ? "ssd" : "taa");
-			}
-			else if (shape != s_last_shape && s_shape_flips_logged < 4)
-			{
-				++s_shape_flips_logged;
-				STRAY_LOG_INFO("RR: serving shape changed to %s (both are accepted "
-					"candidates; role-keyed serving). Logged at most 4 times.",
-					id.velocity_in_set ? "with-velocity" : "velocity-free");
-			}
-			s_last_shape = shape;
-		}
-		else if (rr_refuse(kRrEvaluateFailed))
-		{
-			STRAY_LOG_ERROR("DLSS RR evaluate FAILED (%s); SR carries the frames. First "
-				"occurrence only.", ngx::last_error());
-		}
-	}
-
-	// Back to UAV for the next record, evaluate or not.
-	gbr::transition_outputs(native, /*to_shader_resource=*/false);
-	{
-		std::lock_guard<std::mutex> lock(g_rr_guides_mutex);
-		g_guides_in_srv = false;
-	}
-	return ok;
-}
 
 // Reads the View constant buffer at the moment of the dispatch. It must be read here, at
 // command-recording time on the thread that just set the root arguments, because UE4's
@@ -970,6 +421,32 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 			view.temporal_aa_params.z, view.temporal_aa_params.w);
 		STRAY_LOG_INFO("    PreExposure=%.6f  NearPlane=%.4f  DeltaTime=%.6f  CameraCut=%.1f",
 			view.pre_exposure, view.near_plane, view.delta_time, view.camera_cut);
+		// THE ONLY LINE HERE THAT CAN CONVICT THE CB SEARCH. Everything above is a value that
+		// "looks plausible", which is what a wrong buffer also produces. Row 135 carries three
+		// different data types at predicted places and validates itself from ONE read:
+		//   y*z == 1.0 exactly   - PreExposure * OneOverPreExposure, assigned on adjacent lines
+		//                          from the same float (SceneRendering.cpp:1563-1564), so it is
+		//                          true BY CONSTRUCTION and cannot survive a wrong offset
+		//   x is a denormal      - int32 NumSceneColorMSAASamples == 1 reinterpreted as float
+		//   w == 0.0 exactly     - padding
+		// Read this before believing any other number in this block. CLAUDE.md §2.6.
+		{
+			const ue4::Float4 &r135 = view.pre_exposure_row;
+			const double yz = static_cast<double>(r135.y) * static_cast<double>(r135.z);
+			const bool denormal = r135.x != 0.0f && std::fabs(r135.x) < 1.0e-30f;
+			STRAY_LOG_INFO("    View row 135 (ONE read): x=%.8e y=%.6f z=%.6f w=%.6f "
+				"| y*z=%.6f (want 1.0) | x denormal=%d (want 1) | w==0=%d (want 1) => %s",
+				static_cast<double>(r135.x), r135.y, r135.z, r135.w, yz,
+				denormal ? 1 : 0, r135.w == 0.0f ? 1 : 0,
+				ue4::pre_exposure_plausible(view)
+					? "SELF-CHECK PASSES - this really is the View buffer"
+					: "SELF-CHECK FAILS - the CB search picked the WRONG BUFFER, so jitter, "
+					  "ClipToPrevClip and CameraCut are all suspect");
+		}
+		STRAY_LOG_INFO("    row135 self-check so far: ok=%llu bad=%llu (a rate near 100%% bad "
+			"means the search, not the offsets, is what to fix)",
+			static_cast<unsigned long long>(g_view_row135_ok.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_view_row135_bad.load(std::memory_order_relaxed)));
 		for (int r = 0; r < 4; ++r)
 			STRAY_LOG_INFO("    ClipToPrevClip[%d]  = %+.6f %+.6f %+.6f %+.6f", r,
 				view.clip_to_prev_clip.m[r * 4 + 0], view.clip_to_prev_clip.m[r * 4 + 1],
@@ -992,37 +469,6 @@ const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
 void set_stage_file(bool enabled) { g_stage_file_enabled = enabled; }
-void set_ngx_rr(int mode) { g_ngx_rr_mode.store(mode, std::memory_order_relaxed); }
-void set_gbuffer_resolve_at(bool at_ssd)
-{
-	g_resolve_at_ssd.store(at_ssd, std::memory_order_relaxed);
-}
-void set_gbuffer_resolve_only(bool resolve_only)
-{
-	g_rr_resolve_only.store(resolve_only, std::memory_order_relaxed);
-}
-void rr_counters(std::uint32_t &rr_evaluates, std::uint32_t &sr_fallbacks)
-{
-	rr_evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
-	sr_fallbacks = g_rr_fallbacks.load(std::memory_order_relaxed);
-}
-void rr1_counters(bool &armed, std::uint64_t &suppressed_total,
-                  std::uint32_t &suppressed_last_frame)
-{
-	armed = g_rr1_armed.load(std::memory_order_relaxed);
-	suppressed_total = g_rr1_suppressed_total.load(std::memory_order_relaxed);
-	suppressed_last_frame = g_rr1_last_frame_suppressed.load(std::memory_order_relaxed);
-}
-const char *const kRrRefusalNames[kRrRefusalCount] = {
-	"not-armed", "no-candidate", "stale-bind", "roles-missing", "liveness",
-	"rows-implausible", "resolve-failed", "create-failed", "evaluate-failed",
-	"guides-stale", "resolve-only",
-};
-void rr_refusal_counters(std::uint32_t out[kRrRefusalCount])
-{
-	for (int i = 0; i < kRrRefusalCount; ++i)
-		out[i] = g_rr_refusals[i].load(std::memory_order_relaxed);
-}
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count)
 {
@@ -1051,10 +497,6 @@ void note_present(std::uint64_t frame)
 	// The engine seam's ledger retires announcements by frame, so it needs the same boundary.
 	// Inert unless [STRAYDLSS] EngineSeam=2 installed the stand-in.
 	seamhook::note_present(frame);
-	// Snapshot and clear the per-frame RR-1 suppression tally for the periodic report.
-	g_rr1_last_frame_suppressed.store(
-		g_rr1_suppressed_this_frame.exchange(0, std::memory_order_relaxed),
-		std::memory_order_relaxed);
 	if (g_dry_run_alternate == 0)
 		return;
 	const bool suppressing = ((frame / g_dry_run_alternate) & 1ull) != 0;
@@ -1204,23 +646,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// content is alive HERE — record the guides on this list before the dispatch proceeds
 	// (RR-0 never suppresses it; the throttle above cannot eat this call because every RR
 	// session sets NgxEvaluate, which disables the throttle entirely).
-	maybe_record_guides_at_ssd(ctx, hash);
-
-	// RR-1 ([STRAYDLSS] NgxRR=3): the guides were just captured at this content-alive point
-	// AND the game's compute state restored, so skipping the SSD dispatch here is clean.
-	// Suppressing it makes the screen-space SSR/SSGI noise reach scene colour uncleaned and
-	// thus TAA t1, which RR then denoises. Gated on RR reliably running + guides-this-frame.
-	if (should_suppress_ssd_for_rr1(hash))
-	{
-		g_rr1_suppressed_total.fetch_add(1, std::memory_order_relaxed);
-		g_rr1_suppressed_this_frame.fetch_add(1, std::memory_order_relaxed);
-		static std::atomic<int> s_rr1_supp_logged{ 0 };
-		if (s_rr1_supp_logged.fetch_add(1, std::memory_order_relaxed) < 4)
-			STRAY_LOG_WARN("RR-1: suppressing SSD 0x%016llx (guides captured, RR armed); its "
-				"noise reaches scene colour raw for RR to denoise. Logged 4x.",
-				static_cast<unsigned long long>(hash));
-		return true;
-	}
 
 	DispatchBindings b;
 	if (!icept::backend()->resolve_compute_bindings(ctx, b))
@@ -1273,15 +698,43 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
-		if (read_view_cb(cb.second, candidate) && ue4::view_params_plausible(candidate))
+		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
+			continue;
+		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
+		// establish that a buffer IS a View uniform buffer; a shadow, cubemap-face or
+		// scene-capture view satisfies both. The search runs in slot order, so a wrong-but-
+		// plausible candidate on a lower register used to win and stop the search - MEASURED
+		// on the box as b3 carrying a 4088x4088 view beating the real one on b4, on ~1.2% of
+		// frames, which made the matcher refuse the real TAA dispatch as "downsampling" and
+		// is the visible flicker (facts §36.17-36.18). The dispatch covers the OUTPUT rect and
+		// UE 4.27's OutputViewRect is never smaller than InputViewRect, so a view claiming to
+		// be larger than the dispatch covers cannot be this one.
+		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			view = candidate;
-			view_ok = true;
-			b.view_cb = cb.second;
-			b.view_cb_valid = true;
-			b.view_cb_register = cb.first;
-			break;
+			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			continue;
 		}
+		view = candidate;
+		view_ok = true;
+		b.view_cb = cb.second;
+		b.view_cb_valid = true;
+		b.view_cb_register = cb.first;
+		break;
+	}
+	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
+	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
+	// wrong ClipToPrevClip and a wrong CameraCut, which is exactly what temporal flicker looks
+	// like. Row 135 is the one row that validates ITSELF from a single read: it must be
+	// (denormal, P, 1/P, 0.0), so `y*z == 1.0` by construction (SceneRendering.cpp:1563-1564),
+	// `x` is an int32 MSAA count reinterpreted, and `w` is padding. Count the frames it fails
+	// on: a rate near zero exonerates the search, a rate near 100% convicts it. Costs nothing —
+	// the quad is already parsed and the predicate already ships.
+	if (view_ok)
+	{
+		if (ue4::pre_exposure_plausible(view))
+			g_view_row135_ok.fetch_add(1, std::memory_order_relaxed);
+		else
+			g_view_row135_bad.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// The signature matcher needs the render rect. Prefer the View buffer; fall back to the
@@ -1323,11 +776,39 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// seam is not live and the fallback is allowed; `engine` when the engine announced this
 	// exact dispatch; a named refusal otherwise. (src/core/engine_seam.hpp, seam::decide)
 	seamhook::Verdict seam_verdict;
+	seamhook::EngineInputs engine_inputs;
 	seam::Gate seam_gate = seam::Gate::heuristic;
+	// THE `unclaimed` INSTRUMENT. A dispatch the matcher refused never reaches claim(), so an
+	// announcement it should have claimed retires as `unclaimed` with no cause recorded. Ask the
+	// ledger whether a pending announcement expected exactly these group counts: if one did, the
+	// engine's own primary upscale just went past and OUR gate turned it away, and the matcher's
+	// verdict and reason are the fix. If none did, this dispatch is unrelated and nothing counts.
+	if (m.verdict != MatchVerdict::structural_only && m.verdict != MatchVerdict::hash_and_structural)
+	{
+		// Carry the matcher's OWN INPUTS, not just its verdict. "dispatch covers less than the
+		// view rect" only tells us the arithmetic failed; the render rect it used, which CB that
+		// came from, and whether row 135 vouched for that CB are what say WHY.
+		seamhook::UnmatchedContext uc;
+		uc.view_width = w;
+		uc.view_height = h;
+		uc.output_width = m.output_width;
+		uc.output_height = m.output_height;
+		uc.cb_register = b.view_cb_register;
+		uc.view_ok = view_ok;
+		uc.row135_ok = view_ok && ue4::pre_exposure_plausible(view);
+		seamhook::note_unmatched_dispatch(x, y, verdict_name(m.verdict), m.reason, uc);
+	}
+
 	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
+		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
+		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
+		// no RHI resource at AddPasses time has one now. Each is validated against our own
+		// resource registry before it is used, so a wrong offset falls back rather than lies.
+		if (seam_gate == seam::Gate::engine)
+			engine_inputs = seamhook::resolve_inputs(seam_verdict);
 
 		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)
 		{
@@ -1537,8 +1018,37 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
 		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
 		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it.
-		const bool resources_live = icept::backend()->is_resource_live(depth_resource) &&
-			icept::backend()->is_resource_live(velocity_resource);
+		// THE ENGINE'S ANSWER WINS. `AddPasses` named these three textures; a resource the
+		// engine is about to bind is alive by construction, and no register walk or
+		// view->resource map can be more authoritative than that. The heuristic's answer is
+		// kept as an assertion (one WARN per session) and as the fallback when L1 could not
+		// resolve - which is counted, never silent.
+		bool engine_depth_used = false;
+		bool engine_velocity_used = false;
+		if (engine_inputs.depth_ok())
+		{
+			if (depth_resource != 0 && depth_resource != engine_inputs.depth)
+				seamhook::note_input_disagreement("depth", engine_inputs.depth, depth_resource);
+			depth_resource = engine_inputs.depth;
+			engine_depth_used = true;
+		}
+		if (engine_inputs.velocity_ok())
+		{
+			if (velocity_resource != 0 && velocity_resource != engine_inputs.velocity)
+				seamhook::note_input_disagreement("velocity", engine_inputs.velocity,
+					velocity_resource);
+			velocity_resource = engine_inputs.velocity;
+			engine_velocity_used = true;
+		}
+
+		// Refuse to touch a resource ReShade has already reported destroyed. Its view->resource
+		// map outlives the resource on D3D12, and building an SRV from a dead one faults inside
+		// the driver (vkCreateImageView, 0xc0000005) and takes the game with it. An
+		// engine-supplied resource skips this: the registry already confirmed it live inside
+		// resolve_inputs, and this is the check that was rejecting the real pass in the menu.
+		const bool resources_live =
+			(engine_depth_used || icept::backend()->is_resource_live(depth_resource)) &&
+			(engine_velocity_used || icept::backend()->is_resource_live(velocity_resource));
 		if (depth_resource != 0 && velocity_resource != 0)
 		{
 			g_resolve_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -1605,6 +1115,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			else if (!resources_live)
 				log_gate_refusal(hash, kGateDeadInputs);
 		}
+		// The CONTINUOUS half of the same fact. The WARN above fires once per pass by design,
+		// which hid the RATE - and the rate is what makes this the user's "DLSS flip": every
+		// refused frame publishes no guides, so NR declines it (guides-stale) and the next
+		// evaluate carries a DLSSNR.Reset.
+		// worth_resolving is unconditionally true under the engine's gate, so the only two ways
+		// an announced dispatch stops here are a View CB we could not decode and inputs we
+		// could not vouch for. They are different fixes, so they are different counters.
+		if (seam_gate == seam::Gate::engine && !view_ok)
+			seamhook::note_outcome(seam::SeamRefusal::view_unreadable);
+		else if (seam_gate == seam::Gate::engine && !resources_live)
+			seamhook::note_outcome(seam::SeamRefusal::dead_inputs);
 
 		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set
 		// via is_camera_cut — so the engine's TAA never runs once DLSS engages. Skipping them
@@ -1675,6 +1196,8 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 				if (tracing && recorded)
 					g_named_recorded.fetch_add(1, std::memory_order_relaxed);
 
+				if (!recorded && seam_gate == seam::Gate::engine)
+					seamhook::note_outcome(seam::SeamRefusal::mv_failed);
 				if (recorded)
 				{
 					mark(5, "recorded");
@@ -1814,8 +1337,18 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						// weaker but not permutation-specific.
 						constexpr std::uint32_t kSceneColourReg = 1;   // t1, CLAUDE.md §2.3
 						constexpr std::uint32_t kHistoryReg = 5;       // t5, CLAUDE.md §2.3
+						// THE ENGINE'S ANNOUNCEMENT IS A STRONGER WARRANT THAN THE HASH.
+						// The §2.3 register map belongs to FTAAStandaloneCS, and being called
+						// through ITemporalUpscaler::AddPasses proves this dispatch IS the
+						// primary temporal upscale — which the cooked-hash table only ever
+						// approximated, and which it misses entirely when a game update
+						// recooks the shaders. Under EngineSeam=3 the hash is demoted to an
+						// assertion everywhere else; leaving the colour path gated on it meant
+						// an engine-announced pass with an unlisted hash silently fell back to
+						// the weaker "which buffer looks like colour" heuristics.
 						const bool trust_registers =
-							m.verdict == MatchVerdict::hash_and_structural;
+							m.verdict == MatchVerdict::hash_and_structural ||
+							seam_gate == seam::Gate::engine;
 
 						std::uint64_t reg_colour = 0;
 						if (trust_registers)
@@ -1872,7 +1405,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 
 						std::uint64_t colour_handle = reg_colour;
 						const char *colour_reason = reg_colour != 0 ? "register t1" : "ok";
-						if (reg_colour != 0)
+						// The engine named the scene colour outright, so none of the
+						// colour-versus-history inference below has to run.
+						if (engine_inputs.colour_ok())
+						{
+							if (colour_handle != 0 && colour_handle != engine_inputs.colour)
+								seamhook::note_input_disagreement("scene colour",
+									engine_inputs.colour, colour_handle);
+							colour_handle = engine_inputs.colour;
+							colour_reason = "the engine's FPassInputs.SceneColorTexture";
+						}
+						else if (reg_colour != 0)
 						{
 							// Already decided by register; nothing to infer.
 						}
@@ -1913,8 +1456,24 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						ngx::FeatureDesc fd;
 						fd.render_width = render_w;
 						fd.render_height = render_h;
-						fd.output_width = m.output_width ? m.output_width : render_w;
-						fd.output_height = m.output_height ? m.output_height : render_h;
+						// THE ENGINE'S OWN OutputViewRect WINS when it announced this
+						// dispatch. The matcher's figure is `group count x 8` clamped to the
+						// UAV, i.e. rounded UP to a multiple of 8 — identical at 3840x2160
+						// (480 groups exactly) and wrong for any rect that is not, which would
+						// create the DLSS feature a few pixels too large and never say so.
+						// `rect_agrees` above already compares the two and asserts once per
+						// pass; this is that assertion's conclusion applied.
+						if (seam_gate == seam::Gate::engine && seam_verdict.out_width != 0 &&
+							seam_verdict.out_height != 0)
+						{
+							fd.output_width = seam_verdict.out_width;
+							fd.output_height = seam_verdict.out_height;
+						}
+						else
+						{
+							fd.output_width = m.output_width ? m.output_width : render_w;
+							fd.output_height = m.output_height ? m.output_height : render_h;
+						}
 
 						// The two dimensions come from DIFFERENT sources — render from the View
 						// CB's view rect, output from this dispatch's coverage — so they can
@@ -1974,8 +1533,19 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								fd.output_width, fd.output_height);
 						}
 
-						if (dims_ok && colour != nullptr && output != nullptr &&
-							ngx::ensure_feature(native, fd))
+						// ensure_feature is called EXACTLY ONCE per dispatch. It creates and
+						// releases the NGX feature, so calling it twice to answer "did it
+						// fail?" separately from "shall we evaluate?" would have doubled the
+						// create/release traffic on every frame.
+						const bool roles_ok =
+							dims_ok && colour != nullptr && output != nullptr;
+						const bool feature_ok = roles_ok && ngx::ensure_feature(native, fd);
+						if (seam_gate == seam::Gate::engine && !roles_ok)
+							seamhook::note_outcome(seam::SeamRefusal::role_unresolved);
+						else if (seam_gate == seam::Gate::engine && !feature_ok)
+							seamhook::note_outcome(seam::SeamRefusal::create_failed);
+
+						if (feature_ok)
 						{
 							// Our resolve just wrote the motion vectors as a UAV; NGX reads
 							// them as a shader resource. Without this the state is simply
@@ -2194,29 +1764,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							}
 							else
 							{
-								// RR-first when [STRAYDLSS] NgxRR=2; SR is the safety net
-								// for ANY missing precondition, every frame.
-								ok = false;
-								const int rrm =
-									g_ngx_rr_mode.load(std::memory_order_relaxed);
-								if (rrm == 2 || rrm == 3)
+								// DLSS SR. Ray Reconstruction used to get first refusal here
+								// and SR was its per-frame fallback, which is why this used to
+								// be wrapped in `if (!ok)`. RR's guide source was the heuristic
+								// G-buffer finder, deleted 2026-09-03 (report §13), so SR is
+								// the only evaluate on this path until RR is rewired to the
+								// engine's own named G-buffer textures.
 								{
-									ok = try_evaluate_rr(native_device, native, ei, fd, view);
-									if (ok)
-										g_rr_evaluates.fetch_add(1,
-											std::memory_order_relaxed);
-									else
-										g_rr_fallbacks.fetch_add(1,
-											std::memory_order_relaxed);
-									// RR-1: arm/disarm SSD suppression from this outcome.
-									update_rr1_arm(ok);
+									perf::Scope perf_sr(perf::kNgxSr);
+									ok = ngx::evaluate(native, ei);
+									if (ok) perf::stall_note_evaluate();
 								}
-								if (!ok)
-									{
-										perf::Scope perf_sr(perf::kNgxSr);
-										ok = ngx::evaluate(native, ei);
-										if (ok) perf::stall_note_evaluate();
-									}
 
 								// DLSS Neural Rendering (NGX feature 18) runs at Present, not
 								// here — but its guides can only be captured here. (ngx_nr.hpp)
@@ -2234,6 +1792,9 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 										ei.render_width, ei.render_height, ei.reset);
 								}
 							}
+							if (seam_gate == seam::Gate::engine)
+								seamhook::note_outcome(ok ? seam::SeamRefusal::none
+								                          : seam::SeamRefusal::eval_failed);
 							if (ok)
 							{
 								g_ngx_evaluated_once.store(true, std::memory_order_relaxed);
@@ -2400,6 +1961,13 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 {
 	attempts = g_resolve_attempts.load(std::memory_order_relaxed);
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
+}
+
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view)
+{
+	ok = g_view_row135_ok.load(std::memory_order_relaxed);
+	bad = g_view_row135_bad.load(std::memory_order_relaxed);
+	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

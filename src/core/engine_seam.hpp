@@ -92,6 +92,80 @@ constexpr std::size_t kIntRectSize = 16;
 constexpr std::uint32_t kTaaTileSize = 8;
 
 // ---------------------------------------------------------------------------------------
+// L1: FRDGTexture -> ID3D12Resource, all [derived] and UNCONFIRMED until the box
+// ---------------------------------------------------------------------------------------
+//
+// The chain, HARD from UE 4.27.2 source (docs/RESEARCH-ENGINE-TAA-HOOK.md §4.2):
+//   FRDGTextureRef == FRDGTexture*                         (RenderGraphDefinitions.h:555)
+//   FRDGResource: vptr@0, `const TCHAR* Name`@8, `FRHIResource* ResourceRHI`@16
+//                                              (RenderGraphResources.h:121, Shipping RDG_ENABLE_DEBUG=0)
+//   FRHITexture::GetNativeResource() virtual returning ID3D12Resource*  (RHIResources.h:997)
+//   D3D12: TD3D12Texture2D::GetNativeResource -> FD3D12Resource::GetResource -> ID3D12Resource*
+//
+// ResourceRHI is null at AddPasses time for a graph-allocated texture (assigned in
+// FRDGBuilder::Execute's CollectPassResources loop); it is non-null at DISPATCH time, which is
+// when the seam claims. So the resolve happens at claim time, never at the AddPasses thunk.
+// NOT A LAYOUT GUESS - it is `GetRHI()`, spelled as an offset. UE 4.27's accessor is
+// `FRHIResource* GetRHI() const { ValidateRHIAccess(); return ResourceRHI; }`, inline in
+// RenderGraphResources.h, and in Shipping (RDG_ENABLE_DEBUG == 0) ValidateRHIAccess() is a
+// no-op — so it compiles to this single load and there is no out-of-line symbol to call
+// instead. NVIDIA's own DLSS plugin reads the same field the same way from inside an RDG pass
+// lambda; we read it from inside AddPasses because we cannot author a pass (report §14).
+constexpr std::size_t kRdgResourceRhiOffset = 16;
+
+// FRHITexture's vtable slot for GetNativeResource in a Shipping build (ENABLE_RHI_VALIDATION=0,
+// so one vptr). FRHIResource declares one virtual (its dtor); FRHITexture then declares
+// GetTexture2D, GetTexture2DArray, GetTexture3D, GetTextureCube, GetTextureReference,
+// GetSizeXYZ, GetNativeResource -> slot 7. [derived] from the MSVC ABI, not measured.
+constexpr unsigned kRhiGetNativeResourceSlot = 7;
+
+// A guarded memory reader the live half supplies; the tests supply an in-memory fake. `read`
+// returns false when the address is not safely readable, so the pure resolver never assumes a
+// dereference succeeded. `is_code` is true when the address is inside an executable section of
+// a loaded module — the guard that stops us calling a garbage `GetNativeResource` pointer.
+struct RdgReader
+{
+	bool (*read_u64)(void *ctx, std::uint64_t va, std::uint64_t *out) = nullptr;
+	bool (*is_code)(void *ctx, std::uint64_t va) = nullptr;
+	void *ctx = nullptr;
+};
+
+enum class RhiChain : std::uint8_t
+{
+	ok = 0,
+	null_rdg,      // the FRDGTexture pointer itself was 0 (the engine passed no texture)
+	rhi_null,      // ResourceRHI is 0 — the texture is transient and not yet allocated
+	rhi_unreadable,// ResourceRHI or its vtable could not be read
+	fn_not_code,   // the resolved GetNativeResource slot does not point into code
+	count
+};
+const char *rhi_chain_name(RhiChain c);
+
+// Walks FRDGTexture -> FRHITexture -> the GetNativeResource function pointer, WITHOUT calling
+// it (the call is the live half's job — a pure function cannot invoke an engine method). Every
+// dereference goes through `r.read_u64`, so a bad pointer is a status, never a fault. On `ok`,
+// `out_rhi` is the FRHITexture* and `out_fn` is the address to call with it.
+RhiChain resolve_rhi_fn(const RdgReader &r, std::uint64_t rdg,
+                        std::uint64_t *out_rhi, std::uint64_t *out_fn);
+
+// Why an engine-announced frame did not reach a DLSS evaluate. Continuous counters (not
+// once-per-pass): a rate that climbs is the "DLSS flip" the user sees, and the breakdown says
+// which gate to fix. `no_dispatch` is the ledger's `unclaimed` (the matcher rejected the real
+// dispatch, so it never claimed); the rest are a claimed engine dispatch failing downstream.
+enum class SeamRefusal : std::uint8_t
+{
+	none = 0,       // SR evaluated — the good outcome
+	view_unreadable,// claimed, but no bound constant buffer decoded as a plausible View
+	dead_inputs,    // claimed, but depth/velocity not live AND the engine inputs did not resolve
+	role_unresolved,// claimed, live, but colour or output could not be identified
+	mv_failed,      // claimed, the motion-vector resolve did not record
+	create_failed,  // claimed, NGX ensure_feature failed
+	eval_failed,    // claimed, EvaluateFeature returned failure
+	count
+};
+const char *seam_refusal_name(SeamRefusal r);
+
+// ---------------------------------------------------------------------------------------
 // Mode, and the gate decision
 // ---------------------------------------------------------------------------------------
 
@@ -237,12 +311,100 @@ struct Announcement
 	std::uint64_t sequence = 0;
 	std::uint32_t out_width = 0;
 	std::uint32_t out_height = 0;
-	// FRDGTexture identities from FPassInputs. Compared, never dereferenced.
+	// FRDGTexture identities from FPassInputs. Compared, never dereferenced OUTSIDE AddPasses.
 	std::uint64_t colour_rdg = 0;
 	std::uint64_t depth_rdg = 0;
 	std::uint64_t velocity_rdg = 0;
+	// The SAME textures, already resolved to ID3D12Resource* ON THE RENDER THREAD INSIDE
+	// AddPasses, where the FRDGBuilder is provably alive because we are inside its setup.
+	// This is the whole architecture (report §12.9): `FRDGBuilder::Execute()` ends with
+	// `Clear()` -> `Allocator.ReleaseAll()`, which frees every FRDGTexture, and it neither
+	// flushes nor waits for the RHI thread - while `FRHICommandList` is "definitions for
+	// queueing up & executing later" and a pass lambda's DispatchComputeShader does
+	// ALLOC_COMMAND rather than calling the RHI. So the D3D12 Dispatch we intercept happens
+	// AFTER the arena is freed, on another thread. Resolving there read freed memory by
+	// construction; resolving here cannot.
+	std::uint64_t colour_res = 0;
+	std::uint64_t depth_res = 0;
+	std::uint64_t velocity_res = 0;
+	RhiChain colour_status = RhiChain::null_rdg;
+	RhiChain depth_status = RhiChain::null_rdg;
+	RhiChain velocity_status = RhiChain::null_rdg;
+	// The OS thread that announced. An FRDGTexture is owned by the FRDGBuilder that made it,
+	// and that builder lives on one thread's stack for the length of one Execute — so a claim
+	// from another thread is a claim against memory that thread may already have recycled.
+	std::uint64_t thread = 0;
 	bool consumed = false;
 };
+
+// WHETHER AN ANNOUNCEMENT'S FRDGTexture POINTERS MAY STILL BE DEREFERENCED.
+//
+// This is the guard L1 shipped without, and its absence is what crashed the game
+// (docs/RESEARCH-ENGINE-TAA-HOOK.md §12). The ledger deliberately holds an announcement for up
+// to `kRetireAfterAnnouncements` newer announcements or `kRetireAfterFrames` presents, because
+// CORRELATION wants that slack: a dispatch that arrives late still names the right rect, and
+// `unclaimed` stays honest. IDENTITY survives that slack; POINTERS do not. `FRDGTexture` is
+// allocated from the frame's `FRDGAllocator`, which the builder resets when Execute finishes,
+// so the instant the announcing graph is gone the pointer addresses recycled arena memory —
+// where `+16` is no longer `ResourceRHI` but whatever the next allocation put there.
+//
+// >>> THIS IS NO LONGER A GATE. It is a PIPELINE-DEPTH DIAGNOSTIC. <<<
+//
+// It was a gate for exactly one build, and the box retired it: `stale=4147` of 4147 claims with
+// `resolved=0`, because the steady state IS "not the newest, and the frame has turned over" —
+// by one, every frame. UE 4.27 runs RDG setup on the render thread and drains the RHI command
+// list on another, one frame behind, so by the time our hook sees a dispatch the render thread
+// has already built the next graph (report §12.9).
+//
+// The right conclusion was NOT a narrower gate. It was that resolving at claim time is
+// unsafe *whatever* this returns — `FRDGBuilder::Execute()` frees the arena before the
+// commands ever run — so the dereference moved into `AddPasses`, and the announcement now
+// carries plain `ID3D12Resource*` that no allocator owns. Nothing about lifetime is decided
+// here any more; liveness at claim is the check.
+//
+// Kept because the number is worth reading: it measures how far the RHI thread lags, and a
+// sudden change in it means the engine's threading moved under us.
+//
+// THREAD IDENTITY IS NOT PART OF THE RULE EITHER, and a version that required it also shipped
+// and also made L1 inert (§12.8). Thread identity governs OWNERSHIP, not VALIDITY: memory held
+// by a live stack frame is readable from any thread. The two ids below are carried so the
+// caller can REPORT the pair and notice if it ever changes; nothing looks at them.
+struct Freshness
+{
+	std::uint64_t announce_sequence = 0; // Announcement::sequence
+	std::uint64_t ledger_sequence = 0;   // Ledger::sequence(), i.e. the newest announcement
+	std::uint64_t announce_frame = 0;    // Announcement::frame
+	std::uint64_t current_frame = 0;     // the ledger's frame at claim time
+	std::uint64_t announce_thread = 0;   // Announcement::thread — REPORTED, never tested
+	std::uint64_t current_thread = 0;    // the dispatch-recording thread — REPORTED, never tested
+};
+bool announcement_is_fresh(const Freshness &f);
+
+// Whether L1 may dereference this frame's FPassInputs, and if not, why. Pure so that the
+// off-switch is TESTED rather than asserted: `[STRAYDLSS] EngineSeamInputs=0` must leave the
+// plugin behaving exactly as it did before L1 existed, and `off` is the only outcome it can
+// produce. Every other outcome except `resolve` also falls back to the heuristic — the
+// difference is only what the [seam] line counts and what it says once.
+enum class L1Gate : std::uint8_t
+{
+	off = 0,   // EngineSeamInputs=0, not authoritative, seam not live, or nothing announced
+	faulted,   // a guarded read or call already faulted; L1 is off for the session
+	resolve,   // proceed
+};
+const char *l1_gate_name(L1Gate g);
+
+struct L1GateInputs
+{
+	bool inputs_enabled = false; // [STRAYDLSS] EngineSeamInputs
+	Mode mode = Mode::off;
+	bool hooked = false;
+	bool announced = false;      // announce: always true; claim: this dispatch claimed one
+	bool faulted = false;        // the session has already seen a guarded read fault
+};
+// Used at BOTH ends: inside AddPasses to decide whether to resolve at all, and at claim to
+// decide whether to hand the resolved resources on. There is deliberately no freshness term —
+// see `announcement_is_fresh`, which is now a DIAGNOSTIC rather than a gate.
+L1Gate l1_gate(const L1GateInputs &in);
 
 struct LedgerCounters
 {
@@ -261,6 +423,12 @@ struct LedgerCounters
 	// It is expected to be non-zero and is NOT an error; `unclaimed` is.
 	std::uint64_t rect_mismatch = 0;
 	std::uint64_t overflow = 0; // more concurrent announcements than the ring holds
+	// A dispatch arrived with EXACTLY the group counts a pending announcement expects, and it
+	// never reached claim() because the matcher refused it first. This is the instrument that
+	// tells the two causes of `unclaimed` apart: non-zero means the real dispatch IS there and
+	// a gate is rejecting it (fixable, and the reason is logged); zero means the engine
+	// announced an upscale no dispatch ever followed (not a loss - nothing to intercept).
+	std::uint64_t near_misses = 0;
 };
 
 // When an unclaimed announcement is retired. Announcement and dispatch both happen on the
@@ -289,9 +457,15 @@ public:
 	std::size_t pending() const;
 	const LedgerCounters &counters() const { return m_counters; }
 	std::uint64_t sequence() const { return m_sequence; }
+	std::uint64_t frame() const { return m_frame; }
 
 	// ceil(extent / kTaaTileSize), the group count UE 4.27 issues for a Main* config.
 	static std::uint32_t expected_groups(std::uint32_t extent);
+
+	// Does any UNCONSUMED announcement expect exactly these group counts? Asked for a dispatch
+	// the matcher REFUSED, so that "the real pass arrived and a gate rejected it" and "no
+	// dispatch ever came" stop being the same number. Counts a near miss when true.
+	bool note_unmatched(std::uint32_t group_x, std::uint32_t group_y);
 
 private:
 	void retire_stale();

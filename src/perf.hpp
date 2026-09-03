@@ -46,9 +46,13 @@ enum Bucket
 {
 	kDispatchPath = 0, // whole post-gate intercept_dispatch body (CONTAINS the buckets below)
 	kMvResolve,        // mv::record
-	kGBufferResolve,   // gbr::record (the RR guide resolve)
 	kNgxSr,            // ngx::evaluate      (DLSS SR)
-	kNgxRr,            // ngx::evaluate_rr   (DLSS Ray Reconstruction)
+	// ngx::evaluate_rr (DLSS Ray Reconstruction). ALWAYS ZERO since 2026-09-03: its only
+	// timing scope lived inside try_evaluate_rr, which went with the heuristic G-buffer
+	// finder (taa_hook.hpp). Kept so the bucket ordering and the NGX side stay intact for
+	// when RR is rewired to the engine's own named G-buffer textures - a zero here means
+	// "not wired", never "free".
+	kNgxRr,
 	kNgxNr,            // nr::apply          (DLSS Neural Rendering, feature 18)
 	kRestore,          // restore_game_compute_state
 	// Present-owner CPU mechanics, NOT nested in kDispatchPath (so the intercept subtraction
