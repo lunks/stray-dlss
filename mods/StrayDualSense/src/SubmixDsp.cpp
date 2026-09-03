@@ -26,11 +26,38 @@ void DownmixToStereo(const float* interleaved, std::size_t frames, int numChanne
         }
         return;
     }
+
+    // UE 4.27 AudioMixerChannelMaps.cpp:86-91, ToStereoMatrix, one row per output channel and
+    // one column per engine channel (FL FR C LFE SL SR BL BR). AUDIO_MIXER_MAX_OUTPUT_CHANNELS
+    // is 8, so a wider input is folded on its first eight channels — the engine itself refuses
+    // such a source ("Unsupported source channel count", :298).
+    constexpr int   kEngineMaxChannels = 8;
+    constexpr float kLeft[kEngineMaxChannels]  = { 1.0f, 0.0f, kFoldCentreAndSurround, 0.0f,
+                                                   kFoldCentreAndSurround, 0.0f,
+                                                   kFoldCentreAndSurround, 0.0f };
+    constexpr float kRight[kEngineMaxChannels] = { 0.0f, 1.0f, kFoldCentreAndSurround, 0.0f,
+                                                   0.0f, kFoldCentreAndSurround,
+                                                   0.0f, kFoldCentreAndSurround };
+    // Get2DChannelMapInternal: every source channel indexes the matrix column of the same
+    // number, EXCEPT quad, whose channels 0 1 2 3 are FL FR SL SR and map to columns 0 1 4 5
+    // (:379-404). Anything else is the general loop at :437-444.
+    constexpr int kQuadColumns[4] = { 0, 1, 4, 5 };
+    const int used = numChannels < kEngineMaxChannels ? numChannels : kEngineMaxChannels;
+
     const std::size_t stride = static_cast<std::size_t>(numChannels);
     for (std::size_t i = 0; i < frames; ++i)
     {
-        out[i * 2]     = interleaved[i * stride];
-        out[i * 2 + 1] = interleaved[i * stride + 1];
+        const float* frame = interleaved + i * stride;
+        float l = 0.0f;
+        float r = 0.0f;
+        for (int c = 0; c < used; ++c)
+        {
+            const int column = numChannels == 4 ? kQuadColumns[c] : c;
+            l += frame[c] * kLeft[column];
+            r += frame[c] * kRight[column];
+        }
+        out[i * 2]     = l;
+        out[i * 2 + 1] = r;
     }
 }
 

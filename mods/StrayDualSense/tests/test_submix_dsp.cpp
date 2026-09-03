@@ -42,15 +42,78 @@ int main()
         DownmixToStereo(st, 3, 2, out);
         Check(out[0] == 1 && out[1] == 2 && out[4] == 5 && out[5] == 6, "stereo passes straight through");
     }
+    // THE ENGINE'S FOLD, coefficient for coefficient (UE 4.27 AudioMixerChannelMaps.cpp:86-91,
+    // ToStereoMatrix; docs/RESEARCH-UE-PAD-AUDIO-ENDPOINT.md §3.3). This is what the real PS5
+    // endpoint receives, so it is what the coils must receive from us.
     {
-        // 6 channels: FL FR C LFE SL SR. Only FL/FR reach the grips — a surround FOLD would
-        // put the centre channel in both hands and smear anything directional.
-        const float surround[12] = { 1, 2, 90, 91, 92, 93,
-                                     4, 5, 94, 95, 96, 97 };
+        // 6 channels in the engine's order: FL FR C LFE SL SR.
+        //   L = FL + 0.707 C + 0.707 SL      R = FR + 0.707 C + 0.707 SR      LFE dropped
+        const float surround[12] = { 1, 2, 10, 1000, 20, 30,
+                                     4, 5, 40, 1000, 50, 60 };
         float out[4] = {};
         DownmixToStereo(surround, 2, 6, out);
-        Check(out[0] == 1 && out[1] == 2, "6ch: frame 0 takes channels 0/1 only");
-        Check(out[2] == 4 && out[3] == 5, "6ch: frame 1 takes channels 0/1 only");
+        Check(Near(out[0], 1 + 0.707f * 10 + 0.707f * 20), "6ch: L = FL + 0.707 C + 0.707 SL");
+        Check(Near(out[1], 2 + 0.707f * 10 + 0.707f * 30), "6ch: R = FR + 0.707 C + 0.707 SR");
+        Check(Near(out[2], 4 + 0.707f * 40 + 0.707f * 50) && Near(out[3], 5 + 0.707f * 40 + 0.707f * 60),
+              "6ch: frame 1 folds the same way");
+        Check(out[0] < 1000 && out[1] < 1000, "6ch: LFE is dropped (coefficient 0.0)");
+    }
+    {
+        // 8 channels — the measured `ch=8` — in the engine's column order: FL FR C LFE SL SR
+        // BL BR. Every coefficient of the cited table, exercised one column at a time by a
+        // unit impulse in each channel.
+        const float expectL[8] = { 1.0f, 0.0f, 0.707f, 0.0f, 0.707f, 0.0f, 0.707f, 0.0f };
+        const float expectR[8] = { 0.0f, 1.0f, 0.707f, 0.0f, 0.0f, 0.707f, 0.0f, 0.707f };
+        bool allOk = true;
+        for (int c = 0; c < 8; ++c)
+        {
+            float impulse[8] = {};
+            impulse[c] = 1.0f;
+            float out[2] = { -1, -1 };
+            DownmixToStereo(impulse, 1, 8, out);
+            if (!Near(out[0], expectL[c]) || !Near(out[1], expectR[c]))
+            {
+                allOk = false;
+                std::printf("      8ch column %d -> L %.3f R %.3f (want %.3f %.3f)\n", c,
+                            static_cast<double>(out[0]), static_cast<double>(out[1]),
+                            static_cast<double>(expectL[c]), static_cast<double>(expectR[c]));
+            }
+        }
+        Check(allOk, "8ch: every column of ToStereoMatrix (AudioMixerChannelMaps.cpp:86-91) is exact");
+        Check(Near(kFoldCentreAndSurround, 0.707f), "the fold coefficient is the engine's literal 0.707, not 1/sqrt(2)");
+    }
+    {
+        // A REAR-ONLY input is no longer silent: a spatialised haptic send behind the cat
+        // lands in BL/BR (8ch) or SL/SR (6ch), and the engine's endpoint shakes the coils at
+        // -3 dB for it. The old channels-0/1 fold dropped it to exactly zero.
+        const float rearOnly8[8] = { 0, 0, 0, 0, 0, 0, 0.5f, 0.25f };   // BL, BR
+        float out[2] = {};
+        DownmixToStereo(rearOnly8, 1, 8, out);
+        Check(Near(out[0], 0.707f * 0.5f) && Near(out[1], 0.707f * 0.25f),
+              "8ch rear-only: BL reaches the LEFT grip and BR the RIGHT, at 0.707");
+        const float rearOnly6[6] = { 0, 0, 0, 0, 0.5f, 0.25f };        // SL, SR
+        DownmixToStereo(rearOnly6, 1, 6, out);
+        Check(Near(out[0], 0.707f * 0.5f) && Near(out[1], 0.707f * 0.25f),
+              "6ch rear-only: SL/SR reach their grips at 0.707 - not silence");
+        const float centreOnly[6] = { 0, 0, 1.0f, 0, 0, 0 };
+        DownmixToStereo(centreOnly, 1, 6, out);
+        Check(Near(out[0], 0.707f) && Near(out[1], 0.707f), "centre goes to BOTH grips at 0.707");
+    }
+    {
+        // QUAD is the engine's special case: channels 0 1 2 3 are FL FR SL SR and index
+        // columns 0 1 4 5 (Get2DChannelMapInternal :379-404), NOT columns 2/3 (C/LFE).
+        const float quad[4] = { 1, 2, 10, 20 };
+        float out[2] = {};
+        DownmixToStereo(quad, 1, 4, out);
+        Check(Near(out[0], 1 + 0.707f * 10) && Near(out[1], 2 + 0.707f * 20),
+              "quad: SL/SR fold into their grips at 0.707 (columns 4/5, the engine's special case)");
+    }
+    {
+        // Wider than the engine's own maximum (8): folded on the first eight, never read past.
+        const float wide[10] = { 1, 2, 0, 0, 0, 0, 0, 0, 999, 999 };
+        float out[2] = {};
+        DownmixToStereo(wide, 1, 10, out);
+        Check(Near(out[0], 1) && Near(out[1], 2), "10ch: channels beyond the engine's 8 are ignored");
     }
     {
         float out[4] = { 9, 9, 9, 9 };

@@ -39,15 +39,69 @@ constexpr std::uint32_t kSubmixDefaultRate = 48000;
 // count — getting that backwards is a factor-of-N speed error, so the caller converts once
 // and this takes frames.
 //
-// The VIBE assets are stereo because the pad has two coils, one per grip
-// (docs/STRAY-DUALSENSE.md §12), so channels 0 and 1 are exactly what we want.
+// THIS IS A REPRODUCTION OF ENGINE CODE, AND THAT IS THE SECOND-BEST ANSWER. Read the three
+// paragraphs below before changing it: they are why we do not call the engine's own fold, and
+// what would let us stop folding altogether.
 //
-//   1 channel  -> the same signal to both grips
-//   2 channels -> straight through
-//   >2         -> channels 0 and 1 only. Deliberately NOT a surround downmix: folding
-//                 centre/LFE/rears into a grip would smear a directional effect across both
-//                 hands, and UE's own channel order puts FL/FR first regardless.
+// WHAT THE ENGINE DOES, and the exact call chain (HARD, Epic 4.27 @ 3abfe77d):
+//   FMixerSubmix::ProcessAudioAndSendToEndpoint      AudioMixerSubmix.cpp:1537-1642
+//     -> FMixerSubmix::DownmixBuffer(...)                                :1623
+//          -> FMixerDevice::Get2DChannelMap(false, in, out, false, map)  :380-385
+//          -> Audio::DownmixBuffer(in, out, buf, buf, map.GetData())
+//   and `Get2DChannelMap` hands back `ToStereoMatrix` for a 2-channel destination
+//   (AudioMixerChannelMaps.cpp:86-91, *"Tables based on Ac-3 down-mixing"* :70-72; the same
+//   numbers live in 5.8's SignalProcessing/Private/ChannelMap.cpp:26-31).
+//   (Aside, so the next reader is not confused by it: :1621-1622 builds an
+//   `EndpointData.DownmixChannelMap` that nothing consumes — the member function on the next
+//   line builds its own. Dead engine code, not a second matrix.)
+//
+// WHY WE REPRODUCE IT RATHER THAN CALL IT. All three candidates were checked and none is
+// reachable from this plugin in THIS build:
+//   * `Audio::DownmixBuffer` is `SIGNALPROCESSING_API` and `FMixerDevice::Get2DChannelMap` is
+//     a static member of an `AUDIOMIXER_API` class — export macros that expand to NOTHING in
+//     a monolithic build, and Stray ships one `Stray-Win64-Shipping.exe`. There is no symbol
+//     to import. This project already learned that the hard way: it reaches
+//     `FAudioDevice::RegisterSubmixBufferListener` by VTABLE INDEX (SubmixDiscovery.hpp)
+//     precisely because no engine symbol is linkable here.
+//   * None of the three is virtual — `Get2DChannelMap` is static, `Audio::DownmixBuffer` is a
+//     free function, `FMixerSubmix::DownmixBuffer` is a non-virtual member — so there is no
+//     devirtualisable call to piggyback on, the way the tap and the reroute do.
+//   * That leaves a signature scan, and it is a bad trade HERE: these are small leaf routines
+//     with SIMD variants, no anchoring string, and `/OPT:ICF` folding, and a wrong match is
+//     called with raw buffer pointers — memory corruption in someone's game. Eight float
+//     constants whose correctness CI proves column by column are the safer half of that trade.
+// **So this is a copy, and it is only correct for engine 4.27.2** (`AudioMixerChannelMaps.cpp`
+// :86-91). It will not track a different build; check it against the cited file if the game's
+// engine ever moves.
+//
+// WHAT WOULD DELETE THIS FUNCTION: being the endpoint rather than tapping a submix
+// (docs/RESEARCH-UE-PAD-AUDIO-ENDPOINT.md §8 #2). An `IAudioEndpoint` DECLARES its own channel
+// count and the engine folds and resamples TO it — that is the whole chain above. A buffer
+// listener cannot: `FMixerSubmix::NumChannels` is assigned `MixerDevice->GetNumDeviceChannels()`
+// unconditionally (AudioMixerSubmix.cpp:303, :317, :1073 — 4.27 has no per-submix channel
+// format left), and the listener is called with exactly that (:1380). **So there is no
+// property we could write, reflectively or otherwise, to make the engine hand this tap
+// stereo.** HARD, and it is the reason the fold has to happen on our side at all.
+//
+// `ToStereoMatrix` (:86-91), columns in the engine's own order:
+//
+//            FL    FR    C      LFE   SL     SR     BL     BR
+//   Left  =  1.0   0.0   0.707  0.0   0.707  0.0    0.707  0.0
+//   Right =  0.0   1.0   0.707  0.0   0.0    0.707  0.0    0.707
+//
+// Get2DChannelMapInternal (:318-446) applies it by source-channel INDEX for every count but
+// two special cases: QUAD maps its four channels to columns 0 1 4 5 (:379-404), and MONO is a
+// project setting (au.MonoChannelUpmixMethod, :356-371) that this plugin cannot read and that
+// cannot arise here — the submix renders at the device count, never 1 — so mono stays the
+// same signal to both grips.
+//
+// The earlier fold kept channels 0/1 and DROPPED C/SL/SR/BL/BR, on the argument that a rear
+// channel in a grip smears a directional effect. The engine does not make that choice: it
+// keeps SL/BL on the left grip and SR/BR on the right at -3 dB and puts C on both, and
+// Stray's haptic sends are SPATIALISED (PS5VibrationAttenuation, HARD from the pak), so a
+// source behind the cat lands in the rear channels and used to vanish from the coils.
 // ---------------------------------------------------------------------------------------
+constexpr float kFoldCentreAndSurround = 0.707f;   // the engine's literal, not 1/sqrt(2)
 void DownmixToStereo(const float* interleaved, std::size_t frames, int numChannels,
                      float* outInterleavedStereo);
 
