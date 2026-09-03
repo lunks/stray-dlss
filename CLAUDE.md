@@ -1520,6 +1520,18 @@ nothing else. All three pass:**
 | `OutputVelocity > 0` | `BasePassVertexShader.usf:225` / `BasePassPixelShader.usf:985`; fed by `bOutputVelocity \|\| AlwaysHasVelocity()` (`PrimitiveSceneProxy.cpp:385`) | `FurComponent.cpp:42` sets **`bAlwaysHasVelocity = true`**, so it is 1 unconditionally | **HARD** |
 | `DrawsVelocity != 0` | `BasePassPixelShader.usf:997` zeroes the result otherwise; `DrawsVelocity()` is `return IsMovable();` (`PrimitiveSceneProxy.h:571-575`) | the cat's fur component is movable | **HARD** |
 
+**The full `WRITES_VELOCITY_TO_GBUFFER` expression has two further terms and both are satisfied**,
+which is worth spelling out because one of them looks alarming at first: it is
+`(SUPPORTS_WRITING_VELOCITY_TO_BASE_PASS || USES_GBUFFER) && GBUFFER_HAS_VELOCITY &&
+(!SELECTIVE_BASEPASS_OUTPUTS || !(STATICLIGHTING_TEXTUREMASK || STATICLIGHTING_SIGNEDDISTANCEFIELD
+|| HQ_TEXTURE_LIGHTMAP || LQ_TEXTURE_LIGHTMAP || WATER_MESH_FACTORY))`. `GBUFFER_HAS_VELOCITY` is
+`IsUsingBasePassVelocity` (`ShaderCompiler.cpp:4708`), i.e. `r.BasePassOutputsVelocity`, which
+Stray ships True. The static-lighting term is disarmed twice over: `r.SelectiveBasePassOutputs`
+defaults to 0, and the lightmap defines come from the vertex factory's lightmap policy while
+gFur's VFs declare `bSupportsStaticLighting = false`. **So `bUsedWithStaticLighting` appearing in
+the fur material's own name table (§34.4) is not a problem** — it is a material USAGE flag, not a
+vertex-factory capability, and it cannot reach these defines.
+
 And the previous position the VS fetches is real, not a stand-in for the current one:
 `GFurFactory.ush:722-726` implements `VertexFactoryGetPreviousWorldPosition` → `SkinPreviousPosition`
 (`:390-416`), which uses `CalcPreviousBoneMatrix`, `Primitive.PreviousLocalToWorld`, the previous
