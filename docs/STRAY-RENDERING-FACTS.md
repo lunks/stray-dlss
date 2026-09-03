@@ -1362,7 +1362,6 @@ ResizeBuffers/ResizeBuffers1 — `core::fg_plan::GameIndexMirror`, unit-tested. 
 in-process cross-check available today (the native host has no render-target-bind tap), so a
 mirror error would show as a STALE presented frame; that is what the stage-1 screenshot
 protocol looks for.
-||||||| df1b48d
 
 ### 32.5 No Streamline, by construction — what the snippet reads that only Streamline used to supply
 
@@ -1633,7 +1632,6 @@ fg: generated output VALIDATED (3 consecutive ok crops: generated nonzero 3525/4
   without the pass). Legitimately not generatable: a generated frame needs this frame's depth
   and motion vectors. HARD. The `[fg/ngx]` line and `fg_ngx_refused_*` status keys added in
   the follow-up commit attribute future refusals without this reconstruction.
-||||||| f600641
 
 ### 32.11 The pacing fault, named by the trace, and the phase-locked pacer (2026-09-02 19:59-20:30)
 
