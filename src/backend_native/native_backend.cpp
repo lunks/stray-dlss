@@ -5,6 +5,7 @@
 #include "backend_native/descriptor_shadow.hpp"
 #include "backend_native/resource_registry.hpp"
 #include "backend_native/root_shadow.hpp"
+#include "backend_native/vram_query_watch.hpp"
 #include "backend_native/vtable_patch.hpp"
 #include "core/root_signature_walk.hpp"
 #include "d3d12_restore.hpp"

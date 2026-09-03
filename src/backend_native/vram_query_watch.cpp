@@ -1,9 +1,9 @@
-#include "vram_query_watch.hpp"
+#include "backend_native/vram_query_watch.hpp"
 
-#include "vtable_patch.hpp"
-#include "vtable_slots.hpp"
-#include "../host/config.hpp"
-#include "../log.hpp"
+#include "backend_native/vtable_patch.hpp"
+#include "backend_native/vtable_slots.hpp"
+#include "host/config.hpp"
+#include "log.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
