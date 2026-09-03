@@ -3139,3 +3139,53 @@ shadow leave the hot path. No urgency, and no reason to accept risk for it.
 (`ue4::pre_exposure_plausible`, `ViewParams::pre_exposure_row`); it was simply never printed. One
 log line settled a question that would otherwise have justified a new [derived] offset into
 `FViewInfo`. **Reach for the check the data already contains before building the identity path.**
+
+### 36.15 The cleanup is confirmed on the box: identical behaviour, ~3 970 lines lighter (2026-09-03)
+
+DLL md5 `b7d1cebc…` (`04f6f51`), menu, **no injected input**, same config. Ran past frame 13800,
+game healthy, **zero ERROR lines** other than the pre-existing `nvapi status -5` noise.
+
+**Behaviour is indistinguishable from `77d656e`:**
+
+```
+[seam] frame 13800: announced=13803 claimed=13671 unclaimed=129 orphans=0 lookalikesRefused=10416
+  | claimedButNoSR: viewUnreadable=0 deadInputs=0 roleUnresolved=0 mvFailed=0 createFailed=0 evalFailed=0
+  | evaluated=13550 | l1: resolved=0 partial=13671 fellBack=0 stale=12309 faults=0 off=0
+[view] frame 13800: row135 self-check ok=51915 bad=0
+DLSS evaluate OK: 1920x1080 -> 3840x2160 jitter=0.3594,0.3025 reset=0 preExposure=0.455
+[perf] our CPU/frame: intercept 0.33ms (2%), mv_resolve 0.01ms, ngx_sr 0.16ms (1%),
+       ngx_rr 0.00ms (0%, always 0 - RR is not wired), ngx_nr 0.40ms (2%), restore 0.01ms
+[fg] frame 14400: game presents=14401 issued=28524 generated=14124 (1.98x)
+```
+
+The DLL is **927 744 bytes against 1 028 608** — about 100 KB smaller.
+
+**The two bug fixes are correct and, at this resolution, dormant — which is the useful finding:**
+
+```
+ENGINE SEAM AUTHORITATIVE: ... engine rect 3840x2160, matcher rect 3840x2160, ... cooked-hash=yes
+```
+
+The engine's `OutputViewRect` and the matcher's `group count x 8` **agree exactly at 3840x2160**
+(480 groups), so preferring the engine's changes nothing here and would only matter at an output
+rect not divisible by 8. Likewise `cooked-hash=yes` means `trust_registers` was already true, so
+widening it to accept the engine's warrant is dormant until a hash falls out of the cooked table —
+which is exactly when it would have silently degraded the colour path before. **Both are latent
+correctness, not observable change; neither should be expected to move a number.**
+
+### 36.16 `NgxRR=1` refuses loudly, and the game is unaffected (2026-09-03)
+
+Deliberately set `NgxRR=1` for one launch (config restored byte-identical afterwards):
+
+```
+[ERROR] [STRAYDLSS] NgxRR=1 IS REFUSED: DLSS Ray Reconstruction has no guide source under this
+host. The heuristic G-buffer finder and its resolve pass were deleted on 2026-09-03; the NGX side
+(ensure_feature_rr / evaluate_rr) is intact and waiting for guides taken from the engine's own
+named G-buffer textures via the FViewInfo that AddPasses hands us. DLSS SR runs this session,
+unaffected. Set NgxRR=0 to make that the deliberate configuration and silence this line.
+```
+
+**No crash, and DLSS SR carried the session normally** (`[seam] frame 13200: claimed=13099`).
+Prime directive 2 satisfied: a feature that cannot work says so at ERROR rather than quietly doing
+nothing. `ngx::` still probes DLSSD availability at startup (`DLSS RR (DLSSD) available=1 …
+[NgxRR=0]`), which is the NGX half that was deliberately kept.
