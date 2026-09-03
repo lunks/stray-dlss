@@ -72,6 +72,11 @@ std::atomic<std::uint64_t> g_view_ambiguous{ 0 };
 std::atomic<std::uint64_t> g_view_ambiguous_claimed{ 0 };
 std::atomic<std::uint32_t> g_view_ambiguous_logged{ 0 };
 constexpr std::uint32_t kViewAmbiguousLogLimit = 4;
+// Every bound root CBV the search TRIES, i.e. one describe_resource + one 2448-byte read each.
+// This is the search's own cost, and it is what identity-from-the-engine would replace: divide it
+// by the dispatch count to get candidates per dispatch. Without it "deleting the search saves X"
+// is arithmetic over a guess.
+std::atomic<std::uint64_t> g_view_cb_reads{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -725,6 +730,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
+		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
@@ -2081,11 +2087,12 @@ void set_view_cb_audit(bool enabled)
 }
 
 void view_ambiguity_counters(std::uint64_t &single, std::uint64_t &ambiguous,
-                             std::uint64_t &ambiguous_claimed)
+                             std::uint64_t &ambiguous_claimed, std::uint64_t &cb_reads)
 {
 	single = g_view_single.load(std::memory_order_relaxed);
 	ambiguous = g_view_ambiguous.load(std::memory_order_relaxed);
 	ambiguous_claimed = g_view_ambiguous_claimed.load(std::memory_order_relaxed);
+	cb_reads = g_view_cb_reads.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook
