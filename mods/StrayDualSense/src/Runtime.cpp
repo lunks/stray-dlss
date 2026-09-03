@@ -615,11 +615,19 @@ void Runtime::PadThreadMain()
         // re-applied whenever the handle changes (a pad re-adopted after a disconnect loses
         // its routing) or the settings change (hot reload, so the sony-versus-hid question
         // is one ini edit and one keypress rather than one relaunch per arm).
-        if (m_pad.HasPad())
+        //
+        // The HID routes need NO libScePad handle — they go through HidMode's own HID device —
+        // so gating the whole thing on HasPad() would make `PadSpeakerRoute=hid` silently do
+        // nothing on a session where libScePad never binds, which is precisely the "silent
+        // refusal" this project refuses to ship. Only the Sony routes wait for a pad.
+        const PadSpeakerRoute wanted =
+            m_config.speaker ? m_config.padSpeakerRoute : PadSpeakerRoute::Off;
+        if (m_pad.HasPad() || !RouteUsesSony(wanted))
         {
             const uint64_t sig = SpeakerRouteSignature();
             const char*    why = nullptr;
-            if (m_speakerRouteApplied == 0)              why = "pad adopted";
+            if (m_speakerRouteApplied == 0)              why = m_pad.HasPad() ? "pad adopted"
+                                                                             : "no pad needed";
             else if (m_pad.Handle() != m_speakerRouteHandle) why = "pad handle changed";
             else if (sig != m_speakerRouteApplied)       why = "settings changed";
             if (why != nullptr)
