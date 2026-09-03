@@ -276,10 +276,6 @@ DiscoveryResult FindAudioDevice(const DiscoveryInput& in)
         return r;
     }
     const DeviceCandidate* chosen = &r.candidates[static_cast<std::size_t>(choice.index)];
-    const char* why = choice.why;
-
-    if (chosen == nullptr)
-        return r;
 
     r.ok         = true;
     r.device     = chosen->device;
@@ -288,7 +284,7 @@ DiscoveryResult FindAudioDevice(const DiscoveryInput& in)
     r.fromWorld  = chosen->fromWorld;
     r.deviceId   = chosen->id;
     r.sampleRate = chosen->sampleRate;
-    r.why        = why;
+    r.why        = choice.why;
     return r;
 }
 
