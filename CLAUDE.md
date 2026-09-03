@@ -32,6 +32,12 @@ Depth lives in two companion documents, both of which are load-bearing:
   this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
 * **`docs/RESEARCH-ENGINE-TAA-HOOK.md`** — how UE 4.27 itself says which dispatch is the TAA pass,
   and what that retires from §2.3. Read it before touching the identification path.
+* **`docs/RESEARCH-U0-IDENTITY.md`** — **the `u0` question is CLOSED: there is no engine route to
+  the TAA output UAV's identity**, verified against Epic's own `EpicGames/UnrealEngine` @ `4.27`
+  rather than inferred. Seven mechanisms, each refused for its own reason. Read it before
+  proposing to delete the descriptor shadow, and before assuming `u0` is a "graph-allocated
+  transient" — in 4.27 RDG has no transient allocator and every texture is a pooled render
+  target, so the blocker is a *schedule*, not a lifetime.
 
 ---
 
