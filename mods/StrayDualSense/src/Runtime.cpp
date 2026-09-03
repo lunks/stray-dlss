@@ -221,9 +221,11 @@ void Runtime::StartSubmix()
                       "this session and the coils will stay on the asset path.");
         return;
     }
-    if (m_config.SubmixDrivesCoils())
-        m_tapVibration->SetRing(&m_submixRing);
-
+    // The ring is NOT attached here. MEASURED 2026-09-03 (strict submix, first run): the tap
+    // filled it with silence from its first callback while nothing drained it, so at the
+    // handover the ring sat full (16384/16384, 1.8 M frames dropped) and STAYED near full once
+    // the sink pulled at exactly the production rate - about 300 ms between the engine's mix
+    // and the coils. It is attached at the handover instead, empty, right before the sink opens.
     if (m_config.submixProbeMaster)
     {
         // Meter only: never attached to the ring, so the game's whole soundtrack can never
@@ -574,6 +576,10 @@ void Runtime::StartSinkAtHandover(float peak)
     if (!m_sinkStarted)
     {
         m_sinkStarted = true;
+        // Attach the ring EMPTY, then open the sink: the sink's queue-ahead (40 ms) is the whole
+        // latency budget, not the ring's capacity (see StartSubmix).
+        m_submixRing.ResetCounters();
+        m_tapVibration->SetRing(&m_submixRing);
         m_submixSink.Start(&m_submixRing, m_config.endpointMatch, m_config,
                            [this] { m_hidMode.AssertNow("submix: silence -> signal"); });
         m_submixSink.SetGain(m_padVibrationEnabled.load() ? m_config.submixGain : 0.0f);

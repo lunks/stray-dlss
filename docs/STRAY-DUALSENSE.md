@@ -960,3 +960,56 @@ EGameControllerType @1` (1 byte; `0 Unknown, 1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro,
 5 KeyboardMouse`), called by `UMG_KeyIcon_C:Set Key`. The plugin's POST hook writes 3 into
 `RESULT_DECL` and the frame copy (`Glyphs=ps5`, default) and logs the observed call shape once.
 Whether the prompts actually change on screen has not been seen on this build.
+
+#### MEASURED 2026-09-03, build 0.3.0 (`341139e`): the reroute renders, the engine mixes, the coils are on the mix
+
+Two launches, both driven from the shell through `mods/StrayAudioProbe`'s command file (the
+plugin's own Start pre-hook opened the gate before the Lua's did: `DebugPS5Haptic(before)=true`).
+
+**Run A — `measure` + `SubmixReroute=1` + `ForcePS5HapticPath=1`:**
+
+```
+submix: REROUTE UObject writes: 'Submix_unused'.OutputVolume 1.000 -> 0.0, 'Submix_vibrationMaster'.ParentSubmix VibrationEndpointSubmix -> Submix_unused
+submix: REROUTE - about to call vtable slot 14 ... (parent, bInit=true) then (master, bInit=true)
+submix: REROUTE submitted.
+COILS: driven by the ASSET path | SUBMIX measure bound=1 live=0 cb=1728 (47.0/s) ch=8 rate=48000 frames/cb=1024 peak=0.00000   <- the subtree RENDERS
+  ...vib Scratch_VIBE...
+COILS: driven by the ASSET path | SUBMIX measure ... cb=2056 (45.9/s) peak=0.70795 rms=0.29357 | master-probe peak=0.00774      <- the engine MIXES, no speaker leak
+  ...stop...
+COILS: driven by the ASSET path | SUBMIX measure ... peak=0.00000
+```
+
+Slot 14 is therefore **HARD** for this build (the game did not die, the links were rebuilt), and
+so is the whole mechanism: a submix the mixer skipped for a whole session renders at 47 callbacks
+a second the moment its parent is a rendered one, and the `_VIBE` source played by the shipped
+Blueprint lands in it at peak 0.708 while the master probe stays at ~0.007 (`Submix_unused` at
+volume 0 holds). `ch=8`: the mixer runs at the device's 7.1.
+
+**Run B — strict `submix` + reroute + gate:**
+
+```
+haptics: 'Scratch_VIBE' NOT played on the asset path: COILS: NOBODY - the pad is SILENT by configuration ...
+submix: FIRST REAL SIGNAL (peak 0.70795) - HANDOVER: the SUBMIX now drives the coils.
+submix sink: 'Speakers (DualSense Wireless Controller)' 4ch 48000 Hz buf=48000, queue-ahead 1920 frames
+COILS: driven by the SUBMIX | SUBMIX submix bound=1 live=1 cb=2191 (46.0/s) ... peak=0.70795 rms=0.29317 | rerouted=1 | ring fill=14143/16384 drop=1940480 under=0 | sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=288960 fail=0
+STATUS coils=SUBMIX (HapticSource=submix: the engine's own mix, no asset path) ...
+```
+
+The chain is complete up to the pad's endpoint: no asset played, the engine's signal caused the
+handover, the sink streamed the mix to RL/RR. **What is NOT measured: how it feels.** Nobody was
+holding the pad. The user's test is the strict configuration
+(`deploy-submix-spike.sh --strict --reroute --gate`): whatever is felt came from the engine's mix,
+and a purr on top of rain should now be a SUM rather than a supersession.
+
+**Defect found by the numbers and fixed in the next build:** before the handover the ring was
+full of silence (`16384/16384 drop=1843200`) because the tap wrote from its first callback and
+nothing drained it, and after the handover it stayed near full — ~300 ms of latency. The ring is
+now attached, empty, at the handover, so the sink's 40 ms queue-ahead is the whole budget.
+
+**Glyphs:** `GetGameControllerType observed: RESULT_DECL=... (value 1) ... ReturnValue@1 size 1
+(value 37) _forceGamepad=true`. RESULT_DECL carries the real answer (1 = XBOX); the frame copy is
+garbage (37), so the post-hook's RESULT_DECL write is the one that matters. Three calls were forced
+to 3 during the menu; the pause menu opened by KEYBOARD showed ENTER/ESC prompts, which is the
+gamepad-only rule working (KeyboardMouse is left alone). **Whether the prompts show PlayStation
+glyphs when the pad is the active device is UNCONFIRMED** — the game reads the DualSense over
+hidraw, so a pad press cannot be injected from the shell; the user has to look.
