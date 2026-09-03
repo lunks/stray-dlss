@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 
 namespace stray_dlss::nrhook {
@@ -40,6 +41,31 @@ struct Guides
 };
 Guides g_guides;
 std::atomic<std::uint64_t> g_consumed{ 0 }; // highest sequence the stage has used
+
+// The consumer's own reference on a published guide, held for exactly as long as the stage uses
+// the pointer.
+//
+// WITHOUT THIS the publication references are not enough: on_present copies `g_guides` under the
+// lock and then uses the pointers with the lock released, and note_guides — on a different thread
+// — could publish in that window and drop the last reference to what we are still handing to NGX.
+// The window is small and the resources are usually the game's, which is exactly the shape of
+// race that shows up once a week as an unexplained fault.
+struct GuideRef
+{
+	ID3D12Resource *p = nullptr;
+	explicit GuideRef(ID3D12Resource *r) : p(r)
+	{
+		if (p != nullptr)
+			p->AddRef();
+	}
+	~GuideRef()
+	{
+		if (p != nullptr)
+			p->Release();
+	}
+	GuideRef(const GuideRef &) = delete;
+	GuideRef &operator=(const GuideRef &) = delete;
+};
 
 // --- counters ---
 std::atomic<std::uint64_t> g_triggered{ 0 };
@@ -106,7 +132,39 @@ std::uint32_t back_buffer_state() { return g_bb_state.load(std::memory_order_rel
 void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
                  std::uint32_t render_width, std::uint32_t render_height, bool reset)
 {
+	// NOTHING AT ALL AT THE DEFAULT SITE. The TAA hook calls this every frame so that no new
+	// wiring is needed if the mode ever becomes live-toggleable, but at `taa` the promise is that
+	// the shipped configuration is byte-identical — and the references taken below, however cheap,
+	// are not nothing. One relaxed atomic load is.
+	if (hook_mode() != nrplan::HookMode::present)
+		return;
+
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
+
+	// A REFERENCE IS TAKEN HERE, and the reason is the gap this site introduces.
+	//
+	// At the TAA site the guides are used in the same callback that produced them. Here they are
+	// published from a recording thread and consumed at Present, and UE4 rotates its pooled render
+	// targets constantly — so `depth` could in principle be destroyed in between, and NGX would
+	// then build a descriptor from a dead ID3D12Resource*. That is the CPU-side half of
+	// CLAUDE.md §5's descriptor hazard, and it faults inside the driver rather than returning an
+	// error.
+	//
+	// nr::apply's keep-alive ring covers the GPU-side half (it AddRefs everything it evaluates
+	// with and releases behind the lifetime fence), but it can only do so once the resource has
+	// survived long enough to be handed to it. This pair of references covers publish -> consume.
+	//
+	// The previous frame's are dropped HERE, on the same recording thread that would have
+	// destroyed them anyway, and never on the present thread.
+	if (depth != nullptr)
+		depth->AddRef();
+	if (motion_vectors != nullptr)
+		motion_vectors->AddRef();
+	if (g_guides.depth != nullptr)
+		g_guides.depth->Release();
+	if (g_guides.motion_vectors != nullptr)
+		g_guides.motion_vectors->Release();
+
 	g_guides.published = true;
 	++g_guides.sequence;
 	g_guides.depth = depth;
@@ -114,11 +172,6 @@ void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
 	g_guides.render_width = render_width;
 	g_guides.render_height = render_height;
 	g_guides.reset = reset;
-	// NO AddRef, deliberately, and the same choice the TAA site already makes. The publication and
-	// its consumption are inside ONE frame, and nr::apply is what holds every resource it
-	// evaluates with past GPU execution (ngx_nr.cpp's keep-alive ring, tagged against the lifetime
-	// fence). Taking a reference here would add a Release on the present thread that protects
-	// nothing the keep-alive does not already protect.
 }
 
 void on_present(const icept::PresentContext &pc, ID3D12Device *device)
@@ -172,9 +225,13 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 
 	nrplan::GuideState gs;
 	Guides guides;
+	// Taken INSIDE the lock, so the reference is on the resource the copy names. See GuideRef.
+	std::unique_ptr<GuideRef> depth_ref, motion_ref;
 	{
 		std::lock_guard<std::mutex> lock(g_guides_mutex);
 		guides = g_guides;
+		depth_ref = std::make_unique<GuideRef>(guides.depth);
+		motion_ref = std::make_unique<GuideRef>(guides.motion_vectors);
 	}
 	gs.published = guides.published;
 	gs.have_depth = guides.depth != nullptr;
@@ -301,6 +358,12 @@ void shutdown()
 {
 	nrstage::shutdown();
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
+	// The publish-side references (note_guides) go here. Device destruction is the one call site
+	// where the caller, not us, has established that the GPU is idle.
+	if (g_guides.depth != nullptr)
+		g_guides.depth->Release();
+	if (g_guides.motion_vectors != nullptr)
+		g_guides.motion_vectors->Release();
 	g_guides = Guides{};
 	g_consumed.store(0, std::memory_order_relaxed);
 }
