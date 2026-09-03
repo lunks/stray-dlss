@@ -3252,3 +3252,68 @@ gate**, and on ~1.2% of frames it overrides an answer the engine had already giv
 That is the identical shape to the `trust_registers` bug fixed in §13.4: a heuristic still
 deciding something the engine has authoritatively answered. The design intent was never carried
 through to the claim call site.
+
+### 36.18 The flicker: the View CB search took a DIFFERENT VIEW's buffer (2026-09-03)
+
+DLL `0855d69e…` (`264c04c`), menu, no injected input. The enriched near-miss line named the cause
+outright:
+
+```
+ENGINE SEAM NEAR MISS #1: a dispatch of 480x270 groups (covers 3840x2160 px) arrived while an
+announcement expecting exactly that was pending, and OUR MATCHER REFUSED IT - verdict=no_match
+reason="dispatch covers less than the view rect - downsampling, not TAA upscaling".
+THE INPUTS THE MATCHER USED: render rect 4088x4088 (from the View CB at b3, decoded=1, row135=1),
+output UAV 0x0.
+```
+
+and the same session's healthy frames read:
+
+```
+View CB at b4, offset 4921600
+```
+
+**So: on ~1.2% of frames a DIFFERENT view's constant buffer — 4088x4088, the shape of a shadow or
+capture view — is bound at b3.** The search walks the bound constant buffers **in slot order and
+keeps the FIRST plausible hit**, so b3 wins and the search stops before reaching the real View at
+b4. The matcher then, entirely correctly, refuses a 3840x2160 dispatch as downsampling against a
+4088x4088 view. The real TAA pass never reaches `claim()`, the announcement retires `unclaimed`,
+and that frame runs the engine's TAA instead of DLSS SR.
+
+`nearMiss` tracked `unclaimed` exactly (137 against 134, the 3 being the retire lag), so this
+**accounts for all of it** — and per §36.17 the user reports these frames are the visible flicker.
+
+#### The instinct to bypass the gate was wrong, and that is the lesson
+
+The first reading — "the structural matcher is still gating what the engine already answered, the
+same shape as `trust_registers`" — is seductive and would have been **actively harmful**. Those
+frames would then have run DLSS with a 4088x4088 view's jitter, `ClipToPrevClip` and
+`CameraCut`, which is worse than skipping the frame: this file's own rule is that bad motion
+inputs compound through the accumulation rather than costing one frame.
+
+**The matcher was right. It was fed the wrong view. Fix the input, not the check.**
+
+#### The fix, and why the test is sound
+
+The search no longer stops at the first plausible candidate; it **skips one that describes a
+different view than this dispatch**. UE 4.27's `OutputViewRect` is `>= InputViewRect` for every
+`Main*` config — equal at 1:1, larger when upscaling, never smaller — and the dispatch covers the
+output rect. So this view's `ViewSizeAndInvSize` cannot exceed what the dispatch covers.
+4088x4088 against 3840x2160 is not a close call.
+
+* the bound is **inclusive**, so DLAA (view == dispatch coverage) passes;
+* **200% downsampling is still rejected**, which is what the old gate existed for;
+* with no dispatch extent to compare against it invents no refusal.
+
+`ue4::view_fits_dispatch` is pure, with the measured 4088x4088-vs-3840x2160 pair pinned in CI.
+The `[view]` line gains **`wrongView=`**: each one is a frame that used to lose DLSS SR entirely.
+
+#### What this narrows about row 135
+
+§36.14 read `ok=64044 bad=0` and the CB search was called exonerated. **That was too broad a
+reading of a correct measurement.** Row 135 proves the buffer *is* a View uniform buffer — and a
+shadow or capture view satisfies all three predictions, because it is one. It never said *this*
+view's. The thing that could tell them apart was the dispatch, and it was available at that point
+the whole time.
+
+**The transferable rule: a self-validating check tells you what KIND of thing you have, never
+WHICH one.** Identity needs something that distinguishes the candidates from each other.

@@ -660,12 +660,30 @@ Config and saves live in the **Proton prefix**:
 > TAA runs instead of DLSS SR, so the image changes hands for one frame. **Success is
 > `unclaimed = 0`, judged by eye, not by reading the counter.**
 >
-> **MEASURED 2026-09-03, and it names the cause:** `nearMiss` tracks `unclaimed` exactly, so the
-> real dispatch — the announced 480x270 groups — IS arriving and **our own matcher refuses it**
-> with *"dispatch covers less than the view rect - downsampling, not TAA upscaling"*. That gate
-> needs the View CB to report a render rect wider than 3840. It is the same shape as
-> `trust_registers`: **a heuristic still GATING what the engine has already answered**, when
-> `EngineSeam=3` is documented to make the structural signature an assertion.
+> **ROOT-CAUSED 2026-09-03 (facts §36.18), and it was NOT the gate.** `nearMiss` tracks
+> `unclaimed` exactly, so the real dispatch — the announced 480x270 groups — IS arriving and our
+> matcher refuses it with *"dispatch covers less than the view rect"*. The enriched line said
+> why: **the matcher was reading a render rect of 4088x4088, from a View CB at b3**, while the
+> healthy frames read b4. On ~1.2% of frames a DIFFERENT view's buffer — a shadow or capture
+> view — is bound on a lower register, and the search **walks slot order and keeps the FIRST
+> plausible hit**, so it stops before reaching the real one.
+>
+> **The obvious reading was wrong and would have made things worse.** "A heuristic still gating
+> what the engine answered, the same shape as `trust_registers`" is seductive, and bypassing the
+> gate would have run DLSS with a 4088x4088 view's jitter, `ClipToPrevClip` and `CameraCut` —
+> and §5's rule is that bad motion inputs compound through the accumulation rather than costing
+> one frame. **The matcher was right; it was fed the wrong view. Fix the input, not the check.**
+>
+> The search now skips a candidate that describes a different view than this dispatch:
+> `OutputViewRect >= InputViewRect` always and the dispatch covers the output rect, so a view
+> larger than the dispatch covers cannot be this one (`ue4::view_fits_dispatch`, inclusive so
+> DLAA passes, and 200% downsampling still rejected). Read **`wrongView=`** on the `[view]` line.
+>
+> **And it narrows row 135.** §36.14's `ok=64044 bad=0` was read as exonerating the CB search;
+> it does not. Row 135 proves the buffer IS a View uniform buffer — a shadow view satisfies all
+> three predictions, because it is one. **A self-validating check tells you what KIND of thing
+> you have, never WHICH one.** Identity needs something that separates the candidates, and here
+> that was the dispatch, available at that point all along.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
