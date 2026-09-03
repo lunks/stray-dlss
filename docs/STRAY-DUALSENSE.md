@@ -25,13 +25,14 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   master and lands on FL/FR of the one stream that carries the coils on RL/RR; the asset
   replay path, its extraction tooling, `HapticSource` and its fallback, and the HID
   speaker-route claim are all deleted. **The speaker lane is UNCONFIRMED — never run.** See §18.
-* **Lightbar: the machinery is Sony's, not Stray's, and no Stray-authored layer exists for it.**
-  Driving it would be inventing a feature, not restoring one. **CORRECTED 2026-09-03 (§19):**
-  this bullet used to say "never driven by any shipped content", which was over-claimed — the
-  pak has never been searched for the route that matters, and UE 4.27's stock
-  `APlayerController::SetControllerLightColor` is `BlueprintCallable`, so content could drive it
-  leaving no game-specific string in the exe to find. The conclusion still stands, on a
-  different and better argument; the question is open.
+* **Lightbar: NEVER driven by any shipped content — now measured, not inferred (§19.1).** Zero
+  hits across all **23,846** cooked packages for `SetControllerLightColor`,
+  `ResetControllerLightColor`, `SonyLightColor`, `SetDeviceProperty`, `LightBar`, `PadLight` and
+  `ControllerLight`, against a same-class control (`PlayDynamicForceFeedback`, 37 files) that
+  proves the instrument sees exactly this kind of Blueprint call. Content wires vibration, the
+  controller speaker and the adaptive triggers — three of the four DualSense surfaces — and the
+  light bar not at all. The machinery is Sony's platform extension, not Stray's. **Driving it
+  would be inventing a feature, not restoring one.**
 
 The PC build implements all of this and simply never asks for it; we drive it from a
 `libScePad` shim plus UE4SS hooks.
@@ -96,6 +97,21 @@ Game-side property struct:
 | `+0x0a..0x0c` | three effect parameter bytes |
 
 For `SonyLightColor`: `+0x08` = enable (0 → `ResetLightBar`), `+0x0c/0x0d/0x0e` = colour.
+
+> **REFUTED 2026-09-03 — see §19.1.** The paragraph below claimed a **zero-file** pak result for
+> `PS5TriggerEffect` / `PS5TriggersState` / `SetPS5TriggersState`. Swept over the whole cooked
+> content (23,846 packages, controls firing in the thousands) each returns **one file**:
+> `BP_HKPlayerController` carries the authored `PS5TriggerEffectData` value, and
+> `COMP_CatScratchableComponent` carries `SetPS5TriggersState` / `SetPS5TriggerActivated`.
+> **Content DOES ask for the triggers** — which §6 has known at runtime for days, from those very
+> signals. The original search was folder-scoped (§13's failure mode) and its control was
+> evaluated over the same narrow set, so `ObjectProperty` hitting 112 files proved only that
+> those 112 files decompressed.
+>
+> **The root cause moves rather than disappearing.** §12's independent measurement — *"The game
+> never calls `scePadSetTriggerEffect`"* — stands. The gate is in the executable between
+> `SetPS5TriggersState` and `FPlatformControllers::SetDeviceProperty`, not in the content. Read
+> the original below as the historical claim it is.
 
 **ROOT CAUSE (HARD): no shipped PC content ever sets the `PS5TriggerEffect` property.**
 Searching the Oodle-decompressed pak for `PS5TriggerEffect` / `PS5TriggersState` /
@@ -1860,19 +1876,213 @@ CI's. The speaker lane has never delivered a sample to a pad.
 Answers "on PS5, what drives the light bar in Stray, and does the game's own content ever set
 it?" **It does not close it.** Two of the three legs need a machine this session did not have.
 
-### What could NOT be checked, and why — read this before anything below
+> **SETTLED 2026-09-03, second pass, with pak access — see §19.1.** The whole cooked content
+> was searched and **no shipped Blueprint calls the light bar by any route**: zero across all
+> 23,846 packages, against controls that fire in the thousands and a same-class control
+> (`PlayDynamicForceFeedback`, 37 files) that proves the instrument sees exactly this kind of
+> call. The prediction below is now a measurement. **Everything else in this section stands**,
+> including the two unexplained call sites, which still need the unpacked exe.
 
-* **The pak was never searched.** No copy exists in this worktree or in the repo; box access was
-  out of scope for this investigation. `docs/game-config/` holds five shipped `.ini` copies and
-  no cooked assets. **So there is no pak result here at all** — every statement about Blueprints
-  below is a prediction with a named test, not a measurement.
+### What could NOT be checked in the FIRST pass, and why
+
+* **The pak was not searched** (no copy reachable at the time). **Now done — §19.1.**
 * **The two unexplained call sites were not disassembled.** §7's Steamless-unpacked exe was never
-  committed and is no longer on the box, and the packed exe cannot be read statically.
+  committed and is no longer on the box, and the packed exe cannot be read statically. **Still
+  true.**
 
 Everything that follows is from UE 4.27.2's own public source (mirror
 `AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`, the same tree `CLAUDE.md` §5 uses), from the
-game's own shipped `.ini` files in `docs/game-config/`, from this repo's own source, and from
-two public third-party reconstructions of Sony's pad header.
+game's own shipped `.ini` files in `docs/game-config/`, from **the shipped pak (§19.1)**, from
+this repo's own source, and from two public third-party reconstructions of Sony's pad header.
+
+
+### 19.1 The pak, searched whole: no content drives the light bar — HARD, 2026-09-03
+
+The first pass could only predict. This one measured, over **every cooked package in the game**.
+
+**Why `.uasset` alone is the complete test, and this is what makes a zero mean something.** Stray
+is cooked with the event-driven loader's package split — measured from the pak index: **23,846
+`.uasset` (69 MB uncompressed) and 24,051 `.uexp` (7.0 GB)**. The `.uasset` holds the summary, the
+**NameMap**, the import table and the export table; the `.uexp` holds export bytes only. Blueprint
+bytecode reaches a function either as `EX_FinalFunction` (an import whose `ObjectName` is a name
+index) or as `EX_VirtualFunction` (an `FName`, also a name index) — **both are indices into the
+`.uasset`'s NameMap**. A name absent from that table cannot be referenced from the `.uexp` beside
+it. So parsing 23,846 name maps is not a sample of the content, it is the content's entire
+vocabulary, at 0.5% of the pak's bytes.
+
+**Method, and every step was verified rather than assumed.**
+
+1. `tools/paksweep.py` (new) reads the index and pulls every `.uasset` payload **in pak-offset
+   order** into one blob — 32 MB, and offset order turns ~24k scattered seeks into a forward scan.
+   It refuses to start, and aborts every 512 entries, if `pgrep -x Stray-Win64-Shi` matches, so a
+   window that closes cannot become IO contention on the mount the game streams from. Run under
+   `ionice -c3 nice -n19`; **0.72 s wall**, with the game confirmed down before and after.
+2. Decompressed locally with a new `oozbatch` — powzix/ooz's Kraken decoder built for **arm64 via
+   sse2neon**, doing all blocks in one process instead of one `oozraw` fork per block.
+   **19,589 Oodle entries decoded, 0 failures**; 4,257 were stored.
+3. **Integrity oracle: 23,846 / 23,846 outputs carry the UE4 package magic `0x9E2A83C1` at offset
+   0**, and all 23,846 name maps parse. A miscompiled SIMD port would not produce 23,846 valid
+   packages, so the arm64 build is sound.
+4. `namecensus.py` parses `FPackageFileSummary` → `FNameEntrySerialized` and reports **exact
+   names**, not substrings — so "a hit" can be inspected rather than guessed at.
+
+**The result.**
+
+| term | files | reading |
+|---|---|---|
+| `ObjectProperty` | **19 748** | control |
+| `BoolProperty` | **14 197** | control |
+| `/Script/Engine` | **23 636** | control |
+| `PlayDynamicForceFeedback` | **37** | **the control that matters** — see below |
+| `ClientStopForceFeedback` | 2 | same class of call |
+| `EnableInput` | 2 | same class of call |
+| **`SetControllerLightColor`** | **0** | |
+| **`ResetControllerLightColor`** | **0** | |
+| **`SonyLightColor`** | **0** | |
+| **`LightBar`** | **0** | |
+| **`PadLight`** / **`ControllerLight`** | **0** | |
+| **`SetDeviceProperty`** | **0** | no content touches the property API at all |
+| `SetDisableHaptics` | 0 | |
+| `DualSense` / `DualShock` / `scePad*` | 0 | |
+| `LightColor` | 63 | **all scene lights** — see below |
+
+**`PlayDynamicForceFeedback` is the control the question actually needed.** `ObjectProperty` only
+proves we decompressed cooked assets. `PlayDynamicForceFeedback` is an `APlayerController`
+`UFUNCTION(BlueprintCallable)` sitting in the **same `Category="Game|Feedback"`** as
+`SetControllerLightColor`, declared a few lines away in the same header — and it appears in 37
+name maps. **So the instrument demonstrably detects Blueprint calls to exactly this kind of
+function, and it finds zero calls to the two light-bar ones.**
+
+**The 63 `LightColor` files are scene lighting, checked by exact name rather than assumed.** The
+complete set of 13 distinct `*LightColor*` names in the whole game is `LightColor`, `SetLightColor`
+(that is `ULightComponent::SetLightColor`), `GetLightColor`, `SetLightColorInTime`,
+`SetLightColorUpdate`, `TargetLightColor`, `TargetLightColorFloatSmoother`, `NewLightColor`,
+`DefaultLightColor`, `Dyn_Mat_SentinelLightColor`, `LightColor_Material`, `HighlightColor`,
+`CallFunc_GetLightColor_ReturnValue` — sentinels, light bulbs, a garland, a dialogue style set.
+Note that `SetControllerLightColor` **contains** `LightColor`, so it would have been inside those
+63 had it existed anywhere.
+
+**So the §19 prediction is now a finding: no shipped content drives the light bar, by the stock
+route or by the property route.** HARD.
+
+#### And the asymmetry is far larger than "triggers versus light" — HARD
+
+The same census enumerated **every** PS5/Sony name in the cooked content: 143 distinct. Content
+drives **three of the four DualSense surfaces**, at scale:
+
+* **Coil vibration** — `StartPS5Vibration` (23) / `StopPS5Vibration` (10) /
+  `SetPS5VibrationLevel` (6) / `SetPS5VibrationPaused` / `IsPS5Vibrating` and their
+  `*OnAudioComponent` variants (`StartPS5VibrationOnAudioComponent` alone in 53 files),
+  `PS5Vibration` (89), `PS5VibrationAttenuation` (7), `PS5VibrationBus`, `m_PS5VibrationSubmix`,
+  and `PS5Vibration_Jump` / `_ZurkGrab` / `_ZurkSucking` in **493 files each** (a widely inherited
+  base class).
+* **Controller speaker** — `StartPS5ControllerSound`, `StopPS5ControllerSound`,
+  `SetPS5ControllerSoundLevel`, `IsPS5ControllerMakingSound`, `PS5ControllerBus`.
+* **Adaptive triggers** — `SetPS5TriggerActivated`, `SetPS5TriggersState`,
+  `PS5LeftTriggerActivated`, `PS5RightTriggerActivated`, `EPS5TriggersSide` (all in
+  `COMP_CatScratchableComponent`), plus the authored effect on `BP_HKPlayerController`.
+* **Light bar** — **nothing. Not one name, anywhere, in 23,846 packages.**
+
+Plus the UI layer: `EGameControllerType::GameControllerType_PS5` in 32 files and a full
+`Sony_PS5` glyph set. `SonyInteractiveEntertainmentInc` is a credits string in the three
+platform credit screens. `DebugPS5Haptic` is a lone flag on `BP_HKPlayerController`.
+
+**Three of four wired, one untouched, is not an oversight — it is a decision.** §19's original
+argument was "Stray authored a trigger layer and no light-bar counterpart"; the measured version
+is stronger, and it settles the design-intent question the exe alone could not.
+
+#### The recommendation does NOT change, and now it is grounded
+
+§19 recommended route (a) — `scePadSetLightBar` through the already-mapped module — and warned
+that driving the light bar is **inventing** a feature rather than restoring one. That warning was
+the one claim resting on an unsearched pak. **It is now measured**, and the failure modes are
+unchanged: the two-writers note, the `HidMode` non-collision (still HARD), the reset semantics and
+the Steam Input third-writer risk all stand exactly as written, as does the `FColor` byte-order
+trap — which the pak cannot settle either way, because no content ever builds that struct.
+
+One thing the census does add to route (b): **`SetDeviceProperty` appears in zero name maps**, so
+no shipped Blueprint constructs a device property of any kind. Building `SonyLightColor` would not
+merely be un-inherited behaviour, it would be the only caller of that path in the process.
+
+#### THE EARLIER TRIGGER ZERO IN §2 IS REFUTED — and the correction matters more than the light bar
+
+§2's ROOT CAUSE paragraph states that searching the decompressed pak for `PS5TriggerEffect` /
+`PS5TriggersState` / `SetPS5TriggersState` **"returns zero files"**. Measured on this sweep, over
+the whole pak, with controls firing in the thousands:
+
+```
+PS5TriggerEffect      1 file   Hk_project/Content/Technical/BP_HKPlayerController.uasset
+PS5TriggersState      1 file   .../Technical/Components/COMP_CatScratchableComponent.uasset
+SetPS5TriggersState   1 file   .../Technical/Components/COMP_CatScratchableComponent.uasset
+```
+
+Exact names, from the name maps rather than a substring:
+
+* `BP_HKPlayerController` carries `EPS5TriggerEffectMode`,
+  `EPS5TriggerEffectMode::PS5TriggerEffectMode_Feedback`, `PS5TriggerEffectData` and
+  `m_scratchablePS5TriggerEffect` — i.e. the **authored default value** for the C++ property,
+  which is exactly the `Mode=3 V1=0 V2=2 V3=0` §6 read out of the running game. The content and
+  the live read agree.
+* `COMP_CatScratchableComponent` carries `SetPS5TriggersState`, `SetPS5TriggerActivated`,
+  `PS5LeftTriggerActivated`, `PS5RightTriggerActivated`, `EPS5TriggersSide` — i.e. the **calls**,
+  which is exactly the `COMP_CatScratchableComponent_C:SetPS5TriggerActivated(State, Side)` §6
+  hooks at runtime.
+
+**So "no shipped PC content ever asks for the triggers" is false, and it was false when written.**
+Both halves of the trigger system ship as content, and §6 has been driving the real thing off
+those very signals for days — the two facts were sitting next to each other in this file
+contradicting one another.
+
+**What still stands, and where the root cause actually lives.** §12's independent measurement —
+*"The game never calls `scePadSetTriggerEffect` — HARD, measured"* — is untouched. Content asks;
+the C++ between `SetPS5TriggersState` and `FPlatformControllers::SetDeviceProperty` is what
+declines. **The gate is in the executable, not in the absence of content**, and that is a
+different bug in a different place from the one §2 names. §2 has been corrected in place.
+
+**Why the original search missed it, and the lesson.** Both hits are Oodle (method 2) entries in
+`Content/Technical/`, so this is not the extractor bug below — it is §13's failure mode again,
+verbatim: *"A folder-scoped extraction silently missed two coil assets."* A zero result is only
+worth the breadth of the set it was taken over, and **the control must be evaluated over that same
+set** — `ObjectProperty` hitting 112 files proves those 112 files decompressed, not that the
+search covered the game. State the denominator with every zero.
+
+#### A REAL BUG IN `tools/pakextract.py`, found by asserting the magic — fixed here
+
+Uncompressed (method 0) entries came out **shifted 4 bytes early and 4 bytes short**.
+`FPakEntry::Serialize` writes `Offset(8) Size(8) UncompressedSize(8) CompressionMethodIndex(4)
+Hash(20) [blocks] bEncrypted(1) CompressionBlockSize(4)`, and the **last two fields are
+unconditional**. The tool used `hdr = 8+8+8+4+20+1 = 49`, omitting the trailing
+`CompressionBlockSize`; compressed entries were right only by accident, because their
+`+= 4 + 4 + n*16` folded that same 4 into the block-array term.
+
+Caught the moment the output was checked against the UE4 package magic: **104/104 compressed
+assets passed and 124/124 uncompressed ones failed, with the magic sitting at offset 4.**
+**4,257 of the pak's 23,846 `.uasset` entries are method 0** — 17.9% — so every earlier content
+search was reading garbage for nearly a fifth of the game and had no way to notice. Fixed, with
+the derivation in a comment at the site.
+
+**The general lesson, and it is the reason the numbers above can be trusted:** an extractor needs
+an oracle. Four bytes of skew produced files that were the right size, in the right place, with
+plausible-looking bytes — and would silently have contributed a fifth of a false zero. One
+`struct.unpack` against a known magic is the whole cost of not being fooled.
+
+#### What this session used, so it can be re-run
+
+* `tools/pakextract.py` — the method-0 header fix above.
+* `tools/paksweep.py` — offset-ordered whole-pak `.uasset` sweep into one blob, with the
+  game-running abort. This is the tool to reach for whenever a pak-wide *content* question comes
+  up; it costs under a second and it makes zeros mean something.
+* `tools/pakstat.py` — index-only census (path, method, sizes, blocks). Reads no data section at
+  all, so it is safe with the game running, and it is how the 69 MB / 7.0 GB `.uasset` / `.uexp`
+  split above was measured before touching a byte of content.
+* `tools/uassetnames.py` / `tools/namecensus.py` — the name-map parser and the vocabulary census.
+  **Prefer these to `grep`**: they report exact names, which is what turned "63 `LightColor` hits"
+  from a worry into thirteen named scene-light properties.
+* `oozbatch` — the arm64 Kraken build. Not committed (it is powzix/ooz plus a portability header);
+  the recipe is: ooz `master`, replace `stdafx.h` with a portable one that includes `sse2neon.h`
+  and defines `_BitScanForward/Reverse`, `_rotl`, `_byteswap_ushort/ulong/uint64` and
+  `__forceinline`, truncate `kraken.cpp` before its Windows CLI `main`, and link
+  `kraken.cpp bitknit.cpp lzna.cpp`.
 
 ### The finding that changes the question: 4.27 already has a first-class light-bar API — HARD
 
@@ -2155,23 +2365,23 @@ Failure modes of (a), in the order they would bite:
 
 | question | answer | label |
 |---|---|---|
-| Does shipped content ever set the light bar? | **STILL OPEN.** The pak was not searched this session, and the exe-side negative does not cover the stock `SetControllerLightColor` route | the weakening is HARD; the open question is the point |
-| What drives it on PS5? | Unread. 4.27 offers exactly two entry points — the typed `SetLightColor` and the `SonyLightColor` device property — and both terminate at `scePadSetLightBar` / `scePadResetLightBar` | [derived] |
-| Is the "C++ lifecycle only, no content" hypothesis refuted? | **No**, and it is now supported by an argument it did not have before — the authored-layer asymmetry between triggers and light — while its original support (absence of light-bar strings in the exe) is worth materially less | [derived] |
+| Does shipped content ever set the light bar? | **NO.** Zero across all 23,846 cooked packages, by the stock route (`SetControllerLightColor` / `ResetControllerLightColor`), by the property route (`SetDeviceProperty`, `SonyLightColor`) and by any name containing `LightBar` / `PadLight` / `ControllerLight` — against a same-class control, `PlayDynamicForceFeedback`, that hits 37 files | **HARD** (§19.1) |
+| Did Stray design a light-bar behaviour? | **No.** Content wires vibration, the controller speaker and the adaptive triggers — three of the four DualSense surfaces, one of them across 493 packages — and the light bar not at all | **HARD** (§19.1) |
+| What drives it on PS5? | Unread below `FSlateApplication::GetInputInterface()`. 4.27 offers exactly two entry points — the typed `SetLightColor` and the `SonyLightColor` device property — and both terminate at `scePadSetLightBar` / `scePadResetLightBar`. With content excluded, whatever drives it there is the platform's own C++ | [derived] |
+| Is the "C++ lifecycle only, no content" hypothesis refuted? | **No — the "no content" half is now measured.** Which C++ (Reading A or B) is still open | half HARD, half UNCONFIRMED |
 | Are the two extra call sites explained? | **No.** Two readings survive; one cheap runtime test separates them | UNCONFIRMED |
+| Was §2's trigger zero right? | **No, refuted** — 1 file each for `PS5TriggerEffect`, `PS5TriggersState`, `SetPS5TriggersState`. Content asks for the triggers; the executable declines. §2 corrected | **HARD** (§19.1) |
 
-### The three things that would close it
+### What is left, now that the pak is done
 
-1. **Pak.** Decompress (`tools/pakextract.py --raw` + `tools/oodle_unblock.py`, §7) and search for
-   `SetControllerLightColor`, `ResetControllerLightColor`, `SonyLightColor`, `LightBar`,
-   `LightColor`, `PadLight`, `ControllerLight`. **`SetControllerLightColor` is the one that
-   matters** — it is the exact route the exe's strings cannot exclude. Keep §2's control
-   discipline: control on something that only exists *inside* cooked assets (`ObjectProperty`,
-   `BoolProperty`), because a raw grep of the pak matches uncompressed index path strings and is
-   therefore not a control at all (§7).
-2. **Runtime.** The shim's existing `WRAP(scePadSetLightBar)` / `WRAP(scePadResetLightBar)` log,
-   read across boot → menu → gameplay → unplug → replug. Separates Reading A from Reading B in
-   one session and needs no new code.
+1. ~~**Pak.**~~ **DONE — §19.1.** Whole cooked content searched; the tooling is committed
+   (`tools/paksweep.py`, `tools/pakstat.py`, `tools/namecensus.py`, `tools/uassetnames.py`) so the
+   next pak-wide *content* question costs under a second rather than a session.
+2. **Runtime** — the one that now decides everything left. The shim's existing
+   `WRAP(scePadSetLightBar)` / `WRAP(scePadResetLightBar)` log (`libScePad_shim.c:612-613`,
+   macro `:517-527`), read across boot → menu → gameplay → unplug → replug. With content
+   excluded, **any line at all is the platform C++ acting on its own** and refutes Reading A;
+   none across all of that leaves Reading A on a measured negative. No new code.
 3. **Disassembly.** Steamless-unpack (§7), then the function bounds and callers of `0x9FCCF1` and
    `0x9FCD6F`, and whether either is in the `FPlatformControllers` vtable.
 
