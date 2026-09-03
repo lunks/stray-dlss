@@ -235,7 +235,9 @@ At `/O2` that is `lea rax, [rip+disp]; ret` — eight bytes. So:
 
 1. Find the UTF-16LE literal `"FDefaultTemporalUpscaler\0"` in any readable section.
 2. Find `48 8D 05 <int32> C3` in an executable section whose rip-relative target is that literal.
-   That address is `GetDebugName`.
+   That address is `GetDebugName`. If the rip-relative form finds nothing, `48 B8 <uint64> C3`
+   (`movabs rax, imm64; ret`) is tried — the other way x86-64 can materialise an absolute
+   address. Covering a second shape costs 25 lines; a missed shape costs a whole round trip.
 3. Find any 8-byte-aligned qword in a non-executable section equal to it. That is vtable slot 1;
    the vtable base is 8 bytes below. Require all five slots to point into executable memory.
 4. **Validate against three exact predictions, statically — without executing anything.** Decode

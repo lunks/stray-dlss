@@ -166,8 +166,15 @@ Discovery discover(const Image &image);
 std::size_t find_utf16_literal(const Image &image, const char *ascii,
                                std::uint64_t *out, std::size_t max_out);
 // `lea rax, [rip+d]; ret` — 48 8D 05 <int32> C3 — whose rip-relative target is `target_va`.
+// This is what MSVC x64 /O2 emits for `return TEXT("...")`.
 std::size_t find_lea_ret_to(const Image &image, std::uint64_t target_va,
                             std::uint64_t *out, std::size_t max_out);
+// `movabs rax, imm64; ret` — 48 B8 <uint64> C3 — with `target_va` as the immediate. The other
+// way x86-64 can materialise an absolute address, tried only when the rip-relative form finds
+// nothing. It exists because a missed codegen shape costs a whole round trip to the box, and
+// this project's most expensive resource is the round trip (CLAUDE.md §0.1).
+std::size_t find_movabs_ret_to(const Image &image, std::uint64_t target_va,
+                               std::uint64_t *out, std::size_t max_out);
 // Every 8-byte-aligned qword in a non-executable region equal to `value`.
 std::size_t find_qword(const Image &image, std::uint64_t value,
                        std::uint64_t *out, std::size_t max_out);

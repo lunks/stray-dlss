@@ -16,6 +16,9 @@ constexpr unsigned char kLeaRaxRip[3] = { 0x48, 0x8D, 0x05 };
 constexpr unsigned char kRet = 0xC3;
 constexpr std::size_t kLeaRetLength = 8; // 3 opcode + 4 displacement + 1 ret
 
+constexpr unsigned char kMovabsRax[2] = { 0x48, 0xB8 };
+constexpr std::size_t kMovabsRetLength = 11; // 2 opcode + 8 immediate + 1 ret
+
 constexpr unsigned char kMovssXmm0Rip[4] = { 0xF3, 0x0F, 0x10, 0x05 };
 constexpr unsigned char kVmovssXmm0Rip[4] = { 0xC5, 0xFA, 0x10, 0x05 };
 constexpr unsigned char kMovEaxImm = 0xB8;
@@ -175,6 +178,34 @@ std::size_t find_lea_ret_to(const Image &image, std::uint64_t target_va,
 	return hits;
 }
 
+std::size_t find_movabs_ret_to(const Image &image, std::uint64_t target_va,
+                               std::uint64_t *out, std::size_t max_out)
+{
+	if (image.regions == nullptr)
+		return 0;
+	std::size_t hits = 0;
+	for (std::size_t i = 0; i < image.count; ++i)
+	{
+		const Region &r = image.regions[i];
+		if (!r.executable || r.bytes == nullptr || r.size < kMovabsRetLength)
+			continue;
+		for (std::size_t off = 0; off + kMovabsRetLength <= r.size; ++off)
+		{
+			if (r.bytes[off] != kMovabsRax[0] || r.bytes[off + 1] != kMovabsRax[1] ||
+				r.bytes[off + 10] != kRet)
+				continue;
+			std::uint64_t imm = 0;
+			std::memcpy(&imm, r.bytes + off + 2, sizeof(imm));
+			if (imm != target_va)
+				continue;
+			if (out != nullptr && hits < max_out)
+				out[hits] = r.va + off;
+			++hits;
+		}
+	}
+	return hits;
+}
+
 std::size_t find_qword(const Image &image, std::uint64_t value,
                        std::uint64_t *out, std::size_t max_out)
 {
@@ -266,6 +297,8 @@ Discovery discover(const Image &image)
 	for (std::size_t i = 0; i < name_hits && i < kMaxNames && fn_hits == 0; ++i)
 	{
 		fn_hits = find_lea_ret_to(image, names[i], fns, kMaxFns);
+		if (fn_hits == 0)
+			fn_hits = find_movabs_ret_to(image, names[i], fns, kMaxFns);
 		if (fn_hits != 0)
 			d.name_va = names[i];
 	}

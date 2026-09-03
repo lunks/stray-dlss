@@ -172,6 +172,28 @@ TEST_CASE("the mov/movd codegen for a float constant decodes too")
 	CHECK(d.max_fraction == 2.0f);
 }
 
+TEST_CASE("the movabs codegen for GetDebugName is the fallback, and it works")
+{
+	FakeModule m;
+	m.build();
+	// Replace lea+ret with `movabs rax, <literal address>; ret`. If MSVC ever materialises the
+	// literal absolutely rather than rip-relative, discovery must still find the function
+	// rather than costing a round trip to the box to discover a NOT-FOUND.
+	std::fill(m.text.begin() + FakeModule::kGetDebugName,
+	          m.text.begin() + FakeModule::kGetDebugName + 16, static_cast<unsigned char>(0xCC));
+	const std::size_t at = FakeModule::kGetDebugName;
+	m.text[at] = 0x48;
+	m.text[at + 1] = 0xB8;
+	const std::uint64_t target = FakeModule::kDataVa + FakeModule::kLiteral;
+	std::memcpy(m.text.data() + at + 2, &target, sizeof(target));
+	m.text[at + 10] = 0xC3;
+
+	const Discovery d = discover(m.image());
+	REQUIRE(d.status == SeamStatus::ok);
+	CHECK(d.get_debug_name_va == FakeModule::kTextVa + FakeModule::kGetDebugName);
+	CHECK(d.vtable_va == FakeModule::kDataVa + FakeModule::kVtable);
+}
+
 TEST_CASE("every refusal is distinct, named, and stops short of reporting an address")
 {
 	SUBCASE("nothing to scan")
@@ -195,7 +217,7 @@ TEST_CASE("every refusal is distinct, named, and stops short of reporting an add
 		FakeModule m;
 		m.build();
 		std::fill(m.text.begin() + FakeModule::kGetDebugName,
-		          m.text.begin() + FakeModule::kGetDebugName + 8, static_cast<unsigned char>(0x90));
+		          m.text.begin() + FakeModule::kGetDebugName + 16, static_cast<unsigned char>(0x90));
 		const Discovery d = discover(m.image());
 		CHECK(d.status == SeamStatus::debug_name_not_found);
 		CHECK(d.name_va != 0); // it got that far, and says so
