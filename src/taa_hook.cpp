@@ -1645,7 +1645,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// which hid the RATE - and the rate is what makes this the user's "DLSS flip": every
 		// refused frame publishes no guides, so NR declines it (guides-stale) and the next
 		// evaluate carries a DLSSNR.Reset.
-		if (seam_gate == seam::Gate::engine && !(worth_resolving && view_ok && resources_live))
+		// worth_resolving is unconditionally true under the engine's gate, so the only two ways
+		// an announced dispatch stops here are a View CB we could not decode and inputs we
+		// could not vouch for. They are different fixes, so they are different counters.
+		if (seam_gate == seam::Gate::engine && !view_ok)
+			seamhook::note_outcome(seam::SeamRefusal::view_unreadable);
+		else if (seam_gate == seam::Gate::engine && !resources_live)
 			seamhook::note_outcome(seam::SeamRefusal::dead_inputs);
 
 		// Camera-cut frames (1x1 dummy velocity/history) are evaluated too — with InReset set

@@ -699,9 +699,9 @@ TEST_CASE("every refusal reason has a distinct, stable name for the [seam] line"
 {
 	// The names are read by eye out of a pasted log, so a duplicate or an empty one costs a
 	// round trip. Also pins that `none` reads as success rather than as a refusal.
-	const SeamRefusal all[] = { SeamRefusal::none, SeamRefusal::dead_inputs,
-		SeamRefusal::role_unresolved, SeamRefusal::mv_failed, SeamRefusal::create_failed,
-		SeamRefusal::eval_failed };
+	const SeamRefusal all[] = { SeamRefusal::none, SeamRefusal::view_unreadable,
+		SeamRefusal::dead_inputs, SeamRefusal::role_unresolved, SeamRefusal::mv_failed,
+		SeamRefusal::create_failed, SeamRefusal::eval_failed };
 	std::set<std::string> seen;
 	for (SeamRefusal r : all)
 	{

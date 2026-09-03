@@ -149,6 +149,7 @@ RhiChain resolve_rhi_fn(const RdgReader &r, std::uint64_t rdg,
 enum class SeamRefusal : std::uint8_t
 {
 	none = 0,       // SR evaluated — the good outcome
+	view_unreadable,// claimed, but no bound constant buffer decoded as a plausible View
 	dead_inputs,    // claimed, but depth/velocity not live AND the engine inputs did not resolve
 	role_unresolved,// claimed, live, but colour or output could not be identified
 	mv_failed,      // claimed, the motion-vector resolve did not record

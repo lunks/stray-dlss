@@ -410,6 +410,7 @@ const char *seam_refusal_name(SeamRefusal r)
 	switch (r)
 	{
 	case SeamRefusal::none:            return "evaluated";
+	case SeamRefusal::view_unreadable: return "viewUnreadable";
 	case SeamRefusal::dead_inputs:     return "deadInputs";
 	case SeamRefusal::role_unresolved: return "roleUnresolved";
 	case SeamRefusal::mv_failed:       return "mvFailed";

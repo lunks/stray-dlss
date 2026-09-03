@@ -735,8 +735,8 @@ CRT/video surfaces churn resources every frame.
 The `[seam]` line now carries continuous per-reason counters, split by how far the frame got:
 
 ```
-| notClaimed: noDispatch=N | claimedButNoSR: deadInputs=N roleUnresolved=N mvFailed=N
-  createFailed=N evalFailed=N | evaluated=N | l1: resolved=N partial=N fellBack=N
+| notClaimed: noDispatch=N | claimedButNoSR: viewUnreadable=N deadInputs=N roleUnresolved=N
+  mvFailed=N createFailed=N evalFailed=N | evaluated=N | l1: resolved=N partial=N fellBack=N
 ```
 
 `noDispatch` is the ledger's `unclaimed` — the matcher rejected the real dispatch, so it never
