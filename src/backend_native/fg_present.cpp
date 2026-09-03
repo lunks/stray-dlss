@@ -765,9 +765,14 @@ void run_pair(Chain &c, Pair &p, bool on_worker)
 	if (!live)
 	{
 		// The game still expects its Present to have happened; present the real frame if we
-		// can, else pass the call through untouched by calling the original directly.
+		// can, else pass the call through untouched by calling the original directly. This
+		// present takes a flip slot without ever having waited for one, so it is counted: the
+		// waitable object is a counting semaphore and the surplus never comes back.
 		if (p.orig_present != nullptr)
+		{
+			throttle::note_bypassed();
 			g_last_present_hr.store(p.orig_present(p.sc, p.sync, p.flags));
+		}
 	}
 	else
 	{
@@ -1397,7 +1402,7 @@ void log_stats(const char *when)
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
 	const reflex::Status rs = reflex::status();
-	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d) oob=%d(%d,type %d) | throttle %s(%s) flag=%s latency %d->%d waits=%llu slots=%llu timeouts=%llu failed=%llu skipped=%llu blocked mean %.2f ms max %.2f ms",
+	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d) oob=%d(%d,type %d) | throttle %s(%s) flag=%s latency %d->%d waits=%llu slots=%llu timeouts=%llu failed=%llu skipped=%llu bypassed=%llu blocked mean %.2f ms max %.2f ms",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),
 		s.game_presents != 0 ? static_cast<double>(s.presents_issued) / static_cast<double>(s.game_presents) : 0.0,
@@ -1419,7 +1424,7 @@ void log_stats(const char *when)
 		s.throttle.max_latency_after == ~0u ? -1 : static_cast<int>(s.throttle.max_latency_after),
 		static_cast<unsigned long long>(s.throttle.waits), static_cast<unsigned long long>(s.throttle.slots),
 		static_cast<unsigned long long>(s.throttle.timeouts), static_cast<unsigned long long>(s.throttle.failures),
-		static_cast<unsigned long long>(s.throttle.skipped),
+		static_cast<unsigned long long>(s.throttle.skipped), static_cast<unsigned long long>(s.throttle.bypassed),
 		core::fg::throttle_blocked_mean_ms(s.throttle), s.throttle.blocked_max_ns / 1e6);
 }
 

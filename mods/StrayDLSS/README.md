@@ -65,5 +65,7 @@ is driven exactly as SR is. Keys, all `[STRAYDLSS]` in `StrayDLSS.ini`:
 * Read the `[fg]` log line and the `fg_*` status-file keys: presents issued per game present
   (~2x), refusals by reason, the pacer's estimate, whether the issued-interval histogram is
   bimodal (= not paced), the crop gate's verdicts, and the throttle's own section
-  (`throttle ARMED(none) flag=added latency 1->2 waits/slots/timeouts/blocked`) — an inert
+  (`throttle ARMED(none) flag=added latency 1->2 waits/slots/timeouts/skipped/bypassed/blocked`;
+  a rising `bypassed` with `blocked mean` near zero means the semaphore has drifted and an armed
+  throttle has stopped binding) — an inert
   throttle and a refused one are different lines, deliberately.

@@ -163,3 +163,17 @@ TEST_CASE("resize_flags re-asserts the flag ONLY when we added it (MSDN: ResizeB
 	CHECK(resize_flags(false, kAllowTearing | kWaitable) == (kAllowTearing | kWaitable));
 	CHECK(resize_flags(false, 0) == 0);
 }
+
+TEST_CASE("bypassed presents are counted separately from skipped ones")
+{
+	// The waitable object is a COUNTING semaphore released once per present, so a present that
+	// never waited leaves a surplus behind and an armed throttle quietly stops binding. That
+	// outcome must be readable off the counters, not deduced: `skipped` is a wait we chose not
+	// to make (a drain), `bypassed` is a present that never reached the throttle at all.
+	ThrottleState s;
+	note_bypassed(s);
+	note_bypassed(s);
+	CHECK(s.bypassed == 2);
+	CHECK(s.skipped == 0);
+	CHECK(s.waits == 0);
+}

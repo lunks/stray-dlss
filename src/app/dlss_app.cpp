@@ -1124,6 +1124,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				std::fprintf(f, "fg_throttle_waits=%llu\n", (unsigned long long)fs.throttle.waits);
 				std::fprintf(f, "fg_throttle_slots=%llu\n", (unsigned long long)fs.throttle.slots);
 				std::fprintf(f, "fg_throttle_timeouts=%llu\n", (unsigned long long)fs.throttle.timeouts);
+				std::fprintf(f, "fg_throttle_bypassed=%llu\n", (unsigned long long)fs.throttle.bypassed);
 				std::fprintf(f, "fg_throttle_blocked_mean_ms=%.3f\n", core::fg::throttle_blocked_mean_ms(fs.throttle));
 				unsigned long long refused = 0;
 				for (int i = 1; i < static_cast<int>(core::fg::Refusal::count); ++i)

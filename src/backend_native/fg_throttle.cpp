@@ -230,6 +230,14 @@ void wait_for_slot(bool hurried)
 			g_cfg.give_up_after, static_cast<unsigned long>(r), blocked_ns / 1e6);
 }
 
+void note_bypassed()
+{
+	if (!g_cfg.enabled)
+		return;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	core::fg::note_bypassed(g_state);
+}
+
 core::fg::ThrottleState state()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);

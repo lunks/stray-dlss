@@ -43,6 +43,10 @@ void disarm(const char *why);
 // entirely and counts it under `skipped` rather than paying the timeout.
 void wait_for_slot(bool hurried);
 
+// A present that went out WITHOUT passing through wait_for_slot (the pass-through path after a
+// reconfiguration). Recorded because it leaves a surplus count on the swapchain's semaphore.
+void note_bypassed();
+
 core::fg::ThrottleState state();
 // The [fg] line's throttle section. Never null; "off" when the knob was never set.
 const char *report();

@@ -95,6 +95,8 @@ bool note_wait(const ThrottleConfig &cfg, ThrottleState &s, WaitOutcome outcome,
 	return false;
 }
 
+void note_bypassed(ThrottleState &s) { ++s.bypassed; }
+
 double throttle_blocked_mean_ms(const ThrottleState &s)
 {
 	if (s.waits == 0)

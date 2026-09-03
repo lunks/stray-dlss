@@ -88,6 +88,13 @@ struct ThrottleState
 	std::uint64_t timeouts = 0;
 	std::uint64_t failures = 0;
 	std::uint64_t skipped = 0;          // presents that deliberately did not wait (drain, teardown)
+	// Presents that went out WITHOUT passing through the throttle at all (the pass-through path
+	// taken when a reconfiguration invalidated the pair). These matter more than they look: the
+	// waitable object is a COUNTING semaphore that the swapchain releases once per present, so a
+	// present with no matching wait leaves a surplus count behind FOREVER, and enough of them
+	// make an armed throttle silently stop binding. Counted so that "armed and inert" can be
+	// told from "armed and working" without guessing.
+	std::uint64_t bypassed = 0;
 	std::uint64_t blocked_ns = 0;       // total time blocked in waits
 	std::uint64_t blocked_max_ns = 0;
 	unsigned consecutive_timeouts = 0;
@@ -115,6 +122,9 @@ ThrottleRefusal arm_verdict(const ArmInputs &in);
 bool note_wait(const ThrottleConfig &cfg, ThrottleState &s, WaitOutcome outcome, std::uint64_t blocked_ns);
 
 double throttle_blocked_mean_ms(const ThrottleState &s);
+
+// A present that never reached the throttle. See ThrottleState::bypassed.
+void note_bypassed(ThrottleState &s);
 
 // ---- the creation flag ([STRAYDLSS] NgxFGWaitableSwapChain) ----
 //
