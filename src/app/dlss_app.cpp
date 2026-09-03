@@ -1345,7 +1345,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			{
 				const nrhook::Counters sc = nrhook::counters();
 				char line[512];
-				int off = std::snprintf(line, sizeof(line),
+				int stage_off = std::snprintf(line, sizeof(line),
 					"[%s] NR STAGE: triggered=%llu applied=%llu backbuffer=%ux%u fmt=%u "
 					"staging=%lluMB colour/guide ratio=%.4f/%.4f (REPORTED, not sent — NGX gets "
 					"1.0) reasons:",
@@ -1356,8 +1356,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 					static_cast<double>(sc.last_mvec_scale_x),
 					static_cast<double>(sc.last_mvec_scale_y));
 				for (int i = 0; i < nrplan::kPlanResultCount; ++i)
-					if (off > 0 && off < static_cast<int>(sizeof(line)))
-						off += std::snprintf(line + off, sizeof(line) - off, " %s=%u",
+					if (stage_off > 0 && stage_off < static_cast<int>(sizeof(line)))
+						stage_off += std::snprintf(line + stage_off, sizeof(line) - stage_off,
+							" %s=%u",
 							nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)),
 							sc.reasons[i]);
 				STRAY_LOG_INFO("%s", line);
