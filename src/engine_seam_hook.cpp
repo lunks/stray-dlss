@@ -814,7 +814,8 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 }
 
 void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
-                             const char *verdict, const char *reason)
+                             const char *verdict, const char *reason,
+                             const UnmatchedContext &uc)
 {
 	if (!g_hooked.load(std::memory_order_acquire))
 		return;
@@ -833,13 +834,17 @@ void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
 		}
 	}
 	if (log_it)
-		STRAY_LOG_WARN("ENGINE SEAM NEAR MISS #%llu: a dispatch of %ux%u groups arrived while an "
-			"announcement expecting exactly that was pending, and OUR MATCHER REFUSED IT - "
-			"verdict=%s reason=\"%s\". This is an `unclaimed` frame with a named cause: the "
-			"engine's primary temporal upscale ran and DLSS SR did not, so that frame used the "
-			"engine's TAA. Logged %d times.",
-			static_cast<unsigned long long>(n), group_x, group_y,
+		STRAY_LOG_WARN("ENGINE SEAM NEAR MISS #%llu: a dispatch of %ux%u groups (covers %ux%u px) "
+			"arrived while an announcement expecting exactly that was pending, and OUR MATCHER "
+			"REFUSED IT - verdict=%s reason=\"%s\". THE INPUTS THE MATCHER USED: render rect "
+			"%ux%u (from the View CB at b%u, decoded=%d, row135=%d), output UAV %ux%u. This is "
+			"an `unclaimed` frame, and the user reports these ARE the visible flicker: the "
+			"engine's primary temporal upscale ran and DLSS SR did not, so the image changed "
+			"hands for one frame. Logged %d times.",
+			static_cast<unsigned long long>(n), group_x, group_y, group_x * 8u, group_y * 8u,
 			verdict != nullptr ? verdict : "?", reason != nullptr ? reason : "",
+			uc.view_width, uc.view_height, uc.cb_register, uc.view_ok ? 1 : 0,
+			uc.row135_ok ? 1 : 0, uc.output_width, uc.output_height,
 			kNearMissLogLimit);
 }
 

@@ -767,7 +767,20 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// engine's own primary upscale just went past and OUR gate turned it away, and the matcher's
 	// verdict and reason are the fix. If none did, this dispatch is unrelated and nothing counts.
 	if (m.verdict != MatchVerdict::structural_only && m.verdict != MatchVerdict::hash_and_structural)
-		seamhook::note_unmatched_dispatch(x, y, verdict_name(m.verdict), m.reason);
+	{
+		// Carry the matcher's OWN INPUTS, not just its verdict. "dispatch covers less than the
+		// view rect" only tells us the arithmetic failed; the render rect it used, which CB that
+		// came from, and whether row 135 vouched for that CB are what say WHY.
+		seamhook::UnmatchedContext uc;
+		uc.view_width = w;
+		uc.view_height = h;
+		uc.output_width = m.output_width;
+		uc.output_height = m.output_height;
+		uc.cb_register = b.view_cb_register;
+		uc.view_ok = view_ok;
+		uc.row135_ok = view_ok && ue4::pre_exposure_plausible(view);
+		seamhook::note_unmatched_dispatch(x, y, verdict_name(m.verdict), m.reason, uc);
+	}
 
 	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
 	{

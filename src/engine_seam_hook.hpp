@@ -98,8 +98,19 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
 // fixable bug with a named cause. If no such announcement is pending, the dispatch is unrelated
 // and nothing is counted. Splitting those two is the whole point: `unclaimed` alone cannot tell
 // "we rejected the real pass" from "the engine announced an upscale no dispatch followed".
+struct UnmatchedContext
+{
+	std::uint32_t view_width = 0;    // what the matcher used as the RENDER rect
+	std::uint32_t view_height = 0;
+	std::uint32_t output_width = 0;  // the output UAV it measured against
+	std::uint32_t output_height = 0;
+	std::uint32_t cb_register = 0;   // which b# the View CB was found on
+	bool view_ok = false;            // a View CB decoded at all this dispatch
+	bool row135_ok = false;          // ...and row 135 validated it as A View buffer
+};
 void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
-                             const char *verdict, const char *reason);
+                             const char *verdict, const char *reason,
+                             const UnmatchedContext &ctx);
 
 // L1. The engine handed us its scene colour, depth and velocity; this turns each into the
 // ID3D12Resource the D3D12 side already speaks. Call at CLAIM time (during graph execution):
