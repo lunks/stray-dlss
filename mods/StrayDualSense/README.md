@@ -317,7 +317,13 @@ per-component rule working) and `effect=... (game)` versus `(FALLBACK)`.
 Ranked by how likely each is to be the first thing that misbehaves. "UNCONFIRMED" is used in
 the CLAUDE.md sense: plausible from source, not yet compiled by CI or seen on the box.
 
-0. **THE SUBMIX SPIKE, all of it, and it is the riskiest thing in this repo.** It defaults OFF.
+0. **THE SUBMIX SPIKE — MEASURED WORKING up to the pad's endpoint on 2026-09-03** (build
+   0.3.0, `docs/STRAY-DUALSENSE.md` §14 "Third live run"): the FAudioDevice search, slot 16, the
+   reroute through slot 14, the `DebugPS5Haptic` gate, the handover and the sink all ran in the
+   game, twice. **Still UNCONFIRMED: how it feels on the pad** (nobody was holding it), whether
+   the PlayStation glyphs show when the pad is the active device, and every session-long
+   property (stability across level loads, a second HKPlayerController after a reload). The
+   original ranking follows. It defaults OFF.
    Turned on, it calls a virtual on a pointer found by scanning two UObjects for a struct
    shape, at an index counted out of engine source, in a licensee build. Every step is
    validated and logged before the call, and the log line immediately before it names itself as

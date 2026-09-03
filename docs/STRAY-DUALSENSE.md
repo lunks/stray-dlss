@@ -1013,3 +1013,10 @@ to 3 during the menu; the pause menu opened by KEYBOARD showed ENTER/ESC prompts
 gamepad-only rule working (KeyboardMouse is left alone). **Whether the prompts show PlayStation
 glyphs when the pad is the active device is UNCONFIRMED** — the game reads the DualSense over
 hidraw, so a pad press cannot be injected from the shell; the user has to look.
+
+**Ring fix measured (`da014c5`, strict run):** `ring fill=0/16384 drop=0` before the handover;
+after it the fill sits at 864–1344 frames (18–28 ms) with `drop=0` and a single 1153-frame
+startup underrun that never grows. With the sink's 40 ms queue-ahead that is the whole path
+latency between the engine's mix and the coils. **This is the build left on the box**, in
+`HapticSource=submix` + `SubmixReroute=1` + `ForcePS5HapticPath=1` + `Glyphs=ps5`
+(`deploy-submix-spike.sh --strict --reroute --gate`).
