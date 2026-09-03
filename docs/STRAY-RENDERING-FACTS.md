@@ -2286,3 +2286,98 @@ deleted with the site rather than carried forward.
 title, or a present-stage image that looks *flat and washed out* rather than merely HUD-processed.
 There is no longer a second site to fall back to, so the answer then would be to reinstate a
 codec at this site — not to revive the TAA one, whose feedback node was the reason it went.
+
+---
+
+## 34. The cat's fur: the plugin, the vertex factories and the material (2026-09-03, offline)
+
+Read from `Stray-Win64-Shipping.exe` (85,043,200 bytes) and from
+`Hk_project-WindowsNoEditor.pak`. No game process was touched; the game was running throughout
+and every read was read-only.
+
+### 34.1 The plugin, from the exe's string table
+
+Extraction method: every printable run of length >= 4 from the raw file, twice — ASCII
+(`[\x20-\x7e]{4,}`) and UTF-16LE (`(?:[\x20-\x7e]\x00){4,}`) — with no anchoring, so a hit
+inside a longer identifier still counts. 168,534 ASCII runs, 40,370 UTF-16LE runs.
+
+Shader paths present: `/Plugin/gFur/Private/GFurFactory.ush`,
+`/Plugin/gFur/Private/GFurStaticFactory.ush`. Module: `/Script/GFur`, `GFur`, `GFurComponent`,
+`UGFurComponent`. Content path (from the fur material, §34.3): `/GFur/GFurPRO/gFur/Textures/...`.
+
+Vertex factory class names present (10):
+
+```
+FFurSkinVertexFactory                       FFurStaticVertexFactory
+FExtraInfluencesFurSkinVertexFactory        FPhysicsFurStaticVertexFactory
+FMorphFurSkinVertexFactory                  FPhysicsFurSkinVertexFactory
+FMorphExtraInfluencesFurSkinVertexFactory   FPhysicsExtraInfluencesFurSkinVertexFactory
+FMorphPhysicsFurSkinVertexFactory           FMorphPhysicsExtraInfluencesFurSkinVertexFactory
+```
+
+plus `FFurSkinVertexFactoryShaderParameters<Physics>` and
+`FFurStaticVertexFactoryShaderParameters`.
+
+Previous-frame shader parameter names present: `PreviousBoneFurOffsets`, `PreviousFurPosition`,
+`PreviousFurPositionParameter`, `PreviousFurLinearOffset`, `PreviousFurLinearOffsetParameter`,
+`PreviousFurAngularOffset`, `PreviousFurAngularOffsetParameter`.
+
+Fur-named component/shader symbols present (the `Fur` substring search, so this is not a
+complete property list): `FurLength`, `FurLod`, `FurMaterials`, `FurSplines`, `MinFurLength`,
+`FurOffsetPower`, `FurOffsetPowerParameter`, `BoneFurOffsets`, `FurPosition`,
+`FurPositionParameter`, `FurLinearOffset`, `FurLinearOffsetParameter`, `FurAngularOffset`,
+`FurAngularOffsetParameter`, `RegenerateFur`, `SetBackpackFur`, `FurBackpack`.
+
+Absent from the exe, in both encodings: **`NormalDeformer`**, **`GFurPRO`**. Present for
+comparison, by the same method: `r.BasePassOutputsVelocity`, `bBasePassOutputsVelocity`,
+`r.BasePassOutputsVelocityDebug`, `FVelocityVS`.
+
+Asset names present: `M_Fur_2sidedshading_backpackON`, `M_Fur_Rat`, `MC_CatFur`, `Cat_Furmesh`,
+`/Game/Character/Cat/Fur`.
+
+### 34.2 Reading an Oodle-compressed asset out of the pak
+
+The cat's fur assets are pak-level compression **method 2 (Oodle)**, so `tools/pakextract.py`
+alone reports `Error -3 while decompressing data: incorrect header check`. The working chain:
+
+```
+pakextract.py --raw <pak> <outdir> 'Cat/Fur/M_Fur_2sidedshading_backpackON\.u'
+oodle_unblock.py <entry>.uasset.json <entry>.uasset.raw out.uasset <oozraw>
+```
+
+`oozraw` on the target box is at `/tmp/scepad/oozraw` (ELF x86-64, `usage: oozraw
+<uncompressed_size> < block`). Measured sizes: `M_Fur_2sidedshading_backpackON.uasset` 2,452
+compressed / 4,853 uncompressed, 1 block; its `.uexp` 244,848 / 627,209, 3 blocks;
+`M_Base_GFur_2sidedshading.uasset` 3,080 / 6,859, 1 block.
+
+The `.uasset` alone carries the package name table, and UE4 serialises a
+`TEnumAsByte<EBlendMode>` UPROPERTY as a ByteProperty whose value is an FName — so the enum
+literal appears in that table and a property question is answered by listing 146-201 strings.
+
+### 34.3 `M_Fur_2sidedshading_backpackON` (the cat's fur material)
+
+Class: `MaterialInstanceConstant`. `Parent`: `/Game/Character/Cat/Fur/M_Base_GFur_2sidedshading`.
+
+Name-table contents relevant to the render path:
+
+| | |
+|---|---|
+| `BLEND_*` names present | **`BLEND_Masked`** only |
+| Blend-mode property names | `BlendMode`, `EBlendMode`, `BasePropertyOverrides`, `MaterialInstanceBasePropertyOverrides`, `OpacityMaskClipValue` |
+| `bOverride_*` names present | `bOverride`, `bOverride_ShadingModel`, `bOverrideSubsurfaceProfile` — **no `bOverride_BlendMode`** |
+| Shading model | `MSM_SubsurfaceProfile`, `ShadingModel`, `EMaterialShadingModel`, `SubsurfaceProfile`, `SSS_profil_cat` |
+| Textures | `Cat_furmesh_CO`, `Cat_furmesh_FurGrowth`, `FurNoise_CO`, `FurPattern_04`, gFur's `Default_White` / `Default_White_Linear` / `Normal` |
+
+146 names total.
+
+### 34.4 `M_Base_GFur_2sidedshading` (its parent)
+
+| | |
+|---|---|
+| `BLEND_*` names present | **`BLEND_Masked`** only |
+| Blend-mode property names | `BlendMode`, `EBlendMode`, `OpacityMaskClipValue` |
+| Shading model | `MSM_TwoSidedFoliage` |
+| Material usage flags present | `bUsedWithSkeletalMesh`, `bUsedWithStaticLighting` |
+
+201 names total. `BLEND_Translucent` appears in neither this asset nor §34.3's.
+
