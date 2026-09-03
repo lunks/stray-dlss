@@ -631,6 +631,15 @@ confirmed by the game's own settings**, independently of the bytecode and bindin
 The only user-added override in the live `Engine.ini` is `r.BasePassOutputsVelocity=1`, which is
 redundant since the game already ships it as True.
 
+**The cat's fur material, read the same way 2026-09-03.** `M_Fur_2sidedshading_backpackON` is
+a `MaterialInstanceConstant` over `M_Base_GFur_2sidedshading`; both are **`BLEND_Masked`**, the
+instance overrides the shading model to `MSM_SubsurfaceProfile` (parent `MSM_TwoSidedFoliage`),
+and the base sets `bUsedWithSkeletalMesh`. Masked is what puts the ~48 gFur shell layers in the
+**opaque base pass**, which is what makes them write `GBufferVelocity` — see "The cat is unchanged
+under NR, and the fur is NOT a motion-vector hole" in §5 for the full chain and for the extraction
+procedure (these assets are Oodle-compressed, so `pakextract.py --raw` + `oodle_unblock.py` is
+required).
+
 **Reading the pak.** It is version 11, **unencrypted**, 5.3 GiB, 55,120 entries.
 `tools/paklist.py` lists it and `tools/pakextract.py` extracts by regex, both reading only the
 index blobs rather than the archive — worth knowing, because a bulk copy is neither necessary
@@ -1477,6 +1486,251 @@ was wrong; all of it was work the hook point created. **When a feature keeps gro
 to compensate for where it runs, the placement is the bug.** This project spent sessions
 diagnosing the codec, the exposure loop and the feedback node as properties of NR, and every one
 of them was a property of `u0`.
+
+### The cat is unchanged under NR, and the fur is NOT a motion-vector hole (2026-09-03)
+
+**The observation, the user's:** with NR running as a present stage, *"the rest of the world is
+100% perfect"* — and **the cat looks unchanged.** Global controls at the time:
+`NgxNRLocalStructure=1.61`, `NgxNRSkinStructure=2`, `NgxNRIntensity=1`, `NgxNRStyle=2`,
+`NgxNRAutoMask=1`. Fine fur is exactly the content a detail network should act on, so "the
+strength is too low" does not explain it at 1.61.
+
+**Nothing below has run in the game.** Every claim is read out of the UE 4.27.2 source, out of the
+fur plugin's source, out of Stray's own shipped executable, or out of **Stray's own cooked
+material**. Nothing was written to the box; the game was running throughout and was not touched.
+
+#### The leading hypothesis was that the fur shells write no velocity. It is REFUTED, and every link is HARD.
+
+The cat is drawn by **gFur PRO** (`GiM-GamesInMotion/gFurPro`, branch `4.27` @ `d5238a4` — the
+plugin is **open source**; `GFur.uplugin` reads `"FriendlyName": "GFur PRO"`, and Stray's own
+material references `/GFur/GFurPRO/gFur/Textures/...`). The proposed mechanism was that ~48 shell
+layers write nothing into `GBufferVelocity`, so every fur pixel would fall into
+`mv_resolve.hlsl`'s else-branch and be handed the motion of a **static world point at that
+depth** — precisely wrong for the one object always moving relative to the camera.
+
+Stray ships `r.BasePassOutputsVelocity=True` (§2.3.1), so the route is the **base pass**, and the
+separate velocity pass is correctly excluded for gFur (`VelocityRendering.cpp:417-443`:
+`PrimitiveCanHaveVelocity` returns false exactly when the base pass can output velocity, and
+gFur's VFs declare `bSupportsStaticLighting = false`). **The base pass has three gates and
+nothing else. All three pass:**
+
+| Gate | Where | For the fur | Status |
+|---|---|---|---|
+| **Blend mode**, at PREPROCESSOR level | `BasePassCommon.ush:52-54` — `WRITES_VELOCITY_TO_GBUFFER` needs `MATERIALBLENDING_SOLID \|\| MATERIALBLENDING_MASKED`, and so does `USES_GBUFFER` (`:41`), which is the other operand of its `\|\|` | **`BLEND_Masked`** | **HARD** — from the game's own asset, below |
+| `OutputVelocity > 0` | `BasePassVertexShader.usf:225` / `BasePassPixelShader.usf:985`; fed by `bOutputVelocity \|\| AlwaysHasVelocity()` (`PrimitiveSceneProxy.cpp:385`) | `FurComponent.cpp:42` sets **`bAlwaysHasVelocity = true`**, so it is 1 unconditionally | **HARD** |
+| `DrawsVelocity != 0` | `BasePassPixelShader.usf:997` zeroes the result otherwise; `DrawsVelocity()` is `return IsMovable();` (`PrimitiveSceneProxy.h:571-575`) | the cat's fur component is movable | **HARD** |
+
+**The full `WRITES_VELOCITY_TO_GBUFFER` expression has two further terms and both are satisfied**,
+which is worth spelling out because one of them looks alarming at first: it is
+`(SUPPORTS_WRITING_VELOCITY_TO_BASE_PASS || USES_GBUFFER) && GBUFFER_HAS_VELOCITY &&
+(!SELECTIVE_BASEPASS_OUTPUTS || !(STATICLIGHTING_TEXTUREMASK || STATICLIGHTING_SIGNEDDISTANCEFIELD
+|| HQ_TEXTURE_LIGHTMAP || LQ_TEXTURE_LIGHTMAP || WATER_MESH_FACTORY))`. `GBUFFER_HAS_VELOCITY` is
+`IsUsingBasePassVelocity` (`ShaderCompiler.cpp:4708`), i.e. `r.BasePassOutputsVelocity`, which
+Stray ships True. The static-lighting term is disarmed twice over: `r.SelectiveBasePassOutputs`
+defaults to 0, and the lightmap defines come from the vertex factory's lightmap policy while
+gFur's VFs declare `bSupportsStaticLighting = false`. **So `bUsedWithStaticLighting` appearing in
+the fur material's own name table (§34.4) is not a problem** — it is a material USAGE flag, not a
+vertex-factory capability, and it cannot reach these defines.
+
+And the previous position the VS fetches is real, not a stand-in for the current one:
+`GFurFactory.ush:722-726` implements `VertexFactoryGetPreviousWorldPosition` → `SkinPreviousPosition`
+(`:390-416`), which uses `CalcPreviousBoneMatrix`, `Primitive.PreviousLocalToWorld`, the previous
+frame's **fur physics offsets**, and ends `return Position + ResolvedView.PrevPreViewTranslation;`
+— the required previous-frame translated-world convention. The bone matrices are explicitly
+double-buffered *for this purpose* (`FurSkinData.cpp:218`: *"double buffered bone
+positions+orientations to support normal rendering and velocity (new-old position) rendering"*),
+bound at `:791-810` as `PreviousBoneMatrices` **and** `PreviousBoneFurOffsets`, with a
+discontinuity collapse on LOD change or a skipped frame (`:235-248`).
+
+**Stray's own binary carries all of that machinery**, which is what makes the plugin reading apply
+to *this* build rather than to a repo. Exhaustive printable-run extraction of
+`Stray-Win64-Shipping.exe` (85 MB, ASCII and UTF-16LE, unanchored) finds
+`/Plugin/gFur/Private/GFurFactory.ush`, `/Plugin/gFur/Private/GFurStaticFactory.ush`,
+`FFurSkinVertexFactory`, `FPhysicsFurSkinVertexFactory`, `FMorphPhysicsFurSkinVertexFactory`,
+`FFurSkinVertexFactoryShaderParameters<Physics>` — and **`PreviousBoneFurOffsets`,
+`PreviousFurPosition`, `PreviousFurLinearOffset`, `PreviousFurAngularOffset`** with their
+`*Parameter` binding counterparts. Those names exist in a vertex factory for exactly one purpose.
+**HARD.**
+
+**The blend mode was the one live gate, and Stray's own pak settles it.** The material
+`M_Fur_2sidedshading_backpackON` is a `MaterialInstanceConstant` whose `Parent` is
+`M_Base_GFur_2sidedshading`. Both name tables were read (method below), and in **both** the only
+`BLEND_*` name present is **`BLEND_Masked`** — alongside `BlendMode`, `EBlendMode` and (on the
+instance) `BasePropertyOverrides`. `BLEND_Translucent` appears in neither. **The parent alone
+settles it**, which matters because the instance's table carries `bOverride_ShadingModel` but no
+`bOverride_BlendMode`, so its override may well be inactive and the effective blend mode inherited
+— and the inherited one is Masked too. The instance also
+overrides the shading model to `MSM_SubsurfaceProfile` (parent: `MSM_TwoSidedFoliage`) with
+`SubsurfaceProfile = SSS_profil_cat` — both deferred G-buffer shading models, which a translucent
+material cannot use, so the asset corroborates itself.
+
+Two-sidedness excludes nothing: `grep IsTwoSided` over `BasePassCommon.ush`,
+`BasePassPixelShader.usf`, `BasePassVertexShader.usf` and `BasePassRendering.{h,cpp}` returns
+**zero** hits, and every `IsTwoSided()` call site in `Runtime/Renderer/Private` is a cull-mode or
+default-material-swap decision. `MSM_TwoSidedFoliage` appears in exactly one define,
+`WRITES_CUSTOMDATA_TO_GBUFFER` (`BasePassCommon.ush:44`), and in no velocity define.
+`ShouldIncludeMaterialInDefaultOpaquePass` excludes only `IsSky()` and `MSM_SingleLayerWater`.
+
+**So the fur writes velocity, the vectors are right, and the fix is not about motion vectors.**
+Recorded at this length because the hypothesis was good, cheap to state, and would have redirected
+the whole feature — and because this file has twice paid for the opposite mistake (the
+`ClipToPrevClip` transposition, `MVecScale`): *bad motion vectors do not produce one bad frame,
+they compound through the accumulation*, so any temporal artefact on one object reads like a
+motion-vector bug whether or not it is one. The lesson cuts both ways.
+
+**Three traps found on the way, all worth keeping:**
+
+* **`bPrecisePrevWorldPos` is DEAD METADATA in 4.27.2.** gFur declares it true
+  (`IMPLEMENT_VERTEX_FACTORY_TYPE(FFurSkinVertexFactory, "…/GFurFactory.ush", true, false, true,
+  **true**, false)`, `FurSkinData.cpp:551-558`, 4th bool), and it is tempting to read that as the
+  thing that enables velocity. It is not: `SupportsPrecisePrevWorldPos()` has **zero call sites in
+  the entire engine** — only the declaration (`VertexFactory.h:347/385/457`) and the constructor
+  store (`VertexFactory.cpp:81/100`). It is evidence of the author's intent and of nothing else.
+  The only VF property the velocity code actually reads is `SupportsStaticLighting()`.
+* **`BLEND_Masked` does not always compile to `MATERIALBLENDING_MASKED`.**
+  `MaterialShared.cpp:1871-1888` emits `MATERIALBLENDING_SOLID` instead when the material
+  `WritesEveryPixel()`. Harmless for velocity — both are in the define — but "the shader says
+  SOLID" is not evidence the asset is set to Opaque.
+* **`FPrimitiveViewRelevance`'s constructor is not a plain memset.** After zeroing itself it sets
+  `bOpaque = true` and `bRenderInMainPass = true` (`PrimitiveViewRelevance.h:85-100`, under the
+  comment *"only exceptions (bugs we need to fix?)"*). A read that stops at the memset concludes
+  gFur's `bVelocityRelevance = IsMovable() && Result.bOpaque && Result.bRenderInMainPass`
+  (`FurComponent.cpp:296`) is always false — and that conclusion cost one agent a whole section
+  before the fuller quote retired it. Moot here (the separate pass is off), but the shape is the
+  lesson: **asserting a negative from a truncated quote is the failure the HARD label exists to
+  prevent.**
+
+#### `r.BasePassForceOutputsVelocity=1` is a live, restart-free discriminator — keep it in the kit
+
+`SceneRendering.cpp:330-335`, default 0, flags **`ECVF_RenderThreadSafe` only** — *not*
+`ECVF_ReadOnly`, unlike `r.BasePassOutputsVelocity` — so it can be changed live. It reaches the
+shader as `View.ForceDrawAllVelocities` (`SceneRendering.cpp:1524`, `SceneView.h:667`) and appears
+in no C++ branch at all. **It bypasses exactly two gates** — `OutputVelocity` and `DrawsVelocity`,
+at `BasePassVertexShader.usf:225`, `BasePassPixelShader.usf:985` and `:997`. **It cannot bypass
+the blend mode**, because `#if WRITES_VELOCITY_TO_GBUFFER` *wraps* all three sites and resolves at
+shader-compile time: a translucent permutation contains neither the branch nor the cvar test. So
+for any future "does this thing write velocity?" question: flip it, and if the velocity appears
+the fault was a per-primitive gate; if it does not, the fault is the blend mode and no cvar will
+fix it.
+
+#### Reading a cooked material out of Stray's pak, which is now a solved procedure
+
+The fur materials are Oodle-compressed at the pak level, so `tools/pakextract.py` alone reports
+`Error -3 while decompressing`. The full chain, run entirely read-only against the box while the
+user was playing (`nice -n 19 ionice -c3`, no writes outside `/tmp`):
+
+```
+pakextract.py --raw <pak> rawout 'Cat/Fur/M_Fur_2sidedshading_backpackON\.u'
+oodle_unblock.py <entry>.json <entry>.raw out.uasset /tmp/scepad/oozraw
+python3 -c 'print sorted printable runs of out.uasset'
+```
+
+`/tmp/scepad/oozraw` is an existing ooz build on the box (`usage: oozraw <uncompressed_size> <
+block`). **The `.uasset` alone is enough for a property question**: UE4 serialises a
+`TEnumAsByte<EBlendMode>` UPROPERTY as a ByteProperty whose *value* is an FName, so the enum
+literal (`BLEND_Masked`) lands in the package's name table and the whole 146-name table fits on
+one screen — no property-tag walk, no `.uexp`, no CUE4Parse. The same trick reads shading models
+(`MSM_*`), material usage flags (`bUsedWith*`) and every parameter name.
+
+#### What is still open, cheapest test first
+
+1. **FRAME GENERATION IS ON, AND IT IS THE CHEAPEST CONFOUND TO REMOVE.** The live session that
+   produced the report had `fg_enabled=1`, `fg_generated_presented=6563` against
+   `fg_game_presents=6750` — so **roughly half of every frame the user judged was a DLSS-G
+   interpolation.** The ordering is right (**HARD**, `present_owner.cpp`: `pc.back_buffer` is the
+   FG replacement, `sk->on_present(pc)` runs the NR stage over it, and only then `fg::record`
+   generates from `c.replacement[c.mirror.current()]` — the same, already-NR'd resource), so this
+   is *not* "NR skips half the frames". But an interpolated frame is a **warp**, and a warp
+   preserves fine structure on static content far better than on the fastest-moving thing on
+   screen — which is the cat, close to the camera and moving relative to it. **"World perfect, cat
+   unchanged" is the exact shape that predicts.** UNCONFIRMED, and it costs one config flip:
+   **judge NR with `NgxFG=0` before building anything.**
+2. **A shell-fur pixel's guides describe one shell; its colour is a composite of several.** 48
+   alpha-masked layers write one depth and one velocity sample per pixel — the frontmost shell
+   that survived the mask — while the visible colour accumulates whatever showed through the
+   layers behind it. A temporal network reprojecting with those guides fetches history for a
+   surface that is only partly the pixel it is correcting, and over fur the depth guide is a dense
+   field of shell-to-shell discontinuities rather than a surface. That is a structural
+   shell-fur/temporal mismatch of the same family as "temporal network + screen-space
+   reflections", and — like that one — **it is not fixable from the velocity side, because the
+   velocity is correct.** UNCONFIRMED, and there is no cheap test for it.
+3. **The network may simply not read fur as structure.** The strengths are not multipliers on an
+   output: the binary audit ("DLSSNR's structure controls") found they are broadcast
+   bit-identically into the input tile as five of sixteen channels, so they tell the network *how
+   much* local structure to apply and the trained weights decide *where* structure exists. Fur may
+   read as noise. **Probe this with `NgxNRIntensity` and nothing else** — it is the only strength
+   knob NOT in `CG2R_ResetTemporalHistoryOnControlChange`, so it is the only one that can be moved
+   without wiping the accumulation; every structure slider holds `Reset = 1` while it is dragged
+   and changes the whole screen for reasons unrelated to its meaning.
+
+#### The instrument: `NgxDumpInputs` now dumps the engine's own velocity, and `NgxDumpAt` moves it
+
+Built, CI-green, **never fired**. `mv_resolve.hlsl` writes a plausible vector for every pixel —
+decoded object motion where `EncodedVelocity.x > 0`, reconstructed camera motion everywhere else
+— so **the branch a pixel took is invisible in the resolved field**, and a pixel handed the wrong
+branch looks exactly like a pixel handed the right one. The engine's raw `R16G16B16A16_UNORM`
+buffer is the only resource in the frame that records which pixels UE4 actually wrote a velocity
+for. It is now captured as `straydlss_velocity_raw_<n>.bin` beside the colour/depth/output dumps,
+with our resolved `RG16_FLOAT` field as `straydlss_mv_<n>.bin`.
+
+`tools/rawdump2png.py` grows two formats. `rgba16unorm` writes **two** images: the decoded object
+velocity, and `<stem>_mask.png` — UE's own strict `EncodedVelocity.x > 0` test, white where the
+engine wrote a velocity — plus the coverage percentage. Open the mask beside the colour dump of
+the same evaluate. **The refutation above predicts a WHITE cat.** A black one would overturn a
+chain every link of which is HARD, including the game's own asset, and would be the finding of the
+session. `rg16f` renders the resolved field's magnitude and prints its component ranges.
+
+**`[STRAYDLSS] NgxDumpAt` moves the capture points** (default 0 = the shipped 600/900; a
+configured value is the first point and the second follows 300 evaluates later; pure and pinned in
+`src/core/dump_plan.hpp`). The shipped points were chosen for a session that reached gameplay
+quickly. `NR CODEC LUMINANCE` has already been wasted once by firing on a black loading frame, and
+a dump costs a whole round trip — set it past the loading screen.
+
+#### `DLSSNR.ControlMask` — reachable, and not yet worth it
+
+The idea: tag the cat with UE4's custom depth/stencil (`bRenderCustomDepth` on the pawn's
+components, which **StrayFur already reaches by reflection**, plus `r.CustomDepth=3`), turn that
+into `DLSSNR.ControlMask` — an RGB per-pixel control texture, **R = final blend weight, G scales
+local tone, B scales local structure** (HARD, from the disassembly) — and raise structure on the
+cat alone. It is reachable in principle. It should not be built yet, and the reasons are worth
+writing down so the next session does not re-derive them:
+
+* **It costs the skin term outright.** Binding a mask forces `UseAutoMask = 0`, which drives both
+  resolved values to `-1.0f`, and **the mask has no skin channel** — skin exists only on the auto
+  path. The user currently runs `NgxNRAutoMask=1` with `NgxNRSkinStructure=2` over a world that
+  "looks 100% perfect". C trades that away to fix one subject.
+* **Four unknowns, none of them free.** Does gFur render into the custom-depth pass at all (its
+  VFs declare `bSupportsPositionOnly = false`, so the depth pass would use the full VS; the
+  permutations are UNCONFIRMED)? Is the target's content still valid at Present — it is a
+  persistent `FSceneRenderTargets` entry rather than a transient RDG allocation, so it should
+  survive the frame, but that is SOFT? What extent does `ControlMask` want — it has `Subrect`
+  fields but, unlike `MVec`, **no `ScaleX/Y`**, so whether a render-res mask is legal against an
+  output-res colour grid is UNCONFIRMED, and if it is not the upscale needs **the first compute
+  dispatch we have ever recorded on the present list**. And do `G`/`B` scale ABOVE 1, or only
+  damp? If only damp, the design inverts: raise the global and attenuate the world, which changes
+  the half that is already right.
+* **Finding the target is NOT one of the unknowns**, contrary to the first instinct. The native
+  backend hooks `ID3D12Device::CreateDepthStencilView` and shadows every DSV with its resource
+  (`backend_native/d3d12_hooks.cpp:454-467`), so a custom-depth target is observable the moment
+  it is created — and the discriminator is two-way rather than a search: exactly two resources
+  in the frame carry a DSV at the scene-buffer extent, and we already know which one is
+  `SceneDepthZ` because it is the TAA pass's own depth SRV. The other one is custom depth. This
+  is not the TAA identification problem.
+* **It is not free at runtime either.** `r.CustomDepth=3` re-draws the tagged primitives, and with
+  `LAYERS=48` that is 48 extra shell draws per frame on a title already at ~55 fps with FG on.
+
+**If it is ever built, the first step is not the mask.** Bind a CONSTANT ControlMask — uniform
+1.0, then uniform 0.5 — and confirm from the log and the screen that the runtime reads it and that
+`UseAutoMask` dropping to 0 does not by itself wreck the look. That separates "can we drive this
+input" from "is our mask right", which is the `NgxPaint` ladder that cracked "DLSS runs but
+nothing changes".
+
+**And there is a free mask hiding in the answer to A.** Because the fur DOES write velocity, the
+engine's own `EncodedVelocity.x > 0` is already an approximate moving-subject mask, at render
+resolution, in a texture `mv_resolve` reads every frame — one extra UAV and no engine change, no
+custom-depth pass, no new identification problem. It is not exact (it catches every mover and
+loses the cat when the cat is still), but it is the cheap path, and it exists only because A came
+back negative.
 
 ### DLSS Neural Rendering WORKS — the missing piece was an HDR colour codec (2026-09-01)
 

@@ -6,6 +6,7 @@
 
 #include <doctest/doctest.h>
 
+#include "core/dump_plan.hpp"
 #include "core/fnv1a.hpp"
 #include "core/ue4_view.hpp"
 
@@ -176,4 +177,41 @@ TEST_CASE("halton stays inside the pixel-space window DLSS expects")
 	CHECK(ue4::halton(0, 2) == doctest::Approx(0.0f));  // 1/2 - 0.5
 	CHECK(ue4::halton(1, 2) == doctest::Approx(-0.25f)); // 1/4 - 0.5
 	CHECK(ue4::halton(0, 3) == doctest::Approx(-1.0f / 6.0f)); // 1/3 - 0.5
+}
+
+TEST_CASE("the NGX input dump fires at two points, and an absent key never moves them")
+{
+	using stray_dlss::core::DumpPlan;
+	using stray_dlss::core::dump_wants;
+	using stray_dlss::core::plan_dump_points;
+
+	// An absent or zero [STRAYDLSS] NgxDumpAt keeps the shipped 600/900. Deploys write only the
+	// keys they are passed (CLAUDE.md §5, "Box operational traps"), so a key that is simply not
+	// there must be indistinguishable from the shipped behaviour.
+	const DumpPlan shipped = plan_dump_points(0);
+	CHECK(shipped.first == 600);
+	CHECK(shipped.second == 900);
+	CHECK(plan_dump_points(-1).first == 600);
+	CHECK(plan_dump_points(-1).second == 900);
+
+	// A configured value is the FIRST point; the second follows the fixed gap.
+	const DumpPlan late = plan_dump_points(5000);
+	CHECK(late.first == 5000);
+	CHECK(late.second == 5300);
+
+	// The two points must never coincide, or "compare the two captures" — the whole reason
+	// there are two — collapses into one sample.
+	CHECK(shipped.first != shipped.second);
+	CHECK(late.first != late.second);
+
+	// Only those two evaluates capture anything. A dump that fires every frame would allocate
+	// a 66 MB readback per frame.
+	CHECK(dump_wants(shipped, 600));
+	CHECK(dump_wants(shipped, 900));
+	CHECK_FALSE(dump_wants(shipped, 599));
+	CHECK_FALSE(dump_wants(shipped, 601));
+	CHECK_FALSE(dump_wants(shipped, 0));
+	CHECK(dump_wants(late, 5000));
+	CHECK(dump_wants(late, 5300));
+	CHECK_FALSE(dump_wants(late, 600));
 }

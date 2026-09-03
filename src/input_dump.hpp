@@ -7,7 +7,15 @@
 // presents later writes the raw bytes into the game directory. Two samples of the same input
 // with identical bytes prove a stale texture; converting them to PNG shows what DLSS sees.
 //
+// It also dumps the ENGINE'S OWN sparse velocity buffer (`velocity_raw`, R16G16B16A16_UNORM)
+// and our resolved dense field (`mv`, R16G16_FLOAT). Those two answer a question neither the
+// colour nor the resolved vectors can: which pixels UE4 actually wrote an object velocity for.
+// mv_resolve.hlsl produces a plausible vector for every pixel — decoded object motion where
+// `EncodedVelocity.x > 0`, reconstructed camera motion everywhere else — so the branch a pixel
+// took is invisible downstream, and `R > 0` over the raw buffer is the only way to read it.
+//
 // [STRAYDLSS] NgxDumpInputs=1. Diagnostic only — 16-66 MB per capture, freed after the write.
+// [STRAYDLSS] NgxDumpAt=<evaluate> moves the capture points; see set_points below.
 #pragma once
 
 #include <cstdint>
@@ -20,6 +28,13 @@ namespace stray_dlss::input_dump {
 
 void set_enabled(bool enabled);
 bool enabled();
+
+// [STRAYDLSS] NgxDumpAt: the FIRST evaluate to capture at; 0 keeps the shipped 600/900. The
+// second point follows a fixed gap. See src/core/dump_plan.hpp for why this is configurable at
+// all — a run still on a loading screen at evaluate 600 dumps a black frame and answers nothing.
+void set_points(int configured);
+std::uint64_t first_point();
+std::uint64_t second_point();
 
 // True when `evaluate_count` is one of the dump points.
 bool wants(std::uint64_t evaluate_count);
