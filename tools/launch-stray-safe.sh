@@ -33,7 +33,8 @@ APPID=1332010
 GAME_DIR=/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64
 STAGE_DIR=/run/media/deck/GamesLinux/dlss5-stage           # cef-eval.py lives here
 PROBE="$GAME_DIR/stray-game-state.txt"                      # mods/StrayProbe
-STATUS="$GAME_DIR/stray-dlss-status.txt"                    # render host heartbeat (if any)
+STATUS="$GAME_DIR/stray-dlss-status.txt"                    # render host heartbeat, only when StatusFile=1
+PLUGIN_LOG="$GAME_DIR/stray-dlss-plugin.log"                # the render host's log: written whatever StatusFile says
 VERDICT="$GAME_DIR/stray-launch-verdict.txt"
 CRASH_DIR="/home/deck/.local/share/Steam/steamapps/compatdata/$APPID/pfx/drive_c/users/steamuser/AppData/Local/Hk_project/Saved/Crashes"
 PROTON_LOG="/home/deck/steam-$APPID.log"
@@ -135,16 +136,6 @@ fi
 
 # ------------------------------------------------------------------ launch
 rm -f "$PROBE" "$STATUS" "$VERDICT"
-
-# ARM THE PROBE FOR THIS LAUNCH ONLY. mods/StrayProbe does nothing unless it finds this flag,
-# and it DELETES the flag as it reads it — so a session the user starts from Steam finds none
-# and schedules no loops at all. The probe costs a file write plus one game-thread engine read
-# every second, which is the same shape as the ~1 Hz frame-time blip; it should exist while a
-# script needs to tell gameplay from the title screen, and not otherwise.
-: > "$GAME_DIR/stray-probe-armed"
-chown deck:deck "$GAME_DIR/stray-probe-armed" 2>/dev/null || true
-log "Armed mods/StrayProbe for this launch (one-shot flag; a Steam launch leaves it idle)"
-
 log "Asking Steam to launch $APPID (cef-eval output shown, never hidden)"
 OUT=$(su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" 2>&1); RC=$?
 printf '%s\n' "$OUT" | tail -n 3 | sed 's/^/    /'
@@ -174,15 +165,32 @@ done
 log "Probe alive: $(tr '\n' ' ' < "$PROBE")"
 
 if [ "$EXPECT_HEARTBEAT" -eq 1 ]; then
-    log "Waiting for the render host heartbeat (up to 240 s)"
+    # TWO SIGNALS, and the second is why this gate stopped working (2026-09-03). It used to
+    # wait only for stray-dlss-status.txt, which the plugin writes ONLY when StatusFile=1 -
+    # and that key was set to 0 when the periodic writes were dropped. The file then never
+    # appears, so a perfectly healthy plugin failed the gate on every launch ("no heartbeat"
+    # for 240 s while stray-dlss-plugin.log was demonstrably being written). A gate that
+    # cannot pass in the shipped configuration is worse than no gate: it taught two sessions
+    # to ignore it.
+    #
+    # The LOG is the signal that always exists: the plugin appends to it from attach onwards,
+    # so an mtime newer than this launch proves the render host is alive and running THIS
+    # session. The status file stays the preferred signal when it is enabled, because it
+    # carries the frame counter and the census that the line below prints.
+    log "Waiting for the render host heartbeat (up to 240 s; status file or plugin log)"
+    HB=""
     for i in $(seq 1 240); do
-        [ -f "$STATUS" ] && newer "$STATUS" && break
+        [ -f "$STATUS" ]     && newer "$STATUS"     && { HB=status; break; }
+        [ -f "$PLUGIN_LOG" ] && newer "$PLUGIN_LOG" && { HB=log;    break; }
         tick_checks "waiting for the heartbeat"
         [ $((i % 10)) -eq 0 ] && log "  ${i}s: no heartbeat yet"
         sleep 1
     done
-    [ -f "$STATUS" ] && newer "$STATUS" || fail "render host ($HOSTS) never wrote its heartbeat while the game ran"
-    log "Heartbeat: $(head -n 3 "$STATUS" | tr '\n' ' ')"
+    case "$HB" in
+        status) log "Heartbeat (status file): $(head -n 3 "$STATUS" | tr '\n' ' ')" ;;
+        log)    log "Heartbeat (plugin log, StatusFile is off): $(tail -n 1 "$PLUGIN_LOG" | cut -c1-110)" ;;
+        *)      fail "render host ($HOSTS) wrote neither $STATUS nor $PLUGIN_LOG while the game ran" ;;
+    esac
 fi
 
 if [ "$DRIVE" -eq 0 ]; then
