@@ -47,6 +47,9 @@ std::wstring ResolveDir(const std::string& configured, const std::wstring& gameD
 
 // While no pad has been adopted, probe this fast and for this long. 120 probes at 1 s is two
 // minutes, which comfortably covers a load into gameplay.
+// The peak that counts as "the engine really is rendering haptics into this submix". Well above
+// dither and well below anything audible/feelable.
+constexpr float        kSubmixLiveThreshold = 1.0e-4f;
 constexpr float        kFastPadPollSeconds = 1.0f;
 constexpr unsigned long kFastPadProbes     = 120;
 
@@ -239,12 +242,12 @@ void Runtime::StartSubmix()
 
     if (m_config.SubmixDrivesCoils())
     {
-        m_submixSink.Start(&m_submixRing, m_config.endpointMatch, m_config,
-                           [this] { m_hidMode.AssertNow("submix: silence -> signal"); });
-        SDS_LOG_WARN("submix: HapticSource=submix, so the ASSET haptic path is disabled - "
-                     "StartPS5Vibration will no longer play <gamedir>/haptic/<name>.f32. Set "
-                     "HapticSource=measure to keep the assets driving the coils while the tap "
-                     "only reports numbers.");
+        // The sink is NOT started here. It opens the pad endpoint only once the listener has
+        // registered: the 2026-09-03 run streamed 1,097,761 frames of pure underrun to the pad
+        // while the tap was refusing to bind, which is noise in every sense.
+        SDS_LOG_INFO("submix: HapticSource=submix. The ASSET path keeps driving the coils "
+                     "until the tap is bound AND carrying signal - a tap that never binds must "
+                     "not leave the pad silent, which is exactly what happened on 2026-09-03.");
     }
     else
     {
@@ -252,6 +255,11 @@ void Runtime::StartSubmix()
                      "pad. The asset path still drives the coils; this run only answers "
                      "whether the engine is mixing haptics for us.");
     }
+}
+
+bool Runtime::SubmixOwnsCoils() const
+{
+    return m_config.SubmixDrivesCoils() && m_submixLive.load(std::memory_order_acquire);
 }
 
 bool Runtime::SubmixWantsBinding() const
@@ -294,6 +302,8 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     // channel, so the candidate dump follows the same 1-then-every-20 cadence as the WARN
     // below rather than writing several lines a second for a whole session.
     in.logCandidates = (attempt == 1 || attempt % 20 == 0);
+    in.scanBytes     = static_cast<std::size_t>(m_config.submixScanBytes);
+    in.dumpWords     = m_config.submixDumpWords;
 
     const submix::DiscoveryResult d = submix::FindAudioDevice(in);
     if (!d.ok)
@@ -347,6 +357,9 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
 
     m_submixDevice = d.device;
     m_submixBound.store(true, std::memory_order_release);
+    if (m_config.SubmixDrivesCoils())
+        m_submixSink.Start(&m_submixRing, m_config.endpointMatch, m_config,
+                           [this] { m_hidMode.AssertNow("submix: silence -> signal"); });
     SDS_LOG_INFO("submix: registration submitted for '%s'. It is ASYNCHRONOUS - the engine "
                  "runs it on the audio thread (AudioMixerDevice.cpp:2405) - so callbacks are "
                  "expected within a frame or two, not immediately. Watch the SUBMIX line.",
@@ -509,9 +522,10 @@ void Runtime::SubmixStatus()
     else
     {
         std::snprintf(line, sizeof(line),
-                      "SUBMIX %s bound=%d cb=%llu (%.1f/s) ch=%d rate=%d frames/cb=%d "
-                      "peak=%.5f rms=%.5f bad=%llu",
+                      "SUBMIX %s bound=%d live=%d(coils:%s) cb=%llu (%.1f/s) ch=%d rate=%d "
+                      "frames/cb=%d peak=%.5f rms=%.5f bad=%llu",
                       m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0,
+                      m_submixLive.load() ? 1 : 0, SubmixOwnsCoils() ? "submix" : "assets",
                       static_cast<unsigned long long>(vib.callbacks), cbPerSec,
                       vib.lastNumChannels, vib.lastSampleRate,
                       vib.lastNumChannels > 0 ? vib.lastNumSamples / vib.lastNumChannels : 0,
@@ -520,6 +534,18 @@ void Runtime::SubmixStatus()
         // Learned from the engine, never assumed: a project ini can change the rate.
         if (vib.lastSampleRate > 0)
             m_submixSink.SetSourceRate(static_cast<uint32_t>(vib.lastSampleRate));
+
+        // THE HANDOVER. Callbacks alone are not enough: a submix that renders pure silence
+        // would take the coils away from the asset path and give nothing back. Only a real
+        // signal proves the engine is putting haptics in there, so that is the trigger.
+        if (m_config.SubmixDrivesCoils() && level.peak >= kSubmixLiveThreshold &&
+            !m_submixLive.exchange(true, std::memory_order_acq_rel))
+        {
+            SDS_LOG_INFO("submix: FIRST REAL SIGNAL (peak %.5f) - the submix now drives the "
+                         "coils and the asset path stands down.",
+                         static_cast<double>(level.peak));
+            m_haptics.Stop(0.0f);
+        }
     }
 
     char master[220] = "";
@@ -672,7 +698,7 @@ void Runtime::OnStartVibration(const VibrationStart& s)
     // asset player must not also drive them. The call is still LOGGED above, because the log
     // is how a null submix result gets diagnosed — "the game asked for CatPurr2_VIBE and the
     // submix stayed silent" is a completely different finding from "the game never asked".
-    if (m_config.SubmixDrivesCoils())
+    if (SubmixOwnsCoils())
         return;
     if (name.empty())
     {
@@ -696,7 +722,7 @@ void Runtime::OnStopVibration(float fadeOut)
         std::lock_guard<std::mutex> lock(m_componentMutex);
         m_playingComponent.clear();
     }
-    if (m_config.SubmixDrivesCoils())
+    if (SubmixOwnsCoils())
         return;      // the engine's own fade-out is already in the submix we are listening to
     m_haptics.Stop(fadeOut);
 }
@@ -722,7 +748,7 @@ void Runtime::OnStopVibrationOnComponent(const std::string& componentFullName, f
     m_componentStopsHonoured.fetch_add(1, std::memory_order_relaxed);
     SDS_LOG_INFO("StopPS5VibrationOnAudioComponent fadeOut=%.2f (owner) %s",
                  static_cast<double>(fadeOut), componentFullName.c_str());
-    if (m_config.SubmixDrivesCoils())
+    if (SubmixOwnsCoils())
         return;
     m_haptics.Stop(fadeOut);
 }
@@ -730,7 +756,7 @@ void Runtime::OnStopVibrationOnComponent(const std::string& componentFullName, f
 void Runtime::OnSetVibrationLevel(float level)
 {
     // ~60 Hz. Never log it per call.
-    if (m_config.SubmixDrivesCoils())
+    if (SubmixOwnsCoils())
         return;   // the level is already applied by the engine, upstream of the submix
     m_haptics.SetLevel(level);
 }

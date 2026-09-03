@@ -87,6 +87,9 @@ public:
     // The UE4SS glue polls this from inside a game-thread hook and stops as soon as it is
     // false, so a session that never binds is one WARN per attempt and not a silent nothing.
     bool SubmixWantsBinding() const;
+    // Is the submix ACTUALLY driving the coils right now? Config intent AND proven signal.
+    // Everything that would silence the asset path asks this, never the config alone.
+    bool SubmixOwnsCoils() const;
 
     // Called ON THE GAME THREAD by the UE4SS glue, which resolves the three UObjects and the
     // executable's image range reflectively and hands them over as raw pointers — the runtime
@@ -122,6 +125,10 @@ private:
     submix::Tap*       m_tapVibration = nullptr;
     submix::Tap*       m_tapMaster    = nullptr;
     std::atomic<bool>  m_submixBound{false};
+    // The tap has delivered a REAL SIGNAL, not merely callbacks. Until it does, the asset path
+    // keeps driving the coils — the 2026-09-03 run left the user with no haptics at all because
+    // HapticSource=submix disabled the assets on a tap that never bound.
+    std::atomic<bool>  m_submixLive{false};
     std::atomic<int>   m_submixBindAttempts{0};
     const void*        m_submixDevice = nullptr;
     std::string        m_submixStatusPath;   // narrow, for the log; the wide one is below

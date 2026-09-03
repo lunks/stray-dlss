@@ -85,6 +85,14 @@ struct Config
     // escape hatches and say so in the log.
     std::string submixDeviceSource = "both";
 
+    // How far into UWorld/UEngine to scan for the audio device. 0x2000 was NOT ENOUGH:
+    // UEngine declares 268 UPROPERTYs before MainAudioDeviceHandle (Engine.h:1735).
+    int   submixScanBytes    = 0x8000;
+    // 32-bit words of each non-UObject candidate to dump when NOTHING is accepted. The
+    // sample-rate test is the one check that cannot self-check, so a refusal must leave behind
+    // enough to find the rate by eye and measure its offset.
+    int   submixDumpWords    = 96;
+
     float submixGain         = 1.0f;   // applied before the soft clip
     int   submixQueueAheadMs = 40;     // WASAPI lead on the coil stream; raise if it crackles
     int   submixRingMs       = 250;    // ring capacity; ~12 engine callbacks at the default

@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 
 namespace sds {
@@ -30,6 +31,13 @@ const void* ReadPtr(const void* at)
     const void* p = nullptr;
     std::memcpy(&p, at, sizeof(p));
     return p;
+}
+
+std::int32_t ReadI32(const void* at)
+{
+    std::int32_t v = 0;
+    std::memcpy(&v, at, sizeof(v));
+    return v;
 }
 
 // Does this look like a C++ vtable for a class compiled into the game executable?
@@ -58,12 +66,20 @@ std::size_t ReadableWindow(const void* p, std::size_t want)
     return Readable(p, want) ? want : 0;
 }
 
-// FAudioDevice::SampleRate is an int32 (AudioDevice.h:1789) and FAudioPlatformSettings right
-// after it carries another copy, so a live audio device holds at least one — usually two —
-// int32s from this set. A random UObject holds none.
-std::int32_t FindSampleRate(const void* obj, int& hits)
+// FAudioDevice::SampleRate is an int32 (AudioDevice.h:1789) with a second copy in the
+// FAudioPlatformSettings right after it. A live audio device therefore holds at least one —
+// usually two — values from the standard set; a random UObject holds none.
+//
+// Searched as int32 AND as float: the stock header says int32, but this is a LICENSEE build
+// and a float costs nothing to check. The OFFSET of the first hit is recorded, so a run that
+// finds one measures where it lives instead of us deriving it from stock headers.
+std::int32_t FindSampleRate(const void* obj, int& hits, std::size_t& firstAt, int& distinct)
 {
     hits = 0;
+    firstAt = 0;
+    distinct = 0;
+    std::int32_t seen[8] = {};
+    int seenCount = 0;
     const std::size_t window = ReadableWindow(obj, kFingerprintBytes);
     if (window < sizeof(std::int32_t))
         return 0;
@@ -71,90 +87,216 @@ std::int32_t FindSampleRate(const void* obj, int& hits)
     std::int32_t found = 0;
     for (std::size_t k = 0; k + sizeof(std::int32_t) <= window; k += 4)
     {
-        std::int32_t v = 0;
-        std::memcpy(&v, bytes + k, sizeof(v));
-        if (!IsStandardSampleRate(v))
+        const std::int32_t v = ReadI32(bytes + k);
+        bool hit = IsStandardSampleRate(v);
+        if (!hit)
+        {
+            float f = 0.0f;
+            std::memcpy(&f, bytes + k, sizeof(f));
+            if (f > 7000.0f && f < 400000.0f &&
+                IsStandardSampleRate(static_cast<std::int32_t>(f)) &&
+                static_cast<float>(static_cast<std::int32_t>(f)) == f)
+            {
+                hit = true;
+            }
+        }
+        if (!hit)
             continue;
         ++hits;
+        std::int32_t value = v;
+        if (!IsStandardSampleRate(value))
+        {
+            float f = 0.0f;
+            std::memcpy(&f, bytes + k, sizeof(f));
+            value = static_cast<std::int32_t>(f);
+        }
+        bool novel = true;
+        for (int i = 0; i < seenCount; ++i)
+            if (seen[i] == value) { novel = false; break; }
+        if (novel && seenCount < 8)
+        {
+            seen[seenCount++] = value;
+            ++distinct;
+        }
         if (found == 0)
-            found = v;
+        {
+            found   = value;
+            firstAt = k;
+        }
     }
     return found;
 }
 
-void ScanObject(const void* object, std::size_t scanBytes, const void* base, std::size_t size,
-                bool fromWorld, std::int32_t ownerIndex,
-                std::vector<DeviceCandidate>& out, const char* what, bool verbose)
+struct ScanContext
+{
+    const void* imageBase = nullptr;
+    std::size_t imageSize = 0;
+    std::vector<DeviceCandidate>* out = nullptr;
+    std::size_t maxCandidates = 0;
+};
+
+// Record one pointee, if it is new and looks like a C++ object of a class in the exe.
+//
+// POINTER-CENTRIC, not shape-centric. The first design looked for the whole
+// `{TWeakObjectPtr; FAudioDevice*; FDeviceId}` triple, which measured 2026-09-03 found the
+// wrong things and missed the right one: `UWorld::AudioDeviceHandle.Device` is NULL when the
+// world uses the main audio device (so there is no triple to find), and the surrounding bytes
+// prove nothing anyway. What identifies an FAudioDevice is the OBJECT, so that is what we
+// look at; the handle's neighbours are recorded as corroboration only.
+bool Consider(ScanContext& ctx, const void* owner, std::size_t k, bool fromWorld,
+              std::int32_t ownerIndex, bool viaContainer, std::size_t containerOffset)
+{
+    if (ctx.out->size() >= ctx.maxCandidates)
+        return false;
+    const auto* bytes = static_cast<const unsigned char*>(owner);
+    const void* p = ReadPtr(bytes + k);
+
+    if (p == nullptr || (reinterpret_cast<std::uintptr_t>(p) & 7u) != 0)
+        return false;
+    if (InImage(p, ctx.imageBase, ctx.imageSize))    // FAudioDevice is heap-allocated
+        return false;
+    if (!Readable(p, sizeof(void*)))
+        return false;
+    const void* vtable = ReadPtr(p);
+    if (!LooksLikeVtable(vtable, ctx.imageBase, ctx.imageSize))
+        return false;
+
+    for (const DeviceCandidate& c : *ctx.out)
+        if (c.device == p)
+            return false;
+
+    DeviceCandidate cand;
+    cand.device       = p;
+    cand.vtable       = vtable;
+    cand.offset       = k;
+    cand.fromWorld    = fromWorld;
+    cand.viaContainer    = viaContainer;
+    cand.containerOffset = containerOffset;
+    cand.isUObject    = LooksLikeUObject(p);
+    cand.sampleRate   = FindSampleRate(p, cand.sampleRateHits, cand.sampleRateAt,
+                                       cand.distinctRates);
+
+    // Corroboration from the bytes AROUND the pointer, if the handle really is laid out as
+    // {World; Device; DeviceId} with our pointer as Device:
+    //   World.ObjectIndex at -8, DeviceId at +8, and in UEngine the manager at -16.
+    if (!viaContainer)
+    {
+        if (k >= 8)
+        {
+            const std::int32_t objIndex = ReadI32(bytes + k - 8);
+            cand.worldIndexMatch = fromWorld && ownerIndex > 0 && objIndex == ownerIndex;
+        }
+        if (Readable(bytes + k + 8, sizeof(std::int32_t)))
+        {
+            const std::uint32_t id = static_cast<std::uint32_t>(ReadI32(bytes + k + 8));
+            if (id < kMaxPlausibleDeviceId)
+                cand.id = id;
+        }
+        if (!fromWorld && k >= 16)
+        {
+            const void* mgr = ReadPtr(bytes + k - 16);
+            cand.managerBefore = mgr != nullptr &&
+                                 (reinterpret_cast<std::uintptr_t>(mgr) & 7u) == 0 &&
+                                 !InImage(mgr, ctx.imageBase, ctx.imageSize) &&
+                                 Readable(mgr, sizeof(void*));
+        }
+    }
+    ctx.out->push_back(cand);
+    return true;
+}
+
+// Every 8-aligned pointer in the object, and — one hop further — every pointer inside the
+// plain heap blocks it points at. The second hop is how `FAudioDeviceManager` is followed
+// WITHOUT knowing its layout: it has no vtable of its own, so it is invisible to the direct
+// scan, but the devices it owns are not.
+void ScanObject(ScanContext& ctx, const void* object, std::size_t scanBytes, bool fromWorld,
+                std::int32_t ownerIndex, const char* what, bool verbose, bool secondHop)
 {
     if (object == nullptr)
         return;
     const std::size_t window = ReadableWindow(object, scanBytes);
-    if (window < 24)
+    if (window < 16)
     {
-        if (verbose)
-            SDS_LOG_WARN("submix discovery: %s at %p is not readable; skipped.", what, object);
+        SDS_LOG_WARN("submix discovery: %s at %p is not readable; skipped.", what, object);
         return;
     }
-    if (window != scanBytes && verbose)
-        SDS_LOG_INFO("submix discovery: %s readable window shrunk to 0x%zX bytes", what, window);
+    // ALWAYS logged, not only when verbose: a window that quietly shrank is exactly how the
+    // 2026-09-03 run missed UEngine::MainAudioDeviceHandle, and a silent shrink is
+    // indistinguishable from "the thing is not there".
+    if (verbose || window != scanBytes)
+        SDS_LOG_INFO("submix discovery: scanning %s at %p over 0x%zX bytes%s", what, object,
+                     window, window != scanBytes ? "  <- SHRUNK, the object ends sooner" : "");
 
+    const std::size_t before = ctx.out->size();
+    for (std::size_t k = 0; k + sizeof(void*) <= window; k += 8)
+        Consider(ctx, object, k, fromWorld, ownerIndex, false, 0);
+    const std::size_t direct = ctx.out->size() - before;
+
+    if (!secondHop)
+        return;
+
+    // Second hop — THE FAudioDeviceManager PATH. `UEngine::AudioDeviceManager` (Engine.h:1732)
+    // is a plain heap object with no vtable of its own, so the direct scan cannot see it; but
+    // the FAudioDevices it owns are ordinary polymorphic objects, and its pointers to them look
+    // like any other. Following one hop through every non-polymorphic heap block therefore
+    // reaches the device through the manager WITHOUT needing to know the manager's layout — and
+    // the container's own offset is recorded, so a hit names the manager's slot in UEngine.
+    //
+    // Bounded hard: containers are plain heap blocks and there can be many.
+    constexpr std::size_t kMaxContainers   = 96;
+    constexpr std::size_t kContainerWindow = 0x400;
+    std::size_t containers = 0;
     const auto* bytes = static_cast<const unsigned char*>(object);
-    for (std::size_t k = 0; k + 24 <= window; k += 8)
+    for (std::size_t k = 0; k + sizeof(void*) <= window && containers < kMaxContainers; k += 8)
     {
-        std::int32_t  objIndex = 0, serial = 0;
-        const void*   device   = nullptr;
-        std::uint32_t id       = 0;
-        std::memcpy(&objIndex, bytes + k,      sizeof(objIndex));
-        std::memcpy(&serial,   bytes + k + 4,  sizeof(serial));
-        std::memcpy(&device,   bytes + k + 8,  sizeof(device));
-        std::memcpy(&id,       bytes + k + 16, sizeof(id));
-
-        if (device == nullptr || (reinterpret_cast<std::uintptr_t>(device) & 7u) != 0)
+        const void* p = ReadPtr(bytes + k);
+        if (p == nullptr || (reinterpret_cast<std::uintptr_t>(p) & 7u) != 0)
             continue;
-        if (id >= kMaxPlausibleDeviceId)
+        if (InImage(p, ctx.imageBase, ctx.imageSize) || !Readable(p, sizeof(void*)))
             continue;
-        if (objIndex < 0 || objIndex > kMaxPlausibleObjectIndex || serial < 0)
+        // A container is a heap block that is NOT itself a polymorphic object — exactly what
+        // FAudioDeviceManager is.
+        if (LooksLikeVtable(ReadPtr(p), ctx.imageBase, ctx.imageSize))
             continue;
-        // FAudioDevice is heap-allocated; a pointer into the image is not one.
-        if (InImage(device, base, size))
+        const std::size_t inner = ReadableWindow(p, kContainerWindow);
+        if (inner < 16)
             continue;
-        if (!Readable(device, sizeof(void*)))
-            continue;
-
-        const void* vtable = ReadPtr(device);
-        if (!LooksLikeVtable(vtable, base, size))
-            continue;
-
-        bool seen = false;
-        for (const DeviceCandidate& c : out)
-            if (c.device == device) { seen = true; break; }
-        if (seen)
-            continue;
-
-        DeviceCandidate cand;
-        cand.device    = device;
-        cand.vtable    = vtable;
-        cand.offset    = k;
-        cand.id        = id;
-        cand.fromWorld = fromWorld;
-        cand.isUObject = LooksLikeUObject(device);
-        cand.sampleRate = FindSampleRate(device, cand.sampleRateHits);
-        // The handle's weak pointer names the world that asked for the device, so for a
-        // candidate found INSIDE that world the index must be the world's own.
-        cand.worldIndexMatch = fromWorld && ownerIndex > 0 && objIndex == ownerIndex;
-        // UEngine::MainAudioDeviceHandle is preceded by FAudioDeviceManager* (Engine.h:1732).
-        if (!fromWorld && k >= 8)
-        {
-            const void* mgr = ReadPtr(bytes + k - 8);
-            cand.managerBefore = mgr != nullptr &&
-                                 (reinterpret_cast<std::uintptr_t>(mgr) & 7u) == 0 &&
-                                 !InImage(mgr, base, size) && Readable(mgr, sizeof(void*));
-        }
-        out.push_back(cand);
+        ++containers;
+        for (std::size_t j = 0; j + sizeof(void*) <= inner; j += 8)
+            Consider(ctx, p, j, fromWorld, 0, true, k);
     }
+    SDS_LOG_INFO("submix discovery: %s -> %zu direct candidate(s), %zu container(s) followed, "
+                 "%zu total so far", what, direct, containers, ctx.out->size());
 }
 
-const char* SourceName(const DeviceCandidate& c) { return c.fromWorld ? "UWorld " : "UEngine"; }
+const char* SourceName(const DeviceCandidate& c)
+{
+    if (c.viaContainer) return c.fromWorld ? "world^" : "engin^";
+    return c.fromWorld ? "UWorld" : "UEngin";
+}
+
+// The artefact that makes the NEXT run decisive when the sample-rate test is the thing that is
+// wrong. The UObject rejection self-checks; this one cannot, so when nothing is accepted the
+// raw words go in the log and the rate's offset becomes MEASURED rather than derived.
+void DumpCandidate(const DeviceCandidate& c, int words)
+{
+    const std::size_t bytesWanted = static_cast<std::size_t>(words) * 4;
+    const std::size_t window = ReadableWindow(c.device, bytesWanted);
+    if (window < 4)
+        return;
+    SDS_LOG_INFO("  dump %s+0x%04zX device=%p (0x%zX bytes; look for BB80=48000 AC44=44100)",
+                 SourceName(c), c.offset, c.device, window);
+    const auto* b = static_cast<const unsigned char*>(c.device);
+    char line[160];
+    for (std::size_t k = 0; k + 4 <= window; k += 32)
+    {
+        int n = std::snprintf(line, sizeof(line), "    +0x%04zX ", k);
+        for (std::size_t j = 0; j < 32 && k + j + 4 <= window; j += 4)
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%08X ",
+                               static_cast<unsigned>(ReadI32(b + k + j)));
+        SDS_LOG_INFO("%s", line);
+    }
+}
 
 } // namespace
 
@@ -236,47 +378,87 @@ DiscoveryResult FindAudioDevice(const DiscoveryInput& in)
                          kUObjectClassOffset);
     }
 
-    // The UWorld's own GUObjectArray index, for the strongest signal we have.
+    // The UWorld's own GUObjectArray index, for the strongest corroboration available.
     std::int32_t worldIndex = 0;
     if (in.worldObject != nullptr &&
         Readable(in.worldObject, kUObjectInternalIndexOffset + sizeof(std::int32_t)))
     {
-        std::memcpy(&worldIndex,
-                    static_cast<const unsigned char*>(in.worldObject) + kUObjectInternalIndexOffset,
-                    sizeof(worldIndex));
+        worldIndex = ReadI32(static_cast<const unsigned char*>(in.worldObject) +
+                             kUObjectInternalIndexOffset);
         if (worldIndex < 0 || worldIndex > kMaxPlausibleObjectIndex)
             worldIndex = 0;
     }
 
-    if (in.useWorld)
-        ScanObject(in.worldObject, in.scanBytes, in.imageBase, in.imageSize, true, worldIndex,
-                   r.candidates, "UWorld", in.logCandidates);
+    ScanContext ctx;
+    ctx.imageBase     = in.imageBase;
+    ctx.imageSize     = in.imageSize;
+    ctx.out           = &r.candidates;
+    ctx.maxCandidates = in.maxCandidates;
+
     if (in.useEngine)
-        ScanObject(in.engineObject, in.scanBytes, in.imageBase, in.imageSize, false, 0,
-                   r.candidates, "UEngine", in.logCandidates);
+        ScanObject(ctx, in.engineObject, in.scanBytes, false, 0, "UEngine", in.logCandidates,
+                   in.secondHop);
+    if (in.useWorld)
+        ScanObject(ctx, in.worldObject, in.scanBytes, true, worldIndex, "UWorld",
+                   in.logCandidates, in.secondHop);
 
     const Choice choice = ChooseDevice(r.candidates, r.uobjectTestUsable);
 
     if (in.logCandidates)
     {
-        SDS_LOG_INFO("submix discovery: %zu handle-shaped candidate(s); UWorld InternalIndex=%d",
+        SDS_LOG_INFO("submix discovery: %zu candidate object(s); UWorld InternalIndex=%d",
                      r.candidates.size(), worldIndex);
+        int shown = 0;
         for (const DeviceCandidate& c : r.candidates)
-            SDS_LOG_INFO("  %s +0x%04zX device=%p vt=%p id=%u uobj=%d rate=%d(x%d) "
-                         "worldIdx=%d mgr=%d vtShared=%d -> %s",
+        {
+            // A UObject is noise here and there are hundreds of them; report the survivors and
+            // anything non-UObject, and count the rest.
+            if (c.isUObject && r.uobjectTestUsable && c.reject != nullptr)
+                continue;
+            ++shown;
+            char via[64] = "";
+            if (c.viaContainer)
+                std::snprintf(via, sizeof(via), " via container at owner+0x%04zX",
+                              c.containerOffset);
+            SDS_LOG_INFO("  %s +0x%04zX device=%p vt=%p id=%u uobj=%d rate=%d(x%d @+0x%zX) "
+                         "distinct=%d head=%d worldIdx=%d mgr=%d vtShared=%d -> %s%s",
                          SourceName(c), c.offset, c.device, c.vtable, c.id, c.isUObject ? 1 : 0,
-                         c.sampleRate, c.sampleRateHits, c.worldIndexMatch ? 1 : 0,
-                         c.managerBefore ? 1 : 0, c.vtableShared ? 1 : 0,
-                         c.reject != nullptr ? c.reject : "SURVIVES");
+                         c.sampleRate, c.sampleRateHits, c.sampleRateAt, c.distinctRates,
+                         c.rateAtHead ? 1 : 0,
+                         c.worldIndexMatch ? 1 : 0, c.managerBefore ? 1 : 0,
+                         c.vtableShared ? 1 : 0,
+                         c.reject != nullptr ? c.reject : "SURVIVES", via);
+        }
+        SDS_LOG_INFO("submix discovery: %d non-UObject candidate(s) shown, %zu UObject(s) "
+                     "suppressed", shown, r.candidates.size() - static_cast<std::size_t>(shown));
     }
 
     if (choice.index < 0)
     {
         r.refusal = choice.refusal;
+        // NOTHING WAS ACCEPTED, so the sample-rate test is the prime suspect - it is the only
+        // one that cannot self-check. Dump the non-UObject candidates so the rate can be FOUND
+        // and its offset measured, rather than assumed from a stock header.
+        if (in.logCandidates && in.dumpWords > 0)
+        {
+            SDS_LOG_WARN("submix discovery: nothing accepted. Dumping the non-UObject "
+                         "candidates - if one of these IS the FAudioDevice, its sample rate is "
+                         "in here (48000 = 0x0000BB80, 44100 = 0x0000AC44) and its offset is "
+                         "then MEASURED rather than derived.");
+            int dumped = 0;
+            for (const DeviceCandidate& c : r.candidates)
+            {
+                if (c.isUObject && r.uobjectTestUsable)
+                    continue;
+                if (dumped++ >= in.maxDumps)
+                    break;
+                DumpCandidate(c, in.dumpWords);
+            }
+        }
         return r;
     }
-    const DeviceCandidate* chosen = &r.candidates[static_cast<std::size_t>(choice.index)];
 
+    const DeviceCandidate* chosen = &r.candidates[static_cast<std::size_t>(choice.index)];
     r.ok         = true;
     r.device     = chosen->device;
     r.vtable     = chosen->vtable;

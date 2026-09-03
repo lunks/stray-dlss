@@ -35,6 +35,11 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
 
     for (DeviceCandidate& c : candidates)
     {
+        // FAudioDevice::SampleRate is the second data member, so on a stock layout it lands at
+        // +0x0C. A candidate holding a standard rate a thousand bytes in is a rate table or an
+        // unrelated object that happens to contain the number.
+        c.rateAtHead = c.sampleRate != 0 && c.sampleRateAt <= kSampleRateOffset + kSampleRateOffsetSlack;
+
         c.reject = nullptr;
         if (uobjectTestUsable && c.isUObject)
             c.reject = "is a UObject (FAudioDevice is not)";
@@ -47,9 +52,13 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
         out.why   = why;
     };
 
-    // 1. A UWorld handle whose weak pointer names that very world. Exact and unforgeable: the
-    //    handle records the world that requested the device, so inside THAT world the stored
-    //    object index must be the world's own.
+    // Rungs, strongest first. Rungs 1-3 need UWorld corroboration and are DEAD on a build
+    // where the world uses the main audio device (MEASURED 2026-09-03) — they are kept because
+    // they cost nothing and are the best evidence when they do exist, but nothing may depend
+    // on them firing.
+
+    // 1. A UWorld handle whose weak pointer names that very world. Exact and unforgeable when
+    //    the world has its own device at all.
     for (std::size_t i = 0; i < candidates.size(); ++i)
         if (candidates[i].reject == nullptr && candidates[i].worldIndexMatch)
         {
@@ -58,8 +67,60 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
             return out;
         }
 
-    // 2. UEngine::MainAudioDeviceHandle, corroborated twice: the audio device manager sits
-    //    immediately before it, and its vtable is shared with a UWorld candidate.
+    // 2. The sample rate sits where FAudioDevice::SampleRate must be, AND something
+    //    corroborates it positionally or across objects. This is the rung that identifies the
+    //    device on the measured build.
+    // UEngine first: MainAudioDeviceHandle is the device the engine itself uses, and a world's
+    // own device — when it has one at all — is the lesser answer for a submix.
+    for (int wantSingleRate = 1; wantSingleRate >= 0; --wantSingleRate)
+        for (int engineFirst = 1; engineFirst >= 0; --engineFirst)
+            for (std::size_t i = 0; i < candidates.size(); ++i)
+            {
+                const DeviceCandidate& c = candidates[i];
+                if (c.reject != nullptr || !c.rateAtHead)
+                    continue;
+                if (engineFirst && c.fromWorld)
+                    continue;
+                if (wantSingleRate && c.distinctRates > 1)
+                    continue;      // several DIFFERENT rates is a table, not a device
+                if (!c.managerBefore && !c.vtableShared)
+                    continue;
+                pick(static_cast<int>(i),
+                     "its sample rate sits where FAudioDevice::SampleRate must be (+0x0C), "
+                     "corroborated by the manager before it or a shared vtable");
+                return out;
+            }
+
+    // 3. The head-offset rate alone, when it is the ONLY candidate with one. On the measured
+    //    build eleven candidates hold a standard rate and exactly one holds it at the head, so
+    //    this is decisive without needing a UWorld that has no device.
+    for (int wantSingleRate = 1; wantSingleRate >= 0; --wantSingleRate)
+    {
+        int found = 0, which = -1;
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            const DeviceCandidate& c = candidates[i];
+            if (c.reject == nullptr && c.rateAtHead && !(wantSingleRate && c.distinctRates > 1))
+            {
+                ++found;
+                which = static_cast<int>(i);
+            }
+        }
+        if (found == 1)
+        {
+            pick(which,
+                 wantSingleRate
+                     ? "it is the ONLY candidate whose sample rate sits at FAudioDevice's own "
+                       "+0x0C and holds just one distinct rate"
+                     : "it is the ONLY candidate whose sample rate sits at FAudioDevice's own "
+                       "+0x0C");
+            return out;
+        }
+        if (found > 1)
+            break;   // ambiguous at this strictness; loosening cannot help
+    }
+
+    // 4. UEngine::MainAudioDeviceHandle, corroborated twice.
     for (std::size_t i = 0; i < candidates.size(); ++i)
         if (candidates[i].reject == nullptr && !candidates[i].fromWorld &&
             candidates[i].managerBefore && candidates[i].vtableShared)
@@ -70,7 +131,7 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
             return out;
         }
 
-    // 3. A shared vtable on its own. Prefer the UEngine side — MainAudioDeviceHandle is the
+    // 5. A shared vtable on its own. Prefer the UEngine side — MainAudioDeviceHandle is the
     //    device the engine itself uses, and it is the one that matters for a submix.
     for (std::size_t i = 0; i < candidates.size(); ++i)
         if (candidates[i].reject == nullptr && !candidates[i].fromWorld && candidates[i].vtableShared)
@@ -85,8 +146,7 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
             return out;
         }
 
-    // 4. A UEngine handle with the manager immediately before it. Positional, and enough on
-    //    its own: MainAudioDeviceHandle is the answer we actually want.
+    // 6. A UEngine handle with the manager immediately before it.
     for (std::size_t i = 0; i < candidates.size(); ++i)
         if (candidates[i].reject == nullptr && !candidates[i].fromWorld && candidates[i].managerBefore)
         {
@@ -96,7 +156,7 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
             return out;
         }
 
-    // 5. Exactly one survivor anywhere.
+    // 7. Exactly one survivor anywhere.
     int survivors = 0, only = -1;
     for (std::size_t i = 0; i < candidates.size(); ++i)
         if (candidates[i].reject == nullptr) { ++survivors; only = static_cast<int>(i); }
@@ -107,10 +167,10 @@ Choice ChooseDevice(std::vector<DeviceCandidate>& candidates, bool uobjectTestUs
     }
 
     out.refusal = survivors > 1
-        ? "several candidates survived and none carries a decisive signal (no world-index "
-          "match, no shared vtable, no manager before it)"
-        : "no candidate survived: every handle-shaped hit was a UObject or held no standard "
-          "sample rate";
+        ? "several candidates survived and none carries a decisive signal (no rate at "
+          "FAudioDevice's own +0x0C, no world-index match, no shared vtable, no manager "
+          "before it)"
+        : "no candidate survived: every one was a UObject or held no standard sample rate";
     return out;
 }
 

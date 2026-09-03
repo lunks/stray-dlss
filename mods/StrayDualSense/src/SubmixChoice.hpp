@@ -15,6 +15,27 @@
 // DIFFERENT INSTANCES, so identical pointers were never guaranteed. What IS guaranteed is
 // that both are `FMixerDevice`, hence a shared VTABLE.
 //
+// MEASURED AGAIN 2026-09-03, this time by reading the live process through /proc/<pid>/mem
+// while the game ran — which beats any amount of deriving from stock headers:
+//
+//   * UWorld does not point at the audio device AT ALL. Every pointer-shaped qword in its
+//     first 4 KB was followed and none of the targets holds an aligned standard sample rate.
+//     `UWorld::AudioDeviceHandle.Device` is null on this build because the world uses the MAIN
+//     audio device rather than requesting its own — so the handle is empty and there is
+//     nothing to find. Every rung that needed UWorld corroboration (the world-index match, a
+//     shared vtable) is therefore DEAD HERE, and a ladder that relied on them refuses forever.
+//   * UEngine has ELEVEN pointees holding an aligned standard rate, so "survives the rate
+//     test" cannot be the deciding rung either.
+//   * The one that is shaped like an audio device: `Engine+0x0A88 -> vt at +0, 48000 at +0x0C`.
+//
+// That last offset is the discriminator, and it is PRINCIPLED rather than fitted:
+// `FAudioDevice`'s first two data members are `int32 NumStoppingSources; int32 SampleRate;`
+// (AudioDevice.h:1786-1789), and `FMixerDevice` inherits it as the primary base, so the
+// FAudioDevice subobject starts at offset 0. vtable(8) + NumStoppingSources(4) puts SampleRate
+// at exactly **+0x0C** — which is where the live process has it. The other ten hold their rate
+// hundreds or thousands of bytes in: those are rate tables and unrelated objects, and two of
+// them hold 48000 AND 44100, which no single device does.
+//
 // Portable: no Windows, no UE4SS, no engine headers.
 #pragma once
 
@@ -39,6 +60,18 @@ struct DeviceCandidate
     bool          managerBefore   = false;   // UEngine only: FAudioDeviceManager* sits at -8
     std::int32_t  sampleRate      = 0;       // 0 = no standard rate found inside the object
     int           sampleRateHits  = 0;
+    std::size_t   sampleRateAt    = 0;       // MEASURED offset of the first hit, so a run can
+                                             // compare it against the stock header
+    int           distinctRates   = 0;       // >1 means it holds SEVERAL different standard
+                                             // rates, which is a rate table, not a device
+    bool          rateAtHead      = false;   // computed here: the rate sits where
+                                             // FAudioDevice::SampleRate must be
+    bool          viaContainer    = false;   // reached through a second hop rather than directly
+    std::size_t   containerOffset = 0;       // where that container's pointer sat in the owning
+                                             // object. UEngine::AudioDeviceManager is the qword
+                                             // immediately before MainAudioDeviceHandle
+                                             // (Engine.h:1732), so a candidate reached through a
+                                             // container at offset X names the manager at X.
     bool          vtableShared    = false;   // computed here: same vtable, other object
     const char*   reject          = nullptr; // set here; nullptr = survived every test
 };
@@ -49,6 +82,13 @@ struct Choice
     const char* why     = nullptr;   // which rung accepted it
     const char* refusal = nullptr;   // why nothing was accepted
 };
+
+// vtable(8) + int32 NumStoppingSources(4). Where FAudioDevice::SampleRate must be, and where
+// the live process has it (MEASURED 2026-09-03).
+constexpr std::size_t kSampleRateOffset = 0x0C;
+// Room for a licensee to have inserted a member or two ahead of it. Wide enough to be
+// forgiving, far too narrow to admit a rate table hundreds of bytes in.
+constexpr std::size_t kSampleRateOffsetSlack = 0x40;
 
 // Is this int32 a sample rate an audio device can actually be running at?
 bool IsStandardSampleRate(std::int32_t hz);

@@ -109,12 +109,15 @@ constexpr int kDefaultRegisterSlot = 16;
 // comfortably inside it and still enough that a non-vtable pointer fails.
 constexpr int kVtableProbeSlots = 32;
 
-// How far into each UObject to scan for the handle shape.
-constexpr std::size_t kDefaultScanBytes = 0x2000;
+// How far into each UObject to scan. 0x2000 was NOT ENOUGH: UEngine declares 268 UPROPERTYs
+// before MainAudioDeviceHandle (Engine.h:1735), which puts it thousands of bytes in, and the
+// 2026-09-02 run scanned right up to the edge and missed it.
+constexpr std::size_t kDefaultScanBytes = 0x8000;
 
-// How far into a CANDIDATE to look for its int32 SampleRate. FAudioDevice is a large object
-// and SampleRate sits well down it, so this is deliberately generous.
-constexpr std::size_t kFingerprintBytes = 0x1800;
+// How far into a CANDIDATE to look for a sample rate. MEASURED: FAudioDevice's own is at
+// +0x0C, but the window stays wide so a rate found DEEP is still reported — that is how a rate
+// table is told apart from a device rather than silently accepted as one.
+constexpr std::size_t kFingerprintBytes = 0x2000;
 
 // UObjectBase's layout, UE 4.27: vtable(8) ObjectFlags(4) InternalIndex(4) ClassPrivate(8).
 // Both offsets are SELF-CHECKED at runtime against objects already known to be UObjects.
@@ -136,6 +139,17 @@ struct DiscoveryInput
     // so leaving this on for a session that never binds would drown the log — which is this
     // project's only feedback channel.
     bool        logCandidates = true;
+    // Follow one hop through plain heap blocks. This is how FAudioDeviceManager is walked
+    // WITHOUT knowing its layout: it has no vtable of its own so the direct scan cannot see
+    // it, but the devices it owns are ordinary polymorphic objects and its pointers to them
+    // are found the same way as any other.
+    bool        secondHop     = true;
+    std::size_t maxCandidates = 4096;
+    // On a refusal, dump this many 32-bit words of each non-UObject candidate. The
+    // sample-rate test is the one check that cannot self-check, so when nothing is accepted
+    // the raw words go in the log and its offset becomes measured rather than assumed.
+    int         dumpWords     = 96;
+    int         maxDumps      = 12;
 };
 
 struct DiscoveryResult

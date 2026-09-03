@@ -101,6 +101,32 @@ and then the decisive signals — and the acceptance ladder is now a pure functi
 (`src/SubmixChoice.cpp`) so CI proves it against **that run's own candidate list**
 (`tests/test_submix_choice.cpp`), including a negative control showing the old rule refuses it.
 
+### SECOND LIVE RUN + A MEMORY MEASUREMENT, 2026-09-03
+
+Still did not bind — and then the guessing stopped: the running game's memory was read directly
+through `/proc/<pid>/mem`, which settled in one pass what three build cycles had not.
+
+* **`UWorld` points at no audio device at all.** Its handle is empty because the world uses the
+  MAIN device. So the world-index match and the shared vtable — the two strongest rungs — are
+  **dead on this build**, and a ladder that needed either refuses forever.
+* **`UEngine` holds eleven pointees containing a standard sample rate**, so surviving the rate
+  test decides nothing.
+* **`Engine+0x0A88 -> vt at +0, 48000 at +0x0C`** is the one shaped like a device — and +0x0C is
+  exactly where stock UE 4.27 puts it: `FAudioDevice`'s first two data members are
+  `int32 NumStoppingSources; int32 SampleRate;` (`AudioDevice.h:1786-1789`) and `FMixerDevice`
+  inherits it as the primary base. Prediction and measurement agree.
+
+Why it was missed is mundane: `UEngine` declares **268 UPROPERTYs** before
+`MainAudioDeviceHandle` (`Engine.h:1735`), so it sits thousands of bytes in and the 0x2000 window
+stopped right about there — and the scan was shape-centric, looking for a whole
+`{TWeakObjectPtr; FAudioDevice*; FDeviceId}` triple, so a device pointer not wrapped in exactly
+that was invisible at any depth.
+
+**So the discriminator is now the rate's OFFSET, not its presence**, and the scan is
+pointer-centric and 0x8000 deep, with a second hop through plain heap blocks — which is how
+`FAudioDeviceManager` gets followed without knowing its layout: it has no vtable of its own, but
+the devices it owns are ordinary objects and its pointers to them look like any other.
+
 ### How the pointer and the call are reached
 
 `FAudioDevice` is not a UObject, `RegisterSubmixBufferListener` is not reflected, and no

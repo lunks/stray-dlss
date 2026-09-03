@@ -802,3 +802,51 @@ around it worked — the submix resolved by path, and the coil sink opened the p
 kind of thing we want" is not a test; it has to exclude the far more numerous kind of thing that
 merely resembles it. Eight false positives and one refusal is a better outcome than one false
 positive and a crash — but only because the refusal was loud and printed its candidates.
+
+### Second live run + a memory measurement, 2026-09-03: the search was looking in the wrong places
+
+The tap still did not bind. But this round the coordinator stopped guessing and **read the
+running game's memory through `/proc/<pid>/mem`**, which settled in one pass what three build
+cycles of offset archaeology had not. **The method is the finding worth keeping**: the box's
+`/proc/<pid>/mem` is readable as root, Wine's addresses map linearly, and the plugin already logs
+`World=` and `Engine=` on every attempt — so "guess an offset, build, deploy, launch, read the
+log" becomes a measurement taken while the game runs.
+
+**Three things it established, all HARD:**
+
+1. **`UWorld` does not point at the audio device at all.** Every pointer-shaped qword in its
+   first 4 KB was followed and none of the targets holds an aligned standard sample rate.
+   `UWorld::AudioDeviceHandle` (World.h:1243) is EMPTY on this build — the world uses the main
+   audio device rather than requesting its own, so `Device` is null and there is no handle to
+   find. Every discriminator that needed UWorld — the weak-pointer index match, a vtable shared
+   between the two objects — is therefore **dead here**, and a ladder that depended on one
+   refuses forever.
+2. **`UEngine` holds ELEVEN pointees containing an aligned standard rate**, so surviving a
+   sample-rate test cannot decide anything either.
+3. **The one shaped like an audio device is `Engine+0x0A88 -> vt at +0, 48000 at +0x0C`** — and
+   that offset is exactly what stock UE 4.27 predicts. `FAudioDevice`'s first two data members
+   are `int32 NumStoppingSources; int32 SampleRate;` (AudioDevice.h:1786-1789) and `FMixerDevice`
+   inherits `FAudioDevice` as its primary base, so vtable(8) + NumStoppingSources(4) puts
+   `SampleRate` at **+0x0C**. The other ten hold their rate hundreds or thousands of bytes in;
+   two hold 48000 AND 44100, which no single device does. **Prediction and measurement agree,
+   which is the strongest evidence available short of binding.**
+
+**Why the earlier scans missed it, and it is mundane.** `UEngine` declares **268 UPROPERTYs**
+before `MainAudioDeviceHandle` (Engine.h:1735), putting it thousands of bytes into the object;
+the scan window was 0x2000 and stopped right about there. And the scan was shape-centric — it
+looked for the whole `{TWeakObjectPtr; FAudioDevice*; FDeviceId}` triple — so a device pointer
+that is not surrounded by exactly that triple was invisible however deep the window went.
+
+**The search is now pointer-centric and the discriminator is the rate's OFFSET, not its
+presence.** Plus a second hop through plain heap blocks, which is how `FAudioDeviceManager` is
+followed without knowing its layout: it has no vtable of its own so a direct scan cannot see it,
+but the devices it owns are ordinary polymorphic objects and its pointers to them look like any
+other. A candidate found that way records the container's slot, which names the manager.
+
+**Two defects the same run exposed, both fixed:**
+
+* **`HapticSource=submix` left the user with NO haptics** when the tap did not bind — the asset
+  path was disabled on configuration alone. It now stands down only once the tap is bound AND has
+  delivered a real signal, so a tap that never binds costs nothing.
+* **The sink streamed 1,097,761 frames of pure underrun** to the pad endpoint while unbound. It
+  no longer opens the endpoint until the listener has registered.

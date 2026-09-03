@@ -117,6 +117,8 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
         else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "submixdevicesource")     submixDeviceSource     = Lower(val);
+        else if (key == "submixscanbytes")        submixScanBytes        = std::clamp(std::atoi(val.c_str()), 0x800, 0x80000);
+        else if (key == "submixdumpwords")        submixDumpWords        = std::clamp(std::atoi(val.c_str()), 0, 4096);
         else if (key == "submixgain")             submixGain             = std::clamp(ParseFloat(val, submixGain), 0.0f, 8.0f);
         else if (key == "submixqueueaheadms")     submixQueueAheadMs     = std::clamp(std::atoi(val.c_str()), 5, 500);
         else if (key == "submixringms")           submixRingMs           = std::clamp(std::atoi(val.c_str()), 20, 2000);
@@ -207,10 +209,11 @@ void Config::LogSummary(const char* what) const
                  endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
                  hapticLoopsFile.c_str(), spkLoopsFile.c_str());
     SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
-                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms",
+                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d",
                  what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
                  submixRegisterSlot, submixDeviceSource.c_str(),
-                 static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs);
+                 static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs,
+                 static_cast<unsigned>(submixScanBytes), submixDumpWords);
 }
 
 const char* Config::HapticSourceName() const

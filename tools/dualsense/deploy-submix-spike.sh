@@ -257,6 +257,11 @@ SubmixRegisterSlot = 16
 ; manager sits immediately before it. "both" simply means "look in both"; the ladder decides.
 SubmixDeviceSource = both
 
+; MEASURED 2026-09-03 by reading the live process: UEngine::MainAudioDeviceHandle sits thousands
+; of bytes in (268 UPROPERTYs precede it), so a 0x2000 window missed it entirely.
+SubmixScanBytes = 32768
+SubmixDumpWords = 96
+
 SubmixGain = 1.0
 SubmixQueueAheadMs = 40
 SubmixRingMs = 250

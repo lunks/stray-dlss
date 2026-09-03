@@ -52,6 +52,26 @@ DeviceCandidate Device(unsigned long long dev, unsigned long long vt, std::size_
     c.isUObject      = false;
     c.sampleRate     = 48000;
     c.sampleRateHits = 2;      // FAudioDevice::SampleRate and PlatformSettings.SampleRate
+    c.distinctRates  = 1;
+    c.sampleRateAt   = 0x0C;   // where FAudioDevice::SampleRate must be
+    return c;
+}
+
+// Something that merely CONTAINS a standard rate, deep inside — a rate table, a codec, a
+// settings blob. This is what defeated the "sole survivor" rule on 2026-09-03: eleven of them.
+DeviceCandidate RateHolder(unsigned long long dev, unsigned long long vt, std::size_t off,
+                           bool world, std::size_t rateAt, int distinct = 1)
+{
+    DeviceCandidate c;
+    c.device         = P(dev);
+    c.vtable         = P(vt);
+    c.offset         = off;
+    c.fromWorld      = world;
+    c.isUObject      = false;
+    c.sampleRate     = 44100;
+    c.sampleRateHits = distinct;
+    c.distinctRates  = distinct;
+    c.sampleRateAt   = rateAt;
     return c;
 }
 
@@ -216,6 +236,73 @@ int main()
 
         Choice c = ChooseDevice(v, true);
         Check(c.index == 1, "the exact world-index match outranks a positional UEngine match");
+    }
+
+    // -------------------------------------------------------------------------------
+    // THE 2026-09-03 FIELD CASE, read out of the LIVE PROCESS through /proc/<pid>/mem.
+    //
+    // UWorld pointed at no audio device at all (its handle is empty — the world uses the MAIN
+    // device), so every rung needing UWorld corroboration is dead. UEngine had ELEVEN pointees
+    // holding an aligned standard rate. Exactly one holds it at FAudioDevice's own +0x0C.
+    // -------------------------------------------------------------------------------
+    {
+        std::vector<DeviceCandidate> v = {
+            // Two rate TABLES: both 48000 and 44100 live in them, which no single device has.
+            RateHolder(0x10770080, 0xB6B1FB8, 0x0150, false, 0x28E0, 2),
+            RateHolder(0x59D09380, 0xB6FFA40, 0x0780, false, 0x28E0, 1),
+            RateHolder(0x59D0B680, 0xB790B78, 0x0D40, false, 0x05E0, 1),
+            RateHolder(0x4A99F440, 0xB304B70, 0x0D50, false, 0x1090, 1),
+            RateHolder(0x4A99F430, 0xB696BB8, 0x0D58, false, 0x10A0, 1),
+            RateHolder(0x365F54C0, 0x4E7D79F0, 0x09D8, false, 0x0CCC, 1),
+            RateHolder(0x365F55C0, 0x4E7D7A50, 0x09F0, false, 0x0BCC, 1),
+            RateHolder(0x365F56C0, 0x4E7D7990, 0x0A08, false, 0x0ACC, 1),
+        };
+        // The real one: Engine+0x0A88 -> vt at +0, 48000 at +0x0C.
+        v.push_back(Device(0x450910F0, 0xB668290, 0x0A88, false));
+
+        Check(!OldSamePointerRuleWouldAccept(v),
+              "2026-09-03: UWorld contributes nothing, so no pointer can be shared");
+        int survivors = 0;
+        {
+            std::vector<DeviceCandidate> copy = v;
+            ChooseDevice(copy, true);
+            for (const DeviceCandidate& c : copy)
+                if (c.reject == nullptr) ++survivors;
+        }
+        Check(survivors > 1,
+              "2026-09-03: SEVERAL candidates survive the rate test, so 'sole survivor' cannot decide");
+
+        Choice c = ChooseDevice(v, true);
+        Check(c.index >= 0, "the ladder still reaches a verdict");
+        Check(c.index >= 0 && v[static_cast<std::size_t>(c.index)].device == P(0x450910F0),
+              "and it picks Engine+0x0A88 - the only rate at FAudioDevice's own +0x0C");
+        Check(v[static_cast<std::size_t>(c.index)].rateAtHead, "which is why: rateAtHead");
+        for (std::size_t i = 0; i + 1 < v.size(); ++i)
+            if (v[i].rateAtHead)
+                Check(false, "a deep rate must NOT count as rateAtHead");
+        Check(true, "every rate table is correctly not rateAtHead");
+    }
+
+    // A rate at the head but SEVERAL distinct rates is a table that happens to start with one.
+    {
+        std::vector<DeviceCandidate> v = { Device(0x1000, 0xAAAA, 0x0100, false),
+                                           Device(0x2000, 0xBBBB, 0x0200, false) };
+        v[0].distinctRates = 3;                 // a table
+        Choice c = ChooseDevice(v, true);
+        Check(c.index == 1, "a single-rate head beats a multi-rate head");
+    }
+
+    // The slack must admit a licensee that inserted a member, and refuse a rate table.
+    {
+        std::vector<DeviceCandidate> v = { Device(0x1000, 0xAAAA, 0x0100, false) };
+        v[0].sampleRateAt = sds::submix::kSampleRateOffset + sds::submix::kSampleRateOffsetSlack;
+        Choice a = ChooseDevice(v, true);
+        Check(a.index == 0, "a rate just inside the slack still counts as at the head");
+        v[0].sampleRateAt = sds::submix::kSampleRateOffset + sds::submix::kSampleRateOffsetSlack + 4;
+        std::vector<DeviceCandidate> w = v;
+        w.push_back(Device(0x2000, 0xBBBB, 0x0200, false));
+        Choice b = ChooseDevice(w, true);
+        Check(b.index == 1, "a rate just outside it does not, and the head candidate wins");
     }
 
     std::printf(g_failures == 0 ? "\nall SubmixChoice cases passed\n" : "\n%d FAILURE(S)\n",
