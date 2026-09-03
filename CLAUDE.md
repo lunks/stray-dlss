@@ -30,6 +30,8 @@ Depth lives in two companion documents, both of which are load-bearing:
 * **`docs/RESEARCH.md`** — verified external research: the ReShade 6.8 API, the NGX D3D12 SDK, UE
   4.27 internals, the Proton/vkd3d chain, and CI. 228 claims, each adversarially verified. **When
   this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
+* **`docs/RESEARCH-ENGINE-TAA-HOOK.md`** — how UE 4.27 itself says which dispatch is the TAA pass,
+  and what that retires from §2.3. Read it before touching the identification path.
 
 ---
 
@@ -511,6 +513,28 @@ Config and saves live in the **Proton prefix**:
 
 ### 2.3 The TAA pass — our interception point
 
+> **EVERYTHING IN THIS SECTION IS A BEHAVIOURAL IDENTIFICATION, AND THE ENGINE HAS A BETTER ONE
+> (2026-09-03).** The hash, the depth+stencil-SRV-over-one-resource signature, the dispatch-rect
+> arithmetic, the aspect-ratio gate, the permutation pin — all of it exists because this project
+> began as an out-of-process ReShade add-on that could see nothing but D3D12 descriptors. As a
+> UE4SS plugin we are inside the engine, and UE 4.27's `ITemporalUpscaler::AddPasses` is the ONE
+> call site of the primary temporal upscale (`PostProcessing.cpp:559`). **Every look-alike this
+> section documents — and three it does not — reaches `FTAAStandaloneCS` through a call to
+> `AddTemporalAAPass` that never touches the interface**: DiaphragmDOF, LightShaftRendering,
+> IndirectLightRendering (SSR/SSGI), SingleLayerWaterRendering, `FPostProcessing::ProcessPlanarReflection`
+> (which runs a full `Main`-config TAA on a planar reflection — the pass `kGateNotPrimaryView`
+> exists to exclude), and the `DVSM_RayTracingDebug` view. Being called through the interface IS
+> the identification.
+>
+> `docs/RESEARCH-ENGINE-TAA-HOOK.md` is the feasibility report, the provenance ledger and the
+> demotion map for everything below. **`[STRAYDLSS] EngineSeam` is built and ships OFF**: level 1
+> statically finds and validates the `ITemporalUpscaler` vtable and installs nothing; level 2
+> stands in for `AddPasses` (forwarding, so the image is unchanged) and CROSS-CHECKS the matcher
+> against the engine, counting `seam_orphans` — dispatches this section's rules call the TAA pass
+> while the engine announced no primary upscale they fit. That counter is the "wrong shader being
+> picked" symptom, named. **Nothing there has run against the game, so nothing below is retired
+> yet**, and the order is not negotiable: the cross-check comes back clean first.
+
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
 not exist in 4.27**. Threadgroup 8×8, dispatch `ceil(W/8) × ceil(H/8)`.
@@ -977,6 +1001,10 @@ Four stages, each testable in isolation as far as CI allows:
 
 1. **Identify** — hash every compute shader's DXBC at `init_pipeline`; confirm with binding
    signature and dispatch size; never select `0x901e041a7cadc9db`; never hook `0x52101a15e1a0c5cc`.
+   **This whole stage is ReShade-era and has a named successor**: `[STRAYDLSS] EngineSeam`
+   (`src/core/engine_seam.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md`) takes the answer from the
+   engine's own `ITemporalUpscaler::AddPasses` instead of inferring it. It ships OFF and currently
+   only cross-checks; §2.3's warning block says what it would retire and in what order.
 2. **Capture** — record bound SRVs/UAVs/CB **by register** and read the View CB rows.
 3. **Resolve** — our compute pass turning sparse velocity + depth + `ClipToPrevClip` into the dense
    `RG16_FLOAT` field DLSS requires, in DLSS's units and sign.

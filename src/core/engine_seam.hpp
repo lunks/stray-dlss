@@ -1,0 +1,252 @@
+// The engine's own upscaler seam: finding UE 4.27's ITemporalUpscaler in the shipping
+// executable, and correlating what it announces against the dispatches we intercept.
+//
+// WHY THIS EXISTS. Every part of src/core/taa_signature.hpp is a *behavioural* identification
+// of Stray's TAA pass — a DXBC hash, a depth+stencil-SRV-over-one-resource signature, dispatch
+// rect arithmetic, an aspect-ratio gate. All of it exists because the project began as a
+// ReShade add-on that could see nothing but D3D12 descriptors. As a UE4SS plugin we run inside
+// the engine's own address space, and the engine has a first-class extension point for exactly
+// this: `ITemporalUpscaler::AddPasses` is the ONE call site of the primary temporal upscale
+// (PostProcessing.cpp:559 desktop, :2005 mobile), and every documented look-alike reaches
+// FTAAStandaloneCS by a DIFFERENT route that never touches the interface — DiaphragmDOF,
+// LightShaftRendering, IndirectLightRendering, SingleLayerWaterRendering,
+// FPostProcessing::ProcessPlanarReflection and the DVSM_RayTracingDebug view all call
+// `AddTemporalAAPass` directly. So being called through the interface *is* the identification,
+// with no archaeology at all.
+//
+// Everything in this file is pure: bytes in, verdict out. No Windows, no D3D12, no engine
+// headers. src/engine_seam.cpp is the live half that maps the module and installs the hook.
+//
+// PROVENANCE (CLAUDE.md §0.5). Every offset and constant below is HARD, read from the UE 4.27.2
+// source in the AlexMercer-MA/UnrealEngine-4.27 mirror whose Build.version reads
+// 4.27.2 / ++UE4+Release-4.27. What is UNCONFIRMED is whether the code *shapes* this file
+// scans for are the ones MSVC emitted into Stray's own build — nothing here has been run
+// against the executable. Discovery therefore refuses loudly and dumps the bytes it did not
+// understand, so one round trip settles it either way.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace stray_dlss::seam {
+
+// ---------------------------------------------------------------------------------------
+// Layout, all HARD from UE 4.27.2
+// ---------------------------------------------------------------------------------------
+
+// ITemporalUpscaler's vtable, in declaration order — which for MSVC is slot order.
+// TemporalAA.h:160-172 declares, in this order: ~ITemporalUpscaler, GetDebugName, AddPasses,
+// GetMinUpsampleResolutionFraction, GetMaxUpsampleResolutionFraction. There is no other
+// virtual and no virtual base, so a derived class that overrides all four keeps the layout.
+// FDefaultTemporalUpscaler (TemporalAA.cpp:1523-1574) declares no destructor of its own and
+// no data members, so slot 0 is the compiler-generated deleting destructor.
+constexpr unsigned kSlotDestructor = 0;
+constexpr unsigned kSlotGetDebugName = 1;
+constexpr unsigned kSlotAddPasses = 2;
+constexpr unsigned kSlotGetMinFraction = 3;
+constexpr unsigned kSlotGetMaxFraction = 4;
+constexpr unsigned kVtableSlots = 5;
+
+// The literal FDefaultTemporalUpscaler::GetDebugName returns (TemporalAA.cpp:1527-1530). It is
+// a `TEXT()` wide literal, so it lives in the image as UTF-16LE. It cannot be stripped: the
+// function is reachable only through the vtable, and the vtable of an instantiated class is
+// emitted whole.
+constexpr char kDefaultUpscalerName[] = "FDefaultTemporalUpscaler";
+
+// What FDefaultTemporalUpscaler's two fraction accessors return — a compile-time constant each,
+// FSceneViewScreenPercentageConfig::kMin/kMaxTAAUpsampleResolutionFraction, SceneView.h:1438-1439.
+// These are the self-check: a vtable found by any other means must reproduce BOTH exactly, and
+// both are exactly representable in binary32 so the comparison can be ==.
+constexpr float kMinTaaUpsampleResolutionFraction = 0.5f;
+constexpr float kMaxTaaUpsampleResolutionFraction = 2.0f;
+
+// ITemporalUpscaler::FPassInputs (TemporalAA.h:150-157) under the MSVC x64 ABI:
+//   bool         bAllowDownsampleSceneColor;   // 1 byte at 0, 3 bytes of padding
+//   EPixelFormat DownsampleOverrideFormat;     // unscoped enum, int underlying -> 4 at 4
+//   FRDGTextureRef SceneColorTexture;          // pointer, 8-aligned -> 8
+//   FRDGTextureRef SceneDepthTexture;          //                    -> 16
+//   FRDGTextureRef SceneVelocityTexture;       //                    -> 24
+// The three pointers are read for IDENTITY only. NEVER dereference one: FRDGTexture is an
+// RDG-internal type whose layout this project has not established, and at the moment AddPasses
+// runs the graph has not executed, so a transient texture has no RHI resource yet.
+constexpr std::size_t kPassInputsAllowDownsample = 0;
+constexpr std::size_t kPassInputsDownsampleFormat = 4;
+constexpr std::size_t kPassInputsSceneColor = 8;
+constexpr std::size_t kPassInputsSceneDepth = 16;
+constexpr std::size_t kPassInputsSceneVelocity = 24;
+constexpr std::size_t kPassInputsSize = 32;
+
+// FIntRect = { FIntPoint Min, Max }; FIntPoint = { int32 X, Y }. No bases, no virtuals.
+constexpr std::size_t kIntRectMinX = 0;
+constexpr std::size_t kIntRectMinY = 4;
+constexpr std::size_t kIntRectMaxX = 8;
+constexpr std::size_t kIntRectMaxY = 12;
+constexpr std::size_t kIntRectSize = 16;
+
+// GTemporalAATileSizeX. The main pass dispatches
+// GetGroupCount(PracticableDestRect.Size(), GTemporalAATileSizeX) (TemporalAA.cpp:958), and
+// PracticableDestRect is DivideAndRoundUp(Inputs.OutputViewRect, ResolutionDivisor)
+// (TemporalAA.cpp:654-656) with ResolutionDivisor == 1 for every Main* config. So the group
+// count is ceil(the announced rect / 8) exactly.
+constexpr std::uint32_t kTaaTileSize = 8;
+
+// ---------------------------------------------------------------------------------------
+// The module image
+// ---------------------------------------------------------------------------------------
+
+// One mapped section of the executable, with the address it is mapped at. `bytes` is the live
+// mapping in the discovery build and a synthetic buffer in the tests — the scan cannot tell
+// the difference, which is the point.
+struct Region
+{
+	std::uint64_t va = 0;
+	const unsigned char *bytes = nullptr;
+	std::size_t size = 0;
+	bool executable = false;
+	const char *name = "";
+};
+
+struct Image
+{
+	const Region *regions = nullptr;
+	std::size_t count = 0;
+
+	// Reads `n` bytes at `va`, from whichever region covers the whole range. False if none
+	// does — a pointer into unmapped memory is a failed discovery, never a fault.
+	bool read(std::uint64_t va, void *out, std::size_t n) const;
+	// True when `va` lands inside a region marked executable. Used to reject a run of qwords
+	// that looks like a vtable but does not point at code.
+	bool is_code(std::uint64_t va) const;
+};
+
+// ---------------------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------------------
+
+enum class SeamStatus : std::uint8_t
+{
+	ok = 0,
+	no_regions,          // the caller handed us nothing to scan
+	name_not_found,      // no UTF-16LE "FDefaultTemporalUpscaler" in the image
+	debug_name_not_found,// nothing in code returns that literal in the shape we recognise
+	vtable_not_found,    // no plausible 5-slot run of code pointers holds that function
+	fraction_shape,      // slot 3 or 4 is not a shape we can decode without executing it
+	fraction_mismatch,   // decoded, and it is not 0.5 / 2.0 — so this is not the class
+	count
+};
+const char *status_text(SeamStatus s);
+
+struct Discovery
+{
+	SeamStatus status = SeamStatus::no_regions;
+
+	std::uint64_t name_va = 0;          // the UTF-16LE literal
+	std::uint32_t name_hits = 0;        // >1 is not fatal; the literal may be pooled twice
+	std::uint64_t get_debug_name_va = 0;
+	std::uint32_t debug_name_hits = 0;  // >1 means the shape scan is ambiguous — reported
+	std::uint64_t vtable_va = 0;        // address of slot 0
+	std::uint32_t vtable_hits = 0;      // how many candidate runs passed the full validation
+	std::uint64_t slot[kVtableSlots] = {};
+
+	float min_fraction = 0.0f;
+	float max_fraction = 0.0f;
+
+	// The bytes at whichever accessor could not be decoded, so an unfamiliar MSVC codegen
+	// costs one log line rather than one round trip of guessing.
+	std::uint64_t undecoded_va = 0;
+	unsigned char undecoded[16] = {};
+};
+
+// Scans the image and returns the verdict. Never executes anything it finds, never
+// dereferences an address outside the regions it was handed.
+Discovery discover(const Image &image);
+
+// Exposed for the tests, and because each is independently useful in a diagnostic.
+// Returns the number of hits; writes at most `max_out` of them.
+std::size_t find_utf16_literal(const Image &image, const char *ascii,
+                               std::uint64_t *out, std::size_t max_out);
+// `lea rax, [rip+d]; ret` — 48 8D 05 <int32> C3 — whose rip-relative target is `target_va`.
+std::size_t find_lea_ret_to(const Image &image, std::uint64_t target_va,
+                            std::uint64_t *out, std::size_t max_out);
+// Every 8-byte-aligned qword in a non-executable region equal to `value`.
+std::size_t find_qword(const Image &image, std::uint64_t value,
+                       std::uint64_t *out, std::size_t max_out);
+// Decodes a function that does nothing but return a float constant. Recognises the three
+// shapes MSVC x64 emits for `return <constant>;`:
+//   movss  xmm0, [rip+d] ; ret        F3 0F 10 05 <d32> C3
+//   vmovss xmm0, [rip+d] ; ret        C5 FA 10 05 <d32> C3
+//   mov eax, imm32 ; movd xmm0, eax ; ret   B8 <imm32> 66 0F 6E C0 C3
+// False when the bytes are none of those, so the caller can dump them instead of guessing.
+bool read_float_constant_return(const Image &image, std::uint64_t fn_va, float *out);
+
+// ---------------------------------------------------------------------------------------
+// The ledger: what the engine announced, against what we intercepted
+// ---------------------------------------------------------------------------------------
+
+// One `ITemporalUpscaler::AddPasses` call. The rect is the engine's own OutputViewRect, read
+// out of the out-parameter AFTER the forwarded call has written it, so it is measured rather
+// than derived.
+struct Announcement
+{
+	std::uint64_t frame = 0;
+	std::uint64_t sequence = 0;
+	std::uint32_t out_width = 0;
+	std::uint32_t out_height = 0;
+	// FRDGTexture identities from FPassInputs. Compared, never dereferenced.
+	std::uint64_t colour_rdg = 0;
+	std::uint64_t depth_rdg = 0;
+	std::uint64_t velocity_rdg = 0;
+	bool consumed = false;
+};
+
+struct LedgerCounters
+{
+	std::uint64_t announced = 0;
+	std::uint64_t claimed = 0;
+	// Announced, then retired without any dispatch claiming it. A steady non-zero rate means
+	// the correlation rule is wrong, not that the engine skipped its own upscale.
+	std::uint64_t unclaimed = 0;
+	// The heuristic matcher believed a dispatch was the TAA and the engine had announced
+	// NOTHING. This is the counter the whole exercise is for: it is the wrong-pass class,
+	// named, per frame, instead of arriving as "the whole screen appears suddenly".
+	std::uint64_t orphans = 0;
+	// An announcement was pending but no rect agreed with the dispatch.
+	std::uint64_t rect_mismatch = 0;
+	std::uint64_t overflow = 0; // more concurrent announcements than the ring holds
+};
+
+// How many frames an unclaimed announcement survives before it is retired. Announcement and
+// dispatch both happen on the render thread within one frame — RDG setup then
+// FRDGBuilder::Execute — but our frame counter is bumped from Present, and with an RHI thread
+// the recording can straddle that boundary. Two frames of slack costs nothing and removes a
+// whole class of off-by-one.
+constexpr std::uint64_t kRetireAfterFrames = 2;
+
+class Ledger
+{
+public:
+	static constexpr std::size_t kCapacity = 8;
+
+	// Retires stale entries. Call once per Present, before anything else.
+	void begin_frame(std::uint64_t frame);
+	void announce(const Announcement &a);
+	// Called only for a dispatch the existing matcher already believes is the TAA pass.
+	// Returns the announcement it corresponds to, or nullptr — and counts why not.
+	const Announcement *claim(std::uint32_t group_x, std::uint32_t group_y);
+
+	std::size_t pending() const;
+	const LedgerCounters &counters() const { return m_counters; }
+	std::uint64_t sequence() const { return m_sequence; }
+
+	// ceil(extent / kTaaTileSize), the group count UE 4.27 issues for a Main* config.
+	static std::uint32_t expected_groups(std::uint32_t extent);
+
+private:
+	Announcement m_slots[kCapacity]{};
+	std::size_t m_count = 0;
+	std::uint64_t m_frame = 0;
+	std::uint64_t m_sequence = 0;
+	LedgerCounters m_counters{};
+};
+
+} // namespace stray_dlss::seam

@@ -1,6 +1,7 @@
 #include "taa_hook.hpp"
 
 #include "core/exposure_plan.hpp"
+#include "engine_seam_hook.hpp"
 #include "exposure_texture.hpp"
 
 #include "gbuffer_finder.hpp"
@@ -190,6 +191,8 @@ constexpr std::uint64_t kPinStaleFrames = 300;
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
+// One WARN per pass when the engine seam and the heuristic matcher disagree.
+std::unordered_map<std::uint64_t, bool> g_seam_disagreement_logged;
 
 // Why a structurally matched TAA pass never reached DLSS.
 //
@@ -1033,6 +1036,9 @@ bool dry_run_phase_active()
 void note_present(std::uint64_t frame)
 {
 	g_present_frame.store(frame, std::memory_order_relaxed);
+	// The engine seam's ledger retires announcements by frame, so it needs the same boundary.
+	// Inert unless [STRAYDLSS] EngineSeam=2 installed the stand-in.
+	seamhook::note_present(frame);
 	// Snapshot and clear the per-frame RR-1 suppression tally for the periodic report.
 	g_rr1_last_frame_suppressed.store(
 		g_rr1_suppressed_this_frame.exchange(0, std::memory_order_relaxed),
@@ -1289,6 +1295,38 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		st.srvs = static_cast<std::uint32_t>(b.srvs.size());
 		st.uavs = static_cast<std::uint32_t>(b.uavs.size());
 		st.verdict = m.verdict;
+	}
+
+	// THE CROSS-CHECK. Every gate above this line is behavioural — a DXBC hash, a
+	// depth+stencil SRV pair, dispatch-rect arithmetic — and all of it exists because this
+	// project began as a ReShade add-on that could see nothing but D3D12 descriptors. With
+	// [STRAYDLSS] EngineSeam=2 the ENGINE tells us which dispatch is its primary temporal
+	// upscale, so the two answers can be compared instead of one being trusted.
+	//
+	// This changes no behaviour. It counts, and it names the disagreement once: a positive
+	// match that the engine never announced is the wrong-pass class — the failure the user
+	// sees as "the whole screen appears suddenly" — and until now it was indistinguishable
+	// from a correct match. docs/RESEARCH-ENGINE-TAA-HOOK.md.
+	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
+	{
+		const seamhook::Verdict sv = seamhook::claim(x, y);
+		if (sv.active && !sv.announced)
+		{
+			bool first = false;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				first = !g_seam_disagreement_logged[hash];
+				g_seam_disagreement_logged[hash] = true;
+			}
+			if (first)
+				STRAY_LOG_WARN("ENGINE SEAM DISAGREES about pass 0x%016llx: the matcher calls "
+					"this dispatch (%ux%u groups) the TAA pass, and the engine's own "
+					"ITemporalUpscaler::AddPasses announced no primary temporal upscale it "
+					"fits. Either this is a look-alike the signature let through (DOF, light "
+					"shafts, SSR, water, a planar reflection, a cubemap face) or the "
+					"correlation rule is wrong. First occurrence for this pass only.",
+					static_cast<unsigned long long>(hash), x, y);
+		}
 	}
 
 	// Report every large dispatch once, whatever the verdict. During Phase A the point is to

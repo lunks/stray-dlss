@@ -73,6 +73,8 @@ add_library(stray_dlss_core STATIC
     src/core/dlss_quality.cpp
     src/core/taa_signature.cpp
     src/core/taa_signature.hpp
+    src/core/engine_seam.cpp
+    src/core/engine_seam.hpp
     src/core/pass_walk.cpp
     src/core/pass_walk.hpp
     src/core/gbuffer_classify.cpp
@@ -225,6 +227,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/shader_dump.hpp
         src/taa_hook.cpp
         src/taa_hook.hpp
+        src/engine_seam_hook.cpp
+        src/engine_seam_hook.hpp
         src/pass_finder.cpp
         src/pass_finder.hpp
         src/perf.cpp
@@ -468,6 +472,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_view_params.cpp
         tests/test_dlss_quality.cpp
         tests/test_taa_signature.cpp
+        tests/test_engine_seam.cpp
         tests/test_pass_walk.cpp
         tests/test_gbuffer_classify.cpp
         tests/test_envbrdf.cpp

@@ -32,6 +32,7 @@
 #include "perf.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
+#include "engine_seam_hook.hpp"
 
 #include <d3d12.h>
 
@@ -278,6 +279,10 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		ngxfg::shutdown();
+		// The engine seam owns a vtable slot inside the GAME's own module, which outlives
+		// this device and this DLL. Restore it before anything else: a slot pointing into an
+		// unloaded module is an address-0 crash on the next frame (facts §14).
+		seamhook::shutdown();
 		// The present stage records onto a command list of its own and hands work to nr::,
 		// so it must be torn down before nr:: is.
 		nrhook::shutdown();
@@ -335,6 +340,14 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool ngx_evaluate = false;
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	// [STRAYDLSS] EngineSeam, default 0 (off). The engine's OWN answer to "which dispatch is
+	// the TAA pass", instead of the behavioural signature in src/core/taa_signature.cpp.
+	// 1 discovers and validates UE 4.27's ITemporalUpscaler vtable and logs it, installing
+	// nothing; 2 additionally stands in for AddPasses and cross-checks the matcher against
+	// what the engine announces. NEITHER gates DLSS - the heuristic remains the mechanism
+	// until the cross-check has come back from the box. docs/RESEARCH-ENGINE-TAA-HOOK.md.
+	seamhook::configure(host::cfg::get_int("EngineSeam", 0));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
@@ -1174,6 +1187,14 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "taa_pipelines=%u\n", g_state.taa_pipelines_seen.load());
 			std::fprintf(f, "dispatches=%u\n", g_state.dispatches_seen.load());
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
+			{
+				// The engine upscaler seam ([STRAYDLSS] EngineSeam). `orphans` is the number
+				// the whole thing exists for: dispatches the behavioural matcher called the
+				// TAA pass while the engine announced no primary temporal upscale they fit.
+				char seam[256] = {};
+				if (seamhook::format_report(seam, sizeof(seam)) > 0)
+					std::fprintf(f, "%s\n", seam);
+			}
 			{
 				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame
 				// counter against fg_presents_issued is the "~2x presents per engine frame" check.
