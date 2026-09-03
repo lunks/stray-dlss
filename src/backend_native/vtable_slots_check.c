@@ -75,6 +75,9 @@ SLOT_IS(IDXGISwapChain1Vtbl, Present1, 22);
 SLOT_IS(IDXGISwapChain3Vtbl, GetCurrentBackBufferIndex, 36);
 SLOT_IS(IDXGISwapChain3Vtbl, SetColorSpace1, 38);
 SLOT_IS(IDXGISwapChain3Vtbl, ResizeBuffers1, 39);
+#ifdef __IDXGIAdapter3_INTERFACE_DEFINED__
+SLOT_IS(IDXGIAdapter3Vtbl, QueryVideoMemoryInfo, 14);
+#endif
 
 /* A translation unit needs at least one declaration under strict C. */
 int stray_dlss_vtable_slots_checked = 1;

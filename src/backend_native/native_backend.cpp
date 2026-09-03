@@ -107,6 +107,11 @@ bool install(::ID3D12Device *real_device, Mode requested, InstallScope scope, bo
 		return true;
 	}
 
+	// Diagnostic, default OFF: names who calls IDXGIAdapter3::QueryVideoMemoryInfo and how long
+	// it takes (facts §32.16 - one such call per second blocks the RHI thread ~19 ms in the
+	// NVIDIA RM lock). Forwards every call unmodified; failure to install is logged, never fatal.
+	vramwatch::install(real_device);
+
 	registry::set_destroy_listener(&shadow::forget_resource);
 	registry::arm(); // this life's sentinel page, outside the image (resource_registry.hpp)
 	const unsigned dev = scope != InstallScope::list_only ? hooks::install_device_hooks(real_device, !on_proxy) : 0;
@@ -454,6 +459,8 @@ void log_stats(const char *when)
 		static_cast<unsigned long long>(r.destroyed), static_cast<unsigned long long>(r.sentinel_failures),
 		static_cast<unsigned long long>(r.unarmed),
 		static_cast<unsigned long long>(s.slots), static_cast<unsigned long long>(s.heaps));
+	// Who asked the driver for VRAM info, and how many times. Inert unless VramQueryWatch=1.
+	STRAY_LOG_INFO("%s", vramwatch::report());
 	// Growth of the shadow's map, for the rehash hypothesis: a bucket count that changed since
 	// the last report means g_slots REHASHED in the interval. (The reverse index that used to
 	// be reported here is gone - facts §27.)

@@ -253,6 +253,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/backend_native/resource_registry.hpp
         src/backend_native/root_shadow.cpp
         src/backend_native/root_shadow.hpp
+        src/backend_native/vram_query_watch.cpp
+        src/backend_native/vram_query_watch.hpp
         src/backend_native/vtable_patch.cpp
         src/backend_native/vtable_patch.hpp
         src/backend_native/present_owner.cpp
@@ -409,6 +411,7 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/backend_native/present_owner.cpp
         src/backend_native/fg_present.cpp
         src/backend_native/fg_reflex.cpp
+        src/backend_native/vram_query_watch.cpp
         src/backend_native/vtable_patch.cpp
         src/app/diff_observer.cpp)
 

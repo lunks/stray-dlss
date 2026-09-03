@@ -74,5 +74,8 @@ constexpr unsigned kSwapChain1_Present1 = 22;
 constexpr unsigned kSwapChain3_GetCurrentBackBufferIndex = 36;
 constexpr unsigned kSwapChain3_SetColorSpace1 = 38;
 constexpr unsigned kSwapChain3_ResizeBuffers1 = 39;
+// IUnknown 0-2, IDXGIObject 3-6, IDXGIAdapter 7-9, IDXGIAdapter1::GetDesc1 10,
+// IDXGIAdapter2::GetDesc2 11, IDXGIAdapter3 12-17. Checked against dxgi1_4.h.
+constexpr unsigned kAdapter3_QueryVideoMemoryInfo = 14;
 
 } // namespace stray_dlss::native::slot
