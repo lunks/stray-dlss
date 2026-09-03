@@ -1714,6 +1714,8 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 	return true;
 }
 
+#include "warp_nr_lifetime.inc"
+
 #include "warp_native_backend.inc"
 #include "warp_fg_present.inc"
 #include "warp_pso_cache.inc"
@@ -1796,6 +1798,7 @@ int main(int argc, char **argv)
 	test_copy_from_shader_visible_source(gpu);
 	test_static_vtables(gpu);
 	test_private_data_release_on_destroy(gpu);
+	test_nr_codec_deferred_destruction(gpu);
 	// The native backend last: its hooks are installed on this device and never restored.
 	test_vtable_patch_roundtrip(gpu);
 	test_registry_liveness(gpu);

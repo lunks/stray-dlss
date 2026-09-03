@@ -10,6 +10,7 @@
 #include "host/ini.hpp"
 #include "intercept/backend.hpp"
 #include "log.hpp"
+#include "ngx_nr.hpp"
 
 #include <MinHook.h>
 
@@ -431,8 +432,31 @@ void Tick()
 	if (!g_hook_installed.load())
 		install_device_hook();
 	if (g_ini.reload_if_changed())
+	{
 		STRAY_LOG_INFO("host: %s changed on disk and was re-read (%zu values); keys read at startup keep their old value",
 			g_ini_path.c_str(), g_ini.size());
+
+		// ...with ONE exception, and it is deliberate: NgxNR. It is the switch a live A/B needs,
+		// this host has no overlay to flip it from, and turning DLSS Neural Rendering off is the
+		// transition whose safety the deferred-teardown work exists to guarantee
+		// (src/core/nr_lifetime.hpp). Re-applying it here is also the honest test of that
+		// guarantee, because THIS IS NOT THE RENDER THREAD: UE4SS calls Tick from its own thread
+		// while the game is recording and submitting frames. nr::set_enabled destroys nothing on
+		// the caller's thread by design — it queues, and nr::on_present carries the teardown out
+		// once the GPU fence has passed the last evaluate.
+		//
+		// Every other key stays startup-only. A knob that reconfigures the device or the feature
+		// mid-frame is a much larger promise than a boolean that gates a pass.
+		const bool want = host::cfg::get_bool("NgxNR", nr::enabled());
+		if (want != nr::enabled())
+		{
+			STRAY_LOG_WARN("host: NgxNR changed to %d in %s. Applied from the UE4SS tick thread, "
+				"which is NOT the render thread: the teardown is queued and performed at the "
+				"present boundary once the fence has passed the last evaluate.",
+				want ? 1 : 0, g_ini_path.c_str());
+			nr::set_enabled(want);
+		}
+	}
 }
 
 void Stop()

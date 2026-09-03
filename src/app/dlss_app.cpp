@@ -1033,8 +1033,12 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 
 	// Frame-time sampling and the periodic CPU-share report. Fed the cumulative counters we
 	// already maintain, so it adds no hot-path cost of its own. (src/perf.hpp)
-	// Drains the NR validation readback (it gates NR ever touching the screen).
-	nr::on_present();
+	// The NR path's present boundary: signals its lifetime fence on the swapchain's own queue,
+	// performs every deferred free the fence has cleared (a queued NgxNR=0 teardown, a resolution
+	// change's ReleaseFeature), and drains the validation readback that gates NR ever touching
+	// the screen. The queue is what makes "the GPU is done with this" answerable at all
+	// (src/core/nr_lifetime.hpp); with none, NR falls back to a conservative present ring.
+	nr::on_present(pc.queue);
 	// END-OF-FRAME HISTORY RESTORE. Puts the pristine, pre-NR image back into the engine's `u0`
 	// so the next frame's screen-space reflections read the history UE 4.27 would have written,
 	// not the one DLSS Neural Rendering left behind. It records onto ReShade's OWN immediate
@@ -1177,6 +1181,23 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				const native::Stats ns = native::stats();
 				std::fprintf(f, "native_drive_dispatches=%llu\n", (unsigned long long)ns.drive_dispatches);
 				std::fprintf(f, "native_drive_suppressed=%llu\n", (unsigned long long)ns.drive_suppressed);
+			}
+			if (nr::enabled())
+			{
+				// NR's refusal breakdown, machine-readable. The periodic log line carries the
+				// same numbers, but a log line has to be found and read; an A/B harness reads
+				// this file. `nr_refused_no-codec`, `nr_refused_exposure-unknown` and
+				// `nr_refused_degenerate-scale` are the NO CODEC, NO EVALUATE reasons — any of
+				// them climbing means frames are being declined rather than shown raw HDR, which
+				// is the intended behaviour but not a state to sit in unnoticed.
+				std::uint64_t nr_applied = 0, nr_refused = 0;
+				std::uint32_t nr_reasons[nr::kNrRefusalCount] = {};
+				nr::counters(nr_applied, nr_refused, nr_reasons);
+				std::fprintf(f, "nr_applied=%llu\n", (unsigned long long)nr_applied);
+				std::fprintf(f, "nr_refused=%llu\n", (unsigned long long)nr_refused);
+				std::fprintf(f, "nr_validated=%d\n", nr::validated() ? 1 : 0);
+				for (int i = 0; i < nr::kNrRefusalCount; ++i)
+					std::fprintf(f, "nr_refused_%s=%u\n", nr::kNrRefusalNames[i], nr_reasons[i]);
 			}
 			std::fclose(f);
 		}
@@ -1331,7 +1352,11 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::uint64_t nr_applied = 0, nr_refused = 0;
 			std::uint32_t nr_reasons[nr::kNrRefusalCount] = {};
 			nr::counters(nr_applied, nr_refused, nr_reasons);
-			char nr_line[256];
+			// Sized for EVERY reason name plus its count. This was 256, which the list has
+			// outgrown — and a truncated diagnostic drops the reasons at the end of the array,
+			// which are the newest ones and therefore the ones a session is most likely asking
+			// about.
+			char nr_line[640];
 			int off = std::snprintf(nr_line, sizeof(nr_line),
 				"[%s] NR applied=%llu refused=%llu validated=%d reasons:", when,
 				static_cast<unsigned long long>(nr_applied),

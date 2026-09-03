@@ -29,6 +29,7 @@
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
+struct ID3D12CommandQueue;
 struct ID3D12Resource;
 
 namespace stray_dlss::nr {
@@ -48,6 +49,10 @@ enum class Topology
 	sr_shaped,
 };
 
+// [STRAYDLSS] NgxNR, and the overlay checkbox. Callable from ANY thread, and 1 -> 0 destroys
+// nothing on the caller's: it queues a teardown that on_present() executes once the GPU has
+// passed the last evaluate. Flipping back to 1 before that teardown has run cancels it, so a
+// toggle loop neither leaks nor frees anything in flight.
 void set_enabled(bool enabled);
 bool enabled();
 // Empty string = the default beside the game executable (where the operator staged it).
@@ -211,8 +216,20 @@ struct ApplyInputs
 // leaves the SR/RR image untouched, and counts a refusal reason.
 bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInputs &in);
 
-// Drains the deferred validation readback. Call once per present.
-void on_present();
+// THE PRESENT BOUNDARY, and the only place anything NR owns is ever destroyed.
+//
+// `queue` is the swapchain's own command queue (icept::PresentContext::queue) and may be null
+// under a host that does not report one. It is used for exactly one thing: signalling our own
+// fence, so that "the CPU stopped using this" and "the GPU stopped reading it" can be told apart.
+// Every deferred free — the neural output texture on a resolution change, the codec's proxy and
+// descriptor heap on an NgxNR 1->0 toggle, the validation readback buffers, and ReleaseFeature
+// itself — happens here and only once that fence has passed the last evaluate that used the
+// resource. With no queue the decision falls back to a conservative present ring
+// (core/nr_lifetime.hpp).
+//
+// Also drains the deferred validation readback. MUST be called every present, INCLUDING while NR
+// is disabled: the disable is what queues the teardown.
+void on_present(ID3D12CommandQueue *queue);
 
 void shutdown();
 
@@ -220,7 +237,7 @@ const char *last_error();
 
 // Telemetry for the periodic report: how often NR replaced the image versus refused, and why.
 // NOTE: the count is duplicated in src/ngx_nr.cpp's kNrRefusalNames — change both together.
-constexpr int kNrRefusalCount = 11;
+constexpr int kNrRefusalCount = 15;
 extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();

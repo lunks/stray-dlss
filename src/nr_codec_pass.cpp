@@ -1,5 +1,6 @@
 #include "nr_codec_pass.hpp"
 
+#include "core/nr_lifetime.hpp"
 #include "core/ring.hpp"
 #include "log.hpp"
 
@@ -83,12 +84,23 @@ struct State
 	UINT current_slot = 0;
 	bool encoded_this_frame = false;
 
+	// The GPU timeline every deferred free below is decided against. ngx_nr owns the fence and
+	// pushes this down each frame; until it does, `have_fence` is false and the conservative
+	// present ring decides instead (core/nr_lifetime.hpp).
+	nrlife::Timeline timeline;
+
+	// Everything this pass owns, waiting out the GPU. The PSOs and the root signature are in here
+	// as well as the textures and the heap: a command list still in flight references all of
+	// them, and D3D12 does not keep a PSO alive for a recorded-but-unexecuted list.
 	struct Retired
 	{
 		ID3D12DescriptorHeap *heap = nullptr;
 		ID3D12Resource *constants = nullptr;
 		ID3D12Resource *proxy = nullptr;
-		std::uint64_t retire_frame = 0;
+		ID3D12PipelineState *encode_pso = nullptr;
+		ID3D12PipelineState *decode_pso = nullptr;
+		ID3D12RootSignature *root_signature = nullptr;
+		nrlife::Tag tag;
 		std::uint64_t bytes = 0;
 	};
 	std::vector<Retired> retired;
@@ -100,7 +112,7 @@ struct State
 	{
 		ID3D12Resource *a = nullptr;
 		ID3D12Resource *b = nullptr;
-		std::uint64_t frame = 0;
+		nrlife::Tag tag;
 	};
 	std::vector<LiveInput> input_keep_alive;
 
@@ -321,7 +333,7 @@ void keep_alive(ID3D12Resource *a, ID3D12Resource *b)
 	State::LiveInput li;
 	li.a = a;
 	li.b = b;
-	li.frame = g_state.frame;
+	li.tag = nrlife::tag_now(g_state.timeline);
 	if (li.a != nullptr)
 		li.a->AddRef();
 	if (li.b != nullptr)
@@ -330,7 +342,7 @@ void keep_alive(ID3D12Resource *a, ID3D12Resource *b)
 
 	for (auto it = g_state.input_keep_alive.begin(); it != g_state.input_keep_alive.end();)
 	{
-		if (ring::is_safe_to_release(g_state.frame, it->frame))
+		if (nrlife::safe_to_free(g_state.timeline, it->tag))
 		{
 			if (it->a != nullptr)
 				it->a->Release();
@@ -343,11 +355,14 @@ void keep_alive(ID3D12Resource *a, ID3D12Resource *b)
 	}
 }
 
+// Frees every retired set the GPU has demonstrably passed. NEVER frees on a timeline that has
+// not moved — the whole point is that "we stopped using it" and "the GPU stopped reading it" are
+// different moments.
 void retire_expired()
 {
 	for (auto it = g_state.retired.begin(); it != g_state.retired.end();)
 	{
-		if (!ring::is_safe_to_release(g_state.frame, it->retire_frame))
+		if (!nrlife::safe_to_free(g_state.timeline, it->tag))
 		{
 			++it;
 			continue;
@@ -355,10 +370,47 @@ void retire_expired()
 		release(it->heap);
 		release(it->constants);
 		release(it->proxy);
+		release(it->encode_pso);
+		release(it->decode_pso);
+		release(it->root_signature);
 		it = g_state.retired.erase(it);
 		++g_state.stats.resource_sets_released;
 		g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
 	}
+}
+
+// Moves the whole live set into the graveyard, tagged against the current timeline. Callable from
+// any thread: it destroys nothing.
+void retire_live_set(bool include_pipelines)
+{
+	if (g_state.heap == nullptr && g_state.constants == nullptr && g_state.proxy == nullptr &&
+		(!include_pipelines || (g_state.encode_pso == nullptr && g_state.decode_pso == nullptr &&
+			g_state.root_signature == nullptr)))
+		return;
+
+	State::Retired r;
+	r.heap = g_state.heap;
+	r.constants = g_state.constants;
+	r.proxy = g_state.proxy;
+	r.tag = nrlife::tag_now(g_state.timeline);
+	r.bytes = static_cast<std::uint64_t>(g_state.width) * g_state.height * kProxyBytesPerPixel;
+	if (include_pipelines)
+	{
+		r.encode_pso = g_state.encode_pso;
+		r.decode_pso = g_state.decode_pso;
+		r.root_signature = g_state.root_signature;
+		g_state.encode_pso = nullptr;
+		g_state.decode_pso = nullptr;
+		g_state.root_signature = nullptr;
+	}
+	g_state.retired.push_back(r);
+	++g_state.stats.resource_sets_retired;
+	g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
+
+	g_state.heap = nullptr;
+	g_state.constants = nullptr;
+	g_state.proxy = nullptr;
+	g_state.encoded_this_frame = false;
 }
 
 // UAV barrier: make the previous writer's stores visible to the next reader on the same queue.
@@ -509,20 +561,10 @@ bool initialise(ID3D12Device *device, ID3D12Resource *image, std::uint32_t width
 
 	if (!fits && is_ready())
 	{
-		State::Retired r;
-		r.heap = g_state.heap;
-		r.constants = g_state.constants;
-		r.proxy = g_state.proxy;
-		r.retire_frame = g_state.frame;
-		r.bytes = static_cast<std::uint64_t>(g_state.width) * g_state.height *
-			kProxyBytesPerPixel;
-		g_state.retired.push_back(r);
-		++g_state.stats.resource_sets_retired;
-		g_state.stats.live_retired = static_cast<std::uint32_t>(g_state.retired.size());
-
-		g_state.heap = nullptr;
-		g_state.constants = nullptr;
-		g_state.proxy = nullptr;
+		// The PSOs and the root signature do not depend on the extent, so they are kept live
+		// across a grow rather than rebuilt — but the heap, the constants and the proxy are
+		// retired against the GPU timeline, never freed here.
+		retire_live_set(/*include_pipelines=*/false);
 
 		width = width > g_state.width ? width : g_state.width;
 		height = height > g_state.height ? height : g_state.height;
@@ -545,13 +587,68 @@ bool initialise(ID3D12Device *device, ID3D12Resource *image, std::uint32_t width
 	return true;
 }
 
+void set_timeline(const nrlife::Timeline &timeline) { g_state.timeline = timeline; }
+
+void request_shutdown()
+{
+	// Destroys NOTHING. The live set moves into the graveyard tagged against the current
+	// timeline, and collect() frees it at a present the GPU has passed. This is the call the
+	// NgxNR 1->0 toggle and the ini reloader make, from whatever thread they happen to be on.
+	const bool had_anything = is_ready() || g_state.root_signature != nullptr;
+	retire_live_set(/*include_pipelines=*/true);
+	// The engine image and the neural texture we AddRef'd stay held until their own tags clear;
+	// dropping them here would be the same defect in a different resource.
+	g_state.width = 0;
+	g_state.height = 0;
+	g_state.image_format = DXGI_FORMAT_UNKNOWN;
+	g_state.format_checked = false;
+	if (had_anything)
+		STRAY_LOG_INFO("nr_codec: teardown REQUESTED (%u set(s) now waiting on the GPU). Nothing "
+			"is destroyed until a present whose fence has passed the work that referenced it.",
+			static_cast<unsigned int>(g_state.retired.size()));
+}
+
+void collect()
+{
+	retire_expired();
+	// The keep-alive list is drained by the same rule. Without a record this frame nothing else
+	// would ever revisit it, so a disabled NR must still eventually release the engine's
+	// textures — deferred is not the same as leaked.
+	for (auto it = g_state.input_keep_alive.begin(); it != g_state.input_keep_alive.end();)
+	{
+		if (nrlife::safe_to_free(g_state.timeline, it->tag))
+		{
+			if (it->a != nullptr)
+				it->a->Release();
+			if (it->b != nullptr)
+				it->b->Release();
+			it = g_state.input_keep_alive.erase(it);
+		}
+		else
+			++it;
+	}
+}
+
 void shutdown()
 {
+	// IMMEDIATE. Only correct at device destruction, where the caller has already established
+	// that nothing is executing. Say so if anything was still waiting, because that is the one
+	// thing this call cannot check for itself.
+	if (!g_state.retired.empty() || !g_state.input_keep_alive.empty())
+		STRAY_LOG_WARN("nr_codec: immediate shutdown with %u retired set(s) and %u held input(s) "
+			"still tagged against the GPU timeline. That is only safe at device destruction; "
+			"anywhere else it means the deferred path (request_shutdown + collect) was skipped.",
+			static_cast<unsigned int>(g_state.retired.size()),
+			static_cast<unsigned int>(g_state.input_keep_alive.size()));
+
 	for (auto &r : g_state.retired)
 	{
 		release(r.heap);
 		release(r.constants);
 		release(r.proxy);
+		release(r.encode_pso);
+		release(r.decode_pso);
+		release(r.root_signature);
 	}
 	g_state.retired.clear();
 
@@ -576,6 +673,11 @@ void shutdown()
 	g_state.image_format = DXGI_FORMAT_UNKNOWN;
 	g_state.format_checked = false;
 	g_state.encoded_this_frame = false;
+	g_state.stats.live_retired = 0;
+	// The timeline is deliberately NOT reset. It is the OWNER's clock, pushed down every frame,
+	// and initialise() calls this on a device change — clearing it there would drop `have_fence`
+	// and silently demote every tag taken afterwards to the no-fence present ring. That is safe
+	// but it is not what was asked for, and it hid for exactly one CI round trip.
 }
 
 bool record_encode(ID3D12GraphicsCommandList *cmd, ID3D12Resource *image, std::uint32_t width,
