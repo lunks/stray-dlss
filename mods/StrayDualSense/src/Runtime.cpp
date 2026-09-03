@@ -45,6 +45,23 @@ std::wstring ResolveDir(const std::string& configured, const std::wstring& gameD
     return a;   // keep the game-dir path so the per-asset error names the expected location
 }
 
+// While no pad has been adopted, probe this fast and for this long. 120 probes at 1 s is two
+// minutes, which comfortably covers a load into gameplay.
+constexpr float        kFastPadPollSeconds = 1.0f;
+constexpr unsigned long kFastPadProbes     = 120;
+
+// The directory above `dir`, with its trailing separator kept. Empty if there is none.
+// <Mods>/StrayDualSense/dlls/ -> <Mods>/StrayDualSense/
+std::wstring ParentDir(const std::wstring& dir)
+{
+    if (dir.size() < 2)
+        return {};
+    const size_t end = dir.find_last_of(L"\\/", dir.size() - 2);
+    if (end == std::wstring::npos)
+        return {};
+    return dir.substr(0, end + 1);
+}
+
 } // namespace
 
 Runtime& Rt()
@@ -114,18 +131,29 @@ void Runtime::Startup(const void* addressInsideThisModule)
     SDS_LOG_INFO("  game binaries dir: %ls", m_gameDir.c_str());
     SDS_LOG_INFO("  mod dir          : %ls", m_modDir.c_str());
 
-    m_configPath = m_modDir + L"StrayDualSense.ini";
-    if (!m_config.Load(m_configPath))
+    // MEASURED 2026-09-02: the first live run of the submix spike silently used
+    // HapticSource=assets because the deploy script wrote the ini to the mod's ROOT
+    // (<Mods>/StrayDualSense/) while only the DLL's own directory (<Mods>/StrayDualSense/dlls/)
+    // and the game directory were searched. The log said which file it loaded, so it was
+    // diagnosable — but the conventional place for a UE4SS mod's config IS the mod root, so
+    // the search now includes it and EVERY candidate is logged whether it hit or missed.
+    m_configPath.clear();
+    for (const std::wstring& dir : { m_modDir, ParentDir(m_modDir), logDir })
     {
-        const std::wstring alt = logDir + L"StrayDualSense.ini";
-        if (m_config.Load(alt))
-            m_configPath = alt;
-        else
-            SDS_LOG_INFO("config: no StrayDualSense.ini next to the mod DLL or in the game "
-                         "directory; using built-in defaults");
+        if (dir.empty())
+            continue;
+        const std::wstring candidate = dir + L"StrayDualSense.ini";
+        if (m_config.Load(candidate))
+        {
+            m_configPath = candidate;
+            SDS_LOG_INFO("config: LOADED %ls", candidate.c_str());
+            break;
+        }
+        SDS_LOG_INFO("config: not at %ls", candidate.c_str());
     }
-    if (!m_configPath.empty())
-        SDS_LOG_INFO("config: %ls", m_configPath.c_str());
+    if (m_configPath.empty())
+        SDS_LOG_INFO("config: no StrayDualSense.ini in any of those; using built-in defaults. "
+                     "Every default is documented in mods/StrayDualSense/StrayDualSense.ini.");
     Log::SetMinLevel(m_config.logLevel);
     m_config.LogSummary("loaded");
 
@@ -260,7 +288,8 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     in.engineObject = engineObject;
     in.imageBase    = imageBase;
     in.imageSize    = imageSize;
-    in.requireBoth  = m_config.submixDeviceSource == "both";
+    in.useWorld     = m_config.submixDeviceSource != "engine";
+    in.useEngine    = m_config.submixDeviceSource != "world";
     // This runs once a second until it binds, and the log is this project's only feedback
     // channel, so the candidate dump follows the same 1-then-every-20 cadence as the WARN
     // below rather than writing several lines a second for a whole session.
@@ -271,15 +300,18 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     {
         if (attempt == 1 || attempt % 20 == 0)
             SDS_LOG_WARN("submix: FAudioDevice not found (attempt %d): %s. World=%p Engine=%p "
-                         "image=%p+0x%zX", attempt,
+                         "image=%p+0x%zX candidates=%zu uobjectTest=%d", attempt,
                          d.refusal != nullptr ? d.refusal : "no reason recorded",
-                         worldObject, engineObject, imageBase, imageSize);
+                         worldObject, engineObject, imageBase, imageSize, d.candidates.size(),
+                         d.uobjectTestUsable ? 1 : 0);
         return false;
     }
 
-    SDS_LOG_INFO("submix: FAudioDevice %p (vtable %p, deviceId %u) found in UWorld+0x%zX AND "
-                 "UEngine+0x%zX - two independent structures agreeing on one pointer.",
-                 d.device, d.vtable, d.deviceId, d.worldOffset, d.engineOffset);
+    SDS_LOG_INFO("submix: FAudioDevice %p (vtable %p, deviceId %u, sampleRate %d) found at "
+                 "%s+0x%zX. Accepted because %s.",
+                 d.device, d.vtable, d.deviceId, d.sampleRate,
+                 d.fromWorld ? "UWorld" : "UEngine", d.offset,
+                 d.why != nullptr ? d.why : "no reason recorded");
     submix::LogVtable(d.device, imageBase, imageSize);
 
     const char* whyNot = nullptr;
@@ -383,7 +415,19 @@ void Runtime::PadThreadMain()
             m_pad.RefreshIfLost();
         }
 
-        const DWORD sleepMs = static_cast<DWORD>(std::max(0.25f, m_config.padPollSeconds) * 1000.0f);
+        // WHILE THERE IS NO PAD, POLL FAST. MEASURED 2026-09-02: two launches of the same
+        // build, one adopted slot 1 and transmitted triggers, the next found every slot
+        // handing back a handle and an all-zero information struct. libScePad only knows about
+        // a pad the GAME has opened, and this thread starts as soon as the module maps, so the
+        // probe RACES the game's own scePadOpen. A 2 s cadence turns a race we could win into
+        // one we lose for the whole session; 1 s for the first two minutes closes it, and the
+        // steady-state cadence takes over afterwards so a genuinely absent pad is not polled
+        // hard forever.
+        float pollSeconds = m_config.padPollSeconds;
+        if (!m_pad.HasPad() && m_pad.Probes() < kFastPadProbes)
+            pollSeconds = kFastPadPollSeconds;
+
+        const DWORD sleepMs = static_cast<DWORD>(std::max(0.25f, pollSeconds) * 1000.0f);
         for (DWORD slept = 0; slept < sleepMs && m_padThreadRunning.load(std::memory_order_acquire);
              slept += 100)
             ::Sleep(100);
@@ -520,12 +564,14 @@ void Runtime::SubmixStatus()
 void Runtime::LogStatus()
 {
     const TriggerEffect fx = m_triggers.Effect();
-    SDS_LOG_INFO("STATUS pad=%s(user=%d handle=0x%X) hid[open=%d writes=%lu fail=%lu] "
+    SDS_LOG_INFO("STATUS pad=%s(user=%d handle=0x%X probes=%lu misses=%lu) "
+                 "hid[open=%d writes=%lu fail=%lu] "
                  "trig[events=%lu tx=%lu ok=%lu fail=%lu L=%d R=%d effect=%d/%u/%u/%u %s] "
                  "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
                  "compStops ok=%lu ignored=%lu padVibe=%d] "
                  "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s']",
                  m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
+                 m_pad.Probes(), m_pad.ProbeMisses(),
                  m_hidMode.Opened() ? 1 : 0, m_hidMode.Writes(), m_hidMode.Failures(),
                  m_triggerEvents.load(), m_triggers.Transmits(), m_pad.TriggerOk(),
                  m_pad.TriggerFail(), m_triggers.Left() ? 1 : 0, m_triggers.Right() ? 1 : 0,

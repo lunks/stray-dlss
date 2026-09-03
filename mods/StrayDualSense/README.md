@@ -75,6 +75,32 @@ does not exist here — assuming it would have put a second entry in the vtable 
 engine into the wrong function. `NumSamples` is **interleaved samples** (`frames * channels`),
 not frames (`AudioDevice.h:400`, `AudioMixerSubmix.cpp:1082`).
 
+### FIRST LIVE RUN, 2026-09-02: the tap did NOT register — and the diagnostics said so
+
+Deployed and run on the box. Everything either side of the discovery worked: the submix
+resolved by path, the sink opened the pad endpoint (`sink open=1 'Speakers (DualSense Wireless
+Controller)' 4ch 48000Hz`), and the refusal named itself rather than looking like silence.
+
+```
+submix: FAudioDevice not found (attempt 1): no FAudioDevice pointer appeared in both the UWorld
+and the UEngine object; refusing to guess.
+submix discovery: FAudioDeviceHandle-shaped candidates - UWorld -> 8, UEngine -> 3
+  UWorld +0x0360 device=482C7780 id=0     UWorld +0x0778 device=1673ACC0 id=0
+  UWorld +0x0958 device=4E088C00 id=1     ... none shared with UEngine's three
+```
+
+**The rule was wrong twice over.** The shape test — a `{weak ptr; pointer; small int}` triple
+whose pointer has an in-image vtable — is really "a pointer to any polymorphic object whose
+class lives in the exe", and a `UWorld` is full of UObject pointers, every one of which passes.
+And demanding an IDENTICAL pointer in both objects was never sound: a world audio device and
+the main audio device are allowed to be different `FAudioDevice` instances. The real candidate
+was outvoted by noise it should never have been competing with.
+
+The replacement is positive and per-candidate — not a UObject, holds a standard sample rate,
+and then the decisive signals — and the acceptance ladder is now a pure function
+(`src/SubmixChoice.cpp`) so CI proves it against **that run's own candidate list**
+(`tests/test_submix_choice.cpp`), including a negative control showing the old rule refuses it.
+
 ### How the pointer and the call are reached
 
 `FAudioDevice` is not a UObject, `RegisterSubmixBufferListener` is not reflected, and no
@@ -92,11 +118,24 @@ step is logged.
 * **The `FAudioDevice*` is found by a STRUCTURAL SCAN, not an offset.** `FAudioDeviceHandle`
   (`AudioDeviceManager.h:81-125`) is `{TWeakObjectPtr<UWorld> World; FAudioDevice* Device;
   Audio::FDeviceId DeviceId;}`; one lives in `UWorld::AudioDeviceHandle` and another in
-  `UEngine::MainAudioDeviceHandle`, both at offsets that shift with `#if` blocks. So we scan
-  both objects for the shape, require the device's vtable pointer to lie inside the game
-  executable's image, require its first 32 slots to all be in-image function pointers, require
-  a small `DeviceId` — and then the decisive one: **the same pointer must be found
-  independently in both objects.**
+  `UEngine::MainAudioDeviceHandle`, both at offsets that shift with `#if` blocks. The shape
+  test finds them — and, as the live run showed, a great deal else — so each candidate then
+  has to earn it:
+  * **it must not be a UObject.** `FAudioDevice` is not one, and a UObject's `ClassPrivate`
+    (+0x10) chain ends at the `UClass` UClass, which is its own class — a fixed point that
+    identifies a UObject whatever its class. **Self-checked** against the known UWorld and
+    UEngine: if they do not test as UObjects the offset is wrong for this build, and the
+    rejection is disabled and said so rather than discarding the right candidate.
+  * **it must hold a standard sample rate.** `FAudioDevice::SampleRate` is an `int32`
+    (`AudioDevice.h:1789`) with a second copy in the `PlatformSettings` beside it. A random
+    UObject holds none.
+  * **then the decisive signals, strongest first:** a UWorld handle whose weak pointer names
+    that very world (its `ObjectIndex` equals the world's own `InternalIndex` — exact and
+    essentially unforgeable); a UEngine handle with `FAudioDeviceManager*` immediately before
+    it (`Engine.h:1732`); or a **shared vtable** across the two objects, which is the
+    cross-check that actually holds — two different instances are still both `FMixerDevice`.
+  * **and it refuses rather than guesses.** Several undistinguished survivors, or none, is a
+    logged refusal; calling a virtual on the wrong heap object is a crash in someone's game.
 * **It binds from the GAME THREAD**, from inside the first UFunction hook that fires, and from
   nowhere else. `on_update` is UE4SS's own jthread; a UObject read there is an unsynchronised
   cross-thread read, which this plugin does not do anywhere.
@@ -172,6 +211,7 @@ and link-tested without the SDK.
 | `LoopList` | `haptic_loops.txt` / `spk_loops.txt` | unit test |
 | `Fade` | `FadeInTime` / `FadeOutTime` gain ramps | unit test |
 | `SubmixDsp` | the spike's signal path: channel fold, soft clip, resampler, level meter, SPSC ring | unit test |
+| `SubmixChoice` | which FAudioDevice candidate to believe — the part that got it wrong in the game | unit test |
 | `AssetName` | `"SoundWave /Game/.../X.X"` → `X` | unit test |
 | `HidMode` | the `valid_flag0` write and its re-assert thread | mingw compile+link |
 | `Wasapi` | finds the endpoint, opens a shared-mode 32-bit float stream | mingw |
@@ -247,10 +287,14 @@ the CLAUDE.md sense: plausible from source, not yet compiled by CI or seen on th
    Turned on, it calls a virtual on a pointer found by scanning two UObjects for a struct
    shape, at an index counted out of engine source, in a licensee build. Every step is
    validated and logged before the call, and the log line immediately before it names itself as
-   the suspect — but a wrong device pointer or a wrong slot is a crash, not a bad number. Also
-   unverified: whether Stray's PC build renders any audio into `Submix_vibration` at all (the
-   PS5 paths are platform-gated), and whether the buffer we would receive is the vibration mix
-   or its parent's accumulation. See [The submix spike](#the-submix-spike--hapticsource--measure--submix).
+   the suspect — but a wrong device pointer or a wrong slot is a crash, not a bad number.
+   **Run once on the box, 2026-09-02: it refused to register** and named the reason; the
+   discovery has been rewritten around that data and CI now tests the ladder against it, but
+   the rewrite itself has NOT run in the game. Still unverified beyond it: whether the vtable
+   index is 16 in this licensee build, whether Stray's PC build renders any audio into
+   `Submix_vibration` at all (the PS5 paths are platform-gated), and whether the buffer we
+   would receive is the vibration mix or its parent's accumulation.
+   See [The submix spike](#the-submix-spike--hapticsource--measure--submix).
 
 1. **Hardware behaviour — all of it.** `src/Mod.cpp` now **compiles under MSVC** against
    RE-UE4SS `68caddcf` (CI run 33582881130, `4e8fb0c`) — see

@@ -131,14 +131,21 @@ bool ScePad::SelectPad(int forceUserId)
     int     bestUser   = 0;
     int32_t bestHandle = 0;
 
+    // Throttle the per-slot dump: this is retried until a pad appears, and at 5 lines a probe
+    // it would bury the rest of the log within a minute. The first probe and every 15th carry
+    // the full detail; the rest report only the outcome.
+    const unsigned long probe = m_probes.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool verbose = (probe == 1 || probe % 15 == 0);
+
     // MEASURED: the game opens slots 1..4 and every one answers with a positive handle.
     for (int user = 1; user <= 4; ++user)
     {
         const int32_t h = g_getHandle(user, 0, 0);
         if (h <= 0)
         {
-            SDS_LOG_INFO("pad slot %d: scePadGetHandle -> 0x%X (no handle)", user,
-                         static_cast<unsigned>(h));
+            if (verbose)
+                SDS_LOG_INFO("pad slot %d: scePadGetHandle -> 0x%X (no handle)", user,
+                             static_cast<unsigned>(h));
             continue;
         }
 
@@ -147,6 +154,7 @@ bool ScePad::SelectPad(int forceUserId)
 
         char hex[160];
         HexDump(info.raw, 16, hex, sizeof(hex));
+        if (verbose)
         SDS_LOG_INFO("pad slot %d: handle=0x%X info-ret=0x%08X connected=%u connectedCount=%u "
                      "type=%u class=%u density=%.2f touch=%ux%u dz=%u/%u raw=%s",
                      user, static_cast<unsigned>(h), static_cast<unsigned>(info.result),
@@ -164,17 +172,27 @@ bool ScePad::SelectPad(int forceUserId)
 
     if (bestHandle == 0)
     {
-        SDS_LOG_ERROR("no pad slot reports connected=1. Every slot handed back a handle and "
-                      "an all-zero information struct. Check that Steam's *global* "
-                      "PlayStation Controller Support is OFF and that the DualSense is "
-                      "visible to the prefix as a HID device.");
+        const unsigned long misses = m_probeMisses.fetch_add(1, std::memory_order_relaxed) + 1;
+        // The first miss is not a failure: libScePad only knows about a pad the GAME has
+        // opened, and our thread starts as soon as the module maps. It becomes a failure only
+        // if it keeps missing, so the message escalates rather than crying wolf on probe 1.
+        if (misses == 1)
+            SDS_LOG_INFO("pad: no slot reports connected=1 on probe %lu. This is EXPECTED "
+                         "early - libScePad only knows about a pad the game has opened. "
+                         "Retrying.", probe);
+        else if (verbose)
+            SDS_LOG_ERROR("pad: still no slot reporting connected=1 after %lu probe(s). Every "
+                          "slot hands back a handle and an all-zero information struct. Check "
+                          "that Steam's *global* PlayStation Controller Support is OFF and "
+                          "that the DualSense is visible to the prefix as a HID device.",
+                          misses);
         m_handle.store(0, std::memory_order_release);
         m_userId.store(0, std::memory_order_release);
         return false;
     }
 
-    SDS_LOG_INFO("adopted pad: user slot %d, handle 0x%X (connected byte set)",
-                 bestUser, static_cast<unsigned>(bestHandle));
+    SDS_LOG_INFO("adopted pad: user slot %d, handle 0x%X (connected byte set) on probe %lu",
+                 bestUser, static_cast<unsigned>(bestHandle), probe);
     m_handle.store(bestHandle, std::memory_order_release);
     m_userId.store(bestUser, std::memory_order_release);
     return true;

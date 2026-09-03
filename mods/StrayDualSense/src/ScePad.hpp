@@ -56,7 +56,14 @@ public:
     bool IsBound() const { return m_bound.load(std::memory_order_acquire); }
 
     // Probe user slots 1..4 and adopt the one whose `connected` byte is set. `forceUserId`
-    // != 0 skips the probe (escape hatch). Logs every slot's decoded struct either way.
+    // != 0 skips the probe (escape hatch).
+    //
+    // MEASURED 2026-09-02: this RACES the game. On one launch slot 1 answered connected=1 and
+    // the triggers worked; on the next, every slot handed back a handle and an all-zero
+    // information struct. libScePad only knows about a pad the GAME has opened, and our pad
+    // thread starts as soon as the module is mapped — so a probe can simply be too early.
+    // It is therefore retried, and the per-slot dump is throttled rather than dropped: at
+    // ~2 s it is 5 log lines a probe, which over a session buries everything else.
     bool SelectPad(int forceUserId = 0);
 
     // Re-run SelectPad if the current pad has stopped reporting `connected`. Worker only.
@@ -78,6 +85,10 @@ public:
 
     unsigned long TriggerOk() const   { return m_trigOk.load(); }
     unsigned long TriggerFail() const { return m_trigFail.load(); }
+    // How many times the slots have been probed, and how many of those found nothing. A pad
+    // that never appears must be distinguishable from a probe that never ran.
+    unsigned long Probes() const      { return m_probes.load(); }
+    unsigned long ProbeMisses() const { return m_probeMisses.load(); }
 
 private:
     std::atomic<bool>    m_bound{false};
@@ -86,6 +97,8 @@ private:
 
     std::atomic<unsigned long> m_trigOk{0};
     std::atomic<unsigned long> m_trigFail{0};
+    std::atomic<unsigned long> m_probes{0};
+    std::atomic<unsigned long> m_probeMisses{0};
 };
 
 } // namespace sds

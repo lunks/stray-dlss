@@ -156,10 +156,12 @@ if [ "$REVERT" = 1 ]; then
   set_mod StrayDualSense 0
   set_mod StrayTriggers 1
   shim_on
-  if [ -f "$MODS/StrayDualSense/StrayDualSense.ini.straydeploy.bak" ]; then
-    mv -f "$MODS/StrayDualSense/StrayDualSense.ini.straydeploy.bak" \
-          "$MODS/StrayDualSense/StrayDualSense.ini" && note "restored the previous StrayDualSense.ini"
-  fi
+  for d in "$MODS/StrayDualSense/dlls" "$MODS/StrayDualSense"; do
+    if [ -f "$d/StrayDualSense.ini.straydeploy.bak" ]; then
+      mv -f "$d/StrayDualSense.ini.straydeploy.bak" "$d/StrayDualSense.ini" \
+        && note "restored the previous $d/StrayDualSense.ini"
+    fi
+  done
   chown -R deck:deck "$MODS" 2>/dev/null || true
   say ""
   say "$CHANGED change(s). The plugin DLL is left in place but disabled; the game was NOT launched."
@@ -208,9 +210,15 @@ PDB="${DLL%.dll}.pdb"
 [ -f "$PDB" ] && cp -f "$PDB" "$MODS/StrayDualSense/dlls/main.pdb"
 
 # ---------------------------------------------------------------------------------------
-# 4. The ini. Only the keys the spike needs; everything else keeps its built-in default.
+# 4. The ini, NEXT TO THE DLL.
+#
+# MEASURED 2026-09-02: writing it to the mod ROOT made the first live run silently use
+# HapticSource=assets — the plugin searched the DLL's own directory and the game directory,
+# and the mod root was neither. The plugin now searches the mod root too, but a deploy must
+# not depend on the build being new enough to do that, so it goes where every version looks.
+# A stale copy in the mod root would be shadowed by this one; it is removed if present.
 # ---------------------------------------------------------------------------------------
-INI="$MODS/StrayDualSense/StrayDualSense.ini"
+INI="$MODS/StrayDualSense/dlls/StrayDualSense.ini"
 INI_NEW="$INI.straydeploy.tmp"
 cat > "$INI_NEW" <<INI_EOF
 ; Written by tools/dualsense/deploy-submix-spike.sh — the SUBMIX SPIKE.
@@ -241,6 +249,12 @@ SubmixProbeMaster = 1
 ; mods/StrayDualSense/src/SubmixDiscovery.hpp for the derivation. Stray is a LICENSEE build,
 ; so if the log's vtable dump disagrees, change this.
 SubmixRegisterSlot = 16
+; both | world | engine. Which objects may supply the FAudioDevice pointer. MEASURED 2026-09-02:
+; demanding the SAME POINTER in both objects was wrong twice over - the scan found 8 candidates
+; in UWorld and 3 in UEngine with none shared, and a world audio device and the main audio
+; device are ALLOWED to be different instances. The cross-check is now a shared VTABLE (both are
+; FMixerDevice), and UEngine::MainAudioDeviceHandle is accepted on its own when the audio device
+; manager sits immediately before it. "both" simply means "look in both"; the ladder decides.
 SubmixDeviceSource = both
 
 SubmixGain = 1.0
@@ -263,6 +277,13 @@ else
   [ -f "$INI" ] && [ ! -f "$INI.straydeploy.bak" ] && cp -f "$INI" "$INI.straydeploy.bak"
   mv -f "$INI_NEW" "$INI"
   note "wrote $INI"
+fi
+# A leftover from an earlier deploy would sit in the search path behind this one and is pure
+# confusion in a log; take it out of the way rather than leaving two files disagreeing.
+if [ -f "$MODS/StrayDualSense/StrayDualSense.ini" ]; then
+  mv -f "$MODS/StrayDualSense/StrayDualSense.ini" \
+        "$MODS/StrayDualSense/StrayDualSense.ini.superseded" \
+    && note "moved the stale mod-root ini aside (the plugin reads the one beside the DLL)"
 fi
 
 chown -R deck:deck "$MODS" 2>/dev/null || true

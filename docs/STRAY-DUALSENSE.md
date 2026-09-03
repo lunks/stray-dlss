@@ -764,3 +764,41 @@ own mixer solves it, along with the fades, the loops, the levels and the asset e
 reach the pad, and its master-submix probe distinguishes "the game is silent here" from "our
 tap is broken". Deploy with `tools/dualsense/deploy-submix-spike.sh`; the full design,
 including why the listener's vtable lives in a leaked page, is in that mod's README.
+
+### First live run, 2026-09-02: the tap refused, and two defects it exposed
+
+`HapticSource=measure` was deployed and run. **The listener never registered**, and everything
+around it worked — the submix resolved by path, and the coil sink opened the pad's endpoint
+(`4ch 48000Hz`). Three findings:
+
+1. **The FAudioDevice search was far too loose, and its cross-check was wrong.** It looked for a
+   `{TWeakObjectPtr<UWorld>; FAudioDevice*; FDeviceId}`-shaped triple whose pointer had an
+   in-image vtable — which is really "a pointer to any polymorphic object whose class lives in
+   the exe". A `UWorld` is full of UObject pointers and **8** of them passed, against **3** in
+   the UEngine object, with none shared; the rule demanded an identical pointer in both and so
+   refused. That demand was never sound anyway: a world audio device and the main audio device
+   are allowed to be **different instances**. What IS invariant is that both are `FMixerDevice`,
+   so the cross-check is a shared **vtable**, and each candidate now has to earn its place — not
+   a UObject (`ClassPrivate` fixed-point test, self-checked against objects known to be
+   UObjects), holds a standard sample rate (`FAudioDevice::SampleRate`, `AudioDevice.h:1789`),
+   and then a decisive signal: a UWorld handle whose weak pointer names that world, a UEngine
+   handle with `FAudioDeviceManager*` immediately before it (`Engine.h:1732`), or a shared
+   vtable.
+2. **Pad discovery raced the game.** On the first launch slot 1 reported `connected=1` and the
+   triggers transmitted; on the second, every slot handed back a handle and an all-zero
+   information struct. libScePad only knows about a pad **the game has opened**, and our pad
+   thread starts as soon as the module maps — so the probe can simply be too early. The retry
+   loop existed but ran at the 2 s steady-state cadence and re-logged the same five lines each
+   time; it now polls at 1 s for the first two minutes while no pad is adopted, throttles the
+   per-slot dump, treats the first miss as expected rather than an error, and reports
+   `probes=`/`misses=` in the STATUS line.
+3. **The plugin did not look for its ini where the deploy script wrote it** (the mod root),
+   so the first run silently used the default `HapticSource=assets`. The log named the file it
+   loaded, which is how it was caught. The search now includes the mod root — the conventional
+   place for a UE4SS mod's config — every candidate is logged hit or miss, and the deploy script
+   writes beside the DLL where every version looks.
+
+**The lesson worth keeping is the first one's shape.** A structural signature that matches "the
+kind of thing we want" is not a test; it has to exclude the far more numerous kind of thing that
+merely resembles it. Eight false positives and one refusal is a better outcome than one false
+positive and a crash — but only because the refusal was loud and printed its candidates.
