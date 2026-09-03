@@ -388,6 +388,51 @@ Discovery discover(const Image &image)
 }
 
 // ---------------------------------------------------------------------------------------
+// Mode and gate
+// ---------------------------------------------------------------------------------------
+
+Mode mode_from_level(int level)
+{
+	if (level <= 0) return Mode::off;
+	if (level == 1) return Mode::discover;
+	if (level == 2) return Mode::observe;
+	return Mode::authoritative;
+}
+
+const char *mode_name(Mode m)
+{
+	switch (m)
+	{
+	case Mode::off:           return "off";
+	case Mode::discover:      return "discover";
+	case Mode::observe:       return "observe";
+	case Mode::authoritative: return "authoritative";
+	}
+	return "?";
+}
+
+const char *gate_name(Gate g)
+{
+	switch (g)
+	{
+	case Gate::heuristic:            return "heuristic";
+	case Gate::engine:               return "engine";
+	case Gate::refuse_not_announced: return "refuse-not-announced";
+	case Gate::refuse_no_seam:       return "refuse-no-seam";
+	}
+	return "?";
+}
+
+Gate decide(const GateInputs &in)
+{
+	if (in.mode != Mode::authoritative)
+		return Gate::heuristic;
+	if (!in.hooked)
+		return in.fallback_allowed ? Gate::heuristic : Gate::refuse_no_seam;
+	return in.announced ? Gate::engine : Gate::refuse_not_announced;
+}
+
+// ---------------------------------------------------------------------------------------
 // Ledger
 // ---------------------------------------------------------------------------------------
 
@@ -396,14 +441,15 @@ std::uint32_t Ledger::expected_groups(std::uint32_t extent)
 	return (extent + kTaaTileSize - 1u) / kTaaTileSize;
 }
 
-void Ledger::begin_frame(std::uint64_t frame)
+void Ledger::retire_stale()
 {
-	m_frame = frame;
 	std::size_t kept = 0;
 	for (std::size_t i = 0; i < m_count; ++i)
 	{
 		const Announcement &a = m_slots[i];
-		if (a.frame + kRetireAfterFrames > frame)
+		const bool stale_by_sequence = a.sequence + kRetireAfterAnnouncements <= m_sequence;
+		const bool stale_by_present = a.frame + kRetireAfterFrames <= m_frame;
+		if (!stale_by_sequence && !stale_by_present)
 		{
 			m_slots[kept++] = a;
 			continue;
@@ -414,9 +460,18 @@ void Ledger::begin_frame(std::uint64_t frame)
 	m_count = kept;
 }
 
+void Ledger::begin_frame(std::uint64_t frame)
+{
+	m_frame = frame;
+	retire_stale();
+}
+
 void Ledger::announce(const Announcement &in)
 {
 	++m_counters.announced;
+	// Make room the honest way first: anything already dead by the engine's own clock retires
+	// (and is counted) before the ring can be called full.
+	retire_stale();
 	if (m_count >= kCapacity)
 	{
 		++m_counters.overflow;
@@ -426,6 +481,8 @@ void Ledger::announce(const Announcement &in)
 	a.consumed = false;
 	a.sequence = ++m_sequence;
 	m_slots[m_count++] = a;
+	// The engine's own clock has ticked; anything four announcements old is dead.
+	retire_stale();
 }
 
 const Announcement *Ledger::claim(std::uint32_t group_x, std::uint32_t group_y)

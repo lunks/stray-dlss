@@ -15,14 +15,15 @@
 // with no archaeology at all.
 //
 // Everything in this file is pure: bytes in, verdict out. No Windows, no D3D12, no engine
-// headers. src/engine_seam.cpp is the live half that maps the module and installs the hook.
+// headers. src/engine_seam_hook.cpp is the live half that maps the module and installs the hook.
 //
 // PROVENANCE (CLAUDE.md §0.5). Every offset and constant below is HARD, read from the UE 4.27.2
 // source in the AlexMercer-MA/UnrealEngine-4.27 mirror whose Build.version reads
-// 4.27.2 / ++UE4+Release-4.27. What is UNCONFIRMED is whether the code *shapes* this file
-// scans for are the ones MSVC emitted into Stray's own build — nothing here has been run
-// against the executable. Discovery therefore refuses loudly and dumps the bytes it did not
-// understand, so one round trip settles it either way.
+// 4.27.2 / ++UE4+Release-4.27. The code SHAPES this file scans for were UNCONFIRMED until
+// 2026-09-03, when the scan ran on the box against Stray-Win64-Shipping.exe and found exactly
+// one candidate at every stage, validated by all three constants (facts §36). They are HARD on
+// that executable now; a game update recooking the binary is what would make them a question
+// again, and discovery still refuses loudly and dumps what it did not understand.
 #pragma once
 
 #include <cstddef>
@@ -89,6 +90,43 @@ constexpr std::size_t kIntRectSize = 16;
 // (TemporalAA.cpp:654-656) with ResolutionDivisor == 1 for every Main* config. So the group
 // count is ceil(the announced rect / 8) exactly.
 constexpr std::uint32_t kTaaTileSize = 8;
+
+// ---------------------------------------------------------------------------------------
+// Mode, and the gate decision
+// ---------------------------------------------------------------------------------------
+
+// [STRAYDLSS] EngineSeam. Each level includes the ones below it.
+enum class Mode : std::uint8_t
+{
+	off = 0,       // nothing scanned, nothing patched
+	discover,      // scan + validate + log; install nothing
+	observe,       // stand in for AddPasses and cross-check the heuristic; the heuristic gates
+	authoritative, // the engine's announcement gates DLSS; hash and signature are assertions
+};
+Mode mode_from_level(int level);
+const char *mode_name(Mode m);
+
+// What decides whether DLSS may run on a dispatch this frame.
+enum class Gate : std::uint8_t
+{
+	heuristic,           // the pre-seam path: cooked-hash whitelist + structural signature + pin
+	engine,              // the engine announced this dispatch; run on its word
+	refuse_not_announced,// authoritative, seam live, and the engine announced nothing this fits
+	refuse_no_seam,      // authoritative, the seam is NOT live, and the fallback is disallowed
+};
+const char *gate_name(Gate g);
+
+struct GateInputs
+{
+	Mode mode = Mode::off;
+	bool hooked = false;           // the AddPasses stand-in is installed
+	bool fallback_allowed = true;  // [STRAYDLSS] EngineSeamFallback
+	bool announced = false;        // this dispatch claimed an announcement
+};
+// Pure. The heuristic is the answer in every mode below `authoritative`; in `authoritative`
+// the seam is the answer, and a missing seam is either the heuristic (fallback allowed, said
+// loudly by the caller) or a refusal (fallback disallowed). Never a silent downgrade.
+Gate decide(const GateInputs &in);
 
 // ---------------------------------------------------------------------------------------
 // The module image
@@ -210,31 +248,38 @@ struct LedgerCounters
 {
 	std::uint64_t announced = 0;
 	std::uint64_t claimed = 0;
-	// Announced, then retired without any dispatch claiming it. A steady non-zero rate means
-	// the correlation rule is wrong, not that the engine skipped its own upscale.
+	// Announced, then retired without any dispatch claiming it. THE error metric: the engine
+	// ran its primary upscale and we did not intercept it, so that frame ran the engine's own
+	// TAA. A steady non-zero rate is a correlation bug, not the engine skipping its upscale.
 	std::uint64_t unclaimed = 0;
-	// The heuristic matcher believed a dispatch was the TAA and the engine had announced
-	// NOTHING. This is the counter the whole exercise is for: it is the wrong-pass class,
-	// named, per frame, instead of arriving as "the whole screen appears suddenly".
+	// A candidate dispatch arrived and the engine had announced NOTHING pending. Under the
+	// heuristic this was the wrong-pass class; under the authoritative gate it is a refusal.
 	std::uint64_t orphans = 0;
-	// An announcement was pending but no rect agreed with the dispatch.
+	// A candidate dispatch arrived, an announcement was pending, and no rect agreed. MEASURED
+	// 2026-09-03: this is the look-alikes — 0xe3ddca4be9830076 at 240x135 groups and
+	// 0x42af595f8ff91038 at 120x68 — being asked and correctly refused, once each per frame.
+	// It is expected to be non-zero and is NOT an error; `unclaimed` is.
 	std::uint64_t rect_mismatch = 0;
 	std::uint64_t overflow = 0; // more concurrent announcements than the ring holds
 };
 
-// How many frames an unclaimed announcement survives before it is retired. Announcement and
-// dispatch both happen on the render thread within one frame — RDG setup then
-// FRDGBuilder::Execute — but our frame counter is bumped from Present, and with an RHI thread
-// the recording can straddle that boundary. Two frames of slack costs nothing and removes a
-// whole class of off-by-one.
-constexpr std::uint64_t kRetireAfterFrames = 2;
+// When an unclaimed announcement is retired. Announcement and dispatch both happen on the
+// render thread within one frame — RDG setup, then FRDGBuilder::Execute — so the engine's own
+// AddPasses count is the clock to key on: once `kRetireAfterAnnouncements` NEWER announcements
+// exist, this one's dispatch has been and gone. The present counter is only a backstop for a
+// session that stops announcing altogether (a loading screen with no TAA), and it is
+// deliberately generous: nothing about correlation depends on how presents relate to frames,
+// which is what makes the ledger immune to frame generation presenting twice per game frame.
+constexpr std::uint64_t kRetireAfterAnnouncements = 4;
+constexpr std::uint64_t kRetireAfterFrames = 8;
 
 class Ledger
 {
 public:
 	static constexpr std::size_t kCapacity = 8;
 
-	// Retires stale entries. Call once per Present, before anything else.
+	// The present backstop. Call once per GAME present (the present owner delivers exactly
+	// that: our own frame-generation presents are skipped under OwnCodeScope).
 	void begin_frame(std::uint64_t frame);
 	void announce(const Announcement &a);
 	// Called only for a dispatch the existing matcher already believes is the TAA pass.
@@ -249,6 +294,8 @@ public:
 	static std::uint32_t expected_groups(std::uint32_t extent);
 
 private:
+	void retire_stale();
+
 	Announcement m_slots[kCapacity]{};
 	std::size_t m_count = 0;
 	std::uint64_t m_frame = 0;

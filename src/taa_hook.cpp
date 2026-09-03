@@ -191,8 +191,13 @@ constexpr std::uint64_t kPinStaleFrames = 300;
 // the structural TAA candidates measured at this resolution.
 std::unordered_map<std::uint64_t, bool> g_roundtrip_seen;
 std::unordered_map<std::uint64_t, bool> g_candidate_logged;
-// One WARN per pass when the engine seam and the heuristic matcher disagree.
+// One WARN per pass when the engine seam and the heuristic matcher disagree (observe mode),
+// and one per pass per assertion in authoritative mode: an announced pass whose hash is not in
+// the cooked table, or whose dispatched rect is not the one the engine announced.
 std::unordered_map<std::uint64_t, bool> g_seam_disagreement_logged;
+std::unordered_map<std::uint64_t, bool> g_seam_hash_assert_logged;
+std::unordered_map<std::uint64_t, bool> g_seam_rect_assert_logged;
+bool g_seam_first_engine_claim_logged = false;
 
 // Why a structurally matched TAA pass never reached DLSS.
 //
@@ -209,6 +214,8 @@ enum GateReason
 	kGatePinnedElsewhere,  // DLSS is pinned to a different pass
 	kGateNoRoundTrip,      // this pass has not proved it owns the temporal history
 	kGateNotPrimaryView,   // aspect ratio or upscale factor says cubemap face / reflection capture
+	kGateNotAnnounced,     // EngineSeam authoritative: the engine announced no primary upscale this fits
+	kGateNoSeam,           // EngineSeam authoritative, seam not live, EngineSeamFallback=0
 	kGateReasonCount,
 };
 const char *const kGateReasonText[kGateReasonCount] = {
@@ -220,6 +227,11 @@ const char *const kGateReasonText[kGateReasonCount] = {
 	"it has not proved it owns the temporal history yet (no u0 round-trip seen)",
 	"its render/output shape is not the primary view - the aspect ratio or the upscale factor "
 	"is out of range, so it is a cubemap face or a reflection capture, not FTAAStandaloneCS",
+	"the engine's ITemporalUpscaler::AddPasses announced no primary temporal upscale this "
+	"dispatch fits ([STRAYDLSS] EngineSeam=3). For a look-alike (DOF, light shafts, SSR, water, "
+	"a planar reflection) this is the CORRECT outcome and the only line it will ever produce",
+	"EngineSeam=3 was requested, the seam is not live, and EngineSeamFallback=0 - DLSS is "
+	"refused on every dispatch by configuration (see the ENGINE SEAM MODE line at startup)",
 };
 std::unordered_map<std::uint64_t, std::uint32_t> g_gate_logged; // hash -> reason bitmask
 
@@ -1307,11 +1319,19 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// match that the engine never announced is the wrong-pass class — the failure the user
 	// sees as "the whole screen appears suddenly" — and until now it was indistinguishable
 	// from a correct match. docs/RESEARCH-ENGINE-TAA-HOOK.md.
+	// Which authority decides this dispatch. `heuristic` below authoritative mode or when the
+	// seam is not live and the fallback is allowed; `engine` when the engine announced this
+	// exact dispatch; a named refusal otherwise. (src/core/engine_seam.hpp, seam::decide)
+	seamhook::Verdict seam_verdict;
+	seam::Gate seam_gate = seam::Gate::heuristic;
 	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
 	{
-		const seamhook::Verdict sv = seamhook::claim(x, y);
-		if (sv.active && !sv.announced)
+		seam_verdict = seamhook::claim(x, y);
+		seam_gate = seamhook::gate(seam_verdict.announced);
+
+		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)
 		{
+			// Observe mode: the heuristic still gates, so a disagreement is worth a WARN.
 			bool first = false;
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
@@ -1326,6 +1346,59 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 					"shafts, SSR, water, a planar reflection, a cubemap face) or the "
 					"correlation rule is wrong. First occurrence for this pass only.",
 					static_cast<unsigned long long>(hash), x, y);
+		}
+		else if (seam_gate == seam::Gate::engine)
+		{
+			// Authoritative mode: the engine's word is the gate; what the heuristic knows
+			// becomes two ASSERTIONS, each said once per pass. Neither refuses.
+			bool first_claim = false;
+			bool assert_hash = false;
+			bool assert_rect = false;
+			const bool hash_known = is_known_taa_hash(hash) ||
+				(g_ngx_pass_override != 0 && hash == g_ngx_pass_override);
+			const bool rect_agrees = m.output_width == seam_verdict.out_width &&
+				m.output_height == seam_verdict.out_height;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				if (!g_seam_first_engine_claim_logged)
+				{
+					g_seam_first_engine_claim_logged = true;
+					first_claim = true;
+				}
+				if (!hash_known && !g_seam_hash_assert_logged[hash])
+				{
+					g_seam_hash_assert_logged[hash] = true;
+					assert_hash = true;
+				}
+				if (!rect_agrees && !g_seam_rect_assert_logged[hash])
+				{
+					g_seam_rect_assert_logged[hash] = true;
+					assert_rect = true;
+				}
+			}
+			if (first_claim)
+				STRAY_LOG_INFO("ENGINE SEAM AUTHORITATIVE: first announced pass claimed - "
+					"0x%016llx, %ux%u groups, engine rect %ux%u, matcher rect %ux%u, "
+					"render %ux%u, cooked-hash=%s. DLSS SR runs on this dispatch and on "
+					"nothing the engine did not announce. Readable from the main menu: the "
+					"menu runs the TAA pass too.",
+					static_cast<unsigned long long>(hash), x, y,
+					seam_verdict.out_width, seam_verdict.out_height,
+					m.output_width, m.output_height, m.render_width, m.render_height,
+					hash_known ? "yes" : "NO");
+			if (assert_hash)
+				STRAY_LOG_WARN("ENGINE SEAM ASSERTION: the engine announced pass 0x%016llx and "
+					"its DXBC hash is NOT in the cooked FTAAStandaloneCS table. Proceeding on "
+					"the engine's word (a game update recooked the shaders, or the table is "
+					"incomplete - regenerate taa_hashes.hpp). Once per pass.",
+					static_cast<unsigned long long>(hash));
+			if (assert_rect)
+				STRAY_LOG_WARN("ENGINE SEAM ASSERTION: pass 0x%016llx claimed the engine's "
+					"%ux%u announcement but the matcher reads its output rect as %ux%u. The "
+					"engine's rect is used. Once per pass.",
+					static_cast<unsigned long long>(hash),
+					seam_verdict.out_width, seam_verdict.out_height,
+					m.output_width, m.output_height);
 		}
 	}
 
@@ -1505,14 +1578,27 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// view velocity" while resolving structural candidate 0x56571dffb2076ce9 during a
 		// save load. Now that identification is table-driven, unknown hashes have nothing to
 		// gain from the resolve path.
-		const bool worth_resolving = is_known_taa_hash(hash) ||
+		//
+		// Under [STRAYDLSS] EngineSeam=3 the engine's announcement replaces that table as the
+		// gate: an announced pass resolves whether or not its hash is cooked (the hash is an
+		// assertion above), and an unannounced one never does. The loading-screen guard is
+		// preserved by construction - a look-alike over short-lived resources is exactly what
+		// the engine never announces.
+		const bool heuristic_worth = is_known_taa_hash(hash) ||
 			(g_ngx_pass_override != 0 && hash == g_ngx_pass_override);
+		const bool worth_resolving = seam_gate == seam::Gate::engine ? true
+			: seam_gate == seam::Gate::heuristic ? heuristic_worth
+			: false;
 
 		// Say which gate stopped it, once. Only while an evaluate is actually wanted — in
 		// observation-only sessions these paths are expected and silence is correct.
 		if (g_ngx_evaluate)
 		{
-			if (!worth_resolving)
+			if (seam_gate == seam::Gate::refuse_not_announced)
+				log_gate_refusal(hash, kGateNotAnnounced);
+			else if (seam_gate == seam::Gate::refuse_no_seam)
+				log_gate_refusal(hash, kGateNoSeam);
+			else if (!worth_resolving)
 				log_gate_refusal(hash, kGateUnknownHash);
 			else if (!view_ok)
 				log_gate_refusal(hash, kGateNoViewCb);
@@ -1613,7 +1699,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 					{
 						g_ngx_pass_last_frame.store(now, std::memory_order_relaxed);
 					}
-					else if (pinned != 0 &&
+					else if (seam_gate != seam::Gate::engine && pinned != 0 &&
 						now > g_ngx_pass_last_frame.load(std::memory_order_relaxed) +
 							kPinStaleFrames)
 					{
@@ -1628,9 +1714,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						pinned = 0;
 					}
 					// An explicitly named pass wins outright over the round-trip heuristic.
-					const bool eligible = g_ngx_pass_override != 0
-						? (hash == g_ngx_pass_override)
-						: (pinned != 0 ? (pinned == hash) : owns_temporal_history(hash));
+					// Under the engine's gate there is nothing to pin and no round-trip to
+					// wait for: the announcement IS the selection, one per view per frame.
+					const bool eligible = seam_gate == seam::Gate::engine ? true
+						: g_ngx_pass_override != 0
+							? (hash == g_ngx_pass_override)
+							: (pinned != 0 ? (pinned == hash) : owns_temporal_history(hash));
 					if (g_ngx_evaluate && ngx::status().super_sampling_available && !eligible)
 					{
 						if (pinned != 0)
@@ -1848,8 +1937,11 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						// descriptor's render size comes from the View CB's view rect (see the
 						// comment above). Gating the matcher left this path untouched — the
 						// bogus creates continued with zero rejections logged.
+						// Under the engine's gate the shape test is moot: a cubemap face or
+						// a reflection capture never reaches ITemporalUpscaler::AddPasses.
 						bool shape_ok = true;
-						if (fd.render_width > 0 && fd.render_height > 0 &&
+						if (seam_gate != seam::Gate::engine &&
+							fd.render_width > 0 && fd.render_height > 0 &&
 							fd.output_width > 0 && fd.output_height > 0)
 						{
 							const double in_aspect = static_cast<double>(fd.render_width) /

@@ -433,36 +433,122 @@ TEST_CASE("two views in one family are claimed independently, by rect")
 	CHECK(l.counters().rect_mismatch == 0);
 }
 
-TEST_CASE("an announcement survives the present boundary, then retires unclaimed")
+TEST_CASE("retirement is keyed on the engine's OWN announcement count, not on presents")
 {
+	// MEASURED 2026-09-03 with frame generation presenting twice per game frame: the hypothesis
+	// that the present counter mis-pairs announcements was wrong (claimed/announced was 99%,
+	// and the present owner counts GAME presents only), but the ledger must not even be
+	// exposed to the question. So: an announcement lives until four newer ones exist.
 	Ledger l;
 	l.begin_frame(10);
 	l.announce(made(10, 2560, 1440));
-
-	// The recording can straddle Present when an RHI thread is in play, so the very next
-	// frame must still be able to claim it.
-	l.begin_frame(11);
+	// Many presents, no new announcements: the entry stays claimable well past the old
+	// two-frame window (a loading screen presents without announcing).
+	for (std::uint64_t f = 11; f < 10 + kRetireAfterFrames; ++f)
+		l.begin_frame(f);
 	CHECK(l.pending() == 1);
-	const Announcement *a = l.claim(320, 180);
-	CHECK(a != nullptr);
 	CHECK(l.counters().unclaimed == 0);
+	CHECK(l.claim(320, 180) != nullptr);
 
-	// One that nobody ever claims is counted, once, when it retires.
-	l.announce(made(11, 2560, 1440));
-	l.begin_frame(12);
+	// Now the engine's clock: four newer announcements retire an unclaimed older one, with no
+	// present boundary at all in between.
+	l.announce(made(20, 2560, 1440)); // the one we will never claim
+	for (int i = 0; i < 3; ++i)
+		l.announce(made(20, 3840, 2160));
 	CHECK(l.counters().unclaimed == 0);
-	l.begin_frame(13);
+	l.announce(made(20, 3840, 2160)); // the fourth newer one
 	CHECK(l.counters().unclaimed == 1);
-	CHECK(l.pending() == 0);
+	// The 2560x1440 one is gone; the four 4K ones remain claimable, in order.
+	CHECK(l.claim(320, 180) == nullptr);
+	CHECK(l.counters().rect_mismatch == 1);
+	CHECK(l.pending() == 4);
 }
 
-TEST_CASE("the ring is bounded, and says so rather than dropping in silence")
+TEST_CASE("the present backstop retires an announcement nobody follows up")
+{
+	Ledger l;
+	l.begin_frame(100);
+	l.announce(made(100, 3840, 2160));
+	for (std::uint64_t f = 101; f < 100 + kRetireAfterFrames; ++f)
+	{
+		l.begin_frame(f);
+		CHECK(l.pending() == 1);
+	}
+	l.begin_frame(100 + kRetireAfterFrames);
+	CHECK(l.pending() == 0);
+	CHECK(l.counters().unclaimed == 1);
+}
+
+TEST_CASE("a look-alike asking while the real announcement is pending is a rect_mismatch, and the real pass still claims")
+{
+	// The shape of the 2026-09-03 session: one 4K announcement per frame, then the SSD
+	// look-alikes at 240x135 and 120x68 ask first, then the real 480x270 dispatch arrives.
+	Ledger l;
+	for (std::uint64_t f = 1; f <= 100; ++f)
+	{
+		l.begin_frame(f);
+		l.announce(made(f, 3840, 2160));
+		CHECK(l.claim(240, 135) == nullptr);
+		CHECK(l.claim(120, 68) == nullptr);
+		CHECK(l.claim(480, 270) != nullptr);
+	}
+	CHECK(l.counters().announced == 100);
+	CHECK(l.counters().claimed == 100);
+	CHECK(l.counters().rect_mismatch == 200);
+	CHECK(l.counters().orphans == 0);
+	CHECK(l.counters().unclaimed == 0);
+}
+
+TEST_CASE("mode_from_level and the gate decision")
+{
+	CHECK(mode_from_level(-1) == Mode::off);
+	CHECK(mode_from_level(0) == Mode::off);
+	CHECK(mode_from_level(1) == Mode::discover);
+	CHECK(mode_from_level(2) == Mode::observe);
+	CHECK(mode_from_level(3) == Mode::authoritative);
+	CHECK(mode_from_level(9) == Mode::authoritative);
+
+	GateInputs in;
+	// Below authoritative the heuristic decides, whatever the seam says.
+	for (Mode m : { Mode::off, Mode::discover, Mode::observe })
+	{
+		in.mode = m;
+		in.hooked = true;
+		in.announced = false;
+		CHECK(decide(in) == Gate::heuristic);
+		in.announced = true;
+		CHECK(decide(in) == Gate::heuristic);
+	}
+	in.mode = Mode::authoritative;
+	in.hooked = true;
+	in.announced = true;
+	CHECK(decide(in) == Gate::engine);
+	in.announced = false;
+	CHECK(decide(in) == Gate::refuse_not_announced);
+	// The seam is not live: the fallback is a CONFIG decision, never a silent one.
+	in.hooked = false;
+	in.fallback_allowed = true;
+	CHECK(decide(in) == Gate::heuristic);
+	in.fallback_allowed = false;
+	CHECK(decide(in) == Gate::refuse_no_seam);
+	// An announcement cannot exist without the hook, but if it did the hook still decides.
+	in.announced = true;
+	CHECK(decide(in) == Gate::refuse_no_seam);
+
+	CHECK(std::strcmp(gate_name(Gate::engine), "engine") == 0);
+	CHECK(std::strcmp(mode_name(Mode::authoritative), "authoritative") == 0);
+}
+
+TEST_CASE("the ring cannot overflow: the engine's clock retires before capacity is reached")
 {
 	Ledger l;
 	l.begin_frame(1);
 	for (std::size_t i = 0; i < Ledger::kCapacity + 3; ++i)
 		l.announce(made(1, 3840, 2160));
 	CHECK(l.counters().announced == Ledger::kCapacity + 3);
-	CHECK(l.counters().overflow == 3);
-	CHECK(l.pending() == Ledger::kCapacity);
+	CHECK(l.counters().overflow == 0);
+	// Only the newest kRetireAfterAnnouncements survive; everything older retired UNCLAIMED,
+	// which is the counter that would have said so in a live session.
+	CHECK(l.pending() == kRetireAfterAnnouncements);
+	CHECK(l.counters().unclaimed == Ledger::kCapacity + 3 - kRetireAfterAnnouncements);
 }

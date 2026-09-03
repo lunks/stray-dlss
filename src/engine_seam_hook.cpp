@@ -35,7 +35,8 @@ using AddPassesFn = void (*)(const void *self, void *graph_builder, const void *
                              void **out_half_colour, void *out_half_rect);
 
 std::mutex g_mutex;
-int g_level = 0;
+seam::Mode g_mode = seam::Mode::off;
+bool g_fallback_allowed = true;
 Discovery g_discovery;
 Ledger g_ledger;
 
@@ -139,10 +140,13 @@ void add_passes_thunk(const void *self, void *graph_builder, const void *view,
 			"output rect %ux%u, FPassInputs colour=%p depth=%p velocity=%p. This is the "
 			"engine's OWN primary temporal upscale; every FTAAStandaloneCS look-alike (DOF, "
 			"light shafts, SSR, water, planar reflections) arrives by a different route and "
-			"will never appear here.",
+			"will never appear here. Mode=%s: %s.",
 			static_cast<unsigned long long>(a.frame), a.out_width, a.out_height,
 			reinterpret_cast<void *>(a.colour_rdg), reinterpret_cast<void *>(a.depth_rdg),
-			reinterpret_cast<void *>(a.velocity_rdg));
+			reinterpret_cast<void *>(a.velocity_rdg), seam::mode_name(mode()),
+			mode() == seam::Mode::authoritative
+				? "DLSS SR will run ONLY on the dispatch this announcement fits"
+				: "observing; the heuristic matcher still gates DLSS");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -314,7 +318,8 @@ void run_discovery(int level)
 	if (level < 2)
 	{
 		STRAY_LOG_INFO("ENGINE SEAM: EngineSeam=1, so nothing is installed. Set EngineSeam=2 "
-			"to stand in for AddPasses and cross-check the heuristic matcher against it.");
+			"to stand in for AddPasses and cross-check the heuristic matcher against it, or "
+			"EngineSeam=3 (the default) to let the engine's answer gate DLSS.");
 		return;
 	}
 	if (d.vtable_hits != 1)
@@ -341,24 +346,85 @@ void run_discovery(int level)
 	g_hooked.store(true, std::memory_order_release);
 	STRAY_LOG_INFO("ENGINE SEAM INSTALLED: AddPasses slot %p now points at our stand-in; the "
 		"engine's own implementation at %p is forwarded to on every call, so the image is "
-		"unchanged. This OBSERVES ONLY - DLSS is still gated by the heuristic matcher.",
-		static_cast<void *>(slot), original);
+		"unchanged. %s",
+		static_cast<void *>(slot), original,
+		level >= 3
+			? "MODE=AUTHORITATIVE: DLSS SR runs only on the dispatch the engine announced; "
+			  "the cooked-hash table and the structural signature are assertions now, not gates."
+			: "MODE=OBSERVE: counting only - DLSS is still gated by the heuristic matcher.");
 }
 
 } // namespace
 
-void configure(int level)
+void configure(int level, bool fallback)
 {
+	const seam::Mode m = seam::mode_from_level(level);
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
-		g_level = level;
+		g_mode = m;
+		g_fallback_allowed = fallback;
 	}
-	if (level <= 0)
+	if (m == seam::Mode::off)
+	{
+		STRAY_LOG_INFO("ENGINE SEAM MODE: off ([STRAYDLSS] EngineSeam=0). The heuristic matcher "
+			"gates DLSS: cooked-hash table + structural signature + pin.");
 		return;
-	STRAY_LOG_INFO("ENGINE SEAM: EngineSeam=%d. Looking for UE 4.27's ITemporalUpscaler in the "
-		"game module. This is a read-only scan of our own process and executes nothing it "
-		"finds; a wrong answer is refused, never hooked.", level);
+	}
+	STRAY_LOG_INFO("ENGINE SEAM MODE: %s ([STRAYDLSS] EngineSeam=%d, EngineSeamFallback=%d). "
+		"Looking for UE 4.27's ITemporalUpscaler in the game module - a read-only scan of our "
+		"own process that executes nothing it finds; a wrong answer is refused, never hooked.",
+		seam::mode_name(m), level, fallback ? 1 : 0);
 	run_discovery(level);
+
+	// The one line that says what gates DLSS this session. Written before the first frame,
+	// so it is readable from the main menu.
+	if (m == seam::Mode::authoritative && !hooked())
+	{
+		if (fallback)
+			STRAY_LOG_ERROR("ENGINE SEAM MODE: authoritative was requested but the seam is NOT "
+				"live (see the ENGINE SEAM line above). EngineSeamFallback=1, so the HEURISTIC "
+				"matcher gates DLSS this session - the pre-seam path, with its known "
+				"look-alike exposure. Fix the seam; do not get used to this line.");
+		else
+			STRAY_LOG_ERROR("ENGINE SEAM MODE: authoritative was requested, the seam is NOT live, "
+				"and EngineSeamFallback=0. DLSS SR WILL NOT RUN this session: every candidate "
+				"dispatch is refused as no-seam. Set EngineSeamFallback=1 to run the heuristic "
+				"instead.");
+	}
+	else
+	{
+		STRAY_LOG_INFO("ENGINE SEAM MODE: %s is ACTIVE - %s.", seam::mode_name(m),
+			m == seam::Mode::authoritative
+				? "the engine's ITemporalUpscaler::AddPasses announcement gates DLSS SR"
+				: m == seam::Mode::observe
+					? "the heuristic gates DLSS; the engine's announcements are cross-checked"
+					: "discovery only; nothing installed and the heuristic gates DLSS");
+	}
+}
+
+seam::Mode mode()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	return g_mode;
+}
+
+bool fallback_allowed()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	return g_fallback_allowed;
+}
+
+seam::Gate gate(bool announced)
+{
+	seam::GateInputs in;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		in.mode = g_mode;
+		in.fallback_allowed = g_fallback_allowed;
+	}
+	in.hooked = hooked();
+	in.announced = announced;
+	return seam::decide(in);
 }
 
 bool discovered()
@@ -406,17 +472,42 @@ int format_report(char *buffer, std::size_t size)
 		on = g_discovery.status == SeamStatus::ok;
 		c = g_ledger.counters();
 	}
+	seam::Mode m = seam::Mode::off;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		m = g_mode;
+	}
 	return std::snprintf(buffer, size,
-		"seam=%s hooked=%d announced=%llu claimed=%llu orphans=%llu rectMismatch=%llu "
-		"unclaimed=%llu overflow=%llu unreadableRect=%llu",
-		on ? "found" : "off", hooked() ? 1 : 0,
+		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
+		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu",
+		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
 		static_cast<unsigned long long>(c.announced),
 		static_cast<unsigned long long>(c.claimed),
+		static_cast<unsigned long long>(c.unclaimed),
 		static_cast<unsigned long long>(c.orphans),
 		static_cast<unsigned long long>(c.rect_mismatch),
-		static_cast<unsigned long long>(c.unclaimed),
 		static_cast<unsigned long long>(c.overflow),
 		static_cast<unsigned long long>(g_unreadable.load(std::memory_order_relaxed)));
+}
+
+void log_report(const char *when)
+{
+	seam::Mode m = seam::Mode::off;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		m = g_mode;
+	}
+	if (m == seam::Mode::off)
+		return;
+	char line[320] = {};
+	format_report(line, sizeof(line));
+	// `unclaimed` is the number that must stay at zero: an announced primary upscale we never
+	// intercepted is a frame that ran the engine's TAA. `lookalikesRefused` is EXPECTED to
+	// grow (the SSD passes ask every frame and are told no); `orphans` counts candidates in
+	// frames where the engine announced nothing at all.
+	STRAY_LOG_INFO("[seam] %s: %s%s", when != nullptr ? when : "", line,
+		m == seam::Mode::authoritative
+			? "  (unclaimed must stay 0; lookalikesRefused is expected to grow)" : "");
 }
 
 void shutdown()

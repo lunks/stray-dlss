@@ -31,7 +31,7 @@ not re-litigated below.
 
 | Rung | What it is | Feasible? | Status |
 |---|---|---|---|
-| **L0 ORACLE** | Stand in for `FDefaultTemporalUpscaler::AddPasses` via its vtable; read the engine's own output rect and input textures; cross-check the heuristic matcher against it | **Yes, and cheaply.** One string anchor, one qword patch, three exact self-checks, no code signature, no engine headers | **IMPLEMENTED** in this change, default OFF, two levels (`EngineSeam=1` scan-only, `=2` stand-in + cross-check) |
+| **L0 ORACLE** | Stand in for `FDefaultTemporalUpscaler::AddPasses` via its vtable; read the engine's own output rect and input textures; cross-check the heuristic matcher against it | **Yes, and cheaply.** One string anchor, one qword patch, three exact self-checks, no code signature, no engine headers | **MEASURED ON THE BOX 2026-09-03** (§10, facts §36): found at every stage with one candidate, installed, forwarding, `orphans=0` over 8570 announcements, two look-alikes caught. **Now THE GATE**: `EngineSeam=3` is the default and DLSS SR runs only on the announced dispatch |
 | **L1 IDENTIFY** | Map the `FRDGTextureRef`s L0 hands us to `ID3D12Resource*` so interception targets the engine's resources by identity | **Probably, and the last hop is trivial** — `FRHITexture::GetNativeResource()` is a virtual returning `ID3D12Resource*`. Two derived offsets stand in the way, and the RDG resource is null at `AddPasses` time for graph-allocated textures | **Not built.** Needs L0's log first: the same log line that proves L0 also says whether the RHI pointers are non-null there |
 | **L2 OWN IT** | Register our own `ITemporalUpscaler` on the view family and implement `AddPasses` | **The registration is feasible and is NOT the hard part.** Implementing `AddPasses` from an injected DLL means authoring RDG passes and reading `FViewInfo`, and `FViewInfo` is a Renderer-private class of ~180 heavily `#if`-conditioned members. **Do not attempt the full replacement.** The *useful half of L2 is already what L0 does* | **Subsumed.** See §4.3 |
 
@@ -50,11 +50,12 @@ called through it *is* the identification. There is no archaeology left to do.
 | `AlexMercer-MA/UnrealEngine-4.27`, whose `Engine/Build/Build.version` reads 4.27.2 / `++UE4+Release-4.27` — **our exact engine version** | **HARD** for anything quoted |
 | `Engine/Source/Programs/UnrealBuildTool/**` in the same mirror | **HARD** for what UBT does to `*_API` macros |
 | GitHub code search over that mirror (used for "is this the only caller") | **SOFT** — the index is not provably complete for a fork of a repo this size. Every claim below that rests on it is labelled |
-| `Stray-Win64-Shipping.exe` | **NOT CONSULTED.** The box was unreachable from this session (`ssh` to it: *Network is unreachable*), and the task forbids launching the game. **Every claim about the shipped binary's byte-level shape is UNCONFIRMED**, and the implementation is built so that a wrong guess refuses instead of hooking |
+| `Stray-Win64-Shipping.exe` | **Not consulted when this was written** (the box was unreachable), then **run against on 2026-09-03** with the scan at both levels (§10, facts §36). Every byte-level claim §4.1 makes about GetDebugName's shape, the vtable's slot order and the fraction accessors is HARD on that executable now |
 
-**That last row is the single most important caveat in this document.** It is why L0 ships with a
-level 1 that installs nothing, why discovery is *static* (it decodes candidate functions rather
-than calling them), and why the default is 0.
+**That last row was the single most important caveat in this document** when it was written; it
+is why level 1 installs nothing and why discovery is *static*. The design held: the first run
+found one candidate at every stage and validated all three constants, and the second installed the
+stand-in with no visible change. §10 has the lines.
 
 ---
 
@@ -301,17 +302,18 @@ eight structs. No GPU work, no allocation on the render thread.
 
 | # | If this is wrong | The symptom |
 |---|---|---|
-| 1 | The literal is not in the image, or `GetDebugName` is not lea+ret | `ENGINE SEAM: NOT FOUND` with the stage it reached. Nothing installed. **This is the expected first outcome to rule out** |
-| 2 | The vtable slot order is not declaration order | slots 3/4 do not decode to 0.5/2.0 → `fraction_mismatch`, refused |
-| 3 | MSVC emitted a fourth shape for `return 0.5f` | `fraction_shape`, refused, with 16 bytes of hex logged |
-| 4 | `sizeof(EPixelFormat) != 4` | the three `FPassInputs` pointers are read 4 bytes off. They are only compared, so the visible effect is that they look like garbage in the first log line — and the rect, which is the part we correlate on, is unaffected |
-| 5 | `FIntRect` is not four `int32` | the announced rect is nonsense; `rect_mismatch` climbs to 100% and `unreadableRect` counts the degenerate ones |
-| 6 | The thunk's ABI is wrong | a crash on the first frame with TAA. Bounded by level 2 being opt-in |
+| 1 | The literal is not in the image, or `GetDebugName` is not lea+ret | `ENGINE SEAM: NOT FOUND` with the stage it reached. Nothing installed. **RULED OUT 2026-09-03**: found, one candidate each |
+| 2 | The vtable slot order is not declaration order | slots 3/4 do not decode to 0.5/2.0 → `fraction_mismatch`, refused. **RULED OUT**: decoded to exactly 0.5 and 2.0 |
+| 3 | MSVC emitted a fourth shape for `return 0.5f` | `fraction_shape`, refused, with 16 bytes of hex logged. **RULED OUT** |
+| 4 | `sizeof(EPixelFormat) != 4` | the three `FPassInputs` pointers are read 4 bytes off. They are only compared, so the visible effect is that they look like garbage in the first log line — and the rect, which is the part we correlate on, is unaffected. **Not falsified**: the three pointers read as plausible heap addresses on the first call |
+| 5 | `FIntRect` is not four `int32` | the announced rect is nonsense; `rect_mismatch` climbs to 100% and `unreadableRect` counts the degenerate ones. **RULED OUT**: 3840x2160 on frame 0, `unreadableRect=0` across 8570 announcements |
+| 6 | The thunk's ABI is wrong | a crash on the first frame with TAA. **RULED OUT**: 8570 forwarded calls, image unchanged, SR/FG/NR all ran |
 | 7 | `r.TemporalAA.HistoryScreenPercentage > 100` | the config becomes `MainSuperSampling` and `TemporalAA.cpp:1466-1474` overrides `OutputViewRect` *after* `SecondaryViewRect` was captured, so the announced rect stops matching the dispatch. CLAUDE.md §4 already requires this to stay 100; now there is a counter that would say so |
 
 Row 4 deserves its label: `EPixelFormat` is an unscoped `enum` with no fixed underlying type whose
 enumerators run 0..~80 (`Core/Public/PixelFormat.h:12`), so MSVC gives it `int`. **HARD from the
-declaration**, but it is a derivation about a compiler, not a measurement.
+declaration**, and consistent with what the first call read; a wrong offset here would have
+shown as two of the three pointers sharing a value or one being tiny, and neither happened.
 
 ### 4.2 L1 — IDENTIFY. Not built; the last hop is trivial and the first two are not
 
@@ -486,7 +488,7 @@ So the gate becomes a consequence of the identification rather than a second mec
 | `FSceneViewFamily::TemporalUpscalerInterface` is the second of four trailing pointers | **HARD**, `SceneView.h:1845-1849` |
 | Its byte offset is ~184 in Shipping | **[derived], and fragile.** Depends on `sizeof(FEngineShowFlags)`. **Do not hardcode it** |
 | `FTAAPassParameters` is 80 bytes with `InputViewRect` at 12 | **[derived], and contested.** A naive walk inserts a spurious 4-byte pad before `InputViewRect` and gets 88 with it at 16. `FIntRect` aligns to 4, so 12/28/44/48/56/64/72 and size 80 is right — **and the fact that two careful derivations disagree is the argument for the interface route, which needs none of it** |
-| Anything about `Stray-Win64-Shipping.exe`'s actual bytes | **UNCONFIRMED.** The box was unreachable this session |
+| The literal, the lea+ret `GetDebugName`, the five-slot vtable in declaration order, 0.5/2.0 by static decode, the `FPassInputs` and `FIntRect` reads, the thunk's ABI | **HARD on `Stray-Win64-Shipping.exe`, 2026-09-03** (§10, facts §36). Was UNCONFIRMED when this document was written |
 
 ---
 
@@ -508,8 +510,7 @@ So the gate becomes a consequence of the identification rather than a second mec
   at device teardown, ahead of everything else, because the patched slot lives in the *game's*
   module and outlives both this device and this DLL (the address-0 crash of facts §14).
 
-**Ship state: `EngineSeam=0`.** The working SR path is untouched and the heuristic matcher is still
-the mechanism.
+**Ship state as first written: `EngineSeam=0`.** Superseded by §10 — the default is now `3`.
 
 **`docs/STRAY-RENDERING-FACTS.md` is deliberately NOT updated by this change**, and that is the
 house rule applied rather than skipped. Its own scope rule is that every line was *"observed on
@@ -556,3 +557,135 @@ than on a guess (the `NgxPaint` / `NgxDumpInputs` ladder, CLAUDE.md §5).
 * **Do not let level 2 gate DLSS** until the cross-check has come back clean. An unvalidated
   identification that refuses everything is DLSS silently off, which is the same class of quiet
   failure as a wrong pass.
+
+
+---
+
+## 10. Measured on the box, 2026-09-03 — and the switch
+
+Both levels ran. The lines are verbatim in `docs/STRAY-RENDERING-FACTS.md` §36; this section is
+what they mean.
+
+### 10.1 Level 1 found it, with one candidate at every stage
+
+```
+ENGINE SEAM FOUND: ITemporalUpscaler vtable at 0x6ffffae71730 (base=0x6ffff7140000, 82 MB in 178.3 ms).
+Validated by three independent constants from one scan: GetDebugName returns the literal at
+0x6ffffae71758, GetMin/MaxUpsampleResolutionFraction decode to 0.500000 and 2.000000 ...
+ENGINE SEAM slots: dtor=... GetDebugName=... AddPasses=... GetMin=... GetMax=... (candidates: name=1 getDebugName=1 vtable=1)
+```
+
+Every row of §4.1's "what fails first" table is now answered, and every UNCONFIRMED in §7 about
+the binary is HARD. `name=1 getDebugName=1 vtable=1` is the part worth noticing: the scan was
+built to tolerate ambiguity and never had to.
+
+### 10.2 Level 2 installed, forwarded, changed nothing — and caught two look-alikes
+
+The engine reached the stand-in on **frame 0** with `output rect 3840x2160`, i.e. from the main
+menu before any input. DLSS SR, frame generation and neural rendering ran exactly as before. And
+the cross-check did what it was built for:
+
+```
+ENGINE SEAM DISAGREES about pass 0xe3ddca4be9830076: the matcher calls this dispatch (240x135 groups) the TAA pass ...
+ENGINE SEAM DISAGREES about pass 0x42af595f8ff91038: the matcher calls this dispatch (120x68 groups) the TAA pass ...
+```
+
+**The structural signature accepted both.** Only the cooked-hash whitelist stopped DLSS from
+running on them — one line of defence, and one whose table a game update invalidates. The
+engine's answer excluded both, independently, by construction. Over 8570 announcements
+`orphans=0`: the heuristic never once accepted a dispatch in a frame the engine had not run its
+primary upscale.
+
+### 10.3 `rectMismatch` at 45%: root cause, with the evidence first
+
+The counters read `announced=8570 claimed=8496 orphans=0 rectMismatch=3821 unclaimed=73`.
+
+**Hypothesis offered: frame generation presents twice per game frame, the ledger keys on the
+present count, so announcements pair against the wrong frame.** Three independent observations
+kill it:
+
+1. **The mismatches are the two look-alikes.** The `DISAGREES` lines above name them with their
+   group counts, 240x135 and 120x68 — half and quarter of the 480x270 primary. The ledger's
+   `claim()` was called for *every* positive structural match (deliberately: that was the
+   cross-check), and a look-alike asking while the frame's one announcement is pending is, in
+   the counting rule that shipped, exactly one `rect_mismatch`. Two look-alikes per gameplay
+   frame is the growth curve observed (12% in the menu-heavy first snapshot, 45% once the SSD
+   passes were running every frame).
+2. **The claim rate is 99.1%.** Pairing against the wrong frame would *lose* claims, not add
+   mismatches while keeping claims at 99%.
+3. **The present counter is per game present anyway.** `present_owner.cpp`'s `before_present`
+   returns early under `in_own_code()`, and frame generation's own two presents are issued under
+   `OwnCodeScope`; `pc.frame` never doubled.
+
+So `rectMismatch` was a **naming error, not a correlation error**: it counted correct refusals.
+It is now reported as `lookalikesRefused`, and is expected to grow. **`unclaimed` is the error
+metric** — an announced primary upscale we never intercepted, i.e. a frame that ran the engine's
+TAA — and it was 0.85%.
+
+**The ledger was changed regardless**, because the coordinator's instinct was right about the
+design even though the symptom had another cause: correlation must never depend on how presents
+relate to frames. Announcements now retire when four *newer announcements* exist — the engine's
+own `AddPasses` count is the clock — with the present counter only as an eight-present backstop
+for a session that stops announcing altogether. `tests/test_engine_seam.cpp` pins both, plus the
+exact session shape (one 4K announcement, two look-alikes asking first, then the real 480x270
+dispatch, 100 frames: 100 claimed, 200 refused, 0 orphans, 0 unclaimed).
+
+The 73 `unclaimed` are not yet explained (facts §36.5). The old two-present retire window is the
+leading candidate and is gone; the periodic `[seam]` line now reports the number in the log, so
+the next session answers it without the status file.
+
+### 10.4 The switch: `EngineSeam=3`, the engine's announcement gates DLSS SR
+
+*"Can we just switch to the new hook?"* — yes, and it is the default now.
+
+| level | `seam::Mode` | what gates DLSS |
+|---|---|---|
+| 0 | `off` | the heuristic: cooked-hash table + structural signature + pin |
+| 1 | `discover` | the heuristic; the seam is scanned, validated and logged, nothing installed |
+| 2 | `observe` | the heuristic; the stand-in is installed and every announcement is cross-checked (`ENGINE SEAM DISAGREES`) |
+| **3** | **`authoritative`** | **the announcement.** A structural candidate that claims the frame's announcement runs; one that does not is refused as `not-announced`, once per pass in the log. The cooked-hash table and the matcher's rect become **assertions** (`ENGINE SEAM ASSERTION`, once per pass), never gates. The pin, the round-trip proof and the aspect-ratio/upscale-factor shape gate are bypassed — an announced pass needs none of them |
+
+`seam::decide()` is the whole rule, pure and tested: below `authoritative` → heuristic;
+`authoritative` with the seam live → announced ? engine : refuse; `authoritative` with the seam
+**not** live → `EngineSeamFallback=1` (default) runs the heuristic and says so at **ERROR** level
+in the startup line, `=0` refuses every dispatch as `no-seam`. A silent downgrade is not one of
+the outcomes.
+
+**What the structural matcher still does:** it *extracts* the register roles (depth, stencil,
+velocity, colour, output) that the resolve and the evaluate need. That is a binding walk, not a
+judgement, and the announcement does not replace it. It no longer decides anything.
+
+**What did not change:** FG and NR consume what the TAA hook publishes (`nrhook::note_guides`,
+`ngxfg::publish`), and the hook publishes after a successful evaluate exactly as before.
+
+### 10.5 Reading the verdict from the main menu
+
+No launcher, no injected input. A Steam launch that sits in the main menu produces, in order:
+
+1. `ENGINE SEAM MODE: authoritative ([STRAYDLSS] EngineSeam=3, EngineSeamFallback=1)` — the
+   configuration, before the scan.
+2. `ENGINE SEAM FOUND ...` and `ENGINE SEAM INSTALLED ... MODE=AUTHORITATIVE`.
+3. `ENGINE SEAM MODE: authoritative is ACTIVE - the engine's ITemporalUpscaler::AddPasses
+   announcement gates DLSS SR.` **This is the one line that says what is in charge.** Its
+   failure forms are ERROR-level and name the fallback that applies.
+4. `ENGINE SEAM: ITemporalUpscaler::AddPasses reached us on frame 0 ... Mode=authoritative: DLSS
+   SR will run ONLY on the dispatch this announcement fits.`
+5. `ENGINE SEAM AUTHORITATIVE: first announced pass claimed - 0x..., 480x270 groups, engine rect
+   3840x2160, matcher rect 3840x2160, render 1920x1080, cooked-hash=yes.`
+6. `DLSS feature created: ...` as before.
+7. Every 600 presents: `[seam] frame N: seam=found mode=authoritative hooked=1 announced=...
+   claimed=... unclaimed=... orphans=... lookalikesRefused=... (unclaimed must stay 0;
+   lookalikesRefused is expected to grow)`.
+
+A `DLSS did not run for pass 0x...: the engine's ITemporalUpscaler::AddPasses announced no primary
+temporal upscale this dispatch fits` line for `0xe3ddca4be9830076` or `0x42af595f8ff91038` is the
+expected, correct outcome for those two, and the only line each will ever produce.
+
+### 10.6 What §5's demotion map looks like now
+
+Nothing is deleted yet; everything in §5 is *bypassed* under level 3 and still runs under 0–2.
+Deleting the pin, the round-trip proof, the shape gate and the hash whitelist's gating role is a
+follow-up once a level-3 session has come back with `unclaimed=0` and DLSS on the announced pass.
+The one row that stays regardless is the liveness check on the announced pass's own resources:
+the announcement says *which* dispatch, not that its resources are alive under ReShade's stale
+view map.

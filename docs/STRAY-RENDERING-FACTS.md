@@ -2705,3 +2705,94 @@ periodic report, which should show total calls collapse from ~21/frame toward ~0
 * `STATGROUP_D3D12RHI`'s own group-description text was not independently located in source; the
   `STATS=0` conclusion in §32.3 rests on the four member stats' exact description strings plus
   the §32.2 `EngineStats` table, not on every possible `STATS`-only string in the engine.
+
+## 36. The engine's ITemporalUpscaler seam, found and installed in the shipping executable (2026-09-03)
+
+`[STRAYDLSS] EngineSeam` (`src/core/engine_seam.hpp`, `src/engine_seam_hook.cpp`) ran on the box
+at both levels. The log lines are verbatim.
+
+### 36.1 Level 1: discovery, one candidate at every stage
+
+```
+ENGINE SEAM FOUND: ITemporalUpscaler vtable at 0x6ffffae71730 (base=0x6ffff7140000, 82 MB in 178.3 ms). Validated by three independent constants from one scan: GetDebugName returns the literal at 0x6ffffae71758, GetMin/MaxUpsampleResolutionFraction decode to 0.500000 and 2.000000 (want exactly 0.5 and 2.0 - SceneView.h:1438-1439).
+ENGINE SEAM slots: dtor=0x6ffff8bf6b80 GetDebugName=0x6ffff8c057f0 AddPasses=0x6ffff8bfb7b0 GetMin=0x6ffff8c05880 GetMax=0x6ffff8c05870 (candidates: name=1 getDebugName=1 vtable=1)
+```
+
+What this establishes on `Stray-Win64-Shipping.exe`:
+
+* The UTF-16LE literal `FDefaultTemporalUpscaler` is present, exactly once.
+* `FDefaultTemporalUpscaler::GetDebugName` is the eight-byte `lea rax, [rip+d]; ret` shape,
+  exactly once.
+* Exactly one five-pointer run in read-only data holds it at slot 1 with every slot pointing
+  into code; its slots 3 and 4 decode statically to `0.5f` and `2.0f`.
+* The vtable is therefore `{dtor, GetDebugName, AddPasses, GetMin..., GetMax...}` in the MSVC
+  declaration order, at image offset `0x3D31730`; the literal is 40 bytes after it.
+* 82 MB of readable sections were scanned in 178.3 ms on the thread creating the D3D12 device.
+* The module base was `0x6ffff7140000` in this session (Wine's placement; not stable).
+
+### 36.2 Level 2: the stand-in installed, forwarding; DLSS SR, FG and NR all ran normally
+
+```
+ENGINE SEAM INSTALLED: AddPasses slot 00006FFFFAED1740 now points at our stand-in; the engine's own implementation at 00006FFFF8C5B7B0 is forwarded to on every call
+ENGINE SEAM: ITemporalUpscaler::AddPasses reached us on frame 0 - output rect 3840x2160, FPassInputs colour=000000003648A328 depth=0000000048B363A8 velocity=0000000036482978.
+DLSS pinned to pass 0x901e041a7cadc9db; no other pass will be replaced.
+DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b
+[WARN ] ENGINE SEAM DISAGREES about pass 0xe3ddca4be9830076: the matcher calls this dispatch (240x135 groups) the TAA pass, and the engine's own ITemporalUpscaler::AddPasses announced no primary temporal upscale it fits.
+[WARN ] DLSS did not run for pass 0xe3ddca4be9830076: its hash is not a cooked FTAAStandaloneCS permutation
+[WARN ] ENGINE SEAM DISAGREES about pass 0x42af595f8ff91038: the matcher calls this dispatch (120x68 groups) the TAA pass, and the engine's own ITemporalUpscaler::AddPasses announced no primary temporal upscale it fits.
+[WARN ] DLSS did not run for pass 0x42af595f8ff91038: its hash is not a cooked FTAAStandaloneCS permutation
+```
+
+(The base differs from §36.1 because this is a separate launch.)
+
+* The thunk's ABI reading of `FPassInputs` (three pointers at +8/+16/+24) and of the
+  `FIntRect` out-parameter produced a plausible rect on the very first call: 3840x2160, the
+  configured output resolution, on frame 0 — i.e. from the main menu.
+* The structural signature accepted two dispatches the engine never announced,
+  `0xe3ddca4be9830076` at 240x135 groups and `0x42af595f8ff91038` at 120x68 groups (half and
+  quarter of the 480x270 primary dispatch). Only the cooked-hash whitelist stopped DLSS running
+  on them. The engine's announcement excluded both independently.
+* The image was unchanged, and DLSS SR (`0x901e041a7cadc9db`, 1920x1080 -> 3840x2160), frame
+  generation (`NgxFG=1`, ~2x presents) and neural rendering all ran as before.
+
+### 36.3 The counters, two snapshots of one session (FG on, NR on, 3840x2160 / 1920x1080)
+
+```
+frame ~2400: seam=found hooked=1 announced=2534 claimed=2528 orphans=0 rectMismatch=304  unclaimed=6  overflow=0 unreadableRect=0
+frame ~8400: seam=found hooked=1 announced=8570 claimed=8496 orphans=0 rectMismatch=3821 unclaimed=73 overflow=0 unreadableRect=0
+```
+
+* `orphans=0` throughout: the heuristic never accepted a dispatch in a frame the engine had
+  announced nothing for.
+* `claimed/announced` = 99.8% and 99.1%: the announced pass was intercepted almost every
+  frame.
+* `rectMismatch` grew from 12% to 45% of announcements between the snapshots (3517 of the 6036
+  announcements in between).
+* `unclaimed` was 0.2% and 0.85%.
+
+### 36.4 What `rectMismatch` was
+
+Not a frame-correlation error. Three independent observations from the same session:
+
+1. The `ENGINE SEAM DISAGREES` lines name the two dispatches that generate it: a positive
+   structural match at 240x135 and one at 120x68 groups, each asked to claim while the frame's
+   one 4K announcement was pending, each correctly told no. In the counting rule that shipped
+   this session that is exactly one `rectMismatch` per look-alike per frame.
+2. If announcements were being paired against the wrong frame, claims would fall, not
+   mismatches rise. Claims stayed at 99%.
+3. The present counter the ledger used is per GAME present: `present_owner.cpp`'s
+   `before_present` returns early under `in_own_code()`, and frame generation's own two
+   presents are issued under `OwnCodeScope`. It does not double under FG.
+
+The ledger was nevertheless changed to retire announcements by the engine's own `AddPasses`
+count (four newer announcements), with the present counter only as an eight-present backstop,
+so the correlation never depends on how presents relate to frames. The counter was renamed
+`lookalikesRefused` in the report line; `unclaimed` is the error metric.
+
+### 36.5 What is still UNCONFIRMED
+
+* The cause of the 73 `unclaimed` (0.85%). Candidates: the two-present retire window of the
+  version that ran (announcements straddling a present under an RHI thread), and frames whose
+  announced dispatch the structural matcher itself rejected. The retire change addresses the
+  first; the authoritative mode's periodic `[seam]` line reports the number directly.
+* `EngineSeam=3` (the announcement as the gate) has not run on the box at the time of writing.

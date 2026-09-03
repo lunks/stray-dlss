@@ -527,13 +527,19 @@ Config and saves live in the **Proton prefix**:
 > the identification.
 >
 > `docs/RESEARCH-ENGINE-TAA-HOOK.md` is the feasibility report, the provenance ledger and the
-> demotion map for everything below. **`[STRAYDLSS] EngineSeam` is built and ships OFF**: level 1
-> statically finds and validates the `ITemporalUpscaler` vtable and installs nothing; level 2
-> stands in for `AddPasses` (forwarding, so the image is unchanged) and CROSS-CHECKS the matcher
-> against the engine, counting `seam_orphans` — dispatches this section's rules call the TAA pass
-> while the engine announced no primary upscale they fit. That counter is the "wrong shader being
-> picked" symptom, named. **Nothing there has run against the game, so nothing below is retired
-> yet**, and the order is not negotiable: the cross-check comes back clean first.
+> demotion map for everything below. **MEASURED ON THE BOX 2026-09-03 (facts §36):** the scan found
+> the `ITemporalUpscaler` vtable with one candidate at every stage and validated all three
+> constants; the `AddPasses` stand-in installed, forwarded, and changed nothing; and over 8570
+> announcements `orphans=0` while the structural signature below accepted TWO dispatches the
+> engine never announced (`0xe3ddca4be9830076` at 240x135 groups, `0x42af595f8ff91038` at
+> 120x68) — only the cooked-hash whitelist stopped DLSS running on them. **`[STRAYDLSS]
+> EngineSeam=3` is therefore the DEFAULT: the engine's announcement gates DLSS SR, and the hash
+> table and the signature below are ASSERTIONS (`ENGINE SEAM ASSERTION`, once per pass), never
+> gates.** Levels 0-2 keep the heuristic in charge; a level-3 session with no live seam runs the
+> heuristic only if `EngineSeamFallback=1` and says so at ERROR level. The whole verdict is
+> readable from the main menu — the seam fires on frame 0 — and the periodic `[seam]` line's
+> `unclaimed` must stay 0 (`lookalikesRefused` is expected to grow: that is the two passes above
+> being told no, every frame). Nothing below is deleted yet; under level 3 it is bypassed.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -1001,10 +1007,11 @@ Four stages, each testable in isolation as far as CI allows:
 
 1. **Identify** — hash every compute shader's DXBC at `init_pipeline`; confirm with binding
    signature and dispatch size; never select `0x901e041a7cadc9db`; never hook `0x52101a15e1a0c5cc`.
-   **This whole stage is ReShade-era and has a named successor**: `[STRAYDLSS] EngineSeam`
-   (`src/core/engine_seam.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md`) takes the answer from the
-   engine's own `ITemporalUpscaler::AddPasses` instead of inferring it. It ships OFF and currently
-   only cross-checks; §2.3's warning block says what it would retire and in what order.
+   **This whole stage is ReShade-era, and since 2026-09-03 it is BYPASSED by default**:
+   `[STRAYDLSS] EngineSeam=3` (`src/core/engine_seam.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md`
+   §10, facts §36) takes the answer from the engine's own `ITemporalUpscaler::AddPasses` and
+   gates DLSS on it; the hash and the signature are assertions. The matcher still runs to
+   EXTRACT the register roles. Levels 0-2 put the heuristic back in charge.
 2. **Capture** — record bound SRVs/UAVs/CB **by register** and read the View CB rows.
 3. **Resolve** — our compute pass turning sparse velocity + depth + `ClipToPrevClip` into the dense
    `RG16_FLOAT` field DLSS requires, in DLSS's units and sign.

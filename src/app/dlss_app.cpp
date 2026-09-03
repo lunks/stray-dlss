@@ -341,13 +341,16 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
 
-	// [STRAYDLSS] EngineSeam, default 0 (off). The engine's OWN answer to "which dispatch is
-	// the TAA pass", instead of the behavioural signature in src/core/taa_signature.cpp.
-	// 1 discovers and validates UE 4.27's ITemporalUpscaler vtable and logs it, installing
-	// nothing; 2 additionally stands in for AddPasses and cross-checks the matcher against
-	// what the engine announces. NEITHER gates DLSS - the heuristic remains the mechanism
-	// until the cross-check has come back from the box. docs/RESEARCH-ENGINE-TAA-HOOK.md.
-	seamhook::configure(host::cfg::get_int("EngineSeam", 0));
+	// [STRAYDLSS] EngineSeam, default 3 (authoritative). The engine's OWN answer to "which
+	// dispatch is the TAA pass" - UE 4.27's ITemporalUpscaler::AddPasses - instead of the
+	// behavioural signature in src/core/taa_signature.cpp. 1 discovers and logs; 2 stands in
+	// for AddPasses and cross-checks the heuristic; 3 lets the announcement gate DLSS SR, with
+	// the cooked-hash table and the signature demoted to assertions. Measured on the box
+	// 2026-09-03 (facts §36): orphans=0 over 8570 announcements, two look-alikes caught.
+	// EngineSeamFallback (default 1): at level 3 with no live seam, run the heuristic (said
+	// loudly at ERROR level) rather than refuse every frame. docs/RESEARCH-ENGINE-TAA-HOOK.md.
+	seamhook::configure(host::cfg::get_int("EngineSeam", 3),
+		host::cfg::get_bool("EngineSeamFallback", true));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
@@ -1145,6 +1148,15 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				static_cast<unsigned long long>(gs.refused_not_ready), static_cast<unsigned long long>(gs.refused_warmup),
 				gs.width, gs.height, gs.hdr, gs.render_width, gs.render_height, gs.last_evaluate_result);
 		}
+	}
+
+	// The engine seam's own periodic line, in the LOG rather than only the status file (which
+	// is off in normal runs): mode, and the counters that say whether the correlation holds.
+	if (frame != 0 && (frame % 600) == 0)
+	{
+		char when[32];
+		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
+		seamhook::log_report(when);
 	}
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
