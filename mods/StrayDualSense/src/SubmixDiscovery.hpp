@@ -93,6 +93,10 @@ struct DiscoveryInput
     // "both" is the only configuration that cross-validates. The single-object modes exist
     // so a session where one object could not be found still produces an answer, loudly.
     bool        requireBoth  = true;
+    // Print every candidate. The caller retries once a second until it binds, so leaving this
+    // on would write several lines a second for a whole session — and the log is this
+    // project's only feedback channel, so drowning it is a real cost.
+    bool        logCandidates = true;
 };
 
 struct DiscoveryResult

@@ -48,7 +48,7 @@ bool LooksLikeVtable(const void* vtable, const void* base, std::size_t size)
 }
 
 void ScanObject(const void* object, std::size_t scanBytes, const void* base, std::size_t size,
-                std::vector<Candidate>& out, const char* what)
+                std::vector<Candidate>& out, const char* what, bool verbose)
 {
     if (object == nullptr || scanBytes < 24)
         return;
@@ -61,12 +61,14 @@ void ScanObject(const void* object, std::size_t scanBytes, const void* base, std
             scanBytes /= 2;
         if (!Readable(object, scanBytes))
         {
-            SDS_LOG_WARN("submix discovery: %s at %p is not readable at all; skipped.",
-                         what, object);
+            if (verbose)
+                SDS_LOG_WARN("submix discovery: %s at %p is not readable at all; skipped.",
+                             what, object);
             return;
         }
-        SDS_LOG_INFO("submix discovery: %s readable window shrunk to 0x%zX bytes",
-                     what, scanBytes);
+        if (verbose)
+            SDS_LOG_INFO("submix discovery: %s readable window shrunk to 0x%zX bytes",
+                         what, scanBytes);
     }
 
     const auto* bytes = static_cast<const unsigned char*>(object);
@@ -146,18 +148,21 @@ DiscoveryResult FindAudioDevice(const DiscoveryInput& in)
     }
 
     std::vector<Candidate> world, engine;
-    ScanObject(in.worldObject,  in.scanBytes, in.imageBase, in.imageSize, world,  "UWorld");
-    ScanObject(in.engineObject, in.scanBytes, in.imageBase, in.imageSize, engine, "UEngine");
+    ScanObject(in.worldObject,  in.scanBytes, in.imageBase, in.imageSize, world,  "UWorld",  in.logCandidates);
+    ScanObject(in.engineObject, in.scanBytes, in.imageBase, in.imageSize, engine, "UEngine", in.logCandidates);
     r.worldMatches  = static_cast<int>(world.size());
     r.engineMatches = static_cast<int>(engine.size());
 
-    SDS_LOG_INFO("submix discovery: FAudioDeviceHandle-shaped candidates - UWorld %p -> %d, "
-                 "UEngine %p -> %d", in.worldObject, r.worldMatches, in.engineObject,
-                 r.engineMatches);
-    for (const Candidate& c : world)
-        SDS_LOG_INFO("  UWorld  +0x%04zX device=%p id=%u", c.offset, c.device, c.id);
-    for (const Candidate& c : engine)
-        SDS_LOG_INFO("  UEngine +0x%04zX device=%p id=%u", c.offset, c.device, c.id);
+    if (in.logCandidates)
+    {
+        SDS_LOG_INFO("submix discovery: FAudioDeviceHandle-shaped candidates - UWorld %p -> %d, "
+                     "UEngine %p -> %d", in.worldObject, r.worldMatches, in.engineObject,
+                     r.engineMatches);
+        for (const Candidate& c : world)
+            SDS_LOG_INFO("  UWorld  +0x%04zX device=%p id=%u", c.offset, c.device, c.id);
+        for (const Candidate& c : engine)
+            SDS_LOG_INFO("  UEngine +0x%04zX device=%p id=%u", c.offset, c.device, c.id);
+    }
 
     // The decisive check: one device pointer, found independently in two different objects at
     // two different offsets.

@@ -200,12 +200,14 @@ void Runtime::StartSubmix()
         m_tapMaster = submix::Tap::Create("master-probe");
     }
 
-    SDS_LOG_INFO("submix: HapticSource=%s, ring %zu frames (%d ms), probeMaster=%d. The "
-                 "listener is registered lazily from the GAME THREAD, inside the first "
-                 "UFunction hook that fires - reading a UObject from UE4SS's update thread "
-                 "is an unsynchronised cross-thread read and this project does not do it.",
+    SDS_LOG_INFO("submix: HapticSource=%s, ring %zu frames (%d ms), probeMaster=%d, numbers "
+                 "every %.1fs to '%s'. The listener is registered lazily from the GAME THREAD, "
+                 "inside the first UFunction hook that fires - reading a UObject from UE4SS's "
+                 "update thread is an unsynchronised cross-thread read and this project does "
+                 "not do it.",
                  m_config.HapticSourceName(), m_submixRing.CapacityFrames(),
-                 m_config.submixRingMs, m_config.submixProbeMaster ? 1 : 0);
+                 m_config.submixRingMs, m_config.submixProbeMaster ? 1 : 0,
+                 static_cast<double>(m_config.submixStatusSeconds), m_submixStatusPath.c_str());
 
     if (m_config.SubmixDrivesCoils())
     {
@@ -259,6 +261,10 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     in.imageBase    = imageBase;
     in.imageSize    = imageSize;
     in.requireBoth  = m_config.submixDeviceSource == "both";
+    // This runs once a second until it binds, and the log is this project's only feedback
+    // channel, so the candidate dump follows the same 1-then-every-20 cadence as the WARN
+    // below rather than writing several lines a second for a whole session.
+    in.logCandidates = (attempt == 1 || attempt % 20 == 0);
 
     const submix::DiscoveryResult d = submix::FindAudioDevice(in);
     if (!d.ok)
