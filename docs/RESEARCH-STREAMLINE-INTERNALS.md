@@ -32,6 +32,18 @@
 >    frames come from inside the interposed swapchain. Our present-twice design is our own.
 >
 > Superseded reasoning is preserved inline rather than deleted, per `CLAUDE.md`'s house style.
+>
+> ## SECOND PASS, same day: §7 answers "should we REPLACE ours with Streamline?"
+>
+> Because the downgrade above reopens a question this project had treated as closed, **§7 is a
+> new dated section that answers it directly.** Verdict: **KEEP OURS — and the reasoning we had
+> for keeping it was wrong.** "Streamline was measured to break FG under vkd3d-proton" was never
+> established; the measurement contained ReShade by construction and the crash signature is
+> ReShade's. The real reasons are (a) **the pacer is closed and this platform breaks pacers** —
+> we already found and fixed a ~1 ms Wine timer skew in code we own, and could not have fixed it
+> in `sl.dlss_g.dll`; (b) we would be replacing a system measured at **2.00× steady state** with
+> an untested one; (c) the gains are all worth zero on a single-viewport UE 4.27 title on Ada.
+> **§7.6 names a one-launch experiment that could still overturn it, and it should be run.**
 
 We deliberately do not use Streamline. `src/ngx_fg.cpp` drives NGX feature 11
 (`NVSDK_NGX_Feature_FrameGeneration`) directly through the NGX core; `src/backend_native/present_owner.*`
@@ -628,11 +640,293 @@ exists to avoid.**
 
 ---
 
+## 7. NEW 2026-09-03 — Should we REPLACE our present owner with Streamline? A decision, argued
+
+The re-review above downgraded "Streamline breaks frame generation under vkd3d-proton" from a
+settled finding to **SOFT**, and §5.1/§5.2 examined Streamline's own proxy objects for the
+obvious hazard and found them **clean**. That reopens a question this project had treated as
+closed. This section answers it.
+
+**Verdict, up front: KEEP OURS — and the reasoning we had for keeping it was wrong.** The
+right reasons are different from the one that was being repeated, one of them is strong enough
+to be nearly decisive on its own, and none of them is "Streamline was measured to fail."
+Section 7.6 names a cheap experiment that could still overturn this, and it should be run.
+
+### 7.0 The reasoning that was wrong, stated plainly
+
+The claim in circulation was: *Streamline's swapchain path was measured to break frame
+generation on this target, deterministically, across six launches.* **Streamline was never
+convicted, and the evidence does not support that sentence.**
+
+* **The configuration contained ReShade by construction.** OptiScaler was installed as
+  `dxgi.dll` with `LoadReshade=true`, because at that time ReShade was *how this project
+  loaded at all*. Every one of those six launches had ReShade's D3D12 proxy in the process.
+* **The crash signature is ReShade's, not Streamline's.**
+  `EXCEPTION_ACCESS_VIOLATION **writing** address `0x000000020000000d`` — a bit-packed,
+  handle-shaped value used as a destination pointer. `CLAUDE.md` §1 documents exactly this
+  family: ReShade's `IID_ID3D12DeviceExt` handler patches vtable slots 7/8 so descriptor
+  handles run through `convert_to_original_cpu_descriptor_handle`, which has no release-build
+  validation, and the patch is a **process-wide static vtable** that one `QueryInterface` from
+  anywhere installs for every caller. A ReShade-minted synthetic handle reaching vkd3d
+  unconverted, and being written to, produces precisely this. **SOFT** (a signature match and a
+  mechanism, not a proof) — but it is a far better fit than anything in Streamline's own code,
+  which §5.2 checked directly.
+* **`ext_unhook` could not have protected it.** Our repair runs immediately before *our own*
+  NGX calls. DLSS-G's internal NVAPI calls, made from inside the closed snippet at present
+  time, were never covered.
+* **And we no longer run behind ReShade.** The plugin loads through UE4SS; `mods/StrayDLSS/
+  README.md:33` documents **Config A (no ReShade)** as a supported, ordinary configuration.
+
+**There is a second, independent confound that is NOT ReShade, and it must not be dropped.**
+`CLAUDE.md` records that the OptiScaler death came *"about a second after `SetFullscreenState
+Fullscreen: 1`"*. So the deaths correlate with **the fullscreen transition** as well as with
+ReShade's presence. Two confounds, not one. That matters in both directions: it further
+weakens the case against Streamline (the transition is a hard moment for anyone), and it
+weakens any confident claim that removing ReShade alone would fix it.
+
+**What this means for the decision.** "We cannot use Streamline" was doing work it had not
+earned. The honest position is: **Streamline's viability on this stack is UNCONFIRMED — never
+tested without ReShade in the process.** The rest of this section therefore argues the merits
+rather than leaning on a measurement that does not exist.
+
+**One constraint is real but is not a technical finding.** `docs/STRAY-RENDERING-FACTS.md`
+§32.5 records the interposer as off the table as a **hard constraint from the user**
+(2026-09-02). That is a legitimate reason not to build on it and it stands until the user says
+otherwise — but it is **a decision, not evidence**, and it should never again be cited as
+though the SDK had been shown to fail.
+
+### 7.1 Feature by feature: Streamline against what we built
+
+Sources: `NVIDIA-RTX/Streamline` @ **v2.12.0** (`e8aaa6eaac`, public) for the SDK;
+`NvRTX/UnrealEngine` @ `dlss3/sl2-4.27-dlss-plugin` (`32c3e4d5`) and `nvrtx-5.8_prerelease`
+(`5b89940f`) for NVIDIA's own use of it; our own tree at `3224c46`.
+
+| Capability | Streamline | Ours | Honest assessment |
+|---|---|---|---|
+| **Hooking model** | Full COM **wrapper objects** for device/queue/list/swapchain, substituted via inline trampolines on the exports (`sl.interposer/hook.cpp`). By default it also **modifies the DXGI factory v-table** | **V-table slot patches** on the game's real objects (`vtable_patch.cpp`, 108 lines) + MinHook on exports. No new object identity is ever created | **Ours is the smaller surface** and cannot leak a proxy pointer into a driver path, because there is no proxy. Streamline's is more general (it can intercept calls we never see). Roughly equivalent for our needs; ours is safer on a translation layer specifically because a wrapper that escapes is the classic vkd3d hazard |
+| **Swapchain ownership** | Owns it end to end; host renders off-screen; **teardown + recreate on every FG on/off toggle** | Game keeps its real swapchain object; we substitute the **back buffers** via a hooked `GetBuffer` (`fg_present.cpp`, `replacement[kMaxReplacements]`) | Both achieve "host never touches a real swap-chain buffer" (§5.4 correction). Ours does it without a teardown path. **Equivalent in effect, lighter in mechanism** |
+| **Present model** | Presents **once**; extra frames injected inside the interposed swapchain by the closed `sl.dlss_g.dll` | Presents **twice** from a dedicated worker thread | Genuinely different. Ours is measured at exactly `issued = 2 × game_presents − 2` (facts §32.7). Neither is obviously better; theirs needs the interposer |
+| **Frame pacing** | Closed. Guide §13.1 describes an async "SL pacer" using **"specialized hardware to delay the image after Present()"** | `core::fg::Schedule` — phase-locked to the previous real present, 16-sample median interval, hitch re-anchor, **and a 1.5 ms spin window because `condition_variable::wait_for` wakes ~1 ms late under Wine** | **This is the decisive row. See 7.2.** |
+| **Resource tagging** | `setTag` with a lifecycle enum; `eValidUntilPresent` (pointer only) or `eOnlyValidNow` (SL makes a GPU copy) | `GuideSet g_guides[2]` — we always make our own owned copies, double-buffered | **Equivalent, and ours is the stricter mode** — the same one NVIDIA's own plugin chose. Confirmed in §2 |
+| **Reflex** | **Mandatory.** `eFailReflexNotDetectedAtRuntime`; the 8.7.2 plugin `checkf`s the status **every frame** | Best-effort and **non-gating**: we call the five NVAPI entry points, log the result, and proceed regardless (`fg_reflex.cpp`, 215 lines) | **Ours is weaker in principle and more robust here.** Facts §32.7: the calls return `NVAPI_OK` through DXVK-NVAPI 0.9.2, but *what they do* under vkd3d/gamescope is **UNCONFIRMED**. Streamline would gate on a subsystem whose real behaviour on this stack is unknown |
+| **Camera-cut / reset** | UE plugin: `bReset = View.bCameraCut`, with an open `// TODO STREAMLINE check for other conditions` on **both** branches | 3-signal OR (cut flag ∥ jitter `zw==xy` ∥ 1×1 history/velocity) | **Ours is ahead of NVIDIA's shipped code.** Unchanged from the first pass |
+| **Output validation** | Auto Scene Change Detection inside the closed snippet (input-side) | **Crop readback gate**: 3 consecutive good looks to validate, and it **revokes** on a bad one, with per-reason refusal counters (`fg_present.cpp:642-662`) | **We have something Streamline does not**: an output-correctness check at the integration level. It is how we know FG is working at all |
+| **Back-buffer index** | **Requires** `GetCurrentBackBufferIndex`; `eFailGetCurrentBackBufferIndexNotCalled` is a documented failure bit | `GameIndexMirror` models the engine's `++ % N` counter | Ours is correct **only against an engine that manually increments** — true for stock 4.27, false for UE 5.6+. A stated precondition, not a bug |
+| **Resolution / fullscreen** | Teardown + recreate | Drain the worker, idle the GPU, bump an **epoch**, drop and re-arm replacements | Ours is measured through `SetFullscreenState(TRUE)` + `ResizeBuffers` and three checkpoint reloads (facts §32.7, §32.10) — **deliberately, because that is where OptiScaler died** |
+| **Multi-viewport / multi-swapchain** | Supported, view-id keyed | **Assumes one** | A real simplification. Correct for Stray; would not survive a title with a second swapchain |
+| **MFG (>2×)** | Supported | `MultiFrameCount=1` | Not applicable — Ada's ceiling is 2×. Same outcome |
+| **Diagnostics / knobs** | Debug overlay in non-shipping builds; `onErrorCallback` | 12 `NgxFG*` knobs including `NgxFGPacing`, `NgxFGTrace` (per-present timestamp trace), `NgxFGValidate`, plus per-reason refusal counters | **Ours is substantially better for this project's actual workflow** — a round trip to the user's box is expensive, and these are what make one launch diagnostic |
+
+### 7.2 The decisive row: the pacer, and why it is not a fair fight on this platform
+
+**Frame generation is a pacing problem.** A generated frame that is correct but delivered at
+the wrong instant is worse than no frame at all — the user's own verdict on the first working
+build was *"frame pacing is visibly wrong with FG on"*, with the image itself fine.
+
+This project then **found and fixed a Wine-specific timing defect** (facts §32.11, HARD, from a
+per-present timestamp trace):
+
+```
+[fg-trace] gaps: 7.1 5.0 7.1 5.3 7.1 4.8 7.1 5.1 ...     <- before
+[fg-trace] gaps: 6.1 6.2 6.1 6.1 6.1 6.1 6.1 6.1 ...     <- after (165 Hz panel period = 6.06 ms)
+```
+
+The cause was that `std::condition_variable::wait_for` **wakes about 1 ms late under Wine**, so
+a 6.1 ms hold came out at 7.15 ms, every frame. The fix was to spin the last 1.5 ms on the
+worker thread and to anchor the schedule on the previous *real* present.
+
+**Now apply that to Streamline.** Its pacer is inside `sl.dlss_g.dll`, which is closed and is
+not present in the open repository at any tag (§0). It was written for Windows and its
+documented mechanism is *"specialized hardware to delay the image after `Present()`"* — a
+display-stack facility, not a portable CPU wait.
+
+Two possibilities, and **both are bad for us**:
+
+1. **It uses the same class of OS wait primitive.** Then it inherits the same ~1 ms Wine skew,
+   and produces the same 7.1/5.0 alternation we just spent a session removing — **and we cannot
+   fix it**, because the code is closed. We would be trading a defect we diagnosed and repaired
+   for the identical defect with no recourse.
+2. **It really does use a hardware present-timing path.** Then it depends on the Windows
+   display stack (WDDM present statistics / HWS-era scheduling), and there is no reason to
+   expect that to exist through vkd3d-proton, DXVK's DXGI, and gamescope's Wayland compositor.
+   It would degrade to something unspecified, again unfixable.
+
+**This is the single strongest argument in the section, and it is specific to our platform
+rather than a general preference.** **SOFT** — it rests on the guide's prose plus our own
+measurement of Wine's timer behaviour, not on reading Streamline's pacer, which cannot be read.
+But the asymmetry is real and it does not require the hypothesis to be exactly right: *any*
+pacing defect in a closed component is unfixable, and we have already demonstrated that this
+platform produces pacing defects that a Windows-developed component would not have anticipated.
+
+### 7.3 What replacing it would actually cost
+
+**Deleted or reduced to a shim** (line counts from the tree at `3224c46`):
+
+| File | Lines | Fate |
+|---|---|---|
+| `src/backend_native/fg_present.cpp/.hpp` | ~1370 | **Deleted** — replacement ring, pacer, worker, validation gate, epochs |
+| `src/backend_native/present_owner.cpp/.hpp` | ~693 | **Mostly deleted**; SL owns present |
+| `src/core/fg_plan.cpp/.hpp` | ~628 | **Deleted** — `Schedule`, `GameIndexMirror`, `CropJudge`, `IntervalHistogram`, `Epoch` |
+| `tests/test_fg_plan.cpp` | 8 test cases | **Deleted** — the entire CI-testable surface of our FG work |
+| `src/backend_native/fg_reflex.cpp` | 215 | Deleted; SL drives Reflex |
+| `src/ngx_fg.cpp` | 588 | **Rewritten** — `DLSSG.*` parameters become `slDLSSGSetOptions` + tags |
+
+Roughly **3,500 lines deleted, ~600 rewritten**, and the only unit-tested part of the FG system
+goes with it.
+
+**Added:**
+
+* Ship and load `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.pcl.dll`,
+  `sl.reflex.dll` — NVIDIA binaries with a signature-checking loader (`sl_security.h`).
+* Rework our hook layer so SL, not us, wraps device/queue/swapchain — and reconcile that with
+  the SR path, the TAA dispatch interception, and the descriptor/root shadow, which all assume
+  they are looking at the game's real objects.
+* Convert guide publication to `setTag` with view ids and frame tokens.
+
+**Re-measured from scratch** — this is the part that dominates the cost, because every one of
+these is a box round trip and the box is a shared, contended resource:
+DLSS-G creation and evaluate; the 2.00× steady-state ratio; **pacing on the 165 Hz VRR panel**;
+the fullscreen transition; three checkpoint reloads; Reflex behaviour; interaction with
+gamescope; and the SR path, which currently shares the device and command lists.
+
+### 7.4 What we would gain — specifically
+
+1. **We stop owning the pacer, the ring and the epoch machinery.** ~3,500 lines and a whole
+   class of bug (present ordering, resource lifetime across a resize) become NVIDIA's problem.
+   This is the only *large* gain and it is real.
+2. **Multi-swapchain / multi-viewport correctness** we currently do not have. **Worth nothing
+   for Stray**, which has one of each.
+3. **Forward compatibility**: MFG beyond 2× (Blackwell only — worthless on a 4090), Latewarp,
+   Dynamic FG, and whatever comes next, without us implementing each.
+4. **`eUseFrameBasedResourceTagging`** and the frame-token model, which is a cleaner solution to
+   guide freshness than our consumption-sequence counter. Marginal.
+5. **Reflex done properly**, including `NvAPI_D3D12_NotifyOutOfBandCommandQueue` — the one call
+   §4 identifies as missing. **But we can simply make that call ourselves**, which is exactly
+   what recommendation #1 already says.
+
+**Note what is NOT on this list: image quality.** Both paths drive the same closed
+`nvngx_dlssg.dll` with the same guides. Streamline would not generate a better frame; it would
+schedule and present it differently.
+
+### 7.5 What we would lose
+
+1. **A working, measured system.** 2.00× steady-state, correct 6.0-6.2 ms cadence on the
+   user's panel, surviving the fullscreen transition and three checkpoint reloads, zero
+   `[ERROR]` lines, no Xid. **HARD** (facts §32.7-§32.11). Replacing this with something
+   untested on this stack is the core of the trade.
+2. **The ability to fix pacing at all** (7.2).
+3. **The validation gate and the per-reason refusal counters.** These are how a single launch
+   tells us *why* a frame was not generated (`source-missing`, `not-validated`,
+   `no-previous-frame`). Streamline offers a debug overlay in non-shipping builds and an error
+   callback. Given that every diagnosis costs a round trip to the user's machine, this is a
+   larger loss than it looks.
+4. **Our 12 `NgxFG*` knobs**, including `NgxFGTrace`, which is what diagnosed the pacing fault.
+5. **Independence from Reflex's real behaviour on this stack** (7.1).
+6. **The user's stated constraint** would have to be revisited — which is their call, not ours.
+
+### 7.6 The decisive experiment, and it is nearly free
+
+**One launch settles the question that 7.0 opened**, and the reason it is cheap is that the
+configuration already existed once:
+
+> **Re-run the OptiScaler + Streamline frame-generation configuration with `LoadReshade=false`,
+> under the current UE4SS-loaded plugin, and see whether it passes FG frame ~40.**
+
+The original experiment set `LoadReshade=true` **only because ReShade was how this project
+loaded at the time** (`CLAUDE.md`: *"Install OptiScaler AS `dxgi.dll`, copy ReShade's DLL to
+`ReShade64.dll`, set `LoadReshade=true`"*). That is no longer true — we load through UE4SS, and
+`mods/StrayDLSS/README.md:33` documents Config A (no ReShade) as supported. **So the confound
+can be removed by changing one line of OptiScaler's ini.**
+
+* **If it survives past frame 40 and into gameplay** → Streamline works on this stack without
+  ReShade, §5.3's hypothesis is confirmed, and the "keep ours" decision rests purely on 7.2 and
+  7.5 rather than on any doubt about viability. It would also mean the ReShade ext-vtable bug is
+  more dangerous than currently documented.
+* **If it dies at the same frame** → the fullscreen-transition confound (7.0) is the live
+  explanation, Streamline's swapchain path really is unusable here, and the question closes for
+  good.
+
+Either outcome is worth having, and **the negative result is the more valuable one** because it
+would finally convict or acquit a suspect this project has been quoting a verdict on without a
+trial.
+
+**Two knobs to set that the original experiment almost certainly did not**, both first-party
+from `sl_core_types.h:508-542` (**HARD**):
+
+* **`PreferenceFlags::eUseDXGIFactoryProxy`** — *"If specified SL will create DXGI factory proxy
+  rather than modifying the v-table for the base interface. This can help with 3rd party
+  overlays which are NOT integrated with the host application but rather operate via
+  injection."* **Streamline has a flag for exactly our scenario, and the default is the
+  v-table modification** — i.e. the original run had Streamline patching a v-table while
+  ReShade patched another. Worth setting on any retry.
+* **`PreferenceFlags::eBypassOSVersionCheck`** — *"Do not check OS version… VARIOUS WIN APIs
+  INCLUDING BUT NOT LIMITED TO `IsWindowsXXX`, `GetVersionX`, `rtlGetVersion` ARE KNOWN FOR
+  RETURNING INCORRECT RESULTS."* Directly relevant under Wine.
+
+**One caveat that must not be skipped.** DLSS-FG's first-party system requirements
+(`Streamline/README.md:66-69` on `dlss3/sl2-4.27-dlss-plugin`, **HARD**) list *"Display
+Hardware-accelerated GPU Scheduling (HWS) must be enabled"* — a **WDDM** feature that does not
+exist on Linux. **Our own direct-NGX path reaches 2.00× without it**, which proves the gate is
+not inside the snippet. Where it *is* enforced — Streamline, the Windows driver, or nowhere —
+is **UNCONFIRMED**, and it is a specific way the experiment could fail for a reason that has
+nothing to do with ReShade or with fullscreen. If it does fail, check for an HWS-related
+refusal in `sl.log` before concluding anything.
+
+**This experiment is not a prerequisite for the verdict below** — it is worth running for the
+knowledge, and because a wrong belief in this project's own documentation is worth correcting
+even when the conclusion survives.
+
+### 7.7 Verdict: KEEP OURS, and adopt the pieces — but for the right reasons
+
+**Not replace. Not a hybrid in the architectural sense** (there is no way to take Streamline's
+pacer without taking its swapchain — the pacer is inside `sl.dlss_g.dll` and is driven by the
+interposed present). **Hybrid only in the sense our existing recommendations already mean:
+adopt the specific, small things Streamline does that we do not.**
+
+**The argument, in order of weight:**
+
+1. **The pacer is closed and this platform breaks pacers** (7.2). We have already found one
+   Wine-specific timing defect and fixed it in code we own. Handing pacing to a closed,
+   Windows-developed component on a Wine/vkd3d/gamescope stack is the single worst trade
+   available, because the failure mode is *visible to the user* and *unfixable by us*.
+2. **We would be replacing a measured system with an unmeasured one**, and the measured one
+   already hits the theoretical maximum (2.00× steady state; the 1.91× headline is startup and
+   reload frames that are legitimately not generatable).
+3. **The gains do not land on this title.** Multi-swapchain, multi-viewport, MFG beyond 2× and
+   dynamic FG are all worth zero on a single-viewport UE 4.27 game on Ada. The one gain that is
+   real — deleting 3,500 lines — is a maintenance argument, and those lines are currently
+   working, unit-tested where testable, and instrumented.
+4. **The one concrete capability Streamline has that we lack is one call**, not an architecture:
+   `NvAPI_D3D12_NotifyOutOfBandCommandQueue`. We can make it ourselves.
+
+**And the part that matters even though the conclusion is unchanged: the reason we had was
+wrong.** "Streamline was measured to break FG under vkd3d-proton" was never established — the
+measurement contained ReShade by construction, the crash signature is ReShade's, and
+Streamline's own proxy code was checked and found clean. **That sentence should stop being
+repeated.** The correct statement is:
+
+> *Streamline's viability on this stack is untested. We keep our own implementation because it
+> works, is measured, is instrumented, and — critically — because frame pacing on Wine is a
+> problem we must be able to fix ourselves.*
+
+**What would change the verdict:** our pacer proving unfixable for some case we cannot handle;
+a second swapchain or viewport appearing; a move to Blackwell where MFG >2× has value; or the
+7.6 experiment showing Streamline working *and* pacing correctly under gamescope. The last of
+those is the only one that is cheap to check, which is why it is worth running anyway.
+
+---
+
 ## Recommendations, ranked — RE-RANKED 2026-09-03
 
 > The first pass's ranking is largely retained: its two adoptable items both survive first-party
 > checking. What changed is the confidence attached to the diagnostic section, and the removal of
 > one feasibility claim that had flipped.
+>
+> **Updated again for §7's replace-or-keep decision.** The verdict is **keep ours**, so nothing
+> below becomes obsolete — but item 0 is new and outranks everything else on cost-to-value, and
+> item 1 (`NvAPI_D3D12_NotifyOutOfBandCommandQueue`) is now doing more work than before: §7.4
+> identifies it as **the only concrete capability Streamline has that we lack**, which makes it
+> the whole of the "hybrid" option rather than a nicety.
 
 ### Adopt into our own code (independent of Streamline's swapchain — safe under vkd3d-proton)
 
@@ -653,6 +947,18 @@ exists to avoid.**
    the tagging discipline is now **corroborated by NVIDIA's own plugin**, which uses
    `eOnlyValidNow` (the stricter mode) with a TODO noting `eValidUntilPresent` would be more
    efficient. We chose the same trade-off independently, for a reason the guide states. §1, §2.
+
+### Run this — it is one launch and it settles a standing question
+
+0. **Re-run the OptiScaler + Streamline FG configuration with `LoadReshade=false`.** The
+   original six-launch experiment set it to `true` only because ReShade was then our loader;
+   we now load through UE4SS and Config A (no ReShade) is supported. **One ini line removes the
+   confound.** Set `PreferenceFlags::eUseDXGIFactoryProxy` (Streamline's own flag for
+   injection-based third parties — the default is v-table modification) and
+   `eBypassOSVersionCheck` while you are there; both are **HARD** from `sl_core_types.h:508-542`.
+   Either outcome is worth having: it convicts or acquits a suspect this project has been
+   quoting a verdict on without a trial. **It does not change the §7.7 verdict either way** —
+   it changes what we are allowed to say. §7.6.
 
 ### Explains a bug we have measured — DOWNGRADED, and partly overtaken
 
@@ -682,9 +988,12 @@ exists to avoid.**
    exactly that, from outside, today. The real difference is present-once-with-injection versus
    present-twice-from-a-private-ring. §5.4.
 7. **Streamline's interposer deployed as `sl.interposer.dll`.** Off the table by **user
-   constraint** (`docs/STRAY-RENDERING-FACTS.md` §32.5), and separately measured to fail once in
-   a configuration that included ReShade. **Restated as SOFT** rather than as the settled
-   technical finding the document's opening claimed. §5.0.
+   constraint** (`docs/STRAY-RENDERING-FACTS.md` §32.5) — **a decision, not evidence**. It was
+   separately measured to fail once, in a configuration that contained ReShade by construction
+   and whose crash signature is ReShade's. **Restated as UNCONFIRMED**, not as the settled
+   technical finding the document's opening claimed. **§7 now argues the full replace/keep
+   decision on the merits**, and the answer is still keep — but for reasons that survive the
+   suspect being acquitted. §5.0, §7.
 8. **Hudless + UI tagging, and User Interface Recomposition.** Narrowed: the **UI half is dead
    for this title regardless of reachability** — NVIDIA's alpha mask depends on the
    `DrawClearQuadAlpha` engine patch (absent from stock 4.27), and NVIDIA's own README tells HDR
