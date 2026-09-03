@@ -170,8 +170,13 @@ jobs:
           UEPSEUDO_PAT: ${{ secrets.UEPSEUDO_PAT }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # The submodule URLs are git@github.com:..., which has no credentials in CI.
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          # The submodule URLs are git@github.com:..., which has no credentials in CI. The
+          # rewrite is set per branch below, NOT here: git applies exactly ONE
+          # url.<x>.insteadOf rule to the ORIGINAL url (longest matching prefix) and never
+          # re-matches the rewritten result, so two rules do NOT chain. An unconditional
+          # ssh -> plain-https rule here wins the prefix match and strips the credentials the
+          # token rule would have added, which is how run 33709637319 failed: "could not read
+          # Username for 'https://github.com'". dlss-plugin.yml already had it this way.
           git clone --no-checkout https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
           git -C RE-UE4SS fetch --depth 1 origin $env:UE4SS_SHA
           git -C RE-UE4SS checkout --detach FETCH_HEAD
@@ -179,7 +184,9 @@ jobs:
 
           if ($env:UEPSEUDO_PAT) {
             Write-Host "UEPSEUDO_PAT is present: fetching every submodule at its recorded pin."
-            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "https://github.com/"
+            # ONE rule, ssh prefix straight to the token url. A separate ssh -> https rule
+            # would win the prefix match and strip the credentials (see the note above).
+            git config --global url."https://x-access-token:$env:UEPSEUDO_PAT@github.com/".insteadOf "git@github.com:"
             git -C RE-UE4SS submodule update --init --recursive
           } else {
             $warn = "UEPSEUDO_PAT is not set. deps/first/Unreal points at the PRIVATE repo " +
@@ -189,6 +196,8 @@ jobs:
                     "recorded submodule pin eb40a05f. If the resulting DLL fails to load, or " +
                     "loads and then misbehaves, SUSPECT THIS FIRST."
             Write-Host "::warning::$warn"
+            # No token: the public submodules still need ssh -> https, credential-free.
+            git config --global url."https://github.com/".insteadOf "git@github.com:"
             # Everything except deps/first/Unreal can come from its real remote.
             git -C RE-UE4SS submodule update --init --recursive -- deps/first/patternsleuth
             git clone --no-checkout https://github.com/$env:UEPSEUDO_MIRROR_REPO.git mirror
@@ -228,7 +237,11 @@ jobs:
 
       - name: Configure
         shell: pwsh
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=$env:BUILD_CONFIG
+        # Quoted and subexpression-wrapped: pwsh does NOT expand $env: inside a bare -D
+        # argument, so CMake received the literal text "$env:BUILD_CONFIG" as the build type
+        # and every $<CONFIG:...> generator expression then failed to parse (run 33710048662:
+        # "-- Build type: $env:BUILD_CONFIG", then "Expression syntax not recognized").
+        run: cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)"
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.

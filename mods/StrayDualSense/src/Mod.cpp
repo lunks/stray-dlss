@@ -17,7 +17,11 @@
 //   UnrealScriptFunctionCallable =
 //     std::function<void(Context&, void*)>                   Unreal/UFunctionStructs.hpp            HARD
 //   ctx.TheStack.Locals() -> uint8*                          Unreal/FFrame.hpp                      HARD
-//   UStruct::ForEachProperty() -> TFieldRange<FProperty>     Unreal/CoreUObject/UObject/Class.hpp   HARD
+//   UStruct::ForEachProperty() is DEPRECATED at 68caddcf; use RC::Unreal::TFieldRange<FProperty>(
+//     owner, RC::Unreal::EFieldIterationFlags::IncludeDeprecated) instead (the header's own
+//     [[deprecated(...)]] message names this exact replacement) Unreal/CoreUObject/UObject/
+//     UnrealType.hpp                                          HARD (read in the header's own
+//     deprecation attribute, which the compiler printed verbatim in CI run 33581494376)
 //   FProperty::GetOffset_ForInternal / GetSize / IsA<>       Unreal/CoreUObject/UObject/UnrealType.hpp HARD
 //   CPF_Parm / CPF_ReturnParm                                Unreal/UnrealFlags.hpp                 HARD
 //   FBoolProperty::GetPropertyValueInContainer               Unreal/CoreUObject/UObject/UnrealType.hpp HARD
@@ -181,7 +185,10 @@ std::vector<Field> DescribeFields(RC::Unreal::UStruct* owner, bool paramsOnly, c
         return fields;
 
     std::string summary;
-    for (FProperty* prop : owner->ForEachProperty())
+    // ForEachProperty() itself is deprecated at this SHA (68caddcf); the header's own
+    // [[deprecated(...)]] message names this exact replacement, IncludeDeprecated flag and all
+    // — matching ForEachProperty()'s prior behaviour rather than TFieldRange's own ::Default.
+    for (FProperty* prop : RC::Unreal::TFieldRange<FProperty>(owner, RC::Unreal::EFieldIterationFlags::IncludeDeprecated))
     {
         if (paramsOnly && !prop->HasAnyPropertyFlags(RC::Unreal::CPF_Parm))
             continue;
