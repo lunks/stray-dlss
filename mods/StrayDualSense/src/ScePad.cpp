@@ -94,8 +94,8 @@ bool ScePad::Bind()
     m_audioApi.store(g_setAudioOutPath != nullptr, std::memory_order_release);
     if (g_setAudioOutPath == nullptr)
         SDS_LOG_WARN("libScePad.dll exports no scePadSetAudioOutPath. The pad's internal "
-                     "speaker cannot be selected through Sony's API in this build; set "
-                     "PadSpeakerRoute=hid to use the raw output-report claim instead.");
+                     "speaker cannot be selected in this build, so it will stay SILENT "
+                     "whatever the sink writes into FL/FR.");
 
     // GetHandle and GetControllerInformation are required: without both we cannot tell an
     // occupied slot from an empty one, and picking blindly is exactly the bug being avoided.
@@ -115,7 +115,7 @@ bool ScePad::Bind()
 // layout for this pad and this firmware.
 //
 // THE COILS CANNOT BE AFFECTED BY THIS FUNCTION. It touches only the audio routing and the
-// audio levels; the coils are driven as PCM on the endpoint's RL/RR (AudioPlayer) and their
+// audio levels; the coils are driven as PCM on the endpoint's RL/RR (SubmixSink) and their
 // mode comes from HidMode's own output report, which this never writes. The one path from
 // here to the coils would be libScePad writing a report of its own as a side effect — which
 // it does for every trigger call already, and which HidMode's periodic re-assert exists to

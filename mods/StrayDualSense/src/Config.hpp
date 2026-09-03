@@ -4,9 +4,9 @@
 // wants to flip one switch and relaunch. It is hot-reloaded because this mod cannot be built
 // or tested locally — the only tuning loop is the user editing a value on the box.
 //
-// There are deliberately FEW knobs. Everything the game authors (trigger effect, loop flags,
-// asset levels, the speaker's +5 dB trim) is read from the game or is a named constant, not a
-// setting; a knob whose best value equals something the engine already knows is a missing
+// There are deliberately FEW knobs. Everything the game authors (trigger effect, loops, fades,
+// levels, the speaker's +5 dB trim) happens inside the engine's own mix, which is what the
+// taps carry; a knob whose best value equals something the engine already knows is a missing
 // wire, not a feature (CLAUDE.md, "a hand-tuned constant that works is a bug report").
 //
 // No UE4SS types here.
@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <string>
 
-#include "CoilOwner.hpp"
 #include "Log.hpp"
 #include "PadAudio.hpp"
 
@@ -40,124 +39,111 @@ struct Config
     // never the game thread. The first engage after open always reads 0/0 (§5).
     bool triggerReadback = false;
 
-    // ---- haptics (waveforms on the coils) ----------------------------------------------
+    // ---- the coils: the mode byte ----------------------------------------------------
     bool haptics = true;
     // DualSense USB output report 0x02, byte 1 = valid_flag0. Bits are VALIDITY CLAIMS, not a
-    // mode: bit0 COMPATIBLE_VIBRATION, bit1 HAPTICS_SELECT, bit2/3 trigger FFB, bit4/5 audio,
-    // bit6/7 mic. 0x00 claims NOTHING — and thereby stops re-asserting compatible-vibration,
-    // which is all it takes for the coils to take the waveform (§12). 0xFC is WRONG: it claims
-    // trigger data while supplying zeros, which first killed the adaptive triggers and then
-    // latched them on. This exists to reproduce that measurement, not to be tuned.
+    // mode (HidMode.hpp). 0x00 claims NOTHING — and thereby stops re-asserting
+    // compatible-vibration, which is all it takes for the coils to take the waveform (§12).
+    // 0xFC is WRONG: it claims trigger data while supplying zeros, which first killed the
+    // adaptive triggers and then latched them on. This exists to reproduce that measurement,
+    // not to be tuned.
     int   hapticValidFlag0     = 0x00;
     // libScePad's own output reports (triggers, rumble) carry the same flag byte and undo a
-    // single write; re-assert on this cadence AND immediately before each waveform.
+    // single write; re-assert on this cadence AND on the coil lane's silence -> signal edge.
     float hapticReassertSeconds = 2.0f;
 
-    // ---- haptics: where the waveform COMES FROM (the submix spike) ---------------------
-    // The modes and the rule each imposes are defined ONCE, in CoilOwner.hpp, next to the pure
-    // function that turns them plus the tap's facts into "who drives the coils". Read that.
+    // ---- the speaker -----------------------------------------------------------------
+    bool speaker = true;
+    // Applied to the speaker lane before the soft clip. 1.0 on purpose: the samples come out
+    // of the engine's own Submix_controllerPre -> controller -> controllerMaster chain, so the
+    // game's +5 dB SBFX_Boost is already in them. The retired asset-replay path baked that
+    // trim in as a constant (kSpeakerBoost = 1.7783) BECAUSE it bypassed the chain; carrying
+    // it over here would apply it twice (docs §16). A knob so the box can A/B it in one
+    // session, never a level to tune.
+    float speakerGain = 1.0f;
+    // THE PAD'S OWN ROUTING, through Sony's API (PadAudio.hpp). The pad's default routing
+    // MUTES the internal speaker, so the samples above reach nothing until this is selected.
+    // ScePadAudioOutPath: 3 = SPEAKER is the shim's measured-working value.
+    int padSpeakerPath = kSceAudioOutPathSpeaker;
+    // ScePadVolumeGain speakerVolume and jackVolume. The shim passed 80 for both.
+    int padSpeakerGain = kSceVolumeGainDefault;
+    // Re-apply the routing on this cadence as well as on change. 0 = only on change, which is
+    // what the shim did (one call, and the speaker worked). Raise it only if the routing is
+    // observed being lost mid-session — libScePad writes its own reports for triggers and
+    // rumble, and whether any of them resets the audio path is UNCONFIRMED.
+    float padSpeakerReassertSeconds = 0.0f;
+
+    // ---- the two submixes, and the reroute that makes the engine render them ----------
+    // By the paths measured in the box's own UE4SS object dump (docs §14). The vibration
+    // master feeds the coils (RL/RR); the controller master feeds the speaker (FL/FR), tapped
+    // POST-effects so the game's own speaker tuning is in the samples.
     //
-    //   assets           the shipped behaviour: <gamedir>/haptic/<name>.f32, one playback slot
-    //   measure          tap the engine's vibration submix and REPORT; assets drive the coils
-    //   submix-fallback  assets drive the coils until the tap carries a real signal, and every
-    //                    status line and a periodic WARN say so - the 2026-09-03 session read
-    //                    `bound=1` plus a vibrating pad as "the submix works" when it was this
-    //                    fallback, and that must never be possible again
-    //   submix           the submix or NOTHING: the asset path never plays, so anything felt
-    //                    in this mode came from the submix. A silent submix is a silent pad.
-    HapticSource hapticSource = HapticSource::Assets;
-
-    // How often the WARN repeats while a submix mode is configured and the submix is not
-    // delivering (unbound, never called, or silent). 0 disables the cadence (the status line
-    // still says who drives the coils).
-    float submixWarnSeconds = 10.0f;
-
-    // The two submixes to listen on, by the paths measured in the box's own UE4SS object dump
-    // (docs §14): the vibration master feeds the coils (RL/RR), the controller master feeds
-    // the pad speaker (FL/FR). Both are tapped POST-effects, so the game's own speaker
-    // tuning (Submix_controllerPre's SBFX_Boost, +5 dB) is already in the samples.
-    std::string submixPath        = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
-    std::string submixSpeakerPath = "/Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster";
-
-    // Register a SECOND, meter-only listener on the master submix. It is what turns a null
-    // result into a diagnosis: master firing while the vibration submix stays silent means
-    // the tap works and the GAME is not playing haptics into it; neither firing means the
-    // tap is broken. Costs one extra downmix of the game's output per audio callback.
-    bool submixProbeMaster = true;
-
-    // FAudioDevice::RegisterSubmixBufferListener's vtable index. 16 for stock UE 4.27.2, and
-    // the count is unusually safe because no FAudioDevice virtual sits inside a preprocessor
-    // conditional — but Stray is a LICENSEE build, so this is a knob and it is logged.
-    // See src/SubmixDiscovery.hpp for the full derivation.
-    int submixRegisterSlot = 16;
-
-    // both | world | engine. "both" demands the same FAudioDevice pointer be found
-    // independently inside the UWorld and the UEngine object; the single-object modes are
-    // escape hatches and say so in the log.
-    std::string submixDeviceSource = "both";
-
-    // How far into UWorld/UEngine to scan for the audio device. 0x2000 was NOT ENOUGH:
-    // UEngine declares 268 UPROPERTYs before MainAudioDeviceHandle (Engine.h:1735).
-    int   submixScanBytes    = 0x8000;
-    // 32-bit words of each non-UObject candidate to dump when NOTHING is accepted. The
-    // sample-rate test is the one check that cannot self-check, so a refusal must leave behind
-    // enough to find the rate by eye and measure its offset.
-    int   submixDumpWords    = 96;
-
-    float submixGain         = 1.0f;   // applied before the soft clip
-    int   submixQueueAheadMs = 40;     // WASAPI lead on the coil stream; raise if it crackles
-    int   submixRingMs       = 250;    // ring capacity; ~12 engine callbacks at the default
-    float submixStatusSeconds = 1.0f;  // how often the numbers proof is written
-
-    // THE CORRELATION INSTRUMENT (src/SubmixWatch.hpp). Every StartPS5Vibration opens a watch
-    // this many seconds wide; when it closes, ONE line says whether the engine put anything in
-    // the submix for that asset. Without it the only reading available is a per-second peak,
-    // which is 0.00000 whenever nothing happens to be playing - and on 2026-09-03 exactly one
-    // such line was read as "the submix delivers nothing" on a session that had already
-    // handed the coils over on a real signal. 0 disables the watch.
-    float submixWatchSeconds = 3.0f;
-
-    // What counts as a REAL SIGNAL: the peak, in the tap's own units, at or above which the
-    // submix takes the coils over from the asset path (Runtime::StartSinkAtHandover).
-    //
-    // 1e-4 is -80 dBFS. It is deliberately low so a quiet asset cannot be missed, and the
-    // cost of that choice is stated rather than hidden: in STRICT `submix` the handover
-    // DISABLES the asset path for the rest of the session, so a single -80 dBFS tail is
-    // enough to make `live=1` while the pad is, in practice, silent. If a session reports
-    // `live=1` with a `FIRST REAL SIGNAL` peak that is a small fraction of the ~0.7 a real
-    // VIBE asset measures, raise this rather than believing the handover.
-    float submixLiveThreshold = 1.0e-4f;
-    // One line, rewritten in place, next to the log — so the numbers can be read with `cat`
-    // over ssh without the game overlay.
-    std::string submixStatusFile = "stray-dualsense-submix.txt";
-
-    // ---- the reroute: make the engine RENDER the vibration submix on PC --------------------
-    // MEASURED 2026-09-03 (docs/STRAY-DUALSENSE.md §14): VibrationEndpointSubmix is a
-    // UEndpointSubmix whose EndpointType is "Vibration Output". UE 4.27 has no factory for
-    // that name on Windows, so IAudioEndpointFactory::Get hands it the DUMMY factory
-    // (IAudioEndpoint.cpp:174) and FMixerSubmix::ProcessAudioAndSendToEndpoint returns before
-    // processing a single child (AudioMixerSubmix.cpp, IsDummyEndpointSubmix) - the whole
-    // vibration subtree is never rendered, which is why the tap saw ZERO callbacks.
-    //
-    // The reroute re-parents Submix_vibrationMaster under a submix that IS rendered every
-    // callback (SubmixRerouteParent), whose OutputVolume is first set to 0 so nothing leaks
-    // into the speakers, and asks the engine to rebuild the links by calling
-    // FAudioDevice::RegisterSoundSubmix(submix, true) - a virtual two slots below the one the
-    // tap already calls (AudioDevice.h:854, slot 14). The listener on Submix_vibrationMaster
-    // then sees the full mix (listeners run after the submix's OWN volume, which stays 1.0,
-    // and before the parent's). Default OFF: it writes two UPROPERTYs and calls one more
-    // derived vtable slot.
-    bool        submixReroute       = false;
-    std::string submixRerouteMaster = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
+    // MEASURED 2026-09-03 (docs §14/§16): both roots are UEndpointSubmixes ("Vibration
+    // Output", "Pad Speaker Output") with no factory on Windows, so UE 4.27 hands them the
+    // DUMMY endpoint and skips both subtrees - a plain tap reports zero callbacks forever.
+    // The reroute re-parents each master under SubmixRerouteParent (Submix_unused: rendered
+    // every callback, no children, no effects), after setting that parent's OutputVolume to 0
+    // so nothing leaks into the speakers, and asks the engine to rebuild the links through
+    // FAudioDevice::RegisterSoundSubmix (vtable slot SubmixRegisterSoundSubmixSlot; measured
+    // working at 14). Listeners run after the submix's own volume (1.0) and before the
+    // parent's (0), so the taps see the full mix. Always on: without it there is nothing to
+    // tap, and there is no other source.
+    std::string submixPath          = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
+    std::string submixSpeakerPath   = "/Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster";
     std::string submixRerouteParent = "/Game/Sound/tools/settings/Submix_unused.Submix_unused";
     int         submixRegisterSoundSubmixSlot = 14;
 
-    // BP_HKPlayerController_C.DebugPS5Haptic (MEASURED in the object dump, offset 0x778):
-    // a bool beside the PS5 platform gate in every StartPS5Vibration Blueprint. When on, the
-    // plugin sets it TRUE on the player controller from inside its own hooks (game thread),
-    // so the Blueprint body past the gate runs on PC. Default OFF until the probe proves
-    // what the gate is.
-    bool forcePS5HapticPath = false;
+    // FAudioDevice::RegisterSubmixBufferListener's vtable index. 16 for stock UE 4.27.2 and
+    // measured working; Stray is a LICENSEE build, so it stays a knob and the log dumps the
+    // vtable. See src/SubmixDiscovery.hpp for the full derivation.
+    int submixRegisterSlot = 16;
+
+    // both | world | engine. Which objects may supply the FAudioDevice pointer; the ladder in
+    // SubmixChoice decides. MEASURED: UWorld holds no audio device on this build, UEngine does.
+    std::string submixDeviceSource = "both";
+    // How far into UWorld/UEngine to scan. 0x2000 was NOT ENOUGH: UEngine declares 268
+    // UPROPERTYs before MainAudioDeviceHandle (Engine.h:1735).
+    int   submixScanBytes    = 0x8000;
+    // 32-bit words of each non-UObject candidate to dump when NOTHING is accepted.
+    int   submixDumpWords    = 96;
+
+    // A second, meter-only listener on the engine's MASTER submix, never attached to the
+    // pad. It turns a null result into a diagnosis: master firing while a lane stays silent
+    // means the tap works and the engine is not rendering that subtree; neither firing means
+    // the tap is broken. Costs one extra downmix of the game's output per audio callback.
+    bool submixProbeMaster = true;
+
+    float submixGain         = 1.0f;   // the coil lane, before the soft clip
+    int   submixQueueAheadMs = 40;     // WASAPI lead on the pad stream; raise if it crackles
+    int   submixRingMs       = 250;    // per-lane ring capacity; ~12 engine callbacks
+    float submixStatusSeconds = 1.0f;  // how often the numbers proof is written
+
+    // THE CORRELATION INSTRUMENT (src/SubmixWatch.hpp). Every StartPS5Vibration opens the coil
+    // lane's watch and every StartPS5ControllerSound the speaker lane's, this many seconds
+    // wide; when it closes, ONE line says what the engine put in that submix for that asset
+    // (NoData / Silent / Mixed). 0 disables the watches.
+    float submixWatchSeconds = 3.0f;
+
+    // What counts as a REAL SIGNAL: the peak, in the tap's own units, at or above which a
+    // lane is called live and the sink opens. 1e-4 is -80 dBFS, deliberately low so a quiet
+    // asset cannot be missed; a real VIBE asset measures ~0.7 (docs §14). The handover line
+    // prints the peak that tripped it — if that is a small fraction of 0.7, raise this.
+    float submixLiveThreshold = 1.0e-4f;
+
+    // How often the WARN repeats while a lane is enabled and the submix is not delivering
+    // (unbound, never called, or silent). 0 disables the cadence; the COILS:/SPEAKER: lines
+    // still say who drives each pair.
+    float submixWarnSeconds = 10.0f;
+
+    // THE REROUTE WATCHDOG (docs §17). A level load rebuilds the submix graph and drops the
+    // re-parenting; if a bound lane's callbacks stop advancing for this long AFTER having
+    // advanced at least once, the reroute is re-submitted for the parent and both masters.
+    // 0 disables it. The listeners are NOT re-registered (UE appends without de-duplicating).
+    float submixRerouteWatchdogSeconds = 5.0f;
+
+    // One line per lane, rewritten in place, next to the log — so the numbers can be read
+    // with `cat` over ssh without the game overlay.
+    std::string submixStatusFile = "stray-dualsense-submix.txt";
 
     // ---- button glyphs -------------------------------------------------------------------
     // /Script/Hk_project.InputSubsystem:GetGameControllerType(_forceGamepad: bool) returns
@@ -167,76 +153,19 @@ struct Config
     // -1 = leave the game's answer alone.
     int glyphControllerType = 3;
 
-    // THE REROUTE WATCHDOG. The reroute is submitted ONCE at bind time, and both halves of it
-    // — the glue's ParentSubmix/OutputVolume writes and our RegisterSoundSubmix call — are
-    // gated on SubmixWantsBinding(), which latches false forever after the first bind. So a
-    // submix graph rebuilt by a level load could never be repaired, and the pad went silent
-    // for the rest of the session (measured 2026-09-03: worked in BaseMap, silent in
-    // 03_Slums). If the tap is bound and its callbacks stop advancing for this long, re-arm
-    // the reroute. 0 disables it. This is NOT a fallback — it never gives the coils back to
-    // the asset path; it repairs the thing that makes strict mode unreliable.
-    float submixRerouteWatchdogSeconds = 5.0f;
-
-    // ---- controller speaker ----------------------------------------------------------
-    bool speaker = true;
-    // Applied to the speaker lane before the soft clip. 1.0 on purpose: the samples come out
-    // of the engine's own Submix_controllerPre -> controller -> controllerMaster chain, so the
-    // game's +5 dB SBFX_Boost is already in them. The asset-replay path used to bake that
-    // trim in as a constant (kSpeakerBoost = 1.7783) BECAUSE it bypassed the chain; carrying
-    // it over here would apply it twice (docs §16). A knob rather than a constant so the box
-    // can A/B it in one session, never a level to tune.
-    float speakerGain = 1.0f;
-
-    // WHICH MECHANISM SELECTS THE PAD'S AUDIO ROUTING. Read PadAudio.hpp first: the pad's
-    // default routing MUTES the internal speaker, so writing correct samples into its audio
-    // endpoint — which we do, with zero failures and megabytes streamed — reaches nothing
-    // until something selects a route.
-    //
-    //   sony   scePadSetAudioOutPath / scePadSetVolumeGain. What the retired libScePad shim
-    //          did, on this hardware, when the speaker last worked.
-    //   hid    the raw output-report claim. The fallback for a libScePad that refuses.
-    //   both   sony, then hid unconditionally.
-    //   auto   sony, escalating to hid ONLY if Sony's call failed. THE DEFAULT: the HID
-    //          claim's coil safety is argued (a disjoint bit set) rather than measured, so it
-    //          runs only in the world where the measured path is already broken.
-    //   off    write nothing. The behaviour that left the speaker silent.
-    PadSpeakerRoute padSpeakerRoute = PadSpeakerRoute::Auto;
-
-    // ScePadAudioOutPath. 3 = SPEAKER is the shim's measured-working value; do not change it
-    // on a reading of the kernel's OUTPUT_PATH_SEL table, which is a DIFFERENT enum.
-    int padSpeakerPath = kSceAudioOutPathSpeaker;
-    // ScePadVolumeGain speakerVolume and jackVolume. The shim passed 80 for both.
-    int padSpeakerGain = kSceVolumeGainDefault;
-
-    // Re-apply the routing on this cadence as well as on change. 0 = only on change, which is
-    // what the shim did (one call, and the speaker worked). Raise it only if the routing is
-    // observed being lost mid-session — libScePad writes its own reports for triggers and
-    // rumble, and whether any of them resets the audio path is UNCONFIRMED.
-    float padSpeakerReassertSeconds = 0.0f;
-
-    // The HID fallback's own values (PadSpeakerRoute = hid/both, or auto after a refusal).
-    // These are the KERNEL's numbering and have nothing to do with padSpeakerPath above.
-    int padSpeakerHidPath   = kPadSpeakerPathDefault;     // 2: speaker on, headphones alive
-    int padSpeakerHidVolume = kPadSpeakerVolumeDefault;   // 0x64
-    int padSpeakerHidPreamp = kPadSpeakerPreampDefault;   // +6 dB
-
     // ---- the pad's WASAPI endpoint ---------------------------------------------------
     // Substring of the friendly name. MEASURED: "Speakers (DualSense Wireless Controller)",
     // 4ch / 48000 Hz / 32-bit float, FL FR = speaker, RL RR = the two coils.
     std::string endpointMatch = "DualSense";
-
-    // ---- assets ----------------------------------------------------------------------
-    // Relative paths resolve against the game's Binaries/Win64 first, the mod's dir second.
-    std::string hapticDir       = "haptic";            // <name>.f32, stereo float32 @ 48 kHz
-    std::string hapticLoopsFile = "haptic_loops.txt";  // the game's bLooping, one name per line
 
     // ---- diagnostics -----------------------------------------------------------------
     float hookRetrySeconds    = 3.0f;    // MEASURED: registration fails until the BP loads
     float statusSeconds       = 30.0f;
     float configReloadSeconds = 5.0f;    // 0 disables hot reload
 
-    // Parse `path`. Missing keys keep their defaults; unknown keys are logged and ignored.
-    // Returns false only if the file could not be opened.
+    // Parse `path`. Missing keys keep their defaults; keys retired in 0.4.0 are named and
+    // ignored; unknown keys are logged and ignored. Returns false only if the file could not
+    // be opened.
     bool Load(const std::wstring& path);
 
     // Re-read if the file's mtime moved. Only the LIVE scalars are applied; paths, the pad
@@ -245,9 +174,6 @@ struct Config
     bool ReloadIfChanged(const std::wstring& path);
 
     void LogSummary(const char* what) const;
-    const char* HapticSourceName() const { return ::sds::HapticSourceName(hapticSource); }
-    bool SubmixTapWanted() const { return TapWanted(hapticSource); }
-    bool SubmixDrivesCoils() const { return SubmixMayDriveCoils(hapticSource); }
     const char* GlyphName() const;
 
 private:

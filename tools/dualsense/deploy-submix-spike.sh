@@ -1,8 +1,7 @@
 #!/bin/bash
-# Deploy the SUBMIX SPIKE build of StrayDualSense, and be able to undo it.
+# Deploy a StrayDualSense plugin build, and be able to undo it.
 #
-#   tools/dualsense/deploy-submix-spike.sh [GAMEDIR] [--dll PATH] [--measure|--fallback|--strict]
-#                                          [--reroute] [--gate] [--revert]
+#   tools/dualsense/deploy-submix-spike.sh [GAMEDIR] [--dll PATH] [--revert]
 #
 # WHAT IT CHANGES, and why each one is necessary:
 #
@@ -11,51 +10,37 @@
 #     ue4ss/Mods/mods.txt. THE SHIM AND THE PLUGIN BOTH DRIVE THE COILS AND THE HID MODE
 #     BYTE. Two writers of valid_flag0 is exactly the fight that killed the adaptive triggers
 #     twice (docs/STRAY-DUALSENSE.md §12), and two writers of the pad's WASAPI endpoint means
-#     whichever opened last wins. Leaving the shim in place would make the spike unreadable.
+#     whichever opened last wins.
 #  3. Sets `StrayDualSense : 1` in mods.txt and installs the plugin at
 #     ue4ss/Mods/StrayDualSense/dlls/main.dll.
-#  4. Writes ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.ini. The default is
-#     HapticSource = measure (the tap reports numbers, the ASSET path keeps driving the coils:
-#     the safe diagnostic run). --fallback writes `submix-fallback` (assets until the tap
-#     carries signal, LOUDLY), --strict writes `submix` (the submix or nothing - the only mode
-#     in which a felt vibration proves the submix). --reroute turns SubmixReroute on and
-#     --gate turns ForcePS5HapticPath on; together they are the 2026-09-03 experiment.
+#  4. Writes ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.ini with the keys 0.4.0 reads.
+#     There are no modes any more: the engine's own submixes are the only source, the reroute
+#     and the DebugPS5Haptic gate are always on, and Sony's API is the only speaker route.
 #  5. chown deck:deck on everything it writes.
 #
 # It does NOT launch the game. Launch it yourself (tools/launch-stray-safe.sh), then read:
 #
-#     cat <GAMEDIR>/stray-dualsense-submix.txt        <- one line, rewritten every second
-#     grep -E 'submix|SUBMIX' <GAMEDIR>/stray-dualsense.log
+#     cat <GAMEDIR>/stray-dualsense-submix.txt        <- two lines, rewritten every second
+#     grep -E 'submix|SUBMIX|pad audio' <GAMEDIR>/stray-dualsense.log
 #
 # --revert puts every one of those back: StrayDualSense : 0, StrayTriggers : 1, and the shim
 # (libScePad_shim.dll, if that is what was there) reinstated. The previous mods.txt and ini are
 # kept as .straydeploy.bak next to the originals.
-#
-# NOTHING IN THIS BUILD HAS RUN IN THE GAME. The submix tap has never fired; the vtable index
-# it calls is derived from stock UE 4.27.2 source and Stray is a licensee build. If the game
-# dies at the "about to call vtable slot" line in the log, that derivation is the suspect —
-# see mods/StrayDualSense/src/SubmixDiscovery.hpp, and set SubmixRegisterSlot from the vtable
-# dump the log prints just above it.
 set -uo pipefail
 
 GAME_DEFAULT=/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray/Hk_project/Binaries/Win64
 GAME=""
 DLL=""
-MODE=measure
-REROUTE=0
-GATE=0
 REVERT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --revert)  REVERT=1 ;;
-    --measure)  MODE=measure ;;
-    --fallback) MODE=submix-fallback ;;
-    --strict)   MODE=submix ;;
-    --reroute)  REROUTE=1 ;;
-    --gate)     GATE=1 ;;
     --dll)     DLL="${2:-}"; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    --measure|--fallback|--strict|--reroute|--gate)
+      echo "deploy-submix-spike: $1 was retired in 0.4.0 - there are no modes; the submix is the only source" >&2
+      exit 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     -*)        echo "unknown option: $1" >&2; exit 2 ;;
     *)         GAME="$1" ;;
   esac
@@ -171,7 +156,7 @@ shim_on() {
 # --revert
 # ---------------------------------------------------------------------------------------
 if [ "$REVERT" = 1 ]; then
-  say "REVERTING the submix spike in $GAME"
+  say "REVERTING the plugin deploy in $GAME"
   set_mod StrayDualSense 0
   set_mod StrayTriggers 1
   shim_on
@@ -205,10 +190,9 @@ fi
   artifact from the StrayDualSense CI run and pass it:
       $0 --dll /path/to/StrayDualSense/dlls/main.dll"
 
-say "deploying the submix spike"
+say "deploying StrayDualSense"
 say "  game dir : $GAME"
 say "  dll      : $DLL  ($(stat -c %s "$DLL" 2>/dev/null || stat -f %z "$DLL") bytes)"
-say "  mode     : HapticSource = $MODE"
 say ""
 
 # ---------------------------------------------------------------------------------------
@@ -231,106 +215,54 @@ PDB="${DLL%.dll}.pdb"
 # ---------------------------------------------------------------------------------------
 # 4. The ini, NEXT TO THE DLL.
 #
-# MEASURED 2026-09-02: writing it to the mod ROOT made the first live run silently use
-# HapticSource=assets — the plugin searched the DLL's own directory and the game directory,
-# and the mod root was neither. The plugin now searches the mod root too, but a deploy must
-# not depend on the build being new enough to do that, so it goes where every version looks.
-# A stale copy in the mod root would be shadowed by this one; it is removed if present.
+# MEASURED 2026-09-02: writing it to the mod ROOT made the first live run silently use the
+# defaults — the plugin searched the DLL's own directory and the game directory, and the mod
+# root was neither. The plugin now searches the mod root too, but a deploy must not depend on
+# the build being new enough to do that, so it goes where every version looks. A stale copy in
+# the mod root would be shadowed by this one; it is removed if present.
 # ---------------------------------------------------------------------------------------
 INI="$MODS/StrayDualSense/dlls/StrayDualSense.ini"
 INI_NEW="$INI.straydeploy.tmp"
 cat > "$INI_NEW" <<INI_EOF
-; Written by tools/dualsense/deploy-submix-spike.sh — the SUBMIX SPIKE.
+; Written by tools/dualsense/deploy-submix-spike.sh for StrayDualSense 0.4.0.
 ;
-; Nothing in this configuration has ever run in the game. If the game dies, the first thing
-; to try is HapticSource = assets, which is the shipped behaviour and touches none of it.
+; Every value is the plugin's own default; the file exists so a knob can be flipped on the
+; box without a rebuild. mods/StrayDualSense/StrayDualSense.ini documents each one.
 [StrayDualSense]
 Enabled = 1
 LogLevel = Info
 
-; assets          = the shipped one-slot asset player (unchanged behaviour)
-; measure         = tap the engine's vibration submix and report numbers; the ASSET path still
-;                   drives the coils, so nothing new reaches the pad
-; submix-fallback = assets drive the coils until the tap carries a real signal; LOUD meanwhile
-; submix          = STRICT: the submix or nothing; anything felt came from the submix
-; Every status line starts with "COILS: ..." - read that, not bound=.
-HapticSource = $MODE
-SubmixWarnSeconds = 10
+Triggers = 1
+Haptics = 1
+Speaker = 1
+; 1.0: the engine's own SBFX_Boost is already in the tapped samples. A/B only.
+SpeakerGain = 1.0
 
-; The 2026-09-03 finding: the vibration subtree is never rendered on PC (dummy endpoint), and
-; the Blueprints do nothing until DebugPS5Haptic is true. These two switch both on.
-SubmixReroute = $REROUTE
-; The reroute is submitted ONCE at bind, so a LEVEL LOAD that rebuilds the submix graph used to
-; silence the pad for the rest of the session (measured: BaseMap peak 0.708, 03_Slums zero
-; callbacks). If the bound tap's callbacks stall this long, re-arm it. NOT a fallback - strict
-; mode stays strict.
-SubmixRerouteWatchdogSeconds = 5.0
-SubmixRerouteMaster = /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+; Sony's routing call, the shim's measured-working values (docs/STRAY-DUALSENSE.md §16).
+PadSpeakerPath = 3
+PadSpeakerGain = 80
+
+; The two masters and the parent they are re-parented under (docs §14/§16). Both roots are
+; dead on PC; the reroute is always on and the watchdog re-submits it after a level load.
+SubmixPath = /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+SubmixSpeakerPath = /Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster
 SubmixRerouteParent = /Game/Sound/tools/settings/Submix_unused.Submix_unused
 SubmixRegisterSoundSubmixSlot = 14
-ForcePS5HapticPath = $GATE
+SubmixRegisterSlot = 16
+SubmixRerouteWatchdogSeconds = 5.0
 
 ; PS glyphs on the prompts (the game sees an X360 pad and draws Xbox ones otherwise).
 Glyphs = ps5
 
-; Measured in the box's own ue4ss/UE4SS_ObjectDump.txt. The literal "master" taps the engine's
-; MASTER submix instead, which needs no USoundSubmix object at all — use it to prove the tap
-; MECHANISM works when the vibration submix reads silent.
-SubmixPath = /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
-
-; A second, meter-only listener on the master submix. It is what makes a null result a
-; DIAGNOSIS: master firing while the vibration submix stays silent means the tap works and the
-; game is not playing haptics into it; neither firing means the tap is broken.
 SubmixProbeMaster = 1
-
-; FAudioDevice::RegisterSubmixBufferListener's vtable index. 16 for stock UE 4.27.2 — see
-; mods/StrayDualSense/src/SubmixDiscovery.hpp for the derivation. Stray is a LICENSEE build,
-; so if the log's vtable dump disagrees, change this.
-SubmixRegisterSlot = 16
-; both | world | engine. Which objects may supply the FAudioDevice pointer. MEASURED 2026-09-02:
-; demanding the SAME POINTER in both objects was wrong twice over - the scan found 8 candidates
-; in UWorld and 3 in UEngine with none shared, and a world audio device and the main audio
-; device are ALLOWED to be different instances. The cross-check is now a shared VTABLE (both are
-; FMixerDevice), and UEngine::MainAudioDeviceHandle is accepted on its own when the audio device
-; manager sits immediately before it. "both" simply means "look in both"; the ladder decides.
-SubmixDeviceSource = both
-
-; MEASURED 2026-09-03 by reading the live process: UEngine::MainAudioDeviceHandle sits thousands
-; of bytes in (268 UPROPERTYs precede it), so a 0x2000 window missed it entirely.
-SubmixScanBytes = 32768
-SubmixDumpWords = 96
-
 SubmixGain = 1.0
 SubmixQueueAheadMs = 40
 SubmixRingMs = 250
 SubmixStatusSeconds = 1.0
-
-; Every StartPS5Vibration opens a correlation window this wide; one line per start says
-; whether the engine put anything in the submix FOR THAT ASSET. The per-second peak alone
-; cannot answer that — it reads 0.00000 whenever nothing happens to be playing.
 SubmixWatchSeconds = 3.0
-; The peak at or above which the submix takes the coils over. 1e-4 is -80 dBFS; a real VIBE
-; asset measures ~0.7. Raise it if "FIRST REAL SIGNAL" ever reports a peak near the floor.
 SubmixLiveThreshold = 0.0001
-
+SubmixWarnSeconds = 10
 SubmixStatusFile = stray-dualsense-submix.txt
-
-; The triggers keep working from the plugin; the shim is gone.
-Triggers = 1
-Haptics = 1
-Speaker = 1
-
-; THE PAD SPEAKER'S ROUTING. Retiring the shim (which this script does, and correctly) removed
-; the only caller of scePadSetAudioOutPath, and the pad's DEFAULT routing MUTES its internal
-; speaker - which is why the purr is felt and not heard. The plugin now makes Sony's own calls
-; itself, with the handle scePadGetHandle already gives it: no proxy, no rename.
-;   auto  scePadSetAudioOutPath/SetVolumeGain, escalating to the raw HID output-report claim
-;         ONLY if Sony's call fails. sony = never touch a HID byte. off = the silent shape.
-; Read docs/STRAY-DUALSENSE.md §16 before changing PadSpeakerPath: 3 is Sony's SPEAKER and is
-; the shim's measured-working value, and Sony's enum is NOT the kernel's.
-PadSpeakerRoute = auto
-PadSpeakerPath = 3
-PadSpeakerGain = 80
 INI_EOF
 if cmp -s "$INI_NEW" "$INI"; then
   rm -f "$INI_NEW"
@@ -361,14 +293,15 @@ grep -E "^[[:space:]]*(StrayDualSense|StrayTriggers|StrayProbe|StrayFur|StrayCon
 say ""
 say "Then, with the game running:"
 say "  cat $GAME/stray-dualsense-submix.txt"
-say "  grep -E 'submix|SUBMIX' $GAME/stray-dualsense.log | tail -40"
+say "  grep -E 'submix|SUBMIX|pad audio' $GAME/stray-dualsense.log | tail -40"
 say ""
 say "What to look for, in order:"
-say "  0. every SUBMIX/STATUS line starts with 'COILS: ...' - that is who drives the pad"
+say "  0. every SUBMIX/STATUS line starts with 'COILS: ...' / 'SPEAKER: ...' - who drives each pair"
 say "  1. 'submix: FAudioDevice ... found ...'                                the pointer is real"
-say "  2. 'submix: REROUTE submitted' (with --reroute)                        the links were rebuilt"
-say "  3. SUBMIX ... cb=N (46.9/s) ch=2 rate=48000 peak=...                   THE SUBTREE RENDERS"
-say "  4. peak > 0 while a haptic plays (with --gate)                          THE ENGINE MIXES"
-say "  5. 'HANDOVER: the SUBMIX now drives the coils' (fallback/strict)        the pad is on the mix"
+say "  2. 'submix: REROUTE submitted'                                        the links were rebuilt"
+say "  3. SUBMIX vibration|speaker ... cb=N (46.9/s) ch=8 rate=48000 ...     BOTH SUBTREES RENDER"
+say "  4. 'submix watch [vibration|speaker] ... the engine MIXED it'         THE ENGINE MIXES"
+say "  5. 'FIRST REAL SIGNAL on ... HANDOVER'                                the pad is on the mix"
+say "  6. 'pad audio: ... SONY ACCEPTED the route'                           the speaker is routed"
 say ""
 say "Undo everything: $0 $GAME --revert"

@@ -1,10 +1,24 @@
 // StrayDualSense — the runtime.
 //
-// Everything the mod does, expressed as GAME INTENT ("the player started scratching", "the
-// game asked for this vibration asset") and DELIBERATELY free of every UE4SS type. The UE4SS
-// glue in Mod.cpp does nothing but translate UFunction callbacks into these calls, so the
-// part of this mod that depends on an SDK we cannot build against locally is as thin as it
-// can be.
+// A THIN SHIM between three things that already exist: the engine's audio graph, Sony's own
+// libScePad.dll (the game's copy), and the pad's Windows audio endpoint.
+//
+//   UNREAL SIDE (hooks, Mod.cpp)                  SONY SIDE (the game's libScePad.dll)
+//     DebugPS5Haptic gate, pre-hook, per call        scePadGetHandle
+//     reroute the two dead endpoint submixes         scePadSetAudioOutPath(3) + SetVolumeGain
+//       Submix_vibrationMaster  -> Submix_unused     scePadSetTriggerEffect
+//       Submix_controllerMaster -> Submix_unused
+//     tap both (RegisterSubmixBufferListener)      TRANSPORT (this file + SubmixSink)
+//     trigger hooks -> enum translation              ONE WASAPI client on the pad's endpoint:
+//                                                      FL/FR <- speaker tap, RL/RR <- coil tap
+//                                                    HidMode valid_flag0 = 0x00 (§12)
+//
+// The engine does the mixing, the fades, the levels, the loops and the speaker's boost chain.
+// We move samples from where the engine put them to where the pad reads them, and we make
+// Sony's DLL select the route. Everything here is expressed as GAME INTENT and is
+// DELIBERATELY free of every UE4SS type; Mod.cpp translates UFunction callbacks into these
+// calls, so the part of this mod that depends on an SDK we cannot build against locally is as
+// thin as it can be.
 #pragma once
 
 #include <atomic>
@@ -13,10 +27,8 @@
 #include <string>
 #include <thread>
 
-#include "AudioPlayer.hpp"
 #include "Config.hpp"
 #include "HidMode.hpp"
-#include "LoopList.hpp"
 #include "ScePad.hpp"
 #include "SubmixDiscovery.hpp"
 #include "SubmixDsp.hpp"
@@ -30,7 +42,8 @@ namespace sds {
 
 // StartPS5Vibration(SoundVibration, FadeInTime, Level) and
 // StartPS5VibrationOnAudioComponent(AudioComponent, SoundVibration, FadeInTime, Level,
-// VibrationComponent), already resolved BY TYPE by the hook (§ "two hook shapes").
+// VibrationComponent), already resolved BY TYPE by the hook (§ "two hook shapes"). Logged,
+// and used to open the coil lane's watch; the engine plays it.
 struct VibrationStart
 {
     std::string soundFullName;       // "SoundWave /Game/.../CatPurr2_VIBE.CatPurr2_VIBE"
@@ -70,7 +83,7 @@ class Runtime
 {
 public:
     // `addressInsideThisModule` is any address in the mod DLL — used to find the mod
-    // directory as the fallback asset root.
+    // directory, where the ini is looked for.
     void Startup(const void* addressInsideThisModule);
     void Shutdown();
 
@@ -93,45 +106,43 @@ public:
     void OnUseStarted();
     void OnAfterUseDone();
 
+    // The vibration and speaker hooks do not PLAY anything: the engine does, into the
+    // rerouted submixes, once the DebugPS5Haptic gate is open. They log the intent — "the
+    // game asked for CatPurr2_VIBE" is a different finding from "the game never asked" —
+    // and open that lane's watch, so one line per start says what the engine put in the
+    // submix for that asset.
     void OnStartVibration(const VibrationStart& start);
     void OnStopVibration(float fadeOut);                                       // global
     void OnStopVibrationOnComponent(const std::string& componentFullName, float fadeOut);
     void OnSetVibrationLevel(float level);                                     // ~60 Hz
-
-    // The speaker. The engine plays the sound itself once the Blueprint gate is open; these
-    // only LOG the intent and open the speaker lane's watch, so one line per start says what
-    // the engine put in Submix_controllerMaster for that asset.
     void OnStartControllerSound(const std::string& soundFullName, float level, bool levelSeen,
                                 float fadeIn);
     void OnStopControllerSound(float fadeOut);
     void OnSetControllerSoundLevel(float level);
 
-    // HKGameUserSettings.PadVibrationEnabled — the game's only vibration control (§9).
+    // HKGameUserSettings.PadVibrationEnabled — the game's only vibration control (§9). A gain
+    // of 0 on the coil lane, never a teardown.
     void OnPadVibrationEnabled(bool enabled);
 
     void NoteHookRegistered(const char* name);
     void NoteHookMissing(const char* name);
 
-    // BP_HKPlayerController_C.DebugPS5Haptic, reported by the glue every time it tries to open
-    // the gate. `open` is the value READ BACK after the write, so it is the gate's real state
-    // and not our intent. A gate that never opens is the single most likely reason for "the
-    // game asked for a vibration and the engine mixed nothing", so it belongs in the STATUS
-    // line rather than in one INFO line at the top of a 40 MB log.
+    // BP_HKPlayerController_C.DebugPS5Haptic, reported by the glue every time it opens the
+    // gate. `open` is the value READ BACK after the write, so it is the gate's real state and
+    // not our intent. A gate that never opens is the single most likely reason for "the game
+    // asked for a vibration and the engine mixed nothing", so it belongs in the STATUS line.
     void OnHapticGate(bool open, bool wrote);
 
-    // ---- the submix taps ---------------------------------------------------------------
+    // ---- the taps ----------------------------------------------------------------------
     // True while the taps exist and the listeners have not been registered, or while the
     // reroute watchdog has asked for a re-arm. The UE4SS glue polls this from inside a
     // game-thread hook and stops as soon as it is false, so a session that never binds is one
     // WARN per attempt and not a silent nothing.
     bool SubmixWantsBinding() const;
-    // WHO DRIVES THE COILS. The facts are gathered here and judged by the pure CoilOwner
-    // module; every status line, warning and gate asks this verdict, never the config or the
-    // tap's counters on their own (that is how a silent submix passed for a working one).
-    CoilFacts   CoilFactsNow() const;
-    CoilVerdict Coils() const { return JudgeCoils(CoilFactsNow()); }
-    bool        SubmixOwnsCoils() const { return Coils().owner == CoilOwner::Submix; }
-    // WHO DRIVES THE SPEAKER, by the same rule (SubmixWatch.hpp, JudgeLane).
+    // WHO DRIVES EACH PAIR OF CHANNELS (SubmixWatch.hpp, JudgeLane). Every status line and
+    // warning asks these, never the taps' counters on their own — that is how a silent
+    // submix once passed for a working one.
+    LaneVerdict Coils() const;
     LaneVerdict Speaker() const;
 
     // Called ON THE GAME THREAD by the UE4SS glue, which resolves the UObjects and the
@@ -154,10 +165,9 @@ private:
     void SubmixStatus();     // the numbers proof: one log line per lane and one status file
     void LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line, std::size_t lineSize);
     void SubmixWarnIfDue(uint64_t now);
-    // Detects "bound, but a subtree has stopped rendering" and re-arms the reroute. NOT a
-    // fallback: it never gives the coils back to the asset path.
+    // Detects "bound, but a subtree has stopped rendering" and re-arms the reroute.
     void RerouteWatchdog(uint64_t now);
-    // Opens the sink and attaches the lane's ring, on that lane's first real signal.
+    // Opens the sink (once) and attaches the lane's ring, on that lane's first real signal.
     void StartLaneAtHandover(Lane& lane, float peak);
     // Config::submixLiveThreshold, clamped to something a float comparison can mean.
     float LiveThreshold() const;
@@ -165,25 +175,20 @@ private:
     void  OpenWatch(Lane& lane, const std::string& asset);
     // One line per closed watch: what the engine mixed while the game was asking for an asset.
     void  ReportWatch(const Lane& lane, const WatchVerdict& v);
-    bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
-    void LoadLoopLists();
+    LaneVerdict Judge(const Lane& lane) const;
     void ApplySinkGains();
 
-    // ---- the controller speaker's ROUTING -----------------------------------------------
-    // Selects where the pad sends the audio we stream into its endpoint. Runs on the pad
-    // thread — the only thread that owns a libScePad handle. Re-applies when the pad
-    // changes, when the settings change (hot reload), or on the optional cadence.
+    // ---- the controller speaker's ROUTING (PadAudio.hpp) ----------------------------------
+    // Sony's own call, on the pad thread — the only thread that owns a libScePad handle.
+    // Re-applied when the pad changes, when the settings change (hot reload), or on the
+    // optional cadence.
     void ApplySpeakerRoute(const char* why);
-    // Everything that decides what is written, folded into one value so "has anything
-    // changed" is a comparison rather than six.
     uint64_t SpeakerRouteSignature() const;
 
     Config        m_config;
     ScePad        m_pad;
     HidMode       m_hidMode;
     TriggerEngine m_triggers;
-    AudioPlayer   m_haptics;
-    LoopList      m_hapticLoops;
 
     // The two lanes and the one sink. `m_tapMaster` is a meter-only probe on the engine's
     // MASTER submix, never attached to a ring: it is what turns a null result into a
@@ -217,24 +222,16 @@ private:
     int32_t                    m_speakerRouteHandle  = 0;   // the handle it was written to
     uint64_t                   m_lastSpeakerRouteMs  = 0;
     std::atomic<bool>          m_speakerRouteSonyOk{false};
-    std::atomic<bool>          m_speakerRouteHidOn{false};
     std::atomic<int32_t>       m_speakerRouteLastPathResult{0};
     std::atomic<unsigned long> m_speakerRouteApplies{0};
 
     std::wstring m_gameDir;
     std::wstring m_modDir;
     std::wstring m_configPath;
-    std::wstring m_hapticDir;
 
     std::thread       m_padThread;
     std::atomic<bool> m_padThreadRunning{false};
     std::atomic<bool> m_started{false};
-
-    // Which AudioComponent owns the haptic in flight, if any. Only a stop naming THIS
-    // component may end it: StopPS5VibrationOnAudioComponent fires ~700 times a session as
-    // routine housekeeping and wiring it to a global stop killed the purr after 262 ms.
-    std::mutex  m_componentMutex;
-    std::string m_playingComponent;
 
     std::atomic<bool> m_padVibrationEnabled{true};
     std::atomic<bool> m_effectFromGame{false};
@@ -244,8 +241,8 @@ private:
 
     std::atomic<unsigned long> m_triggerEvents{0};
     std::atomic<unsigned long> m_vibrationStarts{0};
-    std::atomic<unsigned long> m_componentStopsHonoured{0};
-    std::atomic<unsigned long> m_componentStopsIgnored{0};
+    std::atomic<unsigned long> m_vibrationStops{0};
+    std::atomic<unsigned long> m_componentStops{0};
     std::atomic<unsigned long> m_speakerStarts{0};
     std::atomic<unsigned long> m_speakerStops{0};
 

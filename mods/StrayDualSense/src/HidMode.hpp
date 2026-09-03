@@ -7,33 +7,27 @@
 // attempt silently failed.
 //
 // USB output report 0x02, byte 1 is `valid_flag0`, whose bits are VALIDITY CLAIMS about the
-// rest of the report:
+// rest of the report (HARD, drivers/hid/hid-playstation.c:154-164):
 //     bit0 COMPATIBLE_VIBRATION   bit1 HAPTICS_SELECT
-//     bit2 / bit3 right / left trigger FFB data is valid
+//     bit2 / bit3 right / left trigger FFB data is valid (§12; the kernel never writes them)
 //     bit5 SPEAKER_VOLUME_ENABLE  bit6 MIC_VOLUME_ENABLE  bit7 AUDIO_CONTROL_ENABLE
-//
-// CORRECTED 2026-09-03. That list used to read "bit4/bit5 audio volume / audio path,
-// bit6/bit7 mic LED / mute", and BOTH halves were wrong — checked against the Linux kernel's
-// own DualSense driver, drivers/hid/hid-playstation.c:154-164. The second half mattered:
-// there is NO "audio path" validity bit. The path lives in the `audio_control` BYTE (offset
-// 8, bits 5:4), gated by bit7. Anyone acting on the old comment would have claimed headphone
-// and speaker volume while supplying zeros — the §12 two-writers trap — and never selected a
-// path. The full corrected layout, its citations and the routing table are in PadAudio.hpp.
 //
 // A report whose flag does NOT claim compatible-vibration stops the firmware re-asserting
 // emulation, and the coils take the waveform. We send 0x00 (claim nothing) with byte 2 = 0.
 // NOT 0xFC: that claims the trigger fields while supplying zeros, which first killed the
 // adaptive triggers and then latched them on, depending on whose write landed last.
 //
-// The optional PAD-SPEAKER CLAIM (PadAudio.hpp, `PadSpeakerRoute = hid`) is OR'd into the
-// same report rather than written by a second writer. It contributes bits 5 and 7 only —
-// disjoint from every bit above — and `ComposeValidFlag0` masks bits 0..3 out of it
-// unconditionally, so the coil behaviour measured working on 2026-09-03 is untouched by
-// construction. It is OFF unless Sony's own API has been tried and refused.
+// WHY THIS IS NOT REDUNDANT WITH scePadSetVibrationMode (docs §16). The game already calls
+// scePadSetVibrationMode itself, and the shim only forwarded it — with a debug override that
+// existed because nobody knew whether the game's chosen mode was right. The measured fact is
+// that with the game's own mode in force the coils were in emulation, so this byte is
+// COUNTERMANDING the game rather than duplicating Sony. Leave it alone without evidence.
 //
 // libScePad writes its own output reports for the triggers and they carry the same flag byte,
 // so one write at startup is undone the moment the game touches the pad. The mode is
-// RE-ASSERTED on a cadence and again immediately before each waveform starts.
+// RE-ASSERTED on a cadence and again on the coil lane's silence -> signal edge. Nothing else
+// writes this report: the speaker's routing goes through Sony's own API (PadAudio.hpp), so
+// there is exactly one writer of ours and it claims nothing.
 //
 // The device is opened directly (SetupAPI + HidD_GetAttributes, VID 054C PID 0CE6): libScePad
 // has no haptic-audio API at all. Nothing here touches UE4SS; Win32 only.
@@ -44,8 +38,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-
-#include "PadAudio.hpp"
 
 #ifndef _WINDOWS_
 using HANDLE = void*;
@@ -69,17 +61,9 @@ public:
     // the state the game expects.
     void Shutdown();
 
-    // Re-assert the configured flag NOW. Called by the haptic worker immediately before a
-    // waveform starts. Thread-safe; never blocks on anything but the HID write itself.
+    // Re-assert the configured flag NOW. Called by the sink on the coil lane's silence ->
+    // signal edge. Thread-safe; never blocks on anything but the HID write itself.
     void AssertNow(const char* why);
-
-    // The pad-audio claim to fold into every report from here on. A default-constructed
-    // claim (`claims == false`) makes the report byte-identical to what this class wrote
-    // before the claim existed — so turning the feature off is a true revert, not a
-    // different set of bytes that happens to look inert. Set by Runtime, and ONLY when
-    // Sony's own API is unavailable or has refused (PadAudio.hpp).
-    void SetAudioClaim(const PadAudioClaim& claim);
-    bool AudioClaimActive() const { return m_audioClaimActive.load(std::memory_order_relaxed); }
 
     bool          Opened() const   { return m_opened.load(std::memory_order_relaxed); }
     unsigned long Writes() const   { return m_writes.load(std::memory_order_relaxed); }
@@ -87,10 +71,8 @@ public:
 
 private:
     void WorkerMain();
-    bool EnsureOpenLocked();                          // m_mutex held
-    // `flag0` is the COIL-MODE base; the audio claim (if any) is OR'd in by
-    // ComposeValidFlag0, which masks the coil and trigger bits out of it unconditionally.
-    bool WriteLocked(uint8_t flag0, const PadAudioClaim& claim, const char* why); // m_mutex held
+    bool EnsureOpenLocked();                            // m_mutex held
+    bool WriteLocked(uint8_t flag0, const char* why);   // m_mutex held
     void CloseLocked();
 
     const Config* m_config = nullptr;
@@ -98,9 +80,7 @@ private:
     std::thread       m_worker;
     std::atomic<bool> m_running{false};
 
-    std::mutex    m_mutex;
-    PadAudioClaim m_audioClaim{};              // guarded by m_mutex
-    std::atomic<bool> m_audioClaimActive{false};
+    std::mutex   m_mutex;
     HANDLE       m_handle = nullptr;
     std::string  m_devicePath;
     uint32_t     m_reportLength = 0;      // OutputReportByteLength from the HID caps

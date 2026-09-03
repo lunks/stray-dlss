@@ -517,7 +517,8 @@ void ReadAuthoredTriggerEffectOnGameThread()
 // true, the Blueprint sets the ControllerVibration AudioComponent's sound and plays it
 // (AC.SetSound / AC.Play fired, IsPlaying()=true). It is a Blueprint variable, so it is a
 // whole-byte bool, but it is written through FBoolProperty regardless. Written from the START
-// pre-hooks, before the body evaluates its gate.
+// pre-hooks, before the body evaluates its gate - ALWAYS: there is no other way for the
+// engine to produce the streams the taps carry, so there is nothing to configure.
 //
 // THE OBJECT IS THE HOOK'S OWN CONTEXT, AND THAT IS A CORRECTION (2026-09-03).
 // It used to be `UObjectGlobals::FindFirstOf(STR("HKPlayerController"))`, which is wrong twice
@@ -542,8 +543,6 @@ int g_gateMisses = 0;
 
 void ForcePS5HapticPathOnGameThread(UObject* controller)
 {
-    if (!sds::Rt().Cfg().forcePS5HapticPath)
-        return;
     UObject* pc = controller;
     if (pc == nullptr)
     {
@@ -659,9 +658,10 @@ void CbGlyphPost(UnrealScriptFunctionCallableContext& context, void* customData)
 }
 
 // ---------------------------------------------------------------------------------------
-// The submix tap's ONE piece of UE4SS glue: resolve three objects and hand them over as raw
-// pointers. Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know
-// nothing about UE4SS and are compiled and link-tested without it.
+// The taps' ONE piece of UE4SS glue: resolve the world, the engine and the three submixes,
+// write the two UPROPERTYs the reroute needs, and hand everything over as raw pointers.
+// Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know nothing
+// about UE4SS and are compiled and link-tested without it.
 //
 // ON THE GAME THREAD, ALWAYS. This is called from the top of every UFunction hook and from
 // nowhere else, for the same reason as the two reads above: on_update runs on UE4SS's own
@@ -765,11 +765,9 @@ void MaybeBindSubmixOnGameThread()
     // All plain UPROPERTY writes through reflection; the engine only acts on them when the
     // runtime asks it to re-register the submixes (RebuildSubmixLinks reads ParentSubmix,
     // InitInternal reads OutputVolume). Idempotent, so it runs every attempt and logs once.
-    UObject* rerouteParent = nullptr;
-    if (cfg.submixReroute)
+    UObject* rerouteParent = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
+        nullptr, nullptr, Widen(cfg.submixRerouteParent));
     {
-        rerouteParent = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, Widen(cfg.submixRerouteParent));
         static bool rerouteLogged = false;
         bool ok = rerouteParent != nullptr && vibration != nullptr && speaker != nullptr;
         if (ok)

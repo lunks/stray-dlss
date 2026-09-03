@@ -58,9 +58,9 @@ void DownmixToStereo(const float* interleaved, std::size_t frames, int numChanne
 // construction: tanh'(0) == 1 and the shoulder is scaled by exactly (1 - knee), so the slope
 // is 1 on both sides. Odd-symmetric. NaN maps to 0.
 //
-// A hard clamp (what the asset path does, AudioPlayer.cpp) is fine for content authored to
-// fit; a live submix carrying several concurrent haptics has no such guarantee, and square
-// corners on a voice coil are audible as a buzz.
+// A hard clamp is fine for content authored to fit; a live submix carrying several
+// concurrent haptics has no such guarantee, and square corners on a voice coil are audible
+// as a buzz.
 // ---------------------------------------------------------------------------------------
 constexpr float kSoftClipKnee = 0.75f;
 float SoftClip(float x);

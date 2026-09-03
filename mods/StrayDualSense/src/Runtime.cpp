@@ -10,44 +10,12 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <vector>
 
 namespace sds {
 namespace {
 
-// Resolve a configured relative directory against the game's Binaries/Win64 first (where the
-// assets are generated) and the mod's own directory second. Never hardcoded; always logged,
-// because "the asset was not found" and "we looked in the wrong place" are the same symptom
-// otherwise.
-std::wstring ResolveDir(const std::string& configured, const std::wstring& gameDir,
-                        const std::wstring& modDir, const char* what)
-{
-    const std::wstring rel = Widen(configured);
-    const bool absolute = rel.size() > 1 && (rel[1] == L':' || rel[0] == L'\\' || rel[0] == L'/');
-    if (absolute)
-    {
-        std::wstring p = rel;
-        if (!p.empty() && p.back() != L'\\' && p.back() != L'/') p += L'\\';
-        SDS_LOG_INFO("assets: %s -> %ls (absolute, exists=%d)", what, p.c_str(),
-                     DirectoryExists(p) ? 1 : 0);
-        return p;
-    }
-    const std::wstring a = gameDir + rel + L"\\";
-    const std::wstring b = modDir + rel + L"\\";
-    const bool aOk = DirectoryExists(a);
-    const bool bOk = DirectoryExists(b);
-    SDS_LOG_INFO("assets: %s candidates: [game] %ls exists=%d | [mod] %ls exists=%d",
-                 what, a.c_str(), aOk ? 1 : 0, b.c_str(), bOk ? 1 : 0);
-    if (aOk) return a;
-    if (bOk) return b;
-    SDS_LOG_ERROR("assets: neither candidate for '%s' exists. Generate them with "
-                  "tools/dualsense/extract_assets.sh and wavegen.sh.", what);
-    return a;   // keep the game-dir path so the per-asset error names the expected location
-}
-
 // The DEFAULT for Config::submixLiveThreshold, kept here as the documented constant the
-// handover was originally written against. See Config.hpp for why it is low and what that
-// costs in strict mode.
+// handover was originally written against. See Config.hpp for why it is low.
 constexpr float        kSubmixLiveThreshold = 1.0e-4f;
 // While no pad has been adopted, probe this fast and for this long. 120 probes at 1 s is two
 // minutes, which comfortably covers a load into gameplay.
@@ -77,36 +45,6 @@ Runtime& Rt()
     return instance;
 }
 
-bool Runtime::LoadLoopList(LoopList& list, const std::string& fileName, const char* what)
-{
-    // Game dir first, mod dir second — the same order as the asset directories.
-    for (const std::wstring& dir : { m_gameDir, m_modDir })
-    {
-        if (dir.empty()) continue;
-        const std::wstring   path = dir + Widen(fileName);
-        std::vector<uint8_t> bytes;
-        if (!ReadWholeFile(path, bytes))
-            continue;
-        list.Parse(std::string(bytes.begin(), bytes.end()));
-        SDS_LOG_INFO("loops: %s -> %ls (%zu looping asset(s))", what, path.c_str(), list.Count());
-        return true;
-    }
-    return false;
-}
-
-void Runtime::LoadLoopLists()
-{
-    if (!LoadLoopList(m_hapticLoops, m_config.hapticLoopsFile, "haptic"))
-    {
-        // Loud: without the list every asset is a one-shot, so the purr and the rain stop after
-        // one pass. That is the safe direction (a bump cannot buzz forever) but it is wrong.
-        SDS_LOG_ERROR("loops: haptic '%s' not found in the game dir or the mod dir. EVERY haptic "
-                      "asset will play as a ONE-SHOT; loops (purr, rain, scratch) will end after "
-                      "one pass. Generate it with tools/dualsense/extract_assets.sh + wavegen.sh.",
-                      m_config.hapticLoopsFile.c_str());
-    }
-}
-
 void Runtime::Startup(const void* addressInsideThisModule)
 {
     if (m_started.load(std::memory_order_acquire))
@@ -124,12 +62,10 @@ void Runtime::Startup(const void* addressInsideThisModule)
     SDS_LOG_INFO("  game binaries dir: %ls", m_gameDir.c_str());
     SDS_LOG_INFO("  mod dir          : %ls", m_modDir.c_str());
 
-    // MEASURED 2026-09-02: the first live run of the submix spike silently used
-    // HapticSource=assets because the deploy script wrote the ini to the mod's ROOT
-    // (<Mods>/StrayDualSense/) while only the DLL's own directory (<Mods>/StrayDualSense/dlls/)
-    // and the game directory were searched. The log said which file it loaded, so it was
-    // diagnosable — but the conventional place for a UE4SS mod's config IS the mod root, so
-    // the search now includes it and EVERY candidate is logged whether it hit or missed.
+    // MEASURED 2026-09-02: a deploy once wrote the ini to the mod's ROOT while only the DLL's
+    // own directory and the game directory were searched, and the run silently used the
+    // defaults. The mod root is the conventional place for a UE4SS mod's config, so it is
+    // searched too, and EVERY candidate is logged whether it hit or missed.
     m_configPath.clear();
     for (const std::wstring& dir : { m_modDir, ParentDir(m_modDir), logDir })
     {
@@ -153,17 +89,8 @@ void Runtime::Startup(const void* addressInsideThisModule)
     if (!m_config.enabled)
         SDS_LOG_WARN("Enabled=0: hooks will still register but nothing reaches the pad.");
 
-    m_hapticDir = ResolveDir(m_config.hapticDir, m_gameDir, m_modDir, "haptic");
-    LoadLoopLists();
-
     m_hidMode.Start(m_config);
     m_triggers.Start(m_pad, m_config);
-    // The coil path re-asserts waveform mode right before every waveform: libScePad's own
-    // trigger reports carry the same flag byte and may have flipped it back since the last
-    // periodic write (§12).
-    m_haptics.Start(kCoilRoute, m_config.endpointMatch, m_hapticDir,
-                    [this] { m_hidMode.AssertNow("before waveform"); });
-
     StartSubmix();
 
     m_padThreadRunning.store(true, std::memory_order_release);
@@ -175,7 +102,7 @@ void Runtime::Startup(const void* addressInsideThisModule)
     m_started.store(true, std::memory_order_release);
 }
 
-// ---- the submix taps --------------------------------------------------------------------
+// ---- the taps ---------------------------------------------------------------------------
 //
 // Two lanes, one mechanism: the engine's own audio mixer hands us the vibration submix and
 // the controller-speaker submix already mixed, faded, looped and levelled. Everything below
@@ -187,14 +114,6 @@ void Runtime::StartSubmix()
     m_coils.owner   = "COILS";
     m_speaker.tag   = "speaker";
     m_speaker.owner = "SPEAKER";
-
-    if (!m_config.SubmixTapWanted())
-    {
-        SDS_LOG_INFO("submix: HapticSource=assets, so no submix tap is created. The shipped "
-                     "coil behaviour is unchanged, and the SPEAKER IS SILENT: the speaker only "
-                     "comes from the tap.");
-        return;
-    }
 
     const std::wstring dir = m_gameDir.empty() ? m_modDir : m_gameDir;
     m_submixStatusFile = dir + Widen(m_config.submixStatusFile);
@@ -213,7 +132,7 @@ void Runtime::StartSubmix()
     if (m_coils.tap == nullptr || m_speaker.tap == nullptr)
     {
         SDS_LOG_ERROR("submix: a listener page could not be allocated (vibration=%p speaker=%p); "
-                      "the taps are DEAD for this session.",
+                      "the taps are DEAD for this session and the pad is SILENT.",
                       static_cast<void*>(m_coils.tap), static_cast<void*>(m_speaker.tap));
         return;
     }
@@ -230,92 +149,59 @@ void Runtime::StartSubmix()
         m_tapMaster = submix::Tap::Create("master-probe");
     }
 
-    SDS_LOG_INFO("submix: HapticSource=%s, two taps ('%s' -> RL/RR, '%s' -> FL/FR), rings %zu "
-                 "frames (%d ms), probeMaster=%d, numbers every %.1fs to '%s'. The listeners "
-                 "are registered lazily from the GAME THREAD, inside the first UFunction hook "
-                 "that fires - reading a UObject from UE4SS's update thread is an "
-                 "unsynchronised cross-thread read and this project does not do it.",
-                 m_config.HapticSourceName(), m_coils.tag, m_speaker.tag,
-                 m_coils.ring.CapacityFrames(), m_config.submixRingMs,
+    SDS_LOG_INFO("submix: two taps ('%s' -> RL/RR, '%s' -> FL/FR), rings %zu frames (%d ms), "
+                 "probeMaster=%d, numbers every %.1fs to '%s'. The listeners are registered "
+                 "lazily from the GAME THREAD, inside the first UFunction hook that fires - "
+                 "reading a UObject from UE4SS's update thread is an unsynchronised "
+                 "cross-thread read and this project does not do it. Until a lane carries a "
+                 "real signal its pair is SILENT, and the log says so every %.0fs; there is "
+                 "no other source.",
+                 m_coils.tag, m_speaker.tag, m_coils.ring.CapacityFrames(), m_config.submixRingMs,
                  m_config.submixProbeMaster ? 1 : 0,
-                 static_cast<double>(m_config.submixStatusSeconds), m_submixStatusPath.c_str());
-
+                 static_cast<double>(m_config.submixStatusSeconds), m_submixStatusPath.c_str(),
+                 static_cast<double>(m_config.submixWarnSeconds));
     // The sink is NOT started here, nor at bind: it opens the pad endpoint only at the first
     // HANDOVER, when a tap has carried a real signal. The 2026-09-03 run streamed 36 million
     // frames of pure underrun to the pad from a bound tap that was never called once.
-    switch (m_config.hapticSource)
-    {
-    case HapticSource::Submix:
-        SDS_LOG_WARN("submix: HapticSource=submix is STRICT: the asset haptic path will NOT play. "
-                     "Until the tap carries a real signal the coils are SILENT, and the log says "
-                     "so every %.0fs. Anything you feel in this mode came from the submix. Use "
-                     "HapticSource=submix-fallback to keep the asset path meanwhile.",
-                     static_cast<double>(m_config.submixWarnSeconds));
-        break;
-    case HapticSource::SubmixFallback:
-        SDS_LOG_WARN("submix: HapticSource=submix-fallback: the ASSET path drives the coils until "
-                     "the tap is bound AND carrying signal. WHAT YOU FEEL BEFORE THE HANDOVER IS "
-                     "THE ASSET PATH, NOT THE SUBMIX - every COILS: line says which.");
-        break;
-    default:
-        SDS_LOG_INFO("submix: HapticSource=measure, so NOTHING from the vibration submix reaches "
-                     "the coils. The asset path still drives them; this run only answers "
-                     "whether the engine is mixing haptics for us. The SPEAKER lane still plays.");
-        break;
-    }
 }
 
-CoilFacts Runtime::CoilFactsNow() const
+LaneVerdict Runtime::Judge(const Lane& lane) const
 {
-    CoilFacts f;
-    f.mode           = m_config.hapticSource;
-    f.hapticsEnabled = m_config.enabled && m_config.haptics;
-    f.padVibration   = m_padVibrationEnabled.load(std::memory_order_relaxed);
-    f.tapCreated     = m_coils.tap != nullptr;
-    f.tapRefused     = m_submixRefused.load(std::memory_order_acquire);
-    f.tapBound       = m_submixBound.load(std::memory_order_acquire) && !f.tapRefused;
-    f.tapCallbacks   = m_coils.tap != nullptr ? m_coils.tap->Stats().callbacks : 0;
-    f.tapLive        = m_coils.live.load(std::memory_order_acquire);
-    return f;
-}
-
-LaneVerdict Runtime::Speaker() const
-{
+    const bool isCoils = &lane == &m_coils;
     LaneFacts f;
-    f.enabled      = m_config.enabled && m_config.speaker && m_config.SubmixTapWanted();
-    f.gameSwitch   = true;   // the game has no speaker switch
-    f.tapCreated   = m_speaker.tap != nullptr;
+    f.enabled      = m_config.enabled && (isCoils ? m_config.haptics : m_config.speaker);
+    f.gameSwitch   = isCoils ? m_padVibrationEnabled.load(std::memory_order_relaxed) : true;
+    f.tapCreated   = lane.tap != nullptr;
     f.tapRefused   = m_submixRefused.load(std::memory_order_acquire);
     f.tapBound     = m_submixBound.load(std::memory_order_acquire) && !f.tapRefused;
-    f.tapCallbacks = m_speaker.tap != nullptr ? m_speaker.tap->Stats().callbacks : 0;
-    f.tapLive      = m_speaker.live.load(std::memory_order_acquire);
+    f.tapCallbacks = lane.tap != nullptr ? lane.tap->Stats().callbacks : 0;
+    f.tapLive      = lane.live.load(std::memory_order_acquire);
     return JudgeLane(f);
 }
 
+LaneVerdict Runtime::Coils() const   { return Judge(m_coils); }
+LaneVerdict Runtime::Speaker() const { return Judge(m_speaker); }
+
 bool Runtime::SubmixWantsBinding() const
 {
-    if (!m_config.SubmixTapWanted() || m_coils.tap == nullptr || m_speaker.tap == nullptr)
+    if (m_coils.tap == nullptr || m_speaker.tap == nullptr)
         return false;
-    // The REROUTE re-arm is the second reason to want the glue again, and it exists because
-    // the reroute was only ever submitted ONCE. Both halves of it are gated on this function:
-    // the glue's UObject writes (ParentSubmix, OutputVolume) and our RegisterSoundSubmix call.
-    // So once bound, a submix graph rebuilt by a level load could never be repaired, which is
-    // exactly the "worked in BaseMap, silent in 03_Slums" shape.
+    // The REROUTE re-arm is the second reason to want the glue again (docs §17): both halves
+    // of the reroute — the glue's UObject writes and our RegisterSoundSubmix calls — are gated
+    // on this function, so a submix graph rebuilt by a level load is repaired by asking for
+    // the glue once more.
     return !m_submixBound.load(std::memory_order_acquire) ||
            m_rerouteRearmWanted.load(std::memory_order_acquire);
 }
 
 // Watchdog: the taps are bound and a subtree has STOPPED being rendered. Re-arm the reroute
-// so the glue re-writes the UObject links and we re-submit RegisterSoundSubmix for every
-// master. The rule itself is pure (SubmixWatch.hpp, StallWatchdog): never before a lane's
-// first callback, any lane that once rendered and then stalls, one re-arm at a time, capped.
-//
-// THIS IS NOT A FALLBACK. It does not hand the coils to the asset path or soften strict mode;
-// it repairs the one thing that makes strict mode unreliable. A silent pad stays a silent pad
-// until the submix genuinely renders again.
+// so the glue re-writes the UObject links and we re-submit RegisterSoundSubmix for the parent
+// and every master. The rule itself is pure (SubmixWatch.hpp, StallWatchdog): never before a
+// lane's first callback, any lane that once rendered and then stalls, one re-arm at a time,
+// capped. A silent pad stays a silent pad until the submix genuinely renders again.
 void Runtime::RerouteWatchdog(uint64_t now)
 {
-    if (!m_config.submixReroute || m_config.submixRerouteWatchdogSeconds <= 0.0f)
+    if (m_config.submixRerouteWatchdogSeconds <= 0.0f)
         return;
     if (m_coils.tap == nullptr || m_speaker.tap == nullptr ||
         !m_submixBound.load(std::memory_order_acquire) ||
@@ -375,9 +261,8 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     // on the voice coils. And ALL of them must be there: the reroute re-registers the parent
     // first and every master after it, so binding one lane now and the other later would
     // re-init the parent underneath the first lane's link.
-    const bool needParent = m_config.submixReroute;
     if (vibrationMasterObject == nullptr || speakerMasterObject == nullptr ||
-        (needParent && rerouteParentObject == nullptr))
+        rerouteParentObject == nullptr)
     {
         if (attempt == 1 || attempt % 20 == 0)
             SDS_LOG_WARN("submix: not every submix has loaded yet (attempt %d): '%s'=%p "
@@ -428,7 +313,6 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     // same queue, so by the time our listeners are attached the trees already render. The
     // PARENT goes first and EVERY master after it: RegisterSoundSubmix(bInit=true) re-inits
     // the parent, and it is each master's own RebuildSubmixLinks that puts it back under it.
-    if (m_config.submixReroute)
     {
         const int   slot = m_config.submixRegisterSoundSubmixSlot;
         const char* why  = nullptr;
@@ -465,6 +349,13 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
                          m_config.submixPath.c_str(), m_config.submixSpeakerPath.c_str(),
                          m_config.submixRerouteParent.c_str());
         }
+        else
+        {
+            SDS_LOG_ERROR("submix: the reroute was refused, so the subtrees stay unrendered "
+                          "and the pad stays SILENT. Not registering the listeners on dead "
+                          "subtrees; the next attempt retries the whole sequence.");
+            return false;
+        }
     }
 
     if (rearming)
@@ -496,7 +387,7 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
             vibrationMasterObject, imageBase, imageSize, &whyNot))
     {
         SDS_LOG_ERROR("submix: REFUSED to call the register slot: %s. The taps are dead for this "
-                      "session.", whyNot != nullptr ? whyNot : "no reason recorded");
+                      "session and the pad is SILENT.", whyNot != nullptr ? whyNot : "no reason recorded");
         m_submixRefused.store(true, std::memory_order_release);
         m_submixBound.store(true, std::memory_order_release);   // stop retrying; it is a refusal
         return false;
@@ -552,7 +443,6 @@ void Runtime::Shutdown()
     if (m_tapMaster   != nullptr) m_tapMaster->Detach();
     m_submixSink.Shutdown();
 
-    m_haptics.Shutdown();
     m_triggers.Shutdown();   // releases the triggers on the way out
     m_hidMode.Shutdown();    // hands the coils back to rumble emulation
 
@@ -562,19 +452,12 @@ void Runtime::Shutdown()
 
 // ---- the controller speaker's ROUTING ----------------------------------------------------
 //
-// THE REGRESSION THIS FIXES (docs §16, PadAudio.hpp). The retired libScePad shim called
-// scePadSetAudioOutPath(3 = SPEAKER) and scePadSetVolumeGain(80), and the pad speaker worked.
-// deploy-submix-spike.sh retired the shim and nothing had called them since, so the pad was
-// sitting on its default routing, where the internal speaker is muted.
-//
-// NO PROXY DLL IS NEEDED. The shim intercepted scePadOpen for its handle; we already hold the
-// same handle from scePadGetHandle (§11, "verified to return the same handles"), and the
-// plugin runs in the game's own process. So Sony's dll stays the SINGLE writer of pad output
-// reports and the §12 two-writers hazard never arises: we are asking it to change a setting,
-// not writing bytes beside it.
-//
-// The routing says where the pad sends what it receives; it is orthogonal to the samples,
-// which now come from the rerouted speaker submix through the tap.
+// Exactly what the retired libScePad shim's `audio_probe` did, in its order, with its values
+// (PadAudio.hpp): scePadSetAudioOutPath(3 = SPEAKER) then scePadSetVolumeGain({80, 80, 0, 0}),
+// on the handle scePadGetHandle already gave us. User-confirmed working on the pad (db83a32).
+// The pad's DEFAULT routing mutes the internal speaker, so without this call the samples the
+// sink writes into FL/FR reach nothing. A refusal is logged with its status code and that is
+// the end of it; there is no second writer.
 
 uint64_t Runtime::SpeakerRouteSignature() const
 {
@@ -582,95 +465,60 @@ uint64_t Runtime::SpeakerRouteSignature() const
     // enable bit, so `Speaker=0` re-applies as a change rather than being silently ignored.
     uint64_t sig = 1;   // never 0: 0 means "nothing has been applied yet"
     sig = sig * 131 + static_cast<uint64_t>(m_config.speaker ? 1 : 0);
-    sig = sig * 131 + static_cast<uint64_t>(static_cast<int>(m_config.padSpeakerRoute));
     sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerPath);
     sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerGain);
-    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidPath);
-    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidVolume);
-    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidPreamp);
     return sig;
 }
 
 void Runtime::ApplySpeakerRoute(const char* why)
 {
-    const PadSpeakerRoute route =
-        m_config.speaker ? m_config.padSpeakerRoute : PadSpeakerRoute::Off;
-
-    if (route == PadSpeakerRoute::Off)
+    if (!m_config.speaker)
     {
-        m_hidMode.SetAudioClaim(PadAudioClaim{});
         m_speakerRouteSonyOk.store(false, std::memory_order_relaxed);
-        m_speakerRouteHidOn.store(false, std::memory_order_relaxed);
-        SDS_LOG_INFO("pad audio: PadSpeakerRoute=%s (%s) - nothing is written, so the pad "
-                     "keeps whatever routing it has. Its DEFAULT routing mutes the internal "
-                     "speaker, so this is the configuration in which the speaker is silent.",
-                     PadSpeakerRouteName(route), why);
+        SDS_LOG_INFO("pad audio: Speaker=0 (%s) - the route is not selected, so the pad keeps "
+                     "whatever routing it has. Its DEFAULT routing mutes the internal speaker.",
+                     why);
         return;
     }
 
-    bool sonyAttempted = false;
-    bool sonyOk        = false;
-    if (RouteUsesSony(route))
-    {
-        const SceVolumeGain gain =
-            BuildSceVolumeGain(m_config.padSpeakerGain, m_config.padSpeakerGain, 0);
-        ScePad::AudioRouteResult r;
-        sonyAttempted = true;
-        sonyOk        = m_pad.ApplyAudioRoute(m_config.padSpeakerPath, gain.bytes, r);
-        m_speakerRouteLastPathResult.store(r.path, std::memory_order_relaxed);
-
-        // Every result code in hex, in one line, exactly as the shim logged them. A Sony
-        // status is not a bitmask to be read leniently: 0 is success and 0x809200xx is not,
-        // and 0x80920007 in particular means "this pad has no audio" (§7) — the device-tree
-        // refusal that the GE-Proton ds5 patches exist to fix.
-        SDS_LOG_INFO("pad audio: scePadIsSupportedAudioFunction=%s0x%08X "
-                     "scePadSetAudioOutPath(%d=%s)=%s0x%08X scePadSetVolumeGain(spk=%d)=%s0x%08X "
-                     "[handle=0x%X, %s]",
-                     r.supportedRan ? "" : "(absent) ", static_cast<unsigned>(r.supported),
-                     m_config.padSpeakerPath, SceAudioOutPathName(m_config.padSpeakerPath),
-                     r.pathRan ? "" : "(absent) ", static_cast<unsigned>(r.path),
-                     m_config.padSpeakerGain,
-                     r.gainRan ? "" : "(absent) ", static_cast<unsigned>(r.gain),
-                     static_cast<unsigned>(m_pad.Handle()), why);
-
-        if (sonyOk)
-            SDS_LOG_INFO("pad audio: SONY ACCEPTED the route. The pad's internal speaker is "
-                         "selected; anything written into FL/FR of its endpoint should now be "
-                         "audible.");
-        else if (!r.pathRan)
-            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath is not exported by this "
-                          "libScePad.dll, so Sony's API cannot select the speaker.");
-        else if (static_cast<uint32_t>(r.path) == 0x80920007u)
-            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x80920007 - libScePad "
-                          "believes this pad HAS NO AUDIO. That is the device-tree refusal "
-                          "docs §7 measured: it walks for USB audio sibling interfaces with "
-                          "SetupDiGetDeviceRegistryPropertyW and finds none. It is a Proton "
-                          "problem, not ours; GE-Proton's proton-ds5-haptic series is the fix.");
-        else
-            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x%08X (not success). "
-                          "The pad speaker will stay silent on this route.",
-                          static_cast<unsigned>(r.path));
-    }
-
-    const bool wantHid = RouteShouldWriteHid(route, sonyAttempted, sonyOk);
-    if (wantHid && route == PadSpeakerRoute::Auto)
-        SDS_LOG_WARN("pad audio: PadSpeakerRoute=auto and Sony's API did not accept the "
-                     "route, so ESCALATING to the raw HID output-report claim. It selects the "
-                     "path in valid_flag0/audio_control directly. Its coil safety is argued "
-                     "(a disjoint bit set, masked in ComposeValidFlag0) rather than measured - "
-                     "if the coils stop working, set PadSpeakerRoute=sony or off.");
-
-    m_hidMode.SetAudioClaim(BuildPadAudioClaim(wantHid, m_config.padSpeakerHidPath,
-                                               m_config.padSpeakerHidVolume,
-                                               m_config.padSpeakerHidPreamp));
-    m_speakerRouteSonyOk.store(sonyOk, std::memory_order_relaxed);
-    m_speakerRouteHidOn.store(wantHid, std::memory_order_relaxed);
+    const SceVolumeGain gain =
+        BuildSceVolumeGain(m_config.padSpeakerGain, m_config.padSpeakerGain, 0);
+    ScePad::AudioRouteResult r;
+    const bool ok = m_pad.ApplyAudioRoute(m_config.padSpeakerPath, gain.bytes, r);
+    m_speakerRouteLastPathResult.store(r.path, std::memory_order_relaxed);
+    m_speakerRouteSonyOk.store(ok, std::memory_order_relaxed);
     m_speakerRouteApplies.fetch_add(1, std::memory_order_relaxed);
 
-    if (!sonyOk && !wantHid)
-        SDS_LOG_ERROR("pad audio: NOTHING selected the pad's audio route (PadSpeakerRoute=%s). "
-                      "The speaker will be silent however good the samples are. Try "
-                      "PadSpeakerRoute=hid.", PadSpeakerRouteName(route));
+    // Every result code in hex, in one line, exactly as the shim logged them. A Sony status
+    // is not a bitmask to be read leniently: 0 is success and 0x809200xx is not, and
+    // 0x80920007 in particular means "this pad has no audio" (§7) — the device-tree refusal
+    // that the GE-Proton ds5 patches exist to fix.
+    SDS_LOG_INFO("pad audio: scePadIsSupportedAudioFunction=%s0x%08X "
+                 "scePadSetAudioOutPath(%d=%s)=%s0x%08X scePadSetVolumeGain(spk=%d)=%s0x%08X "
+                 "[handle=0x%X, %s]",
+                 r.supportedRan ? "" : "(absent) ", static_cast<unsigned>(r.supported),
+                 m_config.padSpeakerPath, SceAudioOutPathName(m_config.padSpeakerPath),
+                 r.pathRan ? "" : "(absent) ", static_cast<unsigned>(r.path),
+                 m_config.padSpeakerGain,
+                 r.gainRan ? "" : "(absent) ", static_cast<unsigned>(r.gain),
+                 static_cast<unsigned>(m_pad.Handle()), why);
+
+    if (ok)
+        SDS_LOG_INFO("pad audio: SONY ACCEPTED the route. The pad's internal speaker is "
+                     "selected; what the sink writes into FL/FR of its endpoint is audible.");
+    else if (!r.pathRan)
+        SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath is not exported by this libScePad.dll, "
+                      "so Sony's API cannot select the speaker. The speaker stays SILENT.");
+    else if (static_cast<uint32_t>(r.path) == 0x80920007u)
+        SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x80920007 - libScePad "
+                      "believes this pad HAS NO AUDIO. That is the device-tree refusal docs §7 "
+                      "measured: it walks for USB audio sibling interfaces with "
+                      "SetupDiGetDeviceRegistryPropertyW and finds none. It is a Proton "
+                      "problem, not ours; GE-Proton's proton-ds5-haptic series is the fix. The "
+                      "speaker stays SILENT.");
+    else
+        SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x%08X (not success). The "
+                      "speaker stays SILENT.", static_cast<unsigned>(r.path));
 }
 
 void Runtime::PadThreadMain()
@@ -710,23 +558,14 @@ void Runtime::PadThreadMain()
 
         // The routing is applied HERE, on the only thread that owns a libScePad handle, and
         // re-applied whenever the handle changes (a pad re-adopted after a disconnect loses
-        // its routing) or the settings change (hot reload, so the sony-versus-hid question
-        // is one ini edit and one keypress rather than one relaunch per arm).
-        //
-        // The HID routes need NO libScePad handle — they go through HidMode's own HID device —
-        // so gating the whole thing on HasPad() would make `PadSpeakerRoute=hid` silently do
-        // nothing on a session where libScePad never binds, which is precisely the "silent
-        // refusal" this project refuses to ship. Only the Sony routes wait for a pad.
-        const PadSpeakerRoute wanted =
-            m_config.speaker ? m_config.padSpeakerRoute : PadSpeakerRoute::Off;
-        if (m_pad.HasPad() || !RouteUsesSony(wanted))
+        // its routing) or the settings change (hot reload).
+        if (m_pad.HasPad())
         {
             const uint64_t sig = SpeakerRouteSignature();
             const char*    why = nullptr;
-            if (m_speakerRouteApplied == 0)              why = m_pad.HasPad() ? "pad adopted"
-                                                                             : "no pad needed";
+            if (m_speakerRouteApplied == 0)                  why = "pad adopted";
             else if (m_pad.Handle() != m_speakerRouteHandle) why = "pad handle changed";
-            else if (sig != m_speakerRouteApplied)       why = "settings changed";
+            else if (sig != m_speakerRouteApplied)           why = "settings changed";
             if (why != nullptr)
             {
                 m_speakerRouteApplied = sig;
@@ -770,7 +609,7 @@ void Runtime::ApplySinkGains()
     // The game's own switch gates the coils and only the coils (§9); Speaker=0 gates the
     // speaker. Both are gains rather than teardowns, so the taps keep reporting numbers -
     // which is what makes "the user turned it off" distinguishable from "the tap died".
-    const bool coilsOn = m_config.SubmixDrivesCoils() && m_padVibrationEnabled.load();
+    const bool coilsOn = m_config.haptics && m_padVibrationEnabled.load();
     m_submixSink.SetCoilGain(coilsOn ? m_config.submixGain : 0.0f);
     m_submixSink.SetSpeakerGain(m_config.speaker ? m_config.speakerGain : 0.0f);
 }
@@ -810,21 +649,21 @@ void Runtime::Tick()
     SubmixWarnIfDue(now);
 }
 
-// The LOUD, PERIODIC half of the owner verdicts. A configuration that asked for the submix
-// and is not getting it is a problem every N seconds, not an INFO line once a second.
+// The LOUD, PERIODIC half of the owner verdicts. A lane that is enabled and is not getting
+// its submix is a problem every N seconds, not an INFO line once a second.
 void Runtime::SubmixWarnIfDue(uint64_t now)
 {
     if (m_config.submixWarnSeconds <= 0.0f)
         return;
     if (now - m_lastSubmixWarnMs < static_cast<uint64_t>(m_config.submixWarnSeconds * 1000.0f))
         return;
-    const CoilVerdict c = Coils();
+    const LaneVerdict c = Coils();
     const LaneVerdict s = Speaker();
     if (!c.warn && !s.warn)
         return;
     m_lastSubmixWarnMs = now;
     if (c.warn)
-        SDS_LOG_WARN("%s | %s | HapticSource=%s", c.headline, c.detail, m_config.HapticSourceName());
+        SDS_LOG_WARN("%s: %s | %s", m_coils.owner, c.headline, c.detail);
     if (s.warn)
         SDS_LOG_WARN("%s: %s | %s", m_speaker.owner, s.headline, s.detail);
 }
@@ -861,15 +700,14 @@ void Runtime::OpenWatch(Lane& lane, const std::string& asset)
 void Runtime::ReportWatch(const Lane& lane, const WatchVerdict& v)
 {
     const double secs = static_cast<double>(v.ms) / 1000.0;
-    const char*  path = &lane == &m_coils ? m_config.submixPath.c_str()
-                                          : m_config.submixSpeakerPath.c_str();
+    const bool   isCoils = &lane == &m_coils;
+    const char*  path = isCoils ? m_config.submixPath.c_str() : m_config.submixSpeakerPath.c_str();
     if (v.result == WatchResult::Mixed)
     {
         SDS_LOG_INFO("submix watch [%s] '%s': the engine MIXED it - peak %.5f over %.1fs "
                      "(%d window(s), %llu frames). This asset reaches the %s.",
                      lane.tag, v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
-                     static_cast<unsigned long long>(v.frames),
-                     &lane == &m_coils ? "coils" : "speaker");
+                     static_cast<unsigned long long>(v.frames), isCoils ? "coils" : "speaker");
         return;
     }
     // THE THIRD STATE, and it is not a statement about the mixer at all. Distinguished
@@ -890,30 +728,23 @@ void Runtime::ReportWatch(const Lane& lane, const WatchVerdict& v)
     SDS_LOG_WARN("submix watch [%s] '%s': the engine mixed NOTHING - peak %.5f over %.1fs "
                  "(%d window(s), %llu frames). The tap WAS delivering audio, so this is a real "
                  "negative: the game ASKED for this asset and '%s' carried silence. The fault "
-                 "is upstream of the tap - the Blueprint gate (ForcePS5HapticPath / "
-                 "DebugPS5Haptic), the level the game passed, or the routing.",
+                 "is upstream of the tap - the Blueprint gate (DebugPS5Haptic, see gate[] in "
+                 "STATUS), the level the game passed, or the routing.",
                  lane.tag, v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
                  static_cast<unsigned long long>(v.frames), path);
 }
 
-// The handover. Callbacks alone are not enough: a submix that renders pure silence would
-// take the coils away from the asset path and give nothing back. Only a real signal proves
-// the engine is putting audio in there, so that is the trigger for each lane - and the first
-// lane to reach it is when the sink opens the pad endpoint, not a moment earlier.
+// The handover. Callbacks alone are not enough: a submix that renders pure silence proves
+// only that the subtree is rendered. A real signal proves the engine is putting audio in it,
+// so that is the trigger for each lane - and the first lane to reach it is when the sink
+// opens the pad endpoint, not a moment earlier.
 void Runtime::StartLaneAtHandover(Lane& lane, float peak)
 {
-    const bool isCoils = &lane == &m_coils;
-    if (isCoils && !m_config.SubmixDrivesCoils())
-        return;   // measure mode: the coils stay on the asset path; the speaker still hands over
     if (lane.live.exchange(true, std::memory_order_acq_rel))
         return;
     SDS_LOG_WARN("submix: FIRST REAL SIGNAL on '%s' (peak %.5f) - HANDOVER: the SUBMIX now "
-                 "drives the %s%s.", lane.tag, static_cast<double>(peak),
-                 isCoils ? "coils" : "speaker",
-                 isCoils && m_config.hapticSource == HapticSource::SubmixFallback
-                     ? " and the asset path stands down" : "");
-    if (isCoils)
-        m_haptics.Stop(0.0f);
+                 "drives the %s.", lane.tag, static_cast<double>(peak),
+                 &lane == &m_coils ? "coils" : "speaker");
     // Attach the ring EMPTY, then make sure the sink is draining it: the sink's queue-ahead
     // (40 ms) is the whole latency budget, not the ring's capacity (see StartSubmix).
     lane.ring.ResetCounters();
@@ -958,17 +789,7 @@ void Runtime::LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line,
             ReportWatch(lane, closed);
     }
 
-    char headline[400];
-    if (&lane == &m_coils)
-    {
-        const CoilVerdict v = Coils();
-        std::snprintf(headline, sizeof(headline), "%s", v.headline);
-    }
-    else
-    {
-        const LaneVerdict v = Speaker();
-        std::snprintf(headline, sizeof(headline), "%s: %s", lane.owner, v.headline);
-    }
+    const LaneVerdict verdict = Judge(lane);
 
     if (level.frames == 0)
     {
@@ -979,10 +800,10 @@ void Runtime::LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line,
             std::snprintf(since, sizeof(since), "%.1fs ago",
                           static_cast<double>(nowMs - stats.lastCallbackMs) / 1000.0);
         std::snprintf(line, lineSize,
-                      "%s | SUBMIX %s bound=%d NO CALLBACKS in the last %.1fs (total=%llu, last %s) "
-                      "| %s",
-                      headline, lane.tag, m_submixBound.load() ? 1 : 0, seconds,
-                      static_cast<unsigned long long>(stats.callbacks), since,
+                      "%s: %s | SUBMIX %s bound=%d NO CALLBACKS in the last %.1fs (total=%llu, "
+                      "last %s) | %s",
+                      lane.owner, verdict.headline, lane.tag, m_submixBound.load() ? 1 : 0,
+                      seconds, static_cast<unsigned long long>(stats.callbacks), since,
                       m_submixBound.load()
                           ? "the tap IS registered, so the engine is rendering nothing into "
                             "this submix"
@@ -1009,10 +830,10 @@ void Runtime::LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line,
                       static_cast<double>(nowMs - lane.lastSignalMs) / 1000.0);
 
     std::snprintf(line, lineSize,
-                  "%s | SUBMIX %s bound=%d live=%d cb=%llu (%.1f/s) ch=%d rate=%d "
+                  "%s: %s | SUBMIX %s bound=%d live=%d cb=%llu (%.1f/s) ch=%d rate=%d "
                   "frames/cb=%d peak=%.5f rms=%.5f bad=%llu%s | ring fill=%zu/%zu drop=%llu "
                   "under=%llu",
-                  headline, lane.tag, m_submixBound.load() ? 1 : 0,
+                  lane.owner, verdict.headline, lane.tag, m_submixBound.load() ? 1 : 0,
                   lane.live.load() ? 1 : 0,
                   static_cast<unsigned long long>(stats.callbacks), cbPerSec,
                   stats.lastNumChannels, stats.lastSampleRate,
@@ -1086,19 +907,20 @@ void Runtime::SubmixStatus()
 void Runtime::LogStatus()
 {
     const TriggerEffect fx      = m_triggers.Effect();
-    const CoilVerdict   coils   = Coils();
+    const LaneVerdict   coils   = Coils();
     const LaneVerdict   speaker = Speaker();
     SDS_LOG_INFO("STATUS coils=%s (%s) speaker=%s (%s) "
                  "pad=%s(user=%d handle=0x%X probes=%lu misses=%lu) "
                  "hid[open=%d writes=%lu fail=%lu] "
                  "trig[events=%lu tx=%lu ok=%lu fail=%lu L=%d R=%d effect=%d/%u/%u/%u %s] "
-                 "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
-                 "compStops ok=%lu ignored=%lu padVibe=%d] "
+                 "vib[starts=%lu stops=%lu compStops=%lu live=%d padVibe=%d] "
                  "gate[open=%d writes=%lu misses=%lu] "
                  "spk[starts=%lu stops=%lu live=%d] "
-                 "padaudio[route=%s api=%d sonyOk=%d pathResult=0x%08X hidClaim=%d applies=%lu "
-                 "fail=%lu]",
-                 CoilOwnerName(coils.owner), coils.detail,
+                 // ONE pasted STATUS line must answer "why is the pad speaker silent". The
+                 // three fields that do it: `api` says libScePad exports the routing call at
+                 // all, `sonyOk` says it accepted, and `pathResult` is its verbatim status.
+                 "padaudio[api=%d sonyOk=%d pathResult=0x%08X applies=%lu fail=%lu]",
+                 LaneOwnerName(coils.owner), coils.detail,
                  LaneOwnerName(speaker.owner), speaker.detail,
                  m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
                  m_pad.Probes(), m_pad.ProbeMisses(),
@@ -1107,23 +929,15 @@ void Runtime::LogStatus()
                  m_pad.TriggerFail(), m_triggers.Left() ? 1 : 0, m_triggers.Right() ? 1 : 0,
                  fx.mode, fx.value1, fx.value2, fx.value3,
                  m_effectFromGame.load() ? "(game)" : "(FALLBACK)",
-                 m_vibrationStarts.load(), m_haptics.Started(), m_haptics.Finished(),
-                 m_haptics.Missing(), m_haptics.Failures(), m_haptics.EndpointFound() ? 1 : 0,
-                 m_haptics.CurrentName().c_str(), m_componentStopsHonoured.load(),
-                 m_componentStopsIgnored.load(), m_padVibrationEnabled.load() ? 1 : 0,
+                 m_vibrationStarts.load(), m_vibrationStops.load(), m_componentStops.load(),
+                 m_coils.live.load() ? 1 : 0, m_padVibrationEnabled.load() ? 1 : 0,
                  m_hapticGateOpen.load() ? 1 : 0, m_hapticGateWrites.load(),
                  m_hapticGateMisses.load(),
                  m_speakerStarts.load(), m_speakerStops.load(),
                  m_speaker.live.load() ? 1 : 0,
-                 // ONE pasted STATUS line must answer "why is the pad speaker silent". The
-                 // three fields that do it: `api` says libScePad exports the routing call at
-                 // all, `sonyOk` says it accepted, and `pathResult` is its verbatim status.
-                 PadSpeakerRouteName(m_config.speaker ? m_config.padSpeakerRoute
-                                                      : PadSpeakerRoute::Off),
                  m_pad.HasAudioApi() ? 1 : 0,
                  m_speakerRouteSonyOk.load(std::memory_order_relaxed) ? 1 : 0,
                  static_cast<unsigned>(m_speakerRouteLastPathResult.load(std::memory_order_relaxed)),
-                 m_speakerRouteHidOn.load(std::memory_order_relaxed) ? 1 : 0,
                  m_pad.AudioApplies(), m_pad.AudioFailures());
 }
 
@@ -1181,106 +995,53 @@ void Runtime::OnAfterUseDone()
     m_triggers.ReleaseAll();
 }
 
+// The vibration hooks play nothing: the engine plays the _VIBE asset itself, into
+// Submix_vibrationMaster, once the DebugPS5Haptic gate is open, and the tap carries it to
+// RL/RR. Each Start LOGS the intent — "the game asked for CatPurr2_VIBE" is a different
+// finding from "the game never asked" — and opens the coil lane's watch, so one line per
+// start says what the engine put in that submix for the asset.
 void Runtime::OnStartVibration(const VibrationStart& s)
 {
     m_vibrationStarts.fetch_add(1, std::memory_order_relaxed);
     const std::string name         = ShortAssetName(s.soundFullName);
     const bool        viaComponent = !s.componentFullName.empty();
-
-    // An absent Level and a Level of 0 need different fixes, so they are distinguished. And
-    // component-attached vibrations arrive with Level=0.0: their level lives in the submix
-    // send (PS5VibrationAttenuation: bAttenuate=False, send constant 1.0), so 0 on that path
-    // means 1.0.
-    float level = s.levelSeen ? s.level : 1.0f;
-    if (viaComponent && level <= 0.0f)
-        level = 1.0f;
-
-    const bool loop = m_hapticLoops.Contains(name);   // the ASSET decides, never the caller
-    SDS_LOG_INFO("StartPS5Vibration%s '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f loop=%d(asset)%s%s",
+    SDS_LOG_INFO("StartPS5Vibration%s '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f%s%s (the "
+                 "engine plays it; the tap carries it)",
                  viaComponent ? "OnAudioComponent" : "", s.soundFullName.c_str(), name.c_str(),
-                 static_cast<double>(level), s.levelSeen ? 1 : 0, static_cast<double>(s.fadeIn),
-                 loop ? 1 : 0, viaComponent ? " component=" : "",
+                 static_cast<double>(s.levelSeen ? s.level : 1.0f), s.levelSeen ? 1 : 0,
+                 static_cast<double>(s.fadeIn), viaComponent ? " component=" : "",
                  viaComponent ? s.componentFullName.c_str() : "");
-
-    {
-        std::lock_guard<std::mutex> lock(m_componentMutex);
-        m_playingComponent = s.componentFullName;   // empty on the plain path
-    }
-
-    // Open the correlation window BEFORE the verdict, and in every mode: "the game asked and
-    // the submix stayed silent" is the measurement that matters whether or not the submix is
-    // what currently drives the coils.
-    OpenWatch(m_coils, name);
-
-    // The verdict decides. The call is still LOGGED above, because the log is how a null
-    // submix result gets diagnosed — "the game asked for CatPurr2_VIBE and the submix stayed
-    // silent" is a completely different finding from "the game never asked".
-    const CoilVerdict verdict = Coils();
-    if (!verdict.assetPathActive)
-    {
-        SDS_LOG_INFO("haptics: '%s' NOT played on the asset path: %s (%s)", name.c_str(),
-                     verdict.headline, verdict.detail);
-        return;
-    }
     if (name.empty())
     {
         SDS_LOG_ERROR("StartPS5Vibration: could not derive an asset name from '%s'",
                       s.soundFullName.c_str());
         return;
     }
-    m_haptics.Play(name, level, s.fadeIn, loop);
+    OpenWatch(m_coils, name);
 }
 
 void Runtime::OnStopVibration(float fadeOut)
 {
-    SDS_LOG_INFO("StopPS5Vibration fadeOut=%.2f (global)", static_cast<double>(fadeOut));
-    {
-        std::lock_guard<std::mutex> lock(m_componentMutex);
-        m_playingComponent.clear();
-    }
-    if (SubmixOwnsCoils())
-        return;      // the engine's own fade-out is already in the submix we are listening to
-    m_haptics.Stop(fadeOut);
+    m_vibrationStops.fetch_add(1, std::memory_order_relaxed);
+    SDS_LOG_INFO("StopPS5Vibration fadeOut=%.2f (global; the engine fades it out)",
+                 static_cast<double>(fadeOut));
 }
 
 void Runtime::OnStopVibrationOnComponent(const std::string& componentFullName, float fadeOut)
 {
     // ~700 calls a session, most of them housekeeping for components that are not playing.
-    // Only the owner of the haptic in flight may stop it.
-    bool owner = false;
-    {
-        std::lock_guard<std::mutex> lock(m_componentMutex);
-        owner = !m_playingComponent.empty() && m_playingComponent == componentFullName;
-        if (owner)
-            m_playingComponent.clear();
-    }
-    if (!owner)
-    {
-        m_componentStopsIgnored.fetch_add(1, std::memory_order_relaxed);
-        SDS_LOG_DEBUG("StopPS5VibrationOnAudioComponent ignored: '%s' is not the playing "
-                      "component", componentFullName.c_str());
-        return;
-    }
-    m_componentStopsHonoured.fetch_add(1, std::memory_order_relaxed);
-    SDS_LOG_INFO("StopPS5VibrationOnAudioComponent fadeOut=%.2f (owner) %s",
-                 static_cast<double>(fadeOut), componentFullName.c_str());
-    if (SubmixOwnsCoils())
-        return;
-    m_haptics.Stop(fadeOut);
+    // The engine sorts out which one is; we only count them.
+    m_componentStops.fetch_add(1, std::memory_order_relaxed);
+    SDS_LOG_DEBUG("StopPS5VibrationOnAudioComponent fadeOut=%.2f %s",
+                  static_cast<double>(fadeOut), componentFullName.c_str());
 }
 
 void Runtime::OnSetVibrationLevel(float level)
 {
-    // ~60 Hz. Never log it per call.
-    if (SubmixOwnsCoils())
-        return;   // the level is already applied by the engine, upstream of the submix
-    m_haptics.SetLevel(level);
+    // ~60 Hz, applied by the engine upstream of the tap. Never log it per call.
+    (void)level;
 }
 
-// The speaker has no player of ours: the engine plays the _CONTROL asset itself once the
-// Blueprint gate is open, into Submix_controllerMaster, which the tap carries to FL/FR. These
-// hooks LOG the intent and open the lane's watch, so one line per start says what the engine
-// put in that submix for the asset the game asked for.
 void Runtime::OnStartControllerSound(const std::string& soundFullName, float level,
                                      bool levelSeen, float fadeIn)
 {
@@ -1309,7 +1070,7 @@ void Runtime::OnStopControllerSound(float fadeOut)
 
 void Runtime::OnSetControllerSoundLevel(float level)
 {
-    // The engine applies it upstream of the tap. Never log it per call.
+    // Applied by the engine upstream of the tap. Never log it per call.
     (void)level;
 }
 
@@ -1319,13 +1080,12 @@ void Runtime::OnPadVibrationEnabled(bool enabled)
     if (was == enabled)
         return;
     SDS_LOG_INFO("haptics: PadVibrationEnabled -> %d", enabled ? 1 : 0);
-    if (!enabled)
-        m_haptics.Stop(0.0f);
-    // The game's only vibration control (§9) must gate the submix path too, and it is a gain
-    // rather than a teardown: the tap keeps reporting numbers, which is what makes "the user
-    // turned it off in the menu" distinguishable from "the tap died".
+    // The game's only vibration control (§9) gates the coil lane as a GAIN rather than a
+    // teardown: the tap keeps reporting numbers, which is what makes "the user turned it off
+    // in the menu" distinguishable from "the tap died".
     ApplySinkGains();
-    SDS_LOG_INFO("%s", Coils().headline);
+    const LaneVerdict v = Coils();
+    SDS_LOG_INFO("%s: %s", m_coils.owner, v.headline);
 }
 
 void Runtime::OnHapticGate(bool open, bool wrote)
