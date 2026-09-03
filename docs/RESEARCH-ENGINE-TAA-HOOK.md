@@ -361,10 +361,14 @@ are what the current matcher's `kGateDeadInputs` and render-extent logic hang of
 input is already resolved by register (§2.3). If more is needed, the honest answer is not to guess
 harder: it is to record our own RDG pass and read the pointers inside its lambda, which is L2 work.
 
-**Cost estimate:** ~150 lines plus tests for the offset decode and a slot-7 self-check (call
-`GetSizeXYZ` at slot 6 and compare against the texture's own `Desc.Extent`, which is the same
-self-validating shape as L0's fractions). **Risk:** moderate — three derived offsets, all
-dereferencing engine memory, where L0 dereferences only its own parameters.
+**Cost estimate:** ~150 lines plus tests for the offset decode. **Validate the ANSWER, not the
+slot index** — slot 7 is a derivation, and §9's rule against calling a discovered address applies
+to checking it by calling slot 6 as much as to anything else. The cheap, safe check is that the
+`ID3D12Resource*` slot 7 returns is one our own resource registry already knows is live
+(`is_resource_live`), and that it is the same pointer the descriptor walk resolves for that
+register on the same frame. A wrong slot index returns something the registry has never seen, and
+that is a refusal, not a fault. **Risk:** moderate — three derived offsets, all dereferencing
+engine memory, where L0 dereferences only its own parameters.
 
 ### 4.3 L2 — OWN IT. Registration is easy; `AddPasses` is not; and L0 already ate the useful half
 
