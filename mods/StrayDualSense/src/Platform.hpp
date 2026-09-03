@@ -27,6 +27,14 @@ std::wstring GameBinariesDir();
 // The directory this mod's DLL lives in. Trailing separator included.
 std::wstring ModuleDir(const void* addressInsideThisModule);
 
+// The module an address belongs to: its load address (an HMODULE IS the base address) and its
+// full path. Both plugins in this repository are loaded by UE4SS, which hardcodes
+// `Mods/<Name>/dlls/main.dll`, so a UE4 crash dump names every one of them `main` and cannot
+// say which. The dump line carries the base (`main 0x00006ffff4720000 + 771f6`), so logging
+// the base once makes the module identifiable by matching it. False (and both outputs left
+// empty) if the address belongs to no loaded module.
+bool ModuleIdentity(const void* addressInsideThisModule, const void*& base, std::wstring& path);
+
 // The game executable's loaded image: base address and SizeOfImage, read from its own PE
 // headers. Used to decide whether a pointer is a function in the game (a vtable entry) or a
 // heap object, which is what makes the FAudioDevice search safe (SubmixDiscovery.hpp).

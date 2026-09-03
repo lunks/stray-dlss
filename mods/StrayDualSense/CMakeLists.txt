@@ -165,5 +165,24 @@ if(MSVC)
     # shared between objects, and CMake+Ninja gives every object of this target the same /Fd.
     # /DEBUG below still emits the full PDB from the embedded per-object records.
     target_compile_options(StrayDualSense PRIVATE /Z7)
-    target_link_options(StrayDualSense PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    #
+    # /PDBALTPATH IS THE HALF THAT MAKES A CRASH DUMP READABLE, and it is not the same lever as
+    # the PDB's filename. The linker writes the file wherever /PDB says (here: StrayDualSense.pdb, next
+    # to the DLL) and stamps a SEPARATE string into the PE's debug directory - by default the
+    # absolute build-machine path, e.g.
+    # `D:\a\stray-dlss\stray-dlss\build\StrayDualSense\StrayDualSense.pdb`. That string is what a symbolizer
+    # looks for, so it has to be a name the shipped tree actually has.
+    #
+    # It matters here because UE4SS hardcodes <Mods>/<Name>/dlls/main.dll (UE4SSProgram.cpp
+    # skips non-directories in both discovery loops; CppMod then opens dlls/main.dll), so BOTH
+    # C++ plugins in this repository load as a module named `main` and a UE4 dump can only say
+    # `main 0x... + 771f6`. The recorded PDB name is then the one thing left in the file that
+    # says which mod it is - and on 2026-09-03 symbolizing only worked after the shipped
+    # main.pdb was renamed by hand to the basename recorded here.
+    #
+    # So: record a BARE basename (resolved next to the DLL, on any machine) and have CI ship the
+    # PDB under exactly that name rather than as main.pdb. `tools/pe_debug_dir.py --expect
+    # StrayDualSense.pdb` asserts the record in the BUILT artifact, because a rename that left the debug
+    # directory saying something else would look fixed and not be.
+    target_link_options(StrayDualSense PRIVATE /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:StrayDualSense.pdb)
 endif()

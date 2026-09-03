@@ -209,8 +209,23 @@ else
   cp -f "$DLL" "$MODS/StrayDualSense/dlls/main.dll" || fail "could not install main.dll"
   note "installed $MODS/StrayDualSense/dlls/main.dll"
 fi
-PDB="${DLL%.dll}.pdb"
-[ -f "$PDB" ] && cp -f "$PDB" "$MODS/StrayDualSense/dlls/main.pdb"
+# The PDB keeps its own name — the artifact ships StrayDualSense.pdb, which is exactly the
+# basename the DLL's debug directory records (/PDBALTPATH), and a symbolizer looks for that name
+# next to main.dll. Installing it as main.pdb is what made the 2026-09-03 crash unsymbolizable
+# until it was renamed by hand. `${DLL%.dll}.pdb` is still tried for a hand-built DLL that has
+# not been renamed to main.dll yet.
+PDB=""
+for c in "$(dirname "$DLL")/StrayDualSense.pdb" "${DLL%.dll}.pdb"; do
+  [ -f "$c" ] && { PDB="$c"; break; }
+done
+if [ -n "$PDB" ]; then
+  cp -f "$PDB" "$MODS/StrayDualSense/dlls/StrayDualSense.pdb"
+  note "installed $MODS/StrayDualSense/dlls/StrayDualSense.pdb (the name the DLL records)"
+  # A main.pdb left by an older deploy is stale and misleading: nothing looks for it.
+  rm -f "$MODS/StrayDualSense/dlls/main.pdb"
+else
+  say "  no PDB beside the DLL; a crash dump will give RVAs but no symbols"
+fi
 
 # ---------------------------------------------------------------------------------------
 # 4. The ini, NEXT TO THE DLL.

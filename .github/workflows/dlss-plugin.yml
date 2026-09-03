@@ -481,6 +481,16 @@ jobs:
           "dll=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         id: verify
 
+      # UE4SS hardcodes <Mods>/<Name>/dlls/main.dll, so a UE4 crash dump can only say
+      # `main 0x... + 771f6` and both C++ plugins in this repository answer to that name. The PDB
+      # path stamped into the PE's debug directory is what a symbolizer resolves against, so it
+      # must be a bare `StrayDLSS.pdb` (the name the artifact ships) rather than the linker's
+      # default absolute build path. Assert it on the BUILT DLL: a change that renamed only the
+      # file on disk would look fixed and would still symbolize to nothing.
+      - name: Verify the module identity the DLL records
+        shell: pwsh
+        run: python repo/tools/pe_debug_dir.py "${{ steps.verify.outputs.dll }}" --expect StrayDLSS.pdb
+
       - name: Stage artifact
         shell: pwsh
         run: |
@@ -492,7 +502,13 @@ jobs:
           # so a build that silently lost its symbols cannot ship.
           $pdb = [IO.Path]::ChangeExtension("${{ steps.verify.outputs.dll }}", '.pdb')
           if (-not (Test-Path $pdb)) { throw "StrayDLSS.pdb was not produced next to the DLL ($pdb)" }
-          Copy-Item $pdb dist/StrayDLSS/dlls/main.pdb
+          # Shipped as StrayDLSS.pdb, NOT main.pdb: that is the name the DLL's own debug directory
+          # records (/PDBALTPATH, asserted in the step above), and a symbolizer looks for exactly
+          # that name next to the binary. It used to ship as main.pdb, which no dump could resolve
+          # until somebody renamed it by hand - and since UE4SS forces the DLL itself to be
+          # main.dll, the PDB name is also the only thing in the deployed folder that says which
+          # of the two C++ plugins this is.
+          Copy-Item $pdb dist/StrayDLSS/dlls/StrayDLSS.pdb
           Copy-Item repo/mods/StrayDLSS/StrayDLSS.ini dist/StrayDLSS/
           Copy-Item repo/mods/StrayDLSS/README.md dist/
           Set-Content dist/mods.txt.fragment @(

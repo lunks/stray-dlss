@@ -383,6 +383,27 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 	STRAY_LOG_INFO("StrayDLSS %s attaching (UE4SS C++ mod, the HOST): mod dir %s, game dir %s",
 		STRAY_DLSS_PLUGIN_VERSION_STRING, sds::Narrow(mod_dir).c_str(), sds::Narrow(game_dir).c_str());
 
+	// WHO IS `main`. UE4SS hardcodes <Mods>/<Name>/dlls/main.dll, so this plugin and
+	// StrayDualSense both load as a module literally named `main`, and a UE4 crash dump says
+	// only `main 0x00006ffff4720000 + 771f6` - which mod that was cost real time to work out
+	// on 2026-09-03. The dump prints the module's BASE next to the offset, so one line here
+	// settles it: if the base matches, the crash is ours and the offset is the RVA. Symbolize
+	// it against StrayDLSS.pdb, which is the name this DLL's own debug directory records
+	// (/PDBALTPATH in mods/StrayDLSS/CMakeLists.txt) and the name CI ships the PDB under.
+	{
+		const void *self_base = nullptr;
+		std::wstring self_path;
+		if (sds::ModuleIdentity(reinterpret_cast<const void *>(&Start), self_base, self_path))
+			STRAY_LOG_INFO("module identity: StrayDLSS is module `main`, loaded at base 0x%016llx, from %s "
+				"-- a UE4 crash dump line `main 0x<base> + <offset>` is OURS when that base matches; the "
+				"offset is then the RVA, symbolize it against StrayDLSS.pdb",
+				reinterpret_cast<unsigned long long>(self_base),
+				sds::Narrow(self_path).c_str());
+		else
+			STRAY_LOG_WARN("module identity: GetModuleHandleEx could not name our own module; a crash "
+				"dump's `main + <offset>` line cannot be attributed to StrayDLSS from this log");
+	}
+
 	// The DLL lives at <Mod>/dlls/main.dll but StrayDLSS.ini sits at the mod ROOT (<Mod>/), the
 	// UE4SS convention. mod_dir is the dll's directory, so try the parent first, then the dll
 	// dir as a fallback. (Measured 2026-09-02: the first host run looked only in dlls/, found

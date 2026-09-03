@@ -706,6 +706,21 @@ the UE4 minidump (`Saved/Crashes/UE4CC-…EA9444C2…`, the 02:41 run) against t
 `main.pdb` and the box's own wine DLLs, with `llvm-symbolizer`. No launch was needed to root-cause
 it. HARD unless marked.
 
+> **The PDB is no longer called `main.pdb`, and neither is a module named `main` ambiguous any
+> more (2026-09-03).** UE4SS hardcodes `<Mods>/<Name>/dlls/main.dll`, so both C++ plugins load as
+> a module literally named `main` — and a UE4 dump (`main 0x00006ffff4720000 + 771f6`) could not
+> say which. Working that out cost real time on 2026-09-03, and symbolizing then only worked after
+> the shipped `main.pdb` was renamed by hand to the basename the DLL's debug directory recorded
+> (`…\build\StrayDLSS\StrayDLSS.pdb`, an absolute path from the CI machine). Two changes:
+> both plugins link with `/PDBALTPATH:<Name>.pdb` so the debug directory records a **bare**
+> `StrayDLSS.pdb` / `StrayDualSense.pdb` resolved next to the DLL, and CI ships the PDB under that
+> name instead of `main.pdb` — asserted on the built artifact by `tools/pe_debug_dir.py --expect`,
+> because a rename that left the debug directory saying something else would look fixed and not
+> be. Each plugin also logs `module identity:` once at startup with its own load base, so a dump's
+> base can simply be matched. The **export directory** already carried `StrayDLSS.dll` /
+> `StrayDualSense.dll` (the link-time name survives the rename to `main.dll`) — a second,
+> independent way to identify a deployed `main.dll`.
+
 **The faulting instruction.** Exception thread context: `Rip = libvkd3d-1.dll+0x3e7b0`,
 `Rcx = 0`, code `c0000005` reading `0x0`. That RVA is `vkd3d_instance_get_vk_instance`, whose
 entire body is `mov rax,[rcx]; ret` — it dereferences its argument. Its caller is **wine-builtin**

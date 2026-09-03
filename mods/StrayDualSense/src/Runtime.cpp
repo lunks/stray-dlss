@@ -62,6 +62,25 @@ void Runtime::Startup(const void* addressInsideThisModule)
     SDS_LOG_INFO("  game binaries dir: %ls", m_gameDir.c_str());
     SDS_LOG_INFO("  mod dir          : %ls", m_modDir.c_str());
 
+    // WHO IS `main`. UE4SS hardcodes <Mods>/<Name>/dlls/main.dll, so this plugin and StrayDLSS
+    // both load as a module literally named `main`, and a UE4 crash dump says only
+    // `main 0x00006ffff4720000 + 771f6` - which mod that was cost real time to work out on
+    // 2026-09-03. The dump prints the module's BASE next to the offset, so one line here
+    // settles it: if the base matches, the crash is ours and the offset is the RVA. Symbolize
+    // it against StrayDualSense.pdb, which is the name this DLL's own debug directory records
+    // (/PDBALTPATH in mods/StrayDualSense/CMakeLists.txt) and the name CI ships the PDB under.
+    const void*  selfBase = nullptr;
+    std::wstring selfPath;
+    if (ModuleIdentity(addressInsideThisModule, selfBase, selfPath))
+        SDS_LOG_INFO("  module identity  : StrayDualSense is module `main`, loaded at base 0x%016llx, "
+                     "from %ls -- a UE4 crash dump line `main 0x<base> + <offset>` is OURS when that "
+                     "base matches; the offset is then the RVA, symbolize it against StrayDualSense.pdb",
+                     reinterpret_cast<unsigned long long>(selfBase),
+                     selfPath.c_str());
+    else
+        SDS_LOG_WARN("  module identity  : GetModuleHandleEx could not name our own module; a crash "
+                     "dump's `main + <offset>` line cannot be attributed to StrayDualSense from this log");
+
     // MEASURED 2026-09-02: a deploy once wrote the ini to the mod's ROOT while only the DLL's
     // own directory and the game directory were searched, and the run silently used the
     // defaults. The mod root is the conventional place for a UE4SS mod's config, so it is
