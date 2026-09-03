@@ -54,6 +54,25 @@ void LinearResampler::Reset()
     m_primed = false;
 }
 
+std::size_t LinearResampler::InputFramesFor(std::size_t outFrames, double step) const
+{
+    if (outFrames == 0)
+        return 0;
+    if (!(step > 0.0) || !(step < 1e6))
+        step = 1.0;
+    // The last sample read sits at `phase + (outFrames - 1) * step`, and interpolating it
+    // needs the frame after that, so the buffer must reach floor(last) + 1 — i.e. hold
+    // floor(last) + 2 frames. Before the first call the phase is not yet primed and is 0.
+    const double phase = m_primed ? m_phase : 0.0;
+    const double last  = phase + static_cast<double>(outFrames - 1) * step;
+    const double need  = std::floor(last) + 2.0;
+    if (!(need > 1.0))
+        return 1;
+    if (need > 1e9)
+        return static_cast<std::size_t>(1e9);
+    return static_cast<std::size_t>(need);
+}
+
 std::size_t LinearResampler::Process(const float* in, std::size_t inFrames, double step,
                                      float* out, std::size_t maxOutFrames)
 {

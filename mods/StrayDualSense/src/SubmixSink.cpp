@@ -182,13 +182,13 @@ bool SubmixSink::RunStream()
             continue;
         }
 
-        // How many source frames feed `want` output frames, plus one for the interpolator's
-        // seam. `step` is srcRate / dstRate: 1.0 in the measured setup, and the resampler is
-        // then a bit-exact copy (pinned in tests/test_submix_dsp.cpp).
+        // EXACTLY the frames the resampler will consume — it drops whatever it is handed
+        // beyond that, so an approximate figure drains the ring faster than the tap fills it
+        // (see LinearResampler::Process). `step` is srcRate / dstRate: 1.0 in the measured
+        // setup, where the resampler is a bit-exact copy (tests/test_submix_dsp.cpp).
         const double step = static_cast<double>(m_sourceRate.load(std::memory_order_relaxed)) /
                             static_cast<double>(rate);
-        const std::size_t needFrames =
-            static_cast<std::size_t>(static_cast<double>(want) * step) + 2;
+        const std::size_t needFrames = m_resampler.InputFramesFor(want, step);
         if (m_pull.size() < needFrames * 2)
             m_pull.assign(needFrames * 2, 0.0f);
         if (m_out.size() < static_cast<std::size_t>(want) * 2)

@@ -80,8 +80,18 @@ public:
     // Consumes `inFrames` stereo frames from `in`, writes at most `maxOutFrames` to `out` and
     // returns how many it wrote. `step` is srcRate / dstRate (1.0 = passthrough). A step that
     // is not finite and positive is treated as 1.0.
+    //
+    // IT CONSUMES THE WHOLE BUFFER. Anything it did not need is DROPPED, not carried — so the
+    // caller must hand it exactly what InputFramesFor() asks for. Feeding it a couple of extra
+    // frames per call (the obvious "+2 for the interpolator" reflex) silently drains the
+    // producer faster than it fills, which reads as a slow leak into permanent underruns plus
+    // a discontinuity click every buffer.
     std::size_t Process(const float* in, std::size_t inFrames, double step,
                         float* out, std::size_t maxOutFrames);
+
+    // Exactly how many input frames are needed to produce `outFrames` output frames from the
+    // current phase. Depends on the resampler's state, so call it immediately before Process.
+    std::size_t InputFramesFor(std::size_t outFrames, double step) const;
 
 private:
     double m_phase  = 0.0;    // fractional read position within the incoming buffer

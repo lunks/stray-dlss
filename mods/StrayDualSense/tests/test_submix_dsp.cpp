@@ -147,6 +147,79 @@ int main()
     }
 
     // -------------------------------------------------------------------------------
+    // THE REGRESSION THAT MATTERS FOR THE SINK, and the bug it was written for.
+    //
+    // Process() consumes the WHOLE buffer and drops whatever it did not need, so the sink must
+    // hand it exactly InputFramesFor(). The first version of the sink asked for
+    // `want * step + 2` "for the interpolator's seam" — two frames per iteration more than the
+    // resampler could use. That drains the producer faster than it fills, which shows up not
+    // as an obvious glitch but as a slow leak into permanent underruns plus a discontinuity
+    // every buffer. This test is a whole pipeline run: a continuous ramp through a ring, in
+    // sink-sized chunks, checked for both gaps and repeats.
+    // -------------------------------------------------------------------------------
+    {
+        for (double step : { 1.0, 0.5, 2.0, 48000.0 / 44100.0 })
+        {
+            LinearResampler r;
+            SubmixRing ring;
+            ring.Init(8192);
+
+            double  produced   = 0.0;      // total output frames
+            double  consumed   = 0.0;      // total input frames requested
+            float   fed        = 0.0f;     // the ramp value written next
+            bool    ok         = true;
+            bool    continuous = true;
+            float   lastOut    = -1.0f;
+
+            std::vector<float> pull, out(2 * 512);
+            for (int iter = 0; iter < 200; ++iter)
+            {
+                const std::size_t want = 256;
+                const std::size_t need = r.InputFramesFor(want, step);
+                // The producer supplies exactly what was asked for — as the tap does, at its
+                // own rate. If the consumer asks for more than it can use, this diverges.
+                if (pull.size() < need * 2) pull.assign(need * 2, 0.0f);
+                std::vector<float> chunk(need * 2);
+                for (std::size_t i = 0; i < need; ++i)
+                {
+                    chunk[i * 2]     = fed;
+                    chunk[i * 2 + 1] = fed;
+                    fed += 1.0f;
+                }
+                ring.Write(chunk.data(), need);
+                if (ring.Read(pull.data(), need) != need) ok = false;
+                const std::size_t got = r.Process(pull.data(), need, step, out.data(), want);
+                if (got != want) ok = false;
+                consumed += static_cast<double>(need);
+                produced += static_cast<double>(got);
+                // The output must be a monotone ramp with no jump back and no stall: a
+                // dropped input frame shows as a step larger than `step`, a repeated one as a
+                // step of zero.
+                for (std::size_t i = 0; i < got; ++i)
+                {
+                    const float v = out[i * 2];
+                    if (iter > 0 || i > 0)
+                    {
+                        const float d = v - lastOut;
+                        if (d < static_cast<float>(step) * 0.5f || d > static_cast<float>(step) * 1.5f)
+                            continuous = false;
+                    }
+                    lastOut = v;
+                }
+            }
+            Check(ok, "sink loop: every iteration produced exactly the frames it asked for");
+            Check(continuous, "sink loop: the ramp survives 200 buffers with no gap and no repeat");
+            // The ratio of input to output frames must be the step, to within a frame or two
+            // of start-up transient. A +2 per iteration overdraw would show as ~1.008 at
+            // step 1.0 — small, and permanent.
+            const double ratio = consumed / produced;
+            Check(ratio > step * 0.999 && ratio < step * 1.001 + 0.001,
+                  "sink loop: input/output frame ratio equals the resampling step (no drain leak)");
+            Check(ring.Underruns() == 0, "sink loop: NO underruns — the ring is not being over-drained");
+        }
+    }
+
+    // -------------------------------------------------------------------------------
     // LevelMeter — the proof instrument. Its whole job is to make "the engine mixed two
     // haptics for us" visible as a bigger number, so the additive case is pinned.
     // -------------------------------------------------------------------------------
