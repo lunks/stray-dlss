@@ -72,11 +72,12 @@ struct Config
     // still says who drives the coils).
     float submixWarnSeconds = 10.0f;
 
-    // The submix to listen on. The path measured in the box's own UE4SS object dump; the
-    // literal "master" registers on the engine's MASTER submix instead, which needs no
-    // USoundSubmix object at all (a nullptr submix means master —
-    // AudioMixerDevice.cpp:2350) and is the surest proof that the tap MECHANISM works.
-    std::string submixPath = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
+    // The two submixes to listen on, by the paths measured in the box's own UE4SS object dump
+    // (docs §14): the vibration master feeds the coils (RL/RR), the controller master feeds
+    // the pad speaker (FL/FR). Both are tapped POST-effects, so the game's own speaker
+    // tuning (Submix_controllerPre's SBFX_Boost, +5 dB) is already in the samples.
+    std::string submixPath        = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
+    std::string submixSpeakerPath = "/Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster";
 
     // Register a SECOND, meter-only listener on the master submix. It is what turns a null
     // result into a diagnosis: master firing while the vibration submix stays silent means
@@ -178,6 +179,13 @@ struct Config
 
     // ---- controller speaker ----------------------------------------------------------
     bool speaker = true;
+    // Applied to the speaker lane before the soft clip. 1.0 on purpose: the samples come out
+    // of the engine's own Submix_controllerPre -> controller -> controllerMaster chain, so the
+    // game's +5 dB SBFX_Boost is already in them. The asset-replay path used to bake that
+    // trim in as a constant (kSpeakerBoost = 1.7783) BECAUSE it bypassed the chain; carrying
+    // it over here would apply it twice (docs §16). A knob rather than a constant so the box
+    // can A/B it in one session, never a level to tune.
+    float speakerGain = 1.0f;
 
     // WHICH MECHANISM SELECTS THE PAD'S AUDIO ROUTING. Read PadAudio.hpp first: the pad's
     // default routing MUTES the internal speaker, so writing correct samples into its audio
@@ -220,9 +228,7 @@ struct Config
     // ---- assets ----------------------------------------------------------------------
     // Relative paths resolve against the game's Binaries/Win64 first, the mod's dir second.
     std::string hapticDir       = "haptic";            // <name>.f32, stereo float32 @ 48 kHz
-    std::string spkDir          = "spk";               // <name>.f32, mono float32 @ 48 kHz
     std::string hapticLoopsFile = "haptic_loops.txt";  // the game's bLooping, one name per line
-    std::string spkLoopsFile    = "spk_loops.txt";
 
     // ---- diagnostics -----------------------------------------------------------------
     float hookRetrySeconds    = 3.0f;    // MEASURED: registration fails until the BP loads

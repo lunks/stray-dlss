@@ -296,6 +296,84 @@ int main()
         Check(ring.Dropped() == 16, "and the lapped frames are counted");
     }
 
+    // -------------------------------------------------------------------------------
+    // InterleaveLanes: two tapped submixes -> the pad's one 4-channel stream. The channel
+    // map is MEASURED (FL FR RL RR; speaker on the front pair, coils on the rear pair) and a
+    // swapped pair is a haptic waveform coming out of the speaker, so it is pinned here.
+    // -------------------------------------------------------------------------------
+    {
+        const float coils[4]   = { 0.10f, -0.20f, 0.30f, -0.40f };   // 2 frames, L/R per frame
+        const float speaker[4] = { 0.50f,  0.50f, 0.60f,  0.60f };
+        float out[8] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+        const LanePeaks p = InterleaveLanes(coils, 2, 1.0f, speaker, 2, 1.0f, 2, 4, out);
+        Check(Near(out[kEndpointChannelFL], 0.5f) && Near(out[kEndpointChannelFR], 0.5f),
+              "frame 0: the SPEAKER lane lands on FL/FR");
+        Check(Near(out[kEndpointChannelRL], 0.1f) && Near(out[kEndpointChannelRR], -0.2f),
+              "frame 0: the COIL lane lands on RL/RR, left grip then right grip");
+        Check(Near(out[4 + kEndpointChannelFL], 0.6f) && Near(out[4 + kEndpointChannelRL], 0.3f) &&
+                  Near(out[4 + kEndpointChannelRR], -0.4f),
+              "frame 1 follows at a stride of `channels`");
+        Check(Near(p.coils, 0.4f) && Near(p.speaker, 0.6f),
+              "the peaks are reported PER LANE, as magnitudes");
+    }
+    {
+        // An 8-channel endpoint (the engine's own mixer runs at 7.1; the pad measured 4):
+        // the four extra channels are written as silence, never left as whatever the WASAPI
+        // buffer held.
+        const float coils[2]   = { 0.1f, 0.2f };
+        const float speaker[2] = { 0.3f, 0.4f };
+        float out[8] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+        InterleaveLanes(coils, 1, 1.0f, speaker, 1, 1.0f, 1, 8, out);
+        Check(out[4] == 0.0f && out[5] == 0.0f && out[6] == 0.0f && out[7] == 0.0f,
+              "channels beyond RR are silence on a wider endpoint");
+        Check(Near(out[0], 0.3f) && Near(out[1], 0.4f) && Near(out[2], 0.1f) && Near(out[3], 0.2f),
+              "and the four we use are unchanged by the width");
+    }
+    {
+        // Lanes are independent: a short (or empty) speaker lane leaves the coils alone, and
+        // vice versa. This is the steady state - the purr is the only event that drives both.
+        const float coils[4] = { 0.1f, 0.1f, 0.2f, 0.2f };
+        float out[8] = {};
+        const LanePeaks p = InterleaveLanes(coils, 2, 1.0f, nullptr, 0, 1.0f, 2, 4, out);
+        Check(out[0] == 0.0f && out[1] == 0.0f && out[4] == 0.0f && out[5] == 0.0f,
+              "an empty speaker lane writes silence to FL/FR");
+        Check(Near(out[2], 0.1f) && Near(out[6], 0.2f), "while the coils still reach RL/RR");
+        Check(p.speaker == 0.0f && Near(p.coils, 0.2f), "and only the coil peak is non-zero");
+
+        float out2[8] = {};
+        const float speaker[2] = { 0.7f, 0.7f };
+        InterleaveLanes(coils, 2, 1.0f, speaker, 1, 1.0f, 2, 4, out2);
+        Check(Near(out2[0], 0.7f) && out2[4] == 0.0f,
+              "a lane shorter than the frame count is zero-padded, not repeated");
+    }
+    {
+        // Gain is per lane and the soft clip runs AFTER it: PadVibrationEnabled=off is a coil
+        // gain of 0 and must silence the coils without touching the speaker.
+        const float coils[2]   = { 0.5f, 0.5f };
+        const float speaker[2] = { 0.5f, 0.5f };
+        float out[4] = {};
+        const LanePeaks p = InterleaveLanes(coils, 1, 0.0f, speaker, 1, 1.0f, 1, 4, out);
+        Check(out[2] == 0.0f && out[3] == 0.0f && Near(out[0], 0.5f),
+              "coil gain 0 silences RL/RR only");
+        Check(p.coils == 0.0f && Near(p.speaker, 0.5f), "and the coil peak reads 0");
+
+        float out2[4] = {};
+        const LanePeaks p2 = InterleaveLanes(coils, 1, 4.0f, speaker, 1, 1.0f, 1, 4, out2);
+        Check(out2[2] > kSoftClipKnee && out2[2] <= 1.0f && Near(out2[2], SoftClip(2.0f)),
+              "a hot coil lane is soft-clipped after the gain, never hard-clamped");
+        Check(Near(p2.coils, SoftClip(2.0f)), "the reported peak is the clipped value that was written");
+    }
+    {
+        // A 2-channel endpoint has no coil pair. The sink refuses it before ever calling this,
+        // but the function itself must not write past the frame either.
+        const float coils[2]   = { 0.1f, 0.2f };
+        const float speaker[2] = { 0.3f, 0.4f };
+        float out[4] = { 9, 9, 9, 9 };
+        InterleaveLanes(coils, 1, 1.0f, speaker, 1, 1.0f, 1, 2, out);
+        Check(Near(out[0], 0.3f) && Near(out[1], 0.4f) && out[2] == 9.0f && out[3] == 9.0f,
+              "a 2-channel endpoint gets the speaker pair and nothing is written beyond it");
+    }
+
     std::printf(g_failures == 0 ? "\nall SubmixDsp cases passed\n" : "\n%d FAILURE(S)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

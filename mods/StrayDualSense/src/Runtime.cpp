@@ -45,14 +45,12 @@ std::wstring ResolveDir(const std::string& configured, const std::wstring& gameD
     return a;   // keep the game-dir path so the per-asset error names the expected location
 }
 
-// While no pad has been adopted, probe this fast and for this long. 120 probes at 1 s is two
-// minutes, which comfortably covers a load into gameplay.
-// The peak that counts as "the engine really is rendering haptics into this submix". Well above
-// dither and well below anything audible/feelable.
 // The DEFAULT for Config::submixLiveThreshold, kept here as the documented constant the
 // handover was originally written against. See Config.hpp for why it is low and what that
 // costs in strict mode.
 constexpr float        kSubmixLiveThreshold = 1.0e-4f;
+// While no pad has been adopted, probe this fast and for this long. 120 probes at 1 s is two
+// minutes, which comfortably covers a load into gameplay.
 constexpr float        kFastPadPollSeconds = 1.0f;
 constexpr unsigned long kFastPadProbes     = 120;
 // How many times the reroute watchdog will re-submit before it stops and says so. A level
@@ -107,20 +105,6 @@ void Runtime::LoadLoopLists()
                       "one pass. Generate it with tools/dualsense/extract_assets.sh + wavegen.sh.",
                       m_config.hapticLoopsFile.c_str());
     }
-    if (!LoadLoopList(m_spkLoops, m_config.spkLoopsFile, "spk"))
-    {
-        // extract_assets.sh writes ONE list covering every controller-class SoundWave, both
-        // families; wavegen.sh splits it. Accept the combined list rather than silencing the
-        // purr's loop over a missing split file.
-        if (LoadLoopList(m_spkLoops, m_config.hapticLoopsFile, "spk (from the combined haptic list)"))
-            SDS_LOG_INFO("loops: '%s' absent; the speaker is using '%s', which lists every "
-                         "controller-class asset", m_config.spkLoopsFile.c_str(),
-                         m_config.hapticLoopsFile.c_str());
-        else
-            SDS_LOG_ERROR("loops: spk '%s' not found (nor '%s'). EVERY speaker asset will play "
-                          "as a ONE-SHOT; the purr will end after one pass.",
-                          m_config.spkLoopsFile.c_str(), m_config.hapticLoopsFile.c_str());
-    }
 }
 
 void Runtime::Startup(const void* addressInsideThisModule)
@@ -170,7 +154,6 @@ void Runtime::Startup(const void* addressInsideThisModule)
         SDS_LOG_WARN("Enabled=0: hooks will still register but nothing reaches the pad.");
 
     m_hapticDir = ResolveDir(m_config.hapticDir, m_gameDir, m_modDir, "haptic");
-    m_spkDir    = ResolveDir(m_config.spkDir,    m_gameDir, m_modDir, "spk");
     LoadLoopLists();
 
     m_hidMode.Start(m_config);
@@ -180,7 +163,6 @@ void Runtime::Startup(const void* addressInsideThisModule)
     // periodic write (§12).
     m_haptics.Start(kCoilRoute, m_config.endpointMatch, m_hapticDir,
                     [this] { m_hidMode.AssertNow("before waveform"); });
-    m_speaker.Start(kSpeakerRoute, m_config.endpointMatch, m_spkDir, nullptr);
 
     StartSubmix();
 
@@ -193,19 +175,24 @@ void Runtime::Startup(const void* addressInsideThisModule)
     m_started.store(true, std::memory_order_release);
 }
 
-// ---- the submix spike -------------------------------------------------------------------
+// ---- the submix taps --------------------------------------------------------------------
 //
-// SPIKE, and nothing about it has run in the game. It answers ONE question: does UE's own
-// audio engine hand us the vibration submix already mixed? If it does, the concurrency limit
-// (one playback slot, so touching the cat kills the rain), the asset extraction, the loop
-// list and the fades all become the engine's problem instead of ours.
+// Two lanes, one mechanism: the engine's own audio mixer hands us the vibration submix and
+// the controller-speaker submix already mixed, faded, looped and levelled. Everything below
+// runs the same for both; only the channel pair on the pad differs.
 
 void Runtime::StartSubmix()
 {
+    m_coils.tag     = "vibration";
+    m_coils.owner   = "COILS";
+    m_speaker.tag   = "speaker";
+    m_speaker.owner = "SPEAKER";
+
     if (!m_config.SubmixTapWanted())
     {
         SDS_LOG_INFO("submix: HapticSource=assets, so no submix tap is created. The shipped "
-                     "behaviour is unchanged.");
+                     "coil behaviour is unchanged, and the SPEAKER IS SILENT: the speaker only "
+                     "comes from the tap.");
         return;
     }
 
@@ -218,38 +205,43 @@ void Runtime::StartSubmix()
     const std::size_t ringFrames =
         static_cast<std::size_t>(submix::kSubmixDefaultRate) *
         static_cast<std::size_t>(m_config.submixRingMs) / 1000u;
-    m_submixRing.Init(ringFrames);
+    m_coils.ring.Init(ringFrames);
+    m_speaker.ring.Init(ringFrames);
 
-    m_tapVibration = submix::Tap::Create("vibration");
-    if (m_tapVibration == nullptr)
+    m_coils.tap   = submix::Tap::Create(m_coils.tag);
+    m_speaker.tap = submix::Tap::Create(m_speaker.tag);
+    if (m_coils.tap == nullptr || m_speaker.tap == nullptr)
     {
-        SDS_LOG_ERROR("submix: the listener page could not be allocated; the tap is DEAD for "
-                      "this session and the coils will stay on the asset path.");
+        SDS_LOG_ERROR("submix: a listener page could not be allocated (vibration=%p speaker=%p); "
+                      "the taps are DEAD for this session.",
+                      static_cast<void*>(m_coils.tap), static_cast<void*>(m_speaker.tap));
         return;
     }
-    // The ring is NOT attached here. MEASURED 2026-09-03 (strict submix, first run): the tap
-    // filled it with silence from its first callback while nothing drained it, so at the
+    // The rings are NOT attached here. MEASURED 2026-09-03 (strict submix, first run): the tap
+    // filled its ring with silence from its first callback while nothing drained it, so at the
     // handover the ring sat full (16384/16384, 1.8 M frames dropped) and STAYED near full once
     // the sink pulled at exactly the production rate - about 300 ms between the engine's mix
-    // and the coils. It is attached at the handover instead, empty, right before the sink opens.
+    // and the coils. Each ring is attached at its lane's handover instead, empty, and the
+    // sink drains both from the moment it opens.
     if (m_config.submixProbeMaster)
     {
-        // Meter only: never attached to the ring, so the game's whole soundtrack can never
-        // reach the coils through it.
+        // Meter only: never attached to a ring, so the game's whole soundtrack can never
+        // reach the pad through it.
         m_tapMaster = submix::Tap::Create("master-probe");
     }
 
-    SDS_LOG_INFO("submix: HapticSource=%s, ring %zu frames (%d ms), probeMaster=%d, numbers "
-                 "every %.1fs to '%s'. The listener is registered lazily from the GAME THREAD, "
-                 "inside the first UFunction hook that fires - reading a UObject from UE4SS's "
-                 "update thread is an unsynchronised cross-thread read and this project does "
-                 "not do it.",
-                 m_config.HapticSourceName(), m_submixRing.CapacityFrames(),
-                 m_config.submixRingMs, m_config.submixProbeMaster ? 1 : 0,
+    SDS_LOG_INFO("submix: HapticSource=%s, two taps ('%s' -> RL/RR, '%s' -> FL/FR), rings %zu "
+                 "frames (%d ms), probeMaster=%d, numbers every %.1fs to '%s'. The listeners "
+                 "are registered lazily from the GAME THREAD, inside the first UFunction hook "
+                 "that fires - reading a UObject from UE4SS's update thread is an "
+                 "unsynchronised cross-thread read and this project does not do it.",
+                 m_config.HapticSourceName(), m_coils.tag, m_speaker.tag,
+                 m_coils.ring.CapacityFrames(), m_config.submixRingMs,
+                 m_config.submixProbeMaster ? 1 : 0,
                  static_cast<double>(m_config.submixStatusSeconds), m_submixStatusPath.c_str());
 
-    // The sink is NOT started here, nor at bind: it opens the pad endpoint only at the
-    // HANDOVER, when the tap has carried a real signal. The 2026-09-03 run streamed 36 million
+    // The sink is NOT started here, nor at bind: it opens the pad endpoint only at the first
+    // HANDOVER, when a tap has carried a real signal. The 2026-09-03 run streamed 36 million
     // frames of pure underrun to the pad from a bound tap that was never called once.
     switch (m_config.hapticSource)
     {
@@ -266,9 +258,9 @@ void Runtime::StartSubmix()
                      "THE ASSET PATH, NOT THE SUBMIX - every COILS: line says which.");
         break;
     default:
-        SDS_LOG_INFO("submix: HapticSource=measure, so NOTHING from the submix reaches the "
-                     "pad. The asset path still drives the coils; this run only answers "
-                     "whether the engine is mixing haptics for us.");
+        SDS_LOG_INFO("submix: HapticSource=measure, so NOTHING from the vibration submix reaches "
+                     "the coils. The asset path still drives them; this run only answers "
+                     "whether the engine is mixing haptics for us. The SPEAKER lane still plays.");
         break;
     }
 }
@@ -279,17 +271,30 @@ CoilFacts Runtime::CoilFactsNow() const
     f.mode           = m_config.hapticSource;
     f.hapticsEnabled = m_config.enabled && m_config.haptics;
     f.padVibration   = m_padVibrationEnabled.load(std::memory_order_relaxed);
-    f.tapCreated     = m_tapVibration != nullptr;
+    f.tapCreated     = m_coils.tap != nullptr;
     f.tapRefused     = m_submixRefused.load(std::memory_order_acquire);
     f.tapBound       = m_submixBound.load(std::memory_order_acquire) && !f.tapRefused;
-    f.tapCallbacks   = m_tapVibration != nullptr ? m_tapVibration->Stats().callbacks : 0;
-    f.tapLive        = m_submixLive.load(std::memory_order_acquire);
+    f.tapCallbacks   = m_coils.tap != nullptr ? m_coils.tap->Stats().callbacks : 0;
+    f.tapLive        = m_coils.live.load(std::memory_order_acquire);
     return f;
+}
+
+LaneVerdict Runtime::Speaker() const
+{
+    LaneFacts f;
+    f.enabled      = m_config.enabled && m_config.speaker && m_config.SubmixTapWanted();
+    f.gameSwitch   = true;   // the game has no speaker switch
+    f.tapCreated   = m_speaker.tap != nullptr;
+    f.tapRefused   = m_submixRefused.load(std::memory_order_acquire);
+    f.tapBound     = m_submixBound.load(std::memory_order_acquire) && !f.tapRefused;
+    f.tapCallbacks = m_speaker.tap != nullptr ? m_speaker.tap->Stats().callbacks : 0;
+    f.tapLive      = m_speaker.live.load(std::memory_order_acquire);
+    return JudgeLane(f);
 }
 
 bool Runtime::SubmixWantsBinding() const
 {
-    if (!m_config.SubmixTapWanted() || m_tapVibration == nullptr)
+    if (!m_config.SubmixTapWanted() || m_coils.tap == nullptr || m_speaker.tap == nullptr)
         return false;
     // The REROUTE re-arm is the second reason to want the glue again, and it exists because
     // the reroute was only ever submitted ONCE. Both halves of it are gated on this function:
@@ -300,8 +305,10 @@ bool Runtime::SubmixWantsBinding() const
            m_rerouteRearmWanted.load(std::memory_order_acquire);
 }
 
-// Watchdog: the tap is bound and the subtree has STOPPED being rendered. Re-arm the reroute
-// so the glue re-writes the UObject links and we re-submit RegisterSoundSubmix.
+// Watchdog: the taps are bound and a subtree has STOPPED being rendered. Re-arm the reroute
+// so the glue re-writes the UObject links and we re-submit RegisterSoundSubmix for every
+// master. The rule itself is pure (SubmixWatch.hpp, StallWatchdog): never before a lane's
+// first callback, any lane that once rendered and then stalls, one re-arm at a time, capped.
 //
 // THIS IS NOT A FALLBACK. It does not hand the coils to the asset path or soften strict mode;
 // it repairs the one thing that makes strict mode unreliable. A silent pad stays a silent pad
@@ -310,76 +317,54 @@ void Runtime::RerouteWatchdog(uint64_t now)
 {
     if (!m_config.submixReroute || m_config.submixRerouteWatchdogSeconds <= 0.0f)
         return;
-    if (m_tapVibration == nullptr || !m_submixBound.load(std::memory_order_acquire) ||
+    if (m_coils.tap == nullptr || m_speaker.tap == nullptr ||
+        !m_submixBound.load(std::memory_order_acquire) ||
         m_submixRefused.load(std::memory_order_acquire))
         return;
-    if (m_rerouteRearmWanted.load(std::memory_order_acquire))
-        return;   // already asked; waiting for the glue's next game-thread pass
 
-    const uint64_t callbacks = m_tapVibration->Stats().callbacks;
-    if (callbacks != m_watchdogLastCallbacks)
-    {
-        m_watchdogLastCallbacks = callbacks;
-        m_watchdogSinceMs       = now;
-        return;
-    }
-    // Never fire before the first callback has EVER arrived: registration is asynchronous
-    // (the engine runs it on the audio thread), so a freshly bound tap legitimately reads 0
-    // for a frame or two and re-arming there would fight the bind instead of repairing it.
-    if (callbacks == 0)
-    {
-        m_watchdogSinceMs = now;
-        return;
-    }
-    if (m_watchdogSinceMs == 0)
-    {
-        m_watchdogSinceMs = now;
-        return;
-    }
+    const uint64_t callbacks[2] = { m_coils.tap->Stats().callbacks,
+                                    m_speaker.tap->Stats().callbacks };
     const uint64_t stalledMs =
         static_cast<uint64_t>(m_config.submixRerouteWatchdogSeconds * 1000.0f);
-    if (now - m_watchdogSinceMs < stalledMs)
-        return;
-
-    const unsigned long n = m_rerouteRearms.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n > kMaxRerouteRearms)
+    const bool wasGivenUp = m_watchdog.GaveUp();
+    if (!m_watchdog.Observe(callbacks, 2, now, stalledMs, kMaxRerouteRearms))
     {
-        // Loud once, then stop: something structural is wrong and re-submitting forever would
-        // bury it. m_watchdogSinceMs is left set so this does not repeat every tick.
-        if (n == kMaxRerouteRearms + 1)
-            SDS_LOG_ERROR("submix: the reroute has been re-armed %lu times and the subtree "
-                          "still stops rendering. Giving up on the watchdog for this session - "
-                          "this is not a transient level-load effect. Read the 'submix: "
-                          "REROUTE' lines and SubmixRegisterSoundSubmixSlot.",
+        if (m_watchdog.GaveUp() && !wasGivenUp)
+            SDS_LOG_ERROR("submix: the reroute has been re-armed %lu times and a subtree still "
+                          "stops rendering. Giving up on the watchdog for this session - this "
+                          "is not a transient level-load effect. Read the 'submix: REROUTE' "
+                          "lines and SubmixRegisterSoundSubmixSlot.",
                           kMaxRerouteRearms);
         return;
     }
-    const uint64_t stalledForMs = now - m_watchdogSinceMs;   // BEFORE the reset, or it reads 0
-    m_watchdogSinceMs = now;
+
+    const Lane& stalled = m_watchdog.StalledLane() == 0 ? m_coils : m_speaker;
     m_rerouteRearmWanted.store(true, std::memory_order_release);
-    SDS_LOG_ERROR("submix: THE SUBTREE HAS STOPPED RENDERING - callbacks stuck at %llu for "
-                  "%.1fs while the tap is bound. The most likely cause is a LEVEL LOAD "
+    SDS_LOG_ERROR("submix: THE '%s' SUBTREE HAS STOPPED RENDERING - callbacks stuck at %llu for "
+                  "%.1fs while the taps are bound. The most likely cause is a LEVEL LOAD "
                   "re-creating the submix graph, which drops the re-parenting we submitted "
-                  "once at bind time. Re-arming the reroute (attempt %lu of %lu): the glue "
-                  "will re-write '%s'.ParentSubmix and we will re-submit RegisterSoundSubmix. "
-                  "The listener is NOT re-registered - it is still attached.",
-                  static_cast<unsigned long long>(callbacks),
-                  static_cast<double>(stalledForMs) / 1000.0, n, kMaxRerouteRearms,
-                  m_config.submixRerouteMaster.c_str());
+                  "at bind time. Re-arming the reroute (attempt %lu of %lu): the glue will "
+                  "re-write both masters' ParentSubmix and we will re-submit "
+                  "RegisterSoundSubmix for the parent and both. The listeners are NOT "
+                  "re-registered - they are still attached.",
+                  stalled.tag, static_cast<unsigned long long>(m_watchdog.StalledAt()),
+                  static_cast<double>(m_watchdog.StalledForMs()) / 1000.0,
+                  m_watchdog.Rearms(), kMaxRerouteRearms);
 }
 
 bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
-                            void* submixObject, bool submixObjectResolved,
-                            void* rerouteMasterObject, void* rerouteParentObject,
-                            const void* imageBase, std::size_t imageSize)
+                            void* vibrationMasterObject, void* speakerMasterObject,
+                            void* rerouteParentObject, const void* imageBase,
+                            std::size_t imageSize)
 {
     if (!SubmixWantsBinding())
         return m_submixBound.load(std::memory_order_acquire);
 
-    // A RE-ARM, not a first bind: the listener is already attached and must NOT be registered
-    // again (UE 4.27's FMixerSubmix::RegisterBufferListener appends without de-duplicating, so
-    // a second registration would deliver every callback twice into one ring). Redo ONLY the
-    // reroute, whose UObject half the glue has already re-written before calling us.
+    // A RE-ARM, not a first bind: the listeners are already attached and must NOT be
+    // registered again (UE 4.27's FMixerSubmix::RegisterBufferListener appends without
+    // de-duplicating, so a second registration would deliver every callback twice into one
+    // ring). Redo ONLY the reroute, whose UObject half the glue has already re-written before
+    // calling us.
     const bool rearming = m_submixBound.load(std::memory_order_acquire);
     m_rerouteRearmWanted.store(false, std::memory_order_release);
 
@@ -387,15 +372,21 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
 
     // Refuse rather than register on the wrong thing: a null submix means MASTER to the
     // engine, so an unresolved USoundSubmix would silently put the game's entire soundtrack
-    // on the voice coils. Only the literal "master" may pass null.
-    const bool wantMaster = m_config.submixPath == "master";
-    if (!wantMaster && !submixObjectResolved)
+    // on the voice coils. And ALL of them must be there: the reroute re-registers the parent
+    // first and every master after it, so binding one lane now and the other later would
+    // re-init the parent underneath the first lane's link.
+    const bool needParent = m_config.submixReroute;
+    if (vibrationMasterObject == nullptr || speakerMasterObject == nullptr ||
+        (needParent && rerouteParentObject == nullptr))
     {
         if (attempt == 1 || attempt % 20 == 0)
-            SDS_LOG_WARN("submix: '%s' has not loaded yet (attempt %d). NOT registering with a "
-                         "null submix - the engine reads that as the MASTER submix and the "
-                         "whole soundtrack would go to the coils.",
-                         m_config.submixPath.c_str(), attempt);
+            SDS_LOG_WARN("submix: not every submix has loaded yet (attempt %d): '%s'=%p "
+                         "'%s'=%p parent '%s'=%p. NOT registering with a null submix - the "
+                         "engine reads that as the MASTER submix and the whole soundtrack "
+                         "would go to the pad.",
+                         attempt, m_config.submixPath.c_str(), vibrationMasterObject,
+                         m_config.submixSpeakerPath.c_str(), speakerMasterObject,
+                         m_config.submixRerouteParent.c_str(), rerouteParentObject);
         return false;
     }
 
@@ -432,81 +423,94 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
                  d.why != nullptr ? d.why : "no reason recorded");
     submix::LogVtable(d.device, imageBase, imageSize);
 
-    // THE REROUTE, before the listener: the engine rebuilds the submix links on the audio
+    // THE REROUTE, before the listeners: the engine rebuilds the submix links on the audio
     // thread in the order the calls are queued, and the listener registration goes through the
-    // same queue, so by the time our listener is attached the tree already renders.
+    // same queue, so by the time our listeners are attached the trees already render. The
+    // PARENT goes first and EVERY master after it: RegisterSoundSubmix(bInit=true) re-inits
+    // the parent, and it is each master's own RebuildSubmixLinks that puts it back under it.
     if (m_config.submixReroute)
     {
-        if (rerouteMasterObject == nullptr || rerouteParentObject == nullptr)
+        const int   slot = m_config.submixRegisterSoundSubmixSlot;
+        const char* why  = nullptr;
+        SDS_LOG_WARN("submix: REROUTE - about to call vtable slot %d as "
+                     "FAudioDevice::RegisterSoundSubmix(parent=%p, bInit=true), then "
+                     "(vibration=%p, bInit=true), then (speaker=%p, bInit=true). AudioDevice.h:854 "
+                     "puts it two slots below RegisterSubmixBufferListener (%d); if the game dies "
+                     "HERE, that count is the suspect - set SubmixRegisterSoundSubmixSlot from the "
+                     "vtable dump above.",
+                     slot, rerouteParentObject, vibrationMasterObject, speakerMasterObject,
+                     m_config.submixRegisterSlot);
+        struct Step { const char* what; void* object; };
+        const Step steps[] = { { "parent", rerouteParentObject },
+                               { m_coils.tag, vibrationMasterObject },
+                               { m_speaker.tag, speakerMasterObject } };
+        bool ok = true;
+        for (const Step& s : steps)
         {
-            SDS_LOG_ERROR("submix: SubmixReroute=1 but the objects did not resolve (master=%p "
-                          "parent=%p). NOT rerouting; the tap will bind to a subtree the engine "
-                          "never renders, and the status line will say so.",
-                          rerouteMasterObject, rerouteParentObject);
+            if (!ok) break;
+            ok = submix::CallRegisterSoundSubmix(d.device, slot, s.object, true, imageBase,
+                                                 imageSize, &why);
+            if (!ok)
+                SDS_LOG_ERROR("submix: REROUTE refused on the %s: %s", s.what,
+                              why != nullptr ? why : "?");
         }
-        else
+        if (ok)
         {
-            const int   slot = m_config.submixRegisterSoundSubmixSlot;
-            const char* why  = nullptr;
-            SDS_LOG_WARN("submix: REROUTE - about to call vtable slot %d as "
-                         "FAudioDevice::RegisterSoundSubmix(parent=%p, bInit=true) then "
-                         "(master=%p, bInit=true). AudioDevice.h:854 puts it two slots below "
-                         "RegisterSubmixBufferListener (%d); if the game dies HERE, that count "
-                         "is the suspect - set SubmixRegisterSoundSubmixSlot from the vtable "
-                         "dump above.",
-                         slot, rerouteParentObject, rerouteMasterObject, m_config.submixRegisterSlot);
-            const bool okParent = submix::CallRegisterSoundSubmix(
-                d.device, slot, rerouteParentObject, true, imageBase, imageSize, &why);
-            if (!okParent)
-                SDS_LOG_ERROR("submix: REROUTE refused on the parent: %s", why != nullptr ? why : "?");
-            const bool okMaster = okParent && submix::CallRegisterSoundSubmix(
-                d.device, slot, rerouteMasterObject, true, imageBase, imageSize, &why);
-            if (okParent && !okMaster)
-                SDS_LOG_ERROR("submix: REROUTE refused on the master: %s", why != nullptr ? why : "?");
-            if (okParent && okMaster)
-            {
-                m_submixRerouted.store(true, std::memory_order_release);
-                SDS_LOG_INFO("submix: REROUTE submitted. The engine re-links '%s' under '%s' on "
-                             "the audio thread; if it worked, the SUBMIX line below turns from "
-                             "'NO CALLBACKS' into a steady callback rate within a second - "
-                             "SILENT callbacks are the proof the subtree now renders, a real "
-                             "signal needs a haptic to play.",
-                             m_config.submixRerouteMaster.c_str(),
-                             m_config.submixRerouteParent.c_str());
-            }
+            m_submixRerouted.store(true, std::memory_order_release);
+            SDS_LOG_INFO("submix: REROUTE submitted. The engine re-links '%s' and '%s' under "
+                         "'%s' on the audio thread; if it worked, both SUBMIX lines below turn "
+                         "from 'NO CALLBACKS' into a steady callback rate within a second - "
+                         "SILENT callbacks are the proof the subtrees now render, a real "
+                         "signal needs a haptic / a controller sound to play.",
+                         m_config.submixPath.c_str(), m_config.submixSpeakerPath.c_str(),
+                         m_config.submixRerouteParent.c_str());
         }
     }
 
     if (rearming)
     {
-        SDS_LOG_WARN("submix: REROUTE RE-SUBMITTED (re-arm %lu). The listener was left alone - "
-                     "it is still registered. If the SUBMIX line's cb= rate comes back within "
+        SDS_LOG_WARN("submix: REROUTE RE-SUBMITTED (re-arm %lu). The listeners were left alone - "
+                     "they are still registered. If the SUBMIX lines' cb= rates come back within "
                      "a second or two, a level load really was dropping the re-parenting; if "
-                     "it stays at 0, the reroute is not what is failing.",
-                     m_rerouteRearms.load(std::memory_order_relaxed));
-        m_watchdogLastCallbacks = m_tapVibration->Stats().callbacks;
-        m_watchdogSinceMs       = NowMs();
+                     "they stay put, the reroute is not what is failing.",
+                     m_watchdog.Rearms());
+        const uint64_t callbacks[2] = { m_coils.tap->Stats().callbacks,
+                                        m_speaker.tap->Stats().callbacks };
+        m_watchdog.Rearmed(callbacks, 2, NowMs());
         return true;
     }
 
     const char* whyNot = nullptr;
     SDS_LOG_WARN("submix: about to call vtable slot %d as "
-                 "FAudioDevice::RegisterSubmixBufferListener(listener=%p, submix=%p). The slot "
-                 "is derived from stock UE 4.27.2 (see src/SubmixDiscovery.hpp); Stray is a "
-                 "LICENSEE build, so if the game dies HERE, that derivation is the suspect - "
-                 "read the vtable dump above and set SubmixRegisterSlot.",
-                 m_config.submixRegisterSlot, m_tapVibration->ListenerPointer(),
-                 wantMaster ? nullptr : submixObject);
+                 "FAudioDevice::RegisterSubmixBufferListener(listener=%p, submix=%p) for '%s', "
+                 "then (listener=%p, submix=%p) for '%s'. The slot is derived from stock "
+                 "UE 4.27.2 (see src/SubmixDiscovery.hpp); Stray is a LICENSEE build, so if the "
+                 "game dies HERE, that derivation is the suspect - read the vtable dump above "
+                 "and set SubmixRegisterSlot.",
+                 m_config.submixRegisterSlot, m_coils.tap->ListenerPointer(),
+                 vibrationMasterObject, m_coils.tag, m_speaker.tap->ListenerPointer(),
+                 speakerMasterObject, m_speaker.tag);
 
     if (!submix::CallRegisterSubmixBufferListener(
-            d.device, m_config.submixRegisterSlot, m_tapVibration->ListenerPointer(),
-            wantMaster ? nullptr : submixObject, imageBase, imageSize, &whyNot))
+            d.device, m_config.submixRegisterSlot, m_coils.tap->ListenerPointer(),
+            vibrationMasterObject, imageBase, imageSize, &whyNot))
     {
-        SDS_LOG_ERROR("submix: REFUSED to call the register slot: %s. The tap is dead for this "
+        SDS_LOG_ERROR("submix: REFUSED to call the register slot: %s. The taps are dead for this "
                       "session.", whyNot != nullptr ? whyNot : "no reason recorded");
         m_submixRefused.store(true, std::memory_order_release);
         m_submixBound.store(true, std::memory_order_release);   // stop retrying; it is a refusal
         return false;
+    }
+    // The first call passed every check on the device and the slot; the second is the same
+    // call on the same device with a different submix, so a refusal here is a real surprise
+    // and says so.
+    if (!submix::CallRegisterSubmixBufferListener(
+            d.device, m_config.submixRegisterSlot, m_speaker.tap->ListenerPointer(),
+            speakerMasterObject, imageBase, imageSize, &whyNot))
+    {
+        SDS_LOG_ERROR("submix: the '%s' listener was refused AFTER the '%s' one was accepted: "
+                      "%s. The speaker lane is dead for this session; the coils are not.",
+                      m_speaker.tag, m_coils.tag, whyNot != nullptr ? whyNot : "no reason recorded");
     }
 
     if (m_tapMaster != nullptr)
@@ -523,10 +527,10 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
 
     m_submixDevice = d.device;
     m_submixBound.store(true, std::memory_order_release);
-    SDS_LOG_INFO("submix: registration submitted for '%s'. It is ASYNCHRONOUS - the engine "
-                 "runs it on the audio thread (AudioMixerDevice.cpp:2405) - so callbacks are "
-                 "expected within a frame or two, not immediately. Watch the SUBMIX line.",
-                 wantMaster ? "the MASTER submix" : m_config.submixPath.c_str());
+    SDS_LOG_INFO("submix: registration submitted for '%s' and '%s'. It is ASYNCHRONOUS - the "
+                 "engine runs it on the audio thread (AudioMixerDevice.cpp:2405) - so callbacks "
+                 "are expected within a frame or two, not immediately. Watch the SUBMIX lines.",
+                 m_config.submixPath.c_str(), m_config.submixSpeakerPath.c_str());
     return true;
 }
 
@@ -543,12 +547,12 @@ void Runtime::Shutdown()
     // Detach BEFORE anything else: the taps are the only things the engine can still call
     // into. They are never deleted (SubmixTap.hpp) — after this the leaked trampoline is a
     // `ret` and the engine can hold the pointer for the rest of the process.
-    if (m_tapVibration != nullptr) m_tapVibration->Detach();
-    if (m_tapMaster    != nullptr) m_tapMaster->Detach();
+    if (m_coils.tap   != nullptr) m_coils.tap->Detach();
+    if (m_speaker.tap != nullptr) m_speaker.tap->Detach();
+    if (m_tapMaster   != nullptr) m_tapMaster->Detach();
     m_submixSink.Shutdown();
 
     m_haptics.Shutdown();
-    m_speaker.Shutdown();
     m_triggers.Shutdown();   // releases the triggers on the way out
     m_hidMode.Shutdown();    // hands the coils back to rumble emulation
 
@@ -558,12 +562,10 @@ void Runtime::Shutdown()
 
 // ---- the controller speaker's ROUTING ----------------------------------------------------
 //
-// THE REGRESSION THIS FIXES (docs §15, PadAudio.hpp). The retired libScePad shim called
+// THE REGRESSION THIS FIXES (docs §16, PadAudio.hpp). The retired libScePad shim called
 // scePadSetAudioOutPath(3 = SPEAKER) and scePadSetVolumeGain(80), and the pad speaker worked.
-// deploy-submix-spike.sh retired the shim and nothing has called them since, so the pad has
-// been sitting on its default routing, where the internal speaker is muted — which is exactly
-// the shape of tonight's report: our own counters say the asset loaded, the endpoint opened,
-// zero failures, megabytes streamed, and the user hears nothing.
+// deploy-submix-spike.sh retired the shim and nothing had called them since, so the pad was
+// sitting on its default routing, where the internal speaker is muted.
 //
 // NO PROXY DLL IS NEEDED. The shim intercepted scePadOpen for its handle; we already hold the
 // same handle from scePadGetHandle (§11, "verified to return the same handles"), and the
@@ -571,10 +573,8 @@ void Runtime::Shutdown()
 // reports and the §12 two-writers hazard never arises: we are asking it to change a setting,
 // not writing bytes beside it.
 //
-// This is deliberately NOT hung off AudioPlayer. The routing says where the pad sends what it
-// receives; it is orthogonal to whether those samples came from an extracted asset or (the
-// target shape) from a rerouted speaker submix. Wiring it to the asset player would have to
-// be unpicked the moment the asset path goes.
+// The routing says where the pad sends what it receives; it is orthogonal to the samples,
+// which now come from the rerouted speaker submix through the tap.
 
 uint64_t Runtime::SpeakerRouteSignature() const
 {
@@ -763,6 +763,18 @@ void Runtime::PadThreadMain()
     SDS_LOG_INFO("pad watcher exiting");
 }
 
+void Runtime::ApplySinkGains()
+{
+    if (!m_sinkStarted)
+        return;
+    // The game's own switch gates the coils and only the coils (§9); Speaker=0 gates the
+    // speaker. Both are gains rather than teardowns, so the taps keep reporting numbers -
+    // which is what makes "the user turned it off" distinguishable from "the tap died".
+    const bool coilsOn = m_config.SubmixDrivesCoils() && m_padVibrationEnabled.load();
+    m_submixSink.SetCoilGain(coilsOn ? m_config.submixGain : 0.0f);
+    m_submixSink.SetSpeakerGain(m_config.speaker ? m_config.speakerGain : 0.0f);
+}
+
 void Runtime::Tick()
 {
     if (!m_started.load(std::memory_order_acquire))
@@ -773,7 +785,8 @@ void Runtime::Tick()
         now - m_lastReloadMs >= static_cast<uint64_t>(m_config.configReloadSeconds * 1000.0f))
     {
         m_lastReloadMs = now;
-        m_config.ReloadIfChanged(m_configPath);
+        if (m_config.ReloadIfChanged(m_configPath))
+            ApplySinkGains();
     }
 
     if (m_config.statusSeconds > 0.0f &&
@@ -783,7 +796,8 @@ void Runtime::Tick()
         LogStatus();
     }
 
-    if (m_tapVibration != nullptr && m_config.submixStatusSeconds > 0.0f &&
+    if (m_coils.tap != nullptr && m_speaker.tap != nullptr &&
+        m_config.submixStatusSeconds > 0.0f &&
         now - m_lastSubmixStatusMs >=
             static_cast<uint64_t>(m_config.submixStatusSeconds * 1000.0f))
     {
@@ -796,19 +810,23 @@ void Runtime::Tick()
     SubmixWarnIfDue(now);
 }
 
-// The LOUD, PERIODIC half of the coil-owner verdict. A configuration that asked for the
-// submix and is not getting it is a problem every N seconds, not an INFO line once a second.
+// The LOUD, PERIODIC half of the owner verdicts. A configuration that asked for the submix
+// and is not getting it is a problem every N seconds, not an INFO line once a second.
 void Runtime::SubmixWarnIfDue(uint64_t now)
 {
     if (m_config.submixWarnSeconds <= 0.0f)
         return;
     if (now - m_lastSubmixWarnMs < static_cast<uint64_t>(m_config.submixWarnSeconds * 1000.0f))
         return;
-    const CoilVerdict v = Coils();
-    if (!v.warn)
+    const CoilVerdict c = Coils();
+    const LaneVerdict s = Speaker();
+    if (!c.warn && !s.warn)
         return;
     m_lastSubmixWarnMs = now;
-    SDS_LOG_WARN("%s | %s | HapticSource=%s", v.headline, v.detail, m_config.HapticSourceName());
+    if (c.warn)
+        SDS_LOG_WARN("%s | %s | HapticSource=%s", c.headline, c.detail, m_config.HapticSourceName());
+    if (s.warn)
+        SDS_LOG_WARN("%s: %s | %s", m_speaker.owner, s.headline, s.detail);
 }
 
 float Runtime::LiveThreshold() const
@@ -821,18 +839,37 @@ float Runtime::LiveThreshold() const
     return t;
 }
 
+void Runtime::OpenWatch(Lane& lane, const std::string& asset)
+{
+    if (lane.tap == nullptr || m_config.submixWatchSeconds <= 0.0f || asset.empty())
+        return;
+    WatchVerdict closed;
+    bool         haveClosed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_watchMutex);
+        haveClosed = lane.watch.Start(asset, NowMs(),
+                                      static_cast<uint64_t>(m_config.submixWatchSeconds * 1000.0f),
+                                      LiveThreshold(), closed);
+    }
+    if (haveClosed)
+        ReportWatch(lane, closed);
+}
+
 // THE ANSWER TO "did the engine mix the asset the game asked for". One line, per start,
 // naming the asset — as opposed to a per-second peak, which is 0.00000 whenever nothing
 // happens to be playing and therefore cannot distinguish a dead submix from a quiet moment.
-void Runtime::ReportWatch(const WatchVerdict& v)
+void Runtime::ReportWatch(const Lane& lane, const WatchVerdict& v)
 {
     const double secs = static_cast<double>(v.ms) / 1000.0;
+    const char*  path = &lane == &m_coils ? m_config.submixPath.c_str()
+                                          : m_config.submixSpeakerPath.c_str();
     if (v.result == WatchResult::Mixed)
     {
-        SDS_LOG_INFO("submix watch '%s': the engine MIXED it - peak %.5f over %.1fs "
-                     "(%d window(s), %llu frames). This asset reaches the coils.",
-                     v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
-                     static_cast<unsigned long long>(v.frames));
+        SDS_LOG_INFO("submix watch [%s] '%s': the engine MIXED it - peak %.5f over %.1fs "
+                     "(%d window(s), %llu frames). This asset reaches the %s.",
+                     lane.tag, v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
+                     static_cast<unsigned long long>(v.frames),
+                     &lane == &m_coils ? "coils" : "speaker");
         return;
     }
     // THE THIRD STATE, and it is not a statement about the mixer at all. Distinguished
@@ -841,78 +878,72 @@ void Runtime::ReportWatch(const WatchVerdict& v)
     // delivered no audio: the subtree was not being rendered.
     if (v.result == WatchResult::NoData)
     {
-        SDS_LOG_ERROR("submix watch '%s': NO DATA FROM THE TAP over %.1fs (%d window(s), 0 "
+        SDS_LOG_ERROR("submix watch [%s] '%s': NO DATA FROM THE TAP over %.1fs (%d window(s), 0 "
                       "frames) - this says NOTHING about what the engine mixed. The tap handed "
                       "us no audio at all, so '%s' is not being RENDERED. Suspect the REROUTE, "
-                      "not the game: a level load re-creates the submix graph and the reroute "
-                      "was only ever submitted once. Check 'submix: REROUTE' and the SUBMIX "
-                      "line's cb= rate; the watchdog re-arms it automatically if "
-                      "SubmixRerouteWatchdogSeconds > 0.",
-                      v.asset.c_str(), secs, v.windows, m_config.submixRerouteMaster.c_str());
+                      "not the game: a level load re-creates the submix graph. Check 'submix: "
+                      "REROUTE' and the SUBMIX line's cb= rate; the watchdog re-arms it "
+                      "automatically if SubmixRerouteWatchdogSeconds > 0.",
+                      lane.tag, v.asset.c_str(), secs, v.windows, path);
         return;
     }
-    SDS_LOG_WARN("submix watch '%s': the engine mixed NOTHING - peak %.5f over %.1fs "
+    SDS_LOG_WARN("submix watch [%s] '%s': the engine mixed NOTHING - peak %.5f over %.1fs "
                  "(%d window(s), %llu frames). The tap WAS delivering audio, so this is a real "
                  "negative: the game ASKED for this asset and '%s' carried silence. The fault "
                  "is upstream of the tap - the Blueprint gate (ForcePS5HapticPath / "
                  "DebugPS5Haptic), the level the game passed, or the routing.",
-                 v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
-                 static_cast<unsigned long long>(v.frames), m_config.submixPath.c_str());
+                 lane.tag, v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
+                 static_cast<unsigned long long>(v.frames), path);
 }
 
 // The handover. Callbacks alone are not enough: a submix that renders pure silence would
 // take the coils away from the asset path and give nothing back. Only a real signal proves
-// the engine is putting haptics in there, so that is the trigger - and it is when the sink
-// opens the pad endpoint, not a moment earlier.
-void Runtime::StartSinkAtHandover(float peak)
+// the engine is putting audio in there, so that is the trigger for each lane - and the first
+// lane to reach it is when the sink opens the pad endpoint, not a moment earlier.
+void Runtime::StartLaneAtHandover(Lane& lane, float peak)
 {
-    if (!m_config.SubmixDrivesCoils())
+    const bool isCoils = &lane == &m_coils;
+    if (isCoils && !m_config.SubmixDrivesCoils())
+        return;   // measure mode: the coils stay on the asset path; the speaker still hands over
+    if (lane.live.exchange(true, std::memory_order_acq_rel))
         return;
-    if (m_submixLive.exchange(true, std::memory_order_acq_rel))
-        return;
-    SDS_LOG_WARN("submix: FIRST REAL SIGNAL (peak %.5f) - HANDOVER: the SUBMIX now drives the "
-                 "coils%s.", static_cast<double>(peak),
-                 m_config.hapticSource == HapticSource::SubmixFallback
+    SDS_LOG_WARN("submix: FIRST REAL SIGNAL on '%s' (peak %.5f) - HANDOVER: the SUBMIX now "
+                 "drives the %s%s.", lane.tag, static_cast<double>(peak),
+                 isCoils ? "coils" : "speaker",
+                 isCoils && m_config.hapticSource == HapticSource::SubmixFallback
                      ? " and the asset path stands down" : "");
-    m_haptics.Stop(0.0f);
+    if (isCoils)
+        m_haptics.Stop(0.0f);
+    // Attach the ring EMPTY, then make sure the sink is draining it: the sink's queue-ahead
+    // (40 ms) is the whole latency budget, not the ring's capacity (see StartSubmix).
+    lane.ring.ResetCounters();
+    lane.tap->SetRing(&lane.ring);
     if (!m_sinkStarted)
     {
         m_sinkStarted = true;
-        // Attach the ring EMPTY, then open the sink: the sink's queue-ahead (40 ms) is the whole
-        // latency budget, not the ring's capacity (see StartSubmix).
-        m_submixRing.ResetCounters();
-        m_tapVibration->SetRing(&m_submixRing);
-        m_submixSink.Start(&m_submixRing, m_config.endpointMatch, m_config,
+        m_submixSink.Start(&m_coils.ring, &m_speaker.ring, m_config.endpointMatch, m_config,
                            [this] { m_hidMode.AssertNow("submix: silence -> signal"); });
-        m_submixSink.SetGain(m_padVibrationEnabled.load() ? m_config.submixGain : 0.0f);
+        ApplySinkGains();
     }
 }
 
-// The NUMBERS PROOF. Silence when nothing plays, a live signal during rain, and a HIGHER
-// signal when rain and a purr overlap, is the whole argument that the engine is mixing
-// concurrent haptics for us — which is the thing our own one-slot player cannot do.
-//
-// It is written to a file as well as the log so it can be read with `cat` over ssh, with no
-// overlay and no log grepping. And when the tap never fires it SAYS SO: a listener that was
-// never called and a submix that is genuinely silent produce identical audio, so they must
-// not produce identical text.
-void Runtime::SubmixStatus()
+// One lane's line of the NUMBERS PROOF. Silence when nothing plays, a live signal during
+// rain, and a HIGHER signal when rain and a purr overlap, is the whole argument that the
+// engine is mixing concurrent haptics for us. And when the tap never fires it SAYS SO: a
+// listener that was never called and a submix that is genuinely silent produce identical
+// audio, so they must not produce identical text.
+void Runtime::LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line,
+                         std::size_t lineSize)
 {
-    const submix::TapStats     vib   = m_tapVibration->Stats();
-    const submix::LevelReading level = m_tapVibration->TakeLevels();
-    const double seconds = m_submixStatusWindowMs > 0
-                               ? static_cast<double>(m_submixStatusWindowMs) / 1000.0
-                               : 1.0;
+    const submix::TapStats     stats = lane.tap->Stats();
+    const submix::LevelReading level = lane.tap->TakeLevels();
     const uint64_t deltaCallbacks =
-        vib.callbacks >= m_lastSubmixCallbacks ? vib.callbacks - m_lastSubmixCallbacks : 0;
-    m_lastSubmixCallbacks = vib.callbacks;
+        stats.callbacks >= lane.lastCallbacks ? stats.callbacks - lane.lastCallbacks : 0;
+    lane.lastCallbacks = stats.callbacks;
     const double cbPerSec = static_cast<double>(deltaCallbacks) / seconds;
-
-    const CoilVerdict verdict = Coils();
 
     // The watch is folded in BEFORE the line is built, so a start and its verdict cannot be
     // separated by a status line that says nothing about either.
-    const uint64_t nowMs = NowMs();
     {
         WatchVerdict closed;
         bool         haveClosed = false;
@@ -920,74 +951,100 @@ void Runtime::SubmixStatus()
             std::lock_guard<std::mutex> lock(m_watchMutex);
             // ALWAYS sample, frames included — a frameless window is data, and skipping the
             // call is what made "the tap gave us nothing" print as "the engine mixed nothing".
-            m_submixWatch.Sample(level.peak, level.frames);
-            haveClosed = m_submixWatch.Poll(nowMs, closed);
+            lane.watch.Sample(level.peak, level.frames);
+            haveClosed = lane.watch.Poll(nowMs, closed);
         }
         if (haveClosed)
-            ReportWatch(closed);
+            ReportWatch(lane, closed);
     }
 
-    char line[1200];
+    char headline[400];
+    if (&lane == &m_coils)
+    {
+        const CoilVerdict v = Coils();
+        std::snprintf(headline, sizeof(headline), "%s", v.headline);
+    }
+    else
+    {
+        const LaneVerdict v = Speaker();
+        std::snprintf(headline, sizeof(headline), "%s: %s", lane.owner, v.headline);
+    }
+
     if (level.frames == 0)
     {
-        const uint64_t now  = NowMs();
-        const uint64_t last = vib.lastCallbackMs;
         char since[80];
-        if (last == 0)
+        if (stats.lastCallbackMs == 0)
             std::snprintf(since, sizeof(since), "NEVER - the listener has never been called");
         else
             std::snprintf(since, sizeof(since), "%.1fs ago",
-                          static_cast<double>(now - last) / 1000.0);
-        std::snprintf(line, sizeof(line),
+                          static_cast<double>(nowMs - stats.lastCallbackMs) / 1000.0);
+        std::snprintf(line, lineSize,
                       "%s | SUBMIX %s bound=%d NO CALLBACKS in the last %.1fs (total=%llu, last %s) "
                       "| %s",
-                      verdict.headline,
-                      m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0, seconds,
-                      static_cast<unsigned long long>(vib.callbacks), since,
+                      headline, lane.tag, m_submixBound.load() ? 1 : 0, seconds,
+                      static_cast<unsigned long long>(stats.callbacks), since,
                       m_submixBound.load()
                           ? "the tap IS registered, so the engine is rendering nothing into "
                             "this submix"
                           : "the tap is NOT registered yet (see the WARN lines above)");
+        return;
     }
+
+    if (level.peak > lane.peakEver)
+        lane.peakEver = level.peak;
+    if (level.peak >= LiveThreshold())
+        lane.lastSignalMs = nowMs;
+
+    // `peak` is the LAST WINDOW ONLY, so on its own it says nothing about the session.
+    // These two make one pasted line self-diagnosing: peakEver 0.00000 means the engine
+    // has never put anything in this submix, and a lastSignal of minutes ago against a
+    // peakEver near the ~0.7 a VIBE asset measures means it did and this second is quiet.
+    char ever[120];
+    if (lane.lastSignalMs == 0)
+        std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=NEVER",
+                      static_cast<double>(lane.peakEver));
     else
-    {
-        if (level.peak > m_submixPeakEver)
-            m_submixPeakEver = level.peak;
-        if (level.peak >= LiveThreshold())
-            m_lastSubmixSignalMs = nowMs;
+        std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=%.1fs ago",
+                      static_cast<double>(lane.peakEver),
+                      static_cast<double>(nowMs - lane.lastSignalMs) / 1000.0);
 
-        // `peak` is the LAST WINDOW ONLY, so on its own it says nothing about the session.
-        // These two make one pasted line self-diagnosing: peakEver 0.00000 means the engine
-        // has never put anything in this submix, and a lastSignal of minutes ago against a
-        // peakEver near the ~0.7 a VIBE asset measures means it did and this second is quiet.
-        char ever[120];
-        if (m_lastSubmixSignalMs == 0)
-            std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=NEVER",
-                          static_cast<double>(m_submixPeakEver));
-        else
-            std::snprintf(ever, sizeof(ever), " peakEver=%.5f lastSignal=%.1fs ago",
-                          static_cast<double>(m_submixPeakEver),
-                          static_cast<double>(nowMs - m_lastSubmixSignalMs) / 1000.0);
+    std::snprintf(line, lineSize,
+                  "%s | SUBMIX %s bound=%d live=%d cb=%llu (%.1f/s) ch=%d rate=%d "
+                  "frames/cb=%d peak=%.5f rms=%.5f bad=%llu%s | ring fill=%zu/%zu drop=%llu "
+                  "under=%llu",
+                  headline, lane.tag, m_submixBound.load() ? 1 : 0,
+                  lane.live.load() ? 1 : 0,
+                  static_cast<unsigned long long>(stats.callbacks), cbPerSec,
+                  stats.lastNumChannels, stats.lastSampleRate,
+                  stats.lastNumChannels > 0 ? stats.lastNumSamples / stats.lastNumChannels : 0,
+                  static_cast<double>(level.peak), static_cast<double>(level.rms),
+                  static_cast<unsigned long long>(stats.badCallbacks), ever,
+                  lane.ring.Available(), lane.ring.CapacityFrames(),
+                  static_cast<unsigned long long>(lane.ring.Dropped()),
+                  static_cast<unsigned long long>(lane.ring.Underruns()));
 
-        std::snprintf(line, sizeof(line),
-                      "%s | SUBMIX %s bound=%d live=%d cb=%llu (%.1f/s) ch=%d rate=%d "
-                      "frames/cb=%d peak=%.5f rms=%.5f bad=%llu%s",
-                      verdict.headline,
-                      m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0,
-                      m_submixLive.load() ? 1 : 0,
-                      static_cast<unsigned long long>(vib.callbacks), cbPerSec,
-                      vib.lastNumChannels, vib.lastSampleRate,
-                      vib.lastNumChannels > 0 ? vib.lastNumSamples / vib.lastNumChannels : 0,
-                      static_cast<double>(level.peak), static_cast<double>(level.rms),
-                      static_cast<unsigned long long>(vib.badCallbacks), ever);
+    // Learned from the engine, never assumed: a project ini can change the rate.
+    if (stats.lastSampleRate > 0)
+        m_submixSink.SetSourceRate(static_cast<uint32_t>(stats.lastSampleRate));
 
-        // Learned from the engine, never assumed: a project ini can change the rate.
-        if (vib.lastSampleRate > 0)
-            m_submixSink.SetSourceRate(static_cast<uint32_t>(vib.lastSampleRate));
+    if (level.peak >= LiveThreshold())
+        StartLaneAtHandover(lane, level.peak);
+}
 
-        if (level.peak >= LiveThreshold())
-            StartSinkAtHandover(level.peak);
-    }
+// Both lanes' lines, once a second, to the log and to <gamedir>/stray-dualsense-submix.txt
+// (rewritten in place, so it can be read with `cat` over ssh with no overlay). The shared
+// tail — master probe, reroute, sink — rides on the coil line.
+void Runtime::SubmixStatus()
+{
+    const double seconds = m_submixStatusWindowMs > 0
+                               ? static_cast<double>(m_submixStatusWindowMs) / 1000.0
+                               : 1.0;
+    const uint64_t nowMs = NowMs();
+
+    char coils[1200];
+    char speaker[1200];
+    LaneStatus(m_coils,   seconds, nowMs, coils,   sizeof(coils));
+    LaneStatus(m_speaker, seconds, nowMs, speaker, sizeof(speaker));
 
     char master[220] = "";
     if (m_tapMaster != nullptr)
@@ -1003,27 +1060,24 @@ void Runtime::SubmixStatus()
                           : "");
     }
 
-    char rest[520];
+    char rest[400];
     std::snprintf(rest, sizeof(rest),
-                  "%s | rerouted=%d | ring fill=%zu/%zu drop=%llu under=%llu | sink open=%d '%s' %uch %uHz "
-                  "frames=%llu fail=%llu",
+                  "%s | rerouted=%d | sink open=%d '%s' %uch %uHz frames=%llu fail=%llu",
                   master, m_submixRerouted.load() ? 1 : 0,
-                  m_submixRing.Available(), m_submixRing.CapacityFrames(),
-                  static_cast<unsigned long long>(m_submixRing.Dropped()),
-                  static_cast<unsigned long long>(m_submixRing.Underruns()),
                   m_submixSink.StreamOpen() ? 1 : 0, m_submixSink.EndpointName().c_str(),
                   m_submixSink.EndpointChannels(), m_submixSink.EndpointRate(),
                   static_cast<unsigned long long>(m_submixSink.FramesWritten()),
                   static_cast<unsigned long long>(m_submixSink.Failures()));
 
-    SDS_LOG_INFO("%s%s", line, rest);
+    SDS_LOG_INFO("%s%s", coils, rest);
+    SDS_LOG_INFO("%s", speaker);
 
     if (!m_submixStatusFile.empty())
     {
         FILE* f = nullptr;
         if (_wfopen_s(&f, m_submixStatusFile.c_str(), L"w") == 0 && f != nullptr)
         {
-            std::fprintf(f, "%s%s\n", line, rest);
+            std::fprintf(f, "%s%s\n%s\n", coils, rest, speaker);
             std::fclose(f);
         }
     }
@@ -1031,18 +1085,21 @@ void Runtime::SubmixStatus()
 
 void Runtime::LogStatus()
 {
-    const TriggerEffect fx = m_triggers.Effect();
-    const CoilVerdict   coils = Coils();
-    SDS_LOG_INFO("STATUS coils=%s (%s) pad=%s(user=%d handle=0x%X probes=%lu misses=%lu) "
+    const TriggerEffect fx      = m_triggers.Effect();
+    const CoilVerdict   coils   = Coils();
+    const LaneVerdict   speaker = Speaker();
+    SDS_LOG_INFO("STATUS coils=%s (%s) speaker=%s (%s) "
+                 "pad=%s(user=%d handle=0x%X probes=%lu misses=%lu) "
                  "hid[open=%d writes=%lu fail=%lu] "
                  "trig[events=%lu tx=%lu ok=%lu fail=%lu L=%d R=%d effect=%d/%u/%u/%u %s] "
                  "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
                  "compStops ok=%lu ignored=%lu padVibe=%d] "
                  "gate[open=%d writes=%lu misses=%lu] "
-                 "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s'] "
+                 "spk[starts=%lu stops=%lu live=%d] "
                  "padaudio[route=%s api=%d sonyOk=%d pathResult=0x%08X hidClaim=%d applies=%lu "
                  "fail=%lu]",
                  CoilOwnerName(coils.owner), coils.detail,
+                 LaneOwnerName(speaker.owner), speaker.detail,
                  m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
                  m_pad.Probes(), m_pad.ProbeMisses(),
                  m_hidMode.Opened() ? 1 : 0, m_hidMode.Writes(), m_hidMode.Failures(),
@@ -1056,9 +1113,8 @@ void Runtime::LogStatus()
                  m_componentStopsIgnored.load(), m_padVibrationEnabled.load() ? 1 : 0,
                  m_hapticGateOpen.load() ? 1 : 0, m_hapticGateWrites.load(),
                  m_hapticGateMisses.load(),
-                 m_speakerStarts.load(), m_speaker.Started(), m_speaker.Missing(),
-                 m_speaker.Failures(), m_speaker.EndpointFound() ? 1 : 0,
-                 m_speaker.CurrentName().c_str(),
+                 m_speakerStarts.load(), m_speakerStops.load(),
+                 m_speaker.live.load() ? 1 : 0,
                  // ONE pasted STATUS line must answer "why is the pad speaker silent". The
                  // three fields that do it: `api` says libScePad exports the routing call at
                  // all, `sonyOk` says it accepted, and `pathResult` is its verbatim status.
@@ -1154,20 +1210,7 @@ void Runtime::OnStartVibration(const VibrationStart& s)
     // Open the correlation window BEFORE the verdict, and in every mode: "the game asked and
     // the submix stayed silent" is the measurement that matters whether or not the submix is
     // what currently drives the coils.
-    if (m_tapVibration != nullptr && m_config.submixWatchSeconds > 0.0f && !name.empty())
-    {
-        WatchVerdict closed;
-        bool         haveClosed = false;
-        {
-            std::lock_guard<std::mutex> lock(m_watchMutex);
-            haveClosed = m_submixWatch.Start(
-                name, NowMs(),
-                static_cast<uint64_t>(m_config.submixWatchSeconds * 1000.0f),
-                LiveThreshold(), closed);
-        }
-        if (haveClosed)
-            ReportWatch(closed);
-    }
+    OpenWatch(m_coils, name);
 
     // The verdict decides. The call is still LOGGED above, because the log is how a null
     // submix result gets diagnosed — "the game asked for CatPurr2_VIBE and the submix stayed
@@ -1234,36 +1277,40 @@ void Runtime::OnSetVibrationLevel(float level)
     m_haptics.SetLevel(level);
 }
 
+// The speaker has no player of ours: the engine plays the _CONTROL asset itself once the
+// Blueprint gate is open, into Submix_controllerMaster, which the tap carries to FL/FR. These
+// hooks LOG the intent and open the lane's watch, so one line per start says what the engine
+// put in that submix for the asset the game asked for.
 void Runtime::OnStartControllerSound(const std::string& soundFullName, float level,
                                      bool levelSeen, float fadeIn)
 {
     m_speakerStarts.fetch_add(1, std::memory_order_relaxed);
     const std::string name     = ShortAssetName(soundFullName);
     const float       useLevel = levelSeen ? level : 1.0f;
-    const bool        loop     = m_spkLoops.Contains(name);
-    SDS_LOG_INFO("StartPS5ControllerSound '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f loop=%d(asset)",
+    SDS_LOG_INFO("StartPS5ControllerSound '%s' -> %s level=%.3f(seen=%d) fadeIn=%.2f (the engine "
+                 "plays it; the tap carries it)",
                  soundFullName.c_str(), name.c_str(), static_cast<double>(useLevel),
-                 levelSeen ? 1 : 0, static_cast<double>(fadeIn), loop ? 1 : 0);
-    if (!m_config.enabled || !m_config.speaker)
-        return;
+                 levelSeen ? 1 : 0, static_cast<double>(fadeIn));
     if (name.empty())
     {
         SDS_LOG_ERROR("StartPS5ControllerSound: could not derive an asset name from '%s'",
                       soundFullName.c_str());
         return;
     }
-    m_speaker.Play(name, useLevel, fadeIn, loop);
+    OpenWatch(m_speaker, name);
 }
 
 void Runtime::OnStopControllerSound(float fadeOut)
 {
-    SDS_LOG_INFO("StopPS5ControllerSound fadeOut=%.2f", static_cast<double>(fadeOut));
-    m_speaker.Stop(fadeOut);
+    m_speakerStops.fetch_add(1, std::memory_order_relaxed);
+    SDS_LOG_INFO("StopPS5ControllerSound fadeOut=%.2f (the engine fades it out)",
+                 static_cast<double>(fadeOut));
 }
 
 void Runtime::OnSetControllerSoundLevel(float level)
 {
-    m_speaker.SetLevel(level);
+    // The engine applies it upstream of the tap. Never log it per call.
+    (void)level;
 }
 
 void Runtime::OnPadVibrationEnabled(bool enabled)
@@ -1277,8 +1324,7 @@ void Runtime::OnPadVibrationEnabled(bool enabled)
     // The game's only vibration control (§9) must gate the submix path too, and it is a gain
     // rather than a teardown: the tap keeps reporting numbers, which is what makes "the user
     // turned it off in the menu" distinguishable from "the tap died".
-    if (m_config.SubmixDrivesCoils())
-        m_submixSink.SetGain(enabled ? m_config.submixGain : 0.0f);
+    ApplySinkGains();
     SDS_LOG_INFO("%s", Coils().headline);
 }
 

@@ -66,6 +66,50 @@ constexpr float kSoftClipKnee = 0.75f;
 float SoftClip(float x);
 
 // ---------------------------------------------------------------------------------------
+// The pad's endpoint, and the two lanes that feed it.
+//
+// MEASURED (docs/STRAY-DUALSENSE.md §10/§12): "Speakers (DualSense Wireless Controller)" is
+// 4ch / 48 kHz / float, channel order FL FR RL RR. FL/FR are the SPEAKER, RL/RR are the two
+// COILS (left grip, right grip). Two engine submixes are tapped — Submix_controllerMaster
+// for the speaker, Submix_vibrationMaster for the coils — and ONE stream carries both, each
+// stereo pair landing on its own channel pair. The engine has already mixed, faded, levelled
+// and (for the speaker) run its own SBFX_Boost chain, so no trim of ours belongs here: the
+// lane gains exist for the game's PadVibrationEnabled switch and an ini A/B, not as a level.
+//
+// The internal speaker is fed from the endpoint's RIGHT channel in every routing the kernel
+// driver documents (hid-playstation.c:1366-1377). Both speaker channels are written so that
+// holds whichever channel the firmware reads; a mono source panned centre by the engine
+// arrives equal on both anyway.
+// ---------------------------------------------------------------------------------------
+constexpr std::uint32_t kEndpointChannelFL = 0;
+constexpr std::uint32_t kEndpointChannelFR = 1;
+constexpr std::uint32_t kEndpointChannelRL = 2;
+constexpr std::uint32_t kEndpointChannelRR = 3;
+// The fewest channels an endpoint may have for the coil pair to exist at all. On anything
+// narrower the sink REFUSES: a haptic waveform on the speaker is worse than silence.
+constexpr std::uint32_t kEndpointChannelsRequired = 4;
+
+struct LanePeaks
+{
+    float coils   = 0.0f;   // after gain and soft clip, max over the frames written
+    float speaker = 0.0f;
+};
+
+// Writes `frames` endpoint frames of `channels` samples each into `out`:
+//   speaker stereo (post gain, soft-clipped) -> FL/FR
+//   coil    stereo (post gain, soft-clipped) -> RL/RR
+//   every other channel -> 0
+// Either lane may be SHORT: frames beyond `coilFrames` / `speakerFrames` are silence for that
+// lane only, and a null lane pointer is an empty lane. Channels the endpoint does not have
+// are simply not written (the caller has already refused an endpoint narrower than
+// kEndpointChannelsRequired). Returns each lane's peak so the caller can drive the
+// silence -> signal edge without a second pass.
+LanePeaks InterleaveLanes(const float* coilStereo, std::size_t coilFrames, float coilGain,
+                          const float* speakerStereo, std::size_t speakerFrames,
+                          float speakerGain, std::size_t frames, std::uint32_t channels,
+                          float* out);
+
+// ---------------------------------------------------------------------------------------
 // Linear resampler, stereo interleaved, stateful across buffers.
 //
 // The measured setup has the engine and the pad endpoint both at 48 kHz, so step == 1 and

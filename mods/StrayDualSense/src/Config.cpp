@@ -137,6 +137,7 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixreroutewatchdogseconds") submixRerouteWatchdogSeconds = std::clamp(ParseFloat(val, submixRerouteWatchdogSeconds), 0.0f, 600.0f);
         else if (key == "glyphs")                 glyphControllerType    = ParseGlyphs(val, glyphControllerType);
         else if (key == "submixpath")             submixPath             = val;
+        else if (key == "submixspeakerpath")      submixSpeakerPath      = val;
         else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
         else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "submixdevicesource")     submixDeviceSource     = Lower(val);
@@ -150,6 +151,7 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixlivethreshold")    submixLiveThreshold    = std::clamp(ParseFloat(val, submixLiveThreshold), 0.0f, 1.0f);
         else if (key == "submixstatusfile")       submixStatusFile       = val;
         else if (key == "speaker")                speaker                = ParseBool(val, speaker);
+        else if (key == "speakergain")            speakerGain            = std::clamp(ParseFloat(val, speakerGain), 0.0f, 8.0f);
         else if (key == "padspeakerroute")        padSpeakerRoute        = ParsePadSpeakerRoute(val.c_str(), padSpeakerRoute);
         else if (key == "padspeakerpath")         padSpeakerPath         = std::clamp(std::atoi(val.c_str()), 0, 4);
         else if (key == "padspeakergain")         padSpeakerGain         = std::clamp(std::atoi(val.c_str()), 0, 255);
@@ -159,9 +161,11 @@ bool Config::Load(const std::wstring& path)
         else if (key == "padspeakerhidpreamp")    padSpeakerHidPreamp    = std::clamp(std::atoi(val.c_str()), 0, kPadSpeakerPreampMax);
         else if (key == "endpointmatch")          endpointMatch          = val;
         else if (key == "hapticdir")              hapticDir              = val;
-        else if (key == "spkdir")                 spkDir                 = val;
         else if (key == "hapticloopsfile")        hapticLoopsFile        = val;
-        else if (key == "spkloopsfile")           spkLoopsFile           = val;
+        else if (key == "spkdir" || key == "spkloopsfile")
+            SDS_LOG_INFO("config: '%s' is retired - the speaker comes from the engine's own "
+                         "Submix_controllerMaster through the tap, not from extracted assets. "
+                         "Ignored.", key.c_str());
         else if (key == "hookretryseconds")       hookRetrySeconds       = ParseFloat(val, hookRetrySeconds);
         else if (key == "statusseconds")          statusSeconds          = ParseFloat(val, statusSeconds);
         else if (key == "configreloadseconds")    configReloadSeconds    = ParseFloat(val, configReloadSeconds);
@@ -188,10 +192,9 @@ bool Config::ReloadIfChanged(const std::wstring& path)
         return false;
 
     if (fresh.padUserId != padUserId || fresh.endpointMatch != endpointMatch ||
-        fresh.hapticDir != hapticDir || fresh.spkDir != spkDir ||
-        fresh.hapticLoopsFile != hapticLoopsFile || fresh.spkLoopsFile != spkLoopsFile)
+        fresh.hapticDir != hapticDir || fresh.hapticLoopsFile != hapticLoopsFile)
     {
-        SDS_LOG_WARN("config: PadUserId / EndpointMatch / HapticDir / SpkDir / *LoopsFile "
+        SDS_LOG_WARN("config: PadUserId / EndpointMatch / HapticDir / HapticLoopsFile "
                      "changed but are NOT hot-reloadable. Relaunch the game for those.");
     }
     // The submix tap binds ONCE, on the game thread, into a listener the engine then holds
@@ -199,6 +202,7 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     // against a live audio render thread, which is exactly the kind of half-applied change
     // this function exists to refuse.
     if (fresh.hapticSource != hapticSource || fresh.submixPath != submixPath ||
+        fresh.submixSpeakerPath != submixSpeakerPath ||
         fresh.submixRegisterSlot != submixRegisterSlot ||
         fresh.submixDeviceSource != submixDeviceSource ||
         fresh.submixProbeMaster != submixProbeMaster || fresh.submixReroute != submixReroute ||
@@ -222,6 +226,7 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     hapticValidFlag0      = fresh.hapticValidFlag0;
     hapticReassertSeconds = fresh.hapticReassertSeconds;
     speaker               = fresh.speaker;
+    speakerGain           = fresh.speakerGain;     // live: one atomic on the sink
     // LIVE, deliberately: Runtime re-applies the routing whenever these change, so the whole
     // sony-versus-hid question can be A/B'd inside one session with one keypress per arm
     // rather than one relaunch per arm.
@@ -252,23 +257,24 @@ bool Config::ReloadIfChanged(const std::wstring& path)
 void Config::LogSummary(const char* what) const
 {
     SDS_LOG_INFO("config %s: enabled=%d triggers=%d(readback=%d) haptics=%d(validFlag0=0x%02X "
-                 "reassert=%.1fs) speaker=%d endpoint='%s' padUserId=%d hapticDir='%s' "
-                 "spkDir='%s' loops='%s'/'%s'",
+                 "reassert=%.1fs) speaker=%d(gain=%.3f) endpoint='%s' padUserId=%d "
+                 "hapticDir='%s' loops='%s'",
                  what, enabled ? 1 : 0, triggers ? 1 : 0, triggerReadback ? 1 : 0,
                  haptics ? 1 : 0, static_cast<unsigned>(hapticValidFlag0),
                  static_cast<double>(hapticReassertSeconds), speaker ? 1 : 0,
-                 endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
-                 hapticLoopsFile.c_str(), spkLoopsFile.c_str());
+                 static_cast<double>(speakerGain), endpointMatch.c_str(), padUserId,
+                 hapticDir.c_str(), hapticLoopsFile.c_str());
     SDS_LOG_INFO("config %s: PadSpeakerRoute=%s sonyPath=%d(%s) sonyGain=%d | hid fallback "
                  "path=%d(%s) volume=0x%02X preamp=%d",
                  what, PadSpeakerRouteName(padSpeakerRoute), padSpeakerPath,
                  SceAudioOutPathName(padSpeakerPath), padSpeakerGain, padSpeakerHidPath,
                  PadAudioPathName(padSpeakerHidPath), static_cast<unsigned>(padSpeakerHidVolume),
                  padSpeakerHidPreamp);
-    SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
-                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d "
-                 "warnEvery=%.1fs watch=%.1fs liveThreshold=%.5f",
-                 what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
+    SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' submixSpeakerPath='%s' "
+                 "probeMaster=%d slot=%d deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms "
+                 "scan=0x%X dump=%d warnEvery=%.1fs watch=%.1fs liveThreshold=%.5f",
+                 what, HapticSourceName(), submixPath.c_str(), submixSpeakerPath.c_str(),
+                 submixProbeMaster ? 1 : 0,
                  submixRegisterSlot, submixDeviceSource.c_str(),
                  static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs,
                  static_cast<unsigned>(submixScanBytes), submixDumpWords,
