@@ -113,8 +113,13 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // them. suspect_small counts a View we accepted whose rect is below the engine's own
 // kMinTAAUpsampleResolutionFraction of the dispatch: an impostor too SMALL for view_fits_dispatch
 // to catch, which would feed DLSS another view's jitter/ClipToPrevClip/CameraCut silently.
-// ambiguous counts dispatches where more than one plausible View survived, so the pick was a choice.
+// amb_claimed / amb_other count dispatches where a SECOND surviving View would have given
+// DIFFERENT ClipToPrevClip / jitter / CameraCut - i.e. the slot-order search was guessing rather
+// than having its answer forced. Split by whether the ENGINE claimed the dispatch, because
+// look-alikes outnumber real upscales here and an undifferentiated count cannot answer the only
+// question that matters: was DLSS SR itself ever fed a view we had to guess at?
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
-                          std::uint64_t &suspect_small, std::uint64_t &ambiguous);
+                          std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
+                          std::uint64_t &amb_other);
 
 } // namespace stray_dlss::taa_hook

@@ -1131,19 +1131,25 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		std::uint64_t r135_bad = 0;
 		std::uint64_t wrong_view = 0;
 		std::uint64_t suspect_small = 0;
-		std::uint64_t ambiguous = 0;
-		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view, suspect_small, ambiguous);
-		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0 || suspect_small != 0)
+		std::uint64_t amb_claimed = 0;
+		std::uint64_t amb_other = 0;
+		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view, suspect_small,
+			amb_claimed, amb_other);
+		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0 || suspect_small != 0 || amb_claimed != 0)
 			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
 				"(candidates that were A View buffer but not THIS view - the search skipped "
 				"them; each was an unclaimed frame before facts 36.18) | suspectSmall=%llu "
-				"ambiguous=%llu (INVESTIGATION ONLY, nothing gated: an accepted View below the "
-				"engine's own 0.5 minimum fraction, and dispatches where the pick was a choice)%s", when,
+				"ambClaimed=%llu ambOther=%llu (INVESTIGATION ONLY, nothing gated. ambClaimed is "
+				"THE number: a dispatch the ENGINE claimed where a second surviving View would "
+				"have given different ClipToPrevClip/jitter/CameraCut - i.e. DLSS SR was fed a "
+				"guess. 0 means the search's answer was forced and the quiet residue is "
+				"elsewhere)%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
 				static_cast<unsigned long long>(wrong_view),
 				static_cast<unsigned long long>(suspect_small),
-				static_cast<unsigned long long>(ambiguous),
+				static_cast<unsigned long long>(amb_claimed),
+				static_cast<unsigned long long>(amb_other),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"

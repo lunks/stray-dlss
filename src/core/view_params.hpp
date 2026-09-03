@@ -107,6 +107,19 @@ bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint3
 bool view_fraction_plausible(const ViewParams &p, std::uint32_t covered_w,
                              std::uint32_t covered_h);
 
+// Do these two decoded Views differ in the fields that actually REACH A TEMPORAL CONSUMER?
+//
+// This is what makes an ambiguity count mean something. Two root parameters can point at one
+// suballocation, or hold byte-identical copies of the same view's uniform buffer — neither is a
+// choice the search can get wrong, and counting them inflates the number with events where no
+// view was ever at stake. Only a candidate that would hand DLSS DIFFERENT motion is ambiguity.
+//
+// The fields are exactly those a temporal consumer integrates: ClipToPrevClip element by
+// element (the camera-motion reconstruction), TemporalAAParams (the jitter, CLAUDE.md §2.7) and
+// CameraCut (§2.8). Exact comparison, not a tolerance: two reads of the same buffer are
+// bit-identical, and anything else is a different view.
+bool views_differ_temporally(const ViewParams &a, const ViewParams &b);
+
 // Is the PreExposure / OneOverPreExposure pair (rows 135.y and 135.z) self-consistent? Separate
 // from view_params_plausible ON PURPOSE — that gate governs the whole DLSS path, and those rows
 // are [derived], so a wrong offset there would disable upscaling entirely. Callers that consume

@@ -428,3 +428,60 @@ TEST_CASE("view_fraction_plausible is the OTHER half - it catches an impostor th
 		CHECK(ue4::view_fraction_plausible(p, 0, 0));
 	}
 }
+
+TEST_CASE("views_differ_temporally: duplicates are not ambiguity, different motion is")
+{
+	// An ambiguity counter that counts SURVIVING candidates is inflated by events where no view
+	// was ever at stake - two root parameters pointing at one suballocation, or two copies of
+	// the same view's uniform buffer. Only a candidate that would hand DLSS DIFFERENT motion is
+	// a choice the search can get wrong.
+	ue4::ViewParams a{};
+	a.temporal_aa_params = { 8.0f, 8.0f, 0.25f, -0.125f };
+	a.camera_cut = 0.0f;
+	for (int i = 0; i < 16; ++i)
+		a.clip_to_prev_clip.m[i] = static_cast<float>(i) * 0.5f;
+
+	SUBCASE("a byte-identical copy is NOT ambiguity")
+	{
+		ue4::ViewParams b = a;
+		CHECK_FALSE(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("a different view rect alone is NOT ambiguity - it reaches no temporal consumer")
+	{
+		// The rect matters for the matcher, but DLSS integrates motion, not extents. Two
+		// buffers agreeing on ClipToPrevClip/jitter/CameraCut give the same reprojection.
+		ue4::ViewParams b = a;
+		b.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("any ClipToPrevClip element differing IS ambiguity")
+	{
+		for (int i = 0; i < 16; ++i)
+		{
+			ue4::ViewParams b = a;
+			b.clip_to_prev_clip.m[i] += 1.0f;
+			CHECK(ue4::views_differ_temporally(a, b));
+		}
+	}
+	SUBCASE("jitter differing IS ambiguity")
+	{
+		ue4::ViewParams b = a;
+		b.temporal_aa_params.z = 0.30f;
+		CHECK(ue4::views_differ_temporally(a, b));
+		ue4::ViewParams c = a;
+		c.temporal_aa_params.w = 0.0f;
+		CHECK(ue4::views_differ_temporally(a, c));
+	}
+	SUBCASE("CameraCut differing IS ambiguity")
+	{
+		ue4::ViewParams b = a;
+		b.camera_cut = 1.0f;
+		CHECK(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("it is symmetric")
+	{
+		ue4::ViewParams b = a;
+		b.camera_cut = 1.0f;
+		CHECK(ue4::views_differ_temporally(a, b) == ue4::views_differ_temporally(b, a));
+	}
+}

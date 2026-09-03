@@ -135,6 +135,19 @@ bool view_fraction_plausible(const ViewParams &p, std::uint32_t covered_w,
 	return w >= floor_w && h >= floor_h;
 }
 
+bool views_differ_temporally(const ViewParams &a, const ViewParams &b)
+{
+	for (int i = 0; i < 16; ++i)
+		if (a.clip_to_prev_clip.m[i] != b.clip_to_prev_clip.m[i])
+			return true;
+	if (a.temporal_aa_params.x != b.temporal_aa_params.x ||
+		a.temporal_aa_params.y != b.temporal_aa_params.y ||
+		a.temporal_aa_params.z != b.temporal_aa_params.z ||
+		a.temporal_aa_params.w != b.temporal_aa_params.w)
+		return true;
+	return a.camera_cut != b.camera_cut;
+}
+
 bool pre_exposure_plausible(const ViewParams &p)
 {
 	// DELIBERATELY NOT part of view_params_plausible, which gates the ENTIRE DLSS path: rows

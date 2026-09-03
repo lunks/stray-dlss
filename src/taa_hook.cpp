@@ -60,7 +60,11 @@ std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
 // cannot catch because it is too SMALL rather than too large. Counted, never gated on yet.
 std::atomic<std::uint64_t> g_view_suspect_small{ 0 };
 // More than one plausible View survived the filter on one dispatch, so the pick was a choice.
-std::atomic<std::uint64_t> g_view_ambiguous{ 0 };
+// SPLIT BY WHETHER THE ENGINE CLAIMED THE DISPATCH. A session offers ~10 000 look-alikes beside
+// ~9 000 real upscales, so an undifferentiated count is diluted by an order of magnitude and
+// cannot answer the actual question: was DLSS SR ITSELF ever fed the wrong view?
+std::atomic<std::uint64_t> g_view_amb_claimed{ 0 };
+std::atomic<std::uint64_t> g_view_amb_other{ 0 };
 std::atomic<std::uint32_t> g_view_amb_logged{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
@@ -707,7 +711,11 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// LARGER than the dispatch; one that is SMALLER passes silently and would feed DLSS another
 	// view's jitter, ClipToPrevClip and CameraCut. These two numbers say whether that subset is
 	// empty, occasional or constant — which is the whole question, and it decides the fix.
-	unsigned accepted_candidates = 0;
+	// `distinct_rival` is the number that matters, and it is NOT "how many candidates survived".
+	// Two root parameters can point at one suballocation, or hold byte-identical copies of the
+	// same view - neither is a choice the search can get wrong. Only a survivor that would hand
+	// DLSS DIFFERENT ClipToPrevClip / jitter / CameraCut is ambiguity.
+	bool distinct_rival = false;
 	char cand_list[192];
 	int cand_off = 0;
 	cand_list[0] = '\0';
@@ -732,42 +740,32 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// be larger than the dispatch covers cannot be this one.
 		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			// Gated on !view_ok so this keeps the meaning it had when the loop still broke at
+			// the winner: candidates on LATER root parameters could never have won under either
+			// selection rule, and counting them would make this incomparable with the 19 870
+			// recorded in facts §36.19.
+			if (!view_ok)
+				g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
 			continue;
 		}
-		++accepted_candidates;
 		if (view_ok)
-			continue;  // keep scanning ONLY to count; the pick is unchanged (first accepted)
+		{
+			// Keep scanning ONLY to judge ambiguity; the pick is unchanged (first accepted).
+			if (ue4::views_differ_temporally(view, candidate))
+				distinct_rival = true;
+			continue;
+		}
 		view = candidate;
 		view_ok = true;
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
 	}
-	if (view_ok)
-	{
-		// Would the engine's own kMinTAAUpsampleResolutionFraction have refused what we took?
-		const bool frac_ok = ue4::view_fraction_plausible(view, x * 8u, y * 8u);
-		if (!frac_ok)
-			g_view_suspect_small.fetch_add(1, std::memory_order_relaxed);
-		if (accepted_candidates > 1)
-			g_view_ambiguous.fetch_add(1, std::memory_order_relaxed);
-		// Log only the INTERESTING dispatches - more than one candidate survived the filter, or
-		// the one we took is below the engine's own minimum fraction. A clean frame logs nothing.
-		if ((!frac_ok || accepted_candidates > 1) &&
-			g_view_amb_logged.fetch_add(1, std::memory_order_relaxed) < 8)
-			STRAY_LOG_WARN("VIEW CB AMBIGUITY: dispatch %ux%u groups (covers %ux%u px) had %u "
-				"plausible View buffers survive the fits-dispatch filter; we TOOK b%u = %.0fx%.0f "
-				"(fraction %.3f of the dispatch, engine minimum 0.5 -> %s). All plausible "
-				"candidates:%s. A candidate SMALLER than the dispatch passes the current filter "
-				"silently and would hand DLSS another view's jitter/ClipToPrevClip/CameraCut. "
-				"Investigation only - nothing is gated on this yet. Logged 8 times.",
-				x, y, x * 8u, y * 8u, accepted_candidates, b.view_cb_register,
-				static_cast<double>(view.view_size_and_inv_size.x),
-				static_cast<double>(view.view_size_and_inv_size.y),
-				x != 0 ? static_cast<double>(view.view_size_and_inv_size.x) / (x * 8.0) : 0.0,
-				frac_ok ? "OK" : "BELOW - SUSPECT", cand_list);
-	}
+	// A View below the engine's own minimum fraction is an impostor too SMALL for
+	// view_fits_dispatch to catch. Counted here; the ambiguity verdict waits for the claim.
+	const bool view_frac_ok = !view_ok || ue4::view_fraction_plausible(view, x * 8u, y * 8u);
+	if (view_ok && !view_frac_ok)
+		g_view_suspect_small.fetch_add(1, std::memory_order_relaxed);
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
 	// wrong ClipToPrevClip and a wrong CameraCut, which is exactly what temporal flicker looks
@@ -850,6 +848,34 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
+
+		// THE QUIET-RESIDUE VERDICT, and it is only meaningful on a CLAIMED dispatch. The
+		// question is not "was any dispatch's View ambiguous" - look-alikes outnumber real
+		// upscales here - it is "was DLSS SR itself ever handed a view it had to guess at".
+		// `distinct_rival` means a second surviving candidate would have given different
+		// ClipToPrevClip / jitter / CameraCut, i.e. the slot-order search was guessing.
+		if (view_ok && distinct_rival)
+		{
+			const bool claimed = (seam_gate == seam::Gate::engine);
+			if (claimed)
+				g_view_amb_claimed.fetch_add(1, std::memory_order_relaxed);
+			else
+				g_view_amb_other.fetch_add(1, std::memory_order_relaxed);
+			if (claimed && g_view_amb_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+				STRAY_LOG_WARN("VIEW CB AMBIGUITY ON A CLAIMED DISPATCH: %ux%u groups (covers "
+					"%ux%u px). More than one View survived plausibility + row135 + "
+					"fits-dispatch, AND they disagree on ClipToPrevClip / jitter / CameraCut - "
+					"so the slot-order search GUESSED, and DLSS SR took the guess. We used b%u "
+					"= %.0fx%.0f (fraction %.3f of the dispatch, engine minimum 0.5 -> %s). All "
+					"plausible candidates:%s. THIS is the quiet residue that view_fits_dispatch "
+					"cannot catch (facts §36.20). Investigation only - nothing is gated on it. "
+					"Logged 8 times.",
+					x, y, x * 8u, y * 8u, b.view_cb_register,
+					static_cast<double>(view.view_size_and_inv_size.x),
+					static_cast<double>(view.view_size_and_inv_size.y),
+					x != 0 ? static_cast<double>(view.view_size_and_inv_size.x) / (x * 8.0) : 0.0,
+					view_frac_ok ? "OK" : "BELOW - SUSPECT", cand_list);
+		}
 		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
 		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
 		// no RHI resource at AddPasses time has one now. Each is validated against our own
@@ -2011,13 +2037,15 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 }
 
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
-                          std::uint64_t &suspect_small, std::uint64_t &ambiguous)
+                          std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
+                          std::uint64_t &amb_other)
 {
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
 	suspect_small = g_view_suspect_small.load(std::memory_order_relaxed);
-	ambiguous = g_view_ambiguous.load(std::memory_order_relaxed);
+	amb_claimed = g_view_amb_claimed.load(std::memory_order_relaxed);
+	amb_other = g_view_amb_other.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook
