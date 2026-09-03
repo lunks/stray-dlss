@@ -1277,6 +1277,23 @@ looked at your own code is not an argument.
 > identifies it as **the only concrete capability Streamline has that we lack**, which makes it
 > the whole of the "hybrid" option rather than a nicety.
 
+### Try this first — one environment variable
+
+0. **`NVPRESENT_ENABLE_SMOOTH_MOTION=1`, with our own FG off.** NVIDIA's Linux driver does
+   frame generation at the driver level, *"transparent to the game engine"*, with no Streamline,
+   no NGX feature, no swapchain proxy and nothing to hook. **SOFT** that it works under
+   gamescope — that is what the run establishes. If it works it does not replace our
+   implementation (no guide control, no validation gate, no per-reason refusals) but it **may
+   moot the whole question for a user who simply wants more frames**, and they should get to
+   choose that. NVIDIA warns it must not be combined with native DLSS-FG. §7.6-A.
+
+   > **This replaces the previous item 0**, which proposed re-running OptiScaler with
+   > `LoadReshade=false`. **Withdrawn**: §7.2d found OptiScaler documents *"DLSSG as FG Output"*
+   > as **unsupported by its own maintainers**, so those six launches were driving an unfinished
+   > upstream path and re-running them would most likely reproduce the death for that reason and
+   > teach us nothing about Streamline. The confound the first draft removed was real but was
+   > probably not the important one.
+
 ### Adopt into our own code (independent of Streamline's swapchain — safe under vkd3d-proton)
 
 1. **Call `NvAPI_D3D12_NotifyOutOfBandCommandQueue` on the present owner's queue for the
@@ -1315,23 +1332,6 @@ looked at your own code is not an argument.
    the tagging discipline is now **corroborated by NVIDIA's own plugin**, which uses
    `eOnlyValidNow` (the stricter mode) with a TODO noting `eValidUntilPresent` would be more
    efficient. We chose the same trade-off independently, for a reason the guide states. §1, §2.
-
-### Try this first — one environment variable
-
-0. **`NVPRESENT_ENABLE_SMOOTH_MOTION=1`, with our own FG off.** NVIDIA's Linux driver does
-   frame generation at the driver level, *"transparent to the game engine"*, with no Streamline,
-   no NGX feature, no swapchain proxy and nothing to hook. **SOFT** that it works under
-   gamescope — that is what the run establishes. If it works it does not replace our
-   implementation (no guide control, no validation gate, no per-reason refusals) but it **may
-   moot the whole question for a user who simply wants more frames**, and they should get to
-   choose that. NVIDIA warns it must not be combined with native DLSS-FG. §7.6-A.
-
-   > **This replaces the previous item 0**, which proposed re-running OptiScaler with
-   > `LoadReshade=false`. **Withdrawn**: §7.2d found OptiScaler documents *"DLSSG as FG Output"*
-   > as **unsupported by its own maintainers**, so those six launches were driving an unfinished
-   > upstream path and re-running them would most likely reproduce the death for that reason and
-   > teach us nothing about Streamline. The confound the first draft removed was real but was
-   > probably not the important one.
 
 ### Fix these regardless of the Streamline question — found while writing §7.2b
 
@@ -1408,7 +1408,20 @@ looked at your own code is not an argument.
 * **Confirmation of the §5.3 crash hypothesis.** Unchanged: a reasoned argument, never tested.
   This was a report-only task and the box is owned by another agent this session.
 * **Whether `NvAPI_D3D12_NotifyOutOfBandCommandQueue` is required or merely correct.** Unchanged
-  and still **UNCONFIRMED** after reading both NVIDIA integrations.
+  and still **UNCONFIRMED** after reading both NVIDIA integrations — though it is now confirmed
+  *reachable*: dxvk-nvapi implements it and backs it with real vkd3d-proton queue migration.
+* **Whether Streamline actually runs on THIS box.** §7.2d establishes that Proton implements the
+  HWS gate and that NVIDIA considers Proton supported, but the spoof lives only in **Proton's**
+  Wine fork and was never verified against this specific GE-Proton build. Nothing was run: this
+  was a documentation task and the box is owned by another agent this session. **Every claim in
+  §7 about what would happen here is inference.**
+* **Whether `NVPRESENT_ENABLE_SMOOTH_MOTION=1` works under gamescope.** The recommendation to try
+  it first rests on NVIDIA's driver documentation, not on any Linux-plus-gamescope report.
+  **SOFT.**
+* **Any measurement of Streamline's pacer under Proton.** The argument in §7.2/§7.2d rests on
+  DXVK's presentation-timing APIs being documented as approximate and on an open vkd3d-proton
+  issue, not on anyone having traced SL's frame delivery on this stack. **No published
+  measurement of 3x/4x MFG running on Linux exists at all.**
 * **Streamline SDK 2.12.0's source versus the 2.11.1 the current plugin vendors.** The public SDK
   read by the first pass is *newer* than the vendored one; no diff between them was performed, so
   a 2.12.0-only behaviour could be attributed here to Streamline generally. **SOFT** wherever the
