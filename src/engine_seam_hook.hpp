@@ -92,6 +92,15 @@ struct Verdict
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
 
+// THE INSTRUMENT FOR `unclaimed`. Call for a dispatch the matcher REFUSED, with the verdict and
+// the matcher's own reason. If a pending announcement expects exactly these group counts then
+// the engine's own primary upscale arrived and one of OUR gates turned it away — which is a
+// fixable bug with a named cause. If no such announcement is pending, the dispatch is unrelated
+// and nothing is counted. Splitting those two is the whole point: `unclaimed` alone cannot tell
+// "we rejected the real pass" from "the engine announced an upscale no dispatch followed".
+void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
+                             const char *verdict, const char *reason);
+
 // L1. The engine handed us its scene colour, depth and velocity; this turns each into the
 // ID3D12Resource the D3D12 side already speaks. Call at CLAIM time (during graph execution):
 // at AddPasses time a graph-allocated texture has no RHI resource yet.

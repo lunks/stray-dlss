@@ -978,3 +978,59 @@ TEST_CASE("every L1 gate outcome has a distinct, stable name")
 		CHECK(seen.insert(n).second);
 	}
 }
+
+TEST_CASE("note_unmatched separates 'we refused the real pass' from 'no dispatch came'")
+{
+	// `unclaimed` on its own cannot tell those apart, and they are opposite bugs: the first is
+	// ours to fix and names a gate, the second is not a loss at all - the engine announced an
+	// upscale no dispatch followed, and there was never anything to intercept. This is the
+	// instrument that splits them (report §15).
+	Ledger led;
+	led.begin_frame(1);
+	Announcement a;
+	a.out_width = 3840;
+	a.out_height = 2160;
+	a.frame = 1;
+	a.thread = 1400;
+	led.announce(a);
+
+	const std::uint32_t gx = Ledger::expected_groups(3840);
+	const std::uint32_t gy = Ledger::expected_groups(2160);
+
+	SUBCASE("a refused dispatch of the announced shape IS a near miss")
+	{
+		CHECK(led.note_unmatched(gx, gy));
+		CHECK(led.counters().near_misses == 1);
+	}
+	SUBCASE("a refused dispatch of any other shape is not")
+	{
+		CHECK_FALSE(led.note_unmatched(gx, gy + 1));
+		CHECK_FALSE(led.note_unmatched(120, 68));   // the measured look-alike
+		CHECK(led.counters().near_misses == 0);
+	}
+	SUBCASE("once the announcement is CLAIMED it can no longer be near-missed")
+	{
+		REQUIRE(led.claim(gx, gy) != nullptr);
+		CHECK_FALSE(led.note_unmatched(gx, gy));
+		CHECK(led.counters().near_misses == 0);
+	}
+	SUBCASE("with nothing pending, nothing is a near miss")
+	{
+		Ledger empty;
+		CHECK_FALSE(empty.note_unmatched(gx, gy));
+		CHECK(empty.counters().near_misses == 0);
+	}
+	SUBCASE("it does not disturb the correlation counters")
+	{
+		// The instrument must be pure observation: `unclaimed` and `claimed` have to stay
+		// comparable across every build, which is the rule claim() has been held to throughout.
+		led.note_unmatched(gx, gy);
+		CHECK(led.counters().claimed == 0);
+		CHECK(led.counters().unclaimed == 0);
+		CHECK(led.counters().orphans == 0);
+		CHECK(led.counters().rect_mismatch == 0);
+		// and the announcement is still claimable afterwards
+		CHECK(led.claim(gx, gy) != nullptr);
+		CHECK(led.counters().claimed == 1);
+	}
+}

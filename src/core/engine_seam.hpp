@@ -423,6 +423,12 @@ struct LedgerCounters
 	// It is expected to be non-zero and is NOT an error; `unclaimed` is.
 	std::uint64_t rect_mismatch = 0;
 	std::uint64_t overflow = 0; // more concurrent announcements than the ring holds
+	// A dispatch arrived with EXACTLY the group counts a pending announcement expects, and it
+	// never reached claim() because the matcher refused it first. This is the instrument that
+	// tells the two causes of `unclaimed` apart: non-zero means the real dispatch IS there and
+	// a gate is rejecting it (fixable, and the reason is logged); zero means the engine
+	// announced an upscale no dispatch ever followed (not a loss - nothing to intercept).
+	std::uint64_t near_misses = 0;
 };
 
 // When an unclaimed announcement is retired. Announcement and dispatch both happen on the
@@ -455,6 +461,11 @@ public:
 
 	// ceil(extent / kTaaTileSize), the group count UE 4.27 issues for a Main* config.
 	static std::uint32_t expected_groups(std::uint32_t extent);
+
+	// Does any UNCONSUMED announcement expect exactly these group counts? Asked for a dispatch
+	// the matcher REFUSED, so that "the real pass arrived and a gate rejected it" and "no
+	// dispatch ever came" stop being the same number. Counts a near miss when true.
+	bool note_unmatched(std::uint32_t group_x, std::uint32_t group_y);
 
 private:
 	void retire_stale();

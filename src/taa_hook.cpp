@@ -761,6 +761,14 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	seamhook::Verdict seam_verdict;
 	seamhook::EngineInputs engine_inputs;
 	seam::Gate seam_gate = seam::Gate::heuristic;
+	// THE `unclaimed` INSTRUMENT. A dispatch the matcher refused never reaches claim(), so an
+	// announcement it should have claimed retires as `unclaimed` with no cause recorded. Ask the
+	// ledger whether a pending announcement expected exactly these group counts: if one did, the
+	// engine's own primary upscale just went past and OUR gate turned it away, and the matcher's
+	// verdict and reason are the fix. If none did, this dispatch is unrelated and nothing counts.
+	if (m.verdict != MatchVerdict::structural_only && m.verdict != MatchVerdict::hash_and_structural)
+		seamhook::note_unmatched_dispatch(x, y, verdict_name(m.verdict), m.reason);
+
 	if (m.verdict == MatchVerdict::structural_only || m.verdict == MatchVerdict::hash_and_structural)
 	{
 		seam_verdict = seamhook::claim(x, y);

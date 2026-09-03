@@ -86,6 +86,10 @@ std::uint64_t g_l1_announce_thread = 0;
 std::uint64_t g_l1_claim_thread = 0;
 bool g_l1_threads_latched = false;
 bool g_l1_thread_change_logged = false;
+// Near misses are logged a bounded number of times WITH THE MATCHER'S REASON, because the
+// reason is the fix and a rate alone is not. The count keeps going in the [seam] line.
+constexpr int kNearMissLogLimit = 8;
+int g_near_miss_logged = 0;
 // A read or a call that the guards let through and the CPU refused. Non-zero means an offset
 // or a vtable slot in seam::kRdgResourceRhiOffset / kRhiGetNativeResourceSlot is wrong on this
 // executable, and L1 disables itself for the session rather than roll the dice again.
@@ -809,6 +813,36 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 	return v;
 }
 
+void note_unmatched_dispatch(std::uint32_t group_x, std::uint32_t group_y,
+                             const char *verdict, const char *reason)
+{
+	if (!g_hooked.load(std::memory_order_acquire))
+		return;
+	bool hit = false;
+	bool log_it = false;
+	std::uint64_t n = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		hit = g_ledger.note_unmatched(group_x, group_y);
+		if (hit)
+		{
+			n = g_ledger.counters().near_misses;
+			log_it = g_near_miss_logged < kNearMissLogLimit;
+			if (log_it)
+				++g_near_miss_logged;
+		}
+	}
+	if (log_it)
+		STRAY_LOG_WARN("ENGINE SEAM NEAR MISS #%llu: a dispatch of %ux%u groups arrived while an "
+			"announcement expecting exactly that was pending, and OUR MATCHER REFUSED IT - "
+			"verdict=%s reason=\"%s\". This is an `unclaimed` frame with a named cause: the "
+			"engine's primary temporal upscale ran and DLSS SR did not, so that frame used the "
+			"engine's TAA. Logged %d times.",
+			static_cast<unsigned long long>(n), group_x, group_y,
+			verdict != nullptr ? verdict : "?", reason != nullptr ? reason : "",
+			kNearMissLogLimit);
+}
+
 int format_report(char *buffer, std::size_t size)
 {
 	if (buffer == nullptr || size == 0)
@@ -844,8 +878,9 @@ int format_report(char *buffer, std::size_t size)
 	// frames that published no guides, which is what NR reports as guides-stale / frame-gap.
 	return std::snprintf(buffer, size,
 		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
-		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu | "
-		"claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu | evaluated=%llu | "
+		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu "
+		"nearMiss=%llu | claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu | "
+		"evaluated=%llu | "
 		"l1: resolved=%llu partial=%llu fellBack=%llu stale=%llu faults=%llu off=%d",
 		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
 		static_cast<unsigned long long>(c.announced),
@@ -856,6 +891,7 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(c.overflow),
 		static_cast<unsigned long long>(g_unreadable.load(std::memory_order_relaxed)),
 		"noDispatch", static_cast<unsigned long long>(c.unclaimed),
+		static_cast<unsigned long long>(c.near_misses),
 		seam::seam_refusal_name(seam::SeamRefusal::view_unreadable),
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::view_unreadable)]),
 		seam::seam_refusal_name(seam::SeamRefusal::dead_inputs),
