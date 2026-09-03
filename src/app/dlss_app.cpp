@@ -222,6 +222,7 @@ void apply_nr_live_impl()
 	nr::set_renodx_tuning(g_nr_ui.skin_structure,
 		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
 		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
+	nr::set_style(static_cast<unsigned int>(g_nr_ui.style < 0 ? 0 : (g_nr_ui.style > 2 ? 2 : g_nr_ui.style)));
 	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
 	// The checkbox is the A/B; the slider only matters while it is on. Forcing exactly 1.0 when
 	// off reproduces the unsmoothed behaviour bit for bit rather than approximately.
@@ -483,6 +484,11 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	g_nr_ui.local_structure = host::cfg::get_float("NgxNRLocalStructure", g_nr_ui.local_structure);
 	g_nr_ui.skin_structure = host::cfg::get_float("NgxNRSkinStructure", g_nr_ui.skin_structure);
 	g_nr_ui.preset = host::cfg::get_int("NgxNRPreset", g_nr_ui.preset);
+	// DLSSNR.Style, docs/RESEARCH-DLSSNR-STYLES.md. Default 0 reproduces today (the parameter
+	// was never written before this knob existed). Clamped in apply_nr_live_impl, not here, so
+	// an out-of-range ini value is still visible to a host's status display rather than being
+	// silently rewritten on load.
+	g_nr_ui.style = host::cfg::get_int("NgxNRStyle", g_nr_ui.style);
 	int nr_auto_mask = g_nr_ui.auto_mask ? 1 : 0;
 	int nr_ui_correction = g_nr_ui.ui_correction ? 1 : 0;
 	nr_auto_mask = host::cfg::get_int("NgxNRAutoMask", nr_auto_mask);

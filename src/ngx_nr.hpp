@@ -69,6 +69,24 @@ void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
 // Overrides the motion-vector scale handed to NR; <= 0 means "derive from the topology".
 void set_mvec_scale_override(float scale);
 
+// DLSSNR.Style — confirmed present in the 310.8.0 runtime by exact string search (one
+// occurrence, "DLSSNR.Style", docs/RESEARCH-DLSSNR-STYLES.md), and independently written by two
+// other DLSSNR callers (RenoDX and the OptiScaler_DLSSNR fork). It is NOT DLSSNR.Hint.Render.
+// Preset — that parameter selects a different TRAINED WEIGHT SET (the runtime logs "preset=%d ->
+// %s" against embedded config codenames like WEIGHTS_HT); Style is a small integer with no
+// weight-set switch behind it. 0/1/2 only (values above 2 are meaningless to us; the OptiScaler
+// fork clamps its own UI the same way). Community-tested labels — "Default (standard)", "Natural"
+// and "Cinematic" for 0/1/2 respectively — are the ONLY names attached to these values anywhere
+// we have found; the runtime binary itself carries none (docs/RESEARCH-DLSSNR-STYLES.md). Default
+// here is 0, matching what an unset parameter has always behaved as, so NgxNRStyle=0 changes
+// nothing from today.
+//
+// Style is in the runtime's own control-change list (docs/RESEARCH-RENODX-DLSS5.md's "DLSSNR's
+// structure controls" section), so changing it forces the snippet to wipe feature 18's temporal
+// history for one frame — judge the result a second or two after moving this, never on the frame
+// it changes.
+void set_style(unsigned int style);
+
 // [STRAYDLSS] NgxNRPreload (default ON): LoadLibrary the staged nvngx_dlssnr.dll, resolve its
 // exports and patch its GetModuleFileNameW import, at device init. This is the CHEAP half only
 // — it never calls Init_Ext and never touches the GPU. It matches RenoDX's own description,
