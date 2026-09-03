@@ -25,8 +25,13 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   master and lands on FL/FR of the one stream that carries the coils on RL/RR; the asset
   replay path, its extraction tooling, `HapticSource` and its fallback, and the HID
   speaker-route claim are all deleted. **The speaker lane is UNCONFIRMED — never run.** See §18.
-* **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
-  would be inventing a feature, not restoring one — no evidence Stray designed a behaviour.
+* **Lightbar: the machinery is Sony's, not Stray's, and no Stray-authored layer exists for it.**
+  Driving it would be inventing a feature, not restoring one. **CORRECTED 2026-09-03 (§19):**
+  this bullet used to say "never driven by any shipped content", which was over-claimed — the
+  pak has never been searched for the route that matters, and UE 4.27's stock
+  `APlayerController::SetControllerLightColor` is `BlueprintCallable`, so content could drive it
+  leaving no game-specific string in the exe to find. The conclusion still stands, on a
+  different and better argument; the question is open.
 
 The PC build implements all of this and simply never asks for it; we drive it from a
 `libScePad` shim plus UE4SS hooks.
@@ -1847,3 +1852,338 @@ grep -n "pad audio: scePad\|SONY ACCEPTED" "$L" | head -3                       
 Everything in this section beyond the pure functions (`InterleaveLanes`, `StallWatchdog`,
 `JudgeLane`, unit-tested) and the two CI lanes (unit, mingw) that ran locally. The MSVC lane is
 CI's. The speaker lane has never delivered a sample to a pad.
+
+---
+
+## 19. The light bar: the route, and why the old negative was weaker than it read — 2026-09-03
+
+Answers "on PS5, what drives the light bar in Stray, and does the game's own content ever set
+it?" **It does not close it.** Two of the three legs need a machine this session did not have.
+
+### What could NOT be checked, and why — read this before anything below
+
+* **The pak was never searched.** No copy exists in this worktree or in the repo; box access was
+  out of scope for this investigation. `docs/game-config/` holds five shipped `.ini` copies and
+  no cooked assets. **So there is no pak result here at all** — every statement about Blueprints
+  below is a prediction with a named test, not a measurement.
+* **The two unexplained call sites were not disassembled.** §7's Steamless-unpacked exe was never
+  committed and is no longer on the box, and the packed exe cannot be read statically.
+
+Everything that follows is from UE 4.27.2's own public source (mirror
+`AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`, the same tree `CLAUDE.md` §5 uses), from the
+game's own shipped `.ini` files in `docs/game-config/`, from this repo's own source, and from
+two public third-party reconstructions of Sony's pad header.
+
+### The finding that changes the question: 4.27 already has a first-class light-bar API — HARD
+
+`IInputInterface` does not only carry the untyped device property. It carries **two PURE VIRTUAL
+light-bar methods**:
+
+```cpp
+// IInputInterface.h:146-154
+virtual void SetLightColor(int32 ControllerId, FColor Color) = 0;
+virtual void ResetLightColor(int32 ControllerId) = 0;
+```
+
+and `APlayerController` exposes both **to Blueprint**:
+
+```cpp
+// PlayerController.h:1188-1199
+UFUNCTION(BlueprintCallable, Category="Game|Feedback") void SetControllerLightColor(FColor Color);
+UFUNCTION(BlueprintCallable, Category="Game|Feedback") void ResetControllerLightColor();
+
+// PlayerController.cpp:4103-4119
+IInputInterface* InputInterface = FSlateApplication::Get().GetInputInterface();
+if (InputInterface) { InputInterface->SetLightColor(ControllerId, Color); }
+```
+
+**Consequence, and it is the point of this section.** A Blueprint can drive the light bar with
+**no licensee property, no game-specific FName, and no new reflected type**. So the exhaustive
+strings pass that found no `EPS5Light*`, no `m_*LightColor`, no `SetPS5Light*` and no light data
+struct **does not establish what it was read to establish**. It rules out a licensee-authored
+light system *in the shape the trigger system has*; the stock route leaves no game-specific
+string to find, because the only name involved is an engine `UFUNCTION` present in every UE4
+executable ever cooked.
+
+That is a genuine weakening of the working hypothesis' evidence, and it is why the summary bullet
+at the top of this file has been softened in the same commit.
+
+### But the stock route is DEAD on Windows, and that is why `SonyLightColor` exists — HARD
+
+```cpp
+// WindowsApplication.h:384-390
+// IInputInterface overrides
+virtual void SetLightColor(int32 ControllerId, FColor Color) override { }
+virtual void ResetLightColor(int32 ControllerId) override { }
+```
+
+Empty bodies. And the plugin below them cannot rescue it either: `IInputDevice::SetLightColor` /
+`ResetLightColor` are non-pure with empty bodies (`IInputDevice.h:40-44`) and stock
+`FWinDualShock` **overrides neither** — it forwards only `SetChannelValue`, `SetChannelValues`
+and `SetDeviceProperty` (`WinDualShock.cpp:82-105`).
+
+Contrast the property path, which is plumbed end to end:
+
+```cpp
+// WindowsApplication.cpp:2836-2847
+void FWindowsApplication::SetDeviceProperty(int32 ControllerId, const FInputDeviceProperty* Property)
+{ for (auto DeviceIt = ExternalInputDevices.CreateIterator(); DeviceIt; ++DeviceIt)
+      (*DeviceIt)->SetDeviceProperty(ControllerId, Property); }
+
+// WinDualShock.cpp:102-105
+void SetDeviceProperty(int32 ControllerId, const FInputDeviceProperty* Property) override
+{ Controllers.SetDeviceProperty(ControllerId, Property); }      // -> RVA 0x9FC470
+```
+
+So on stock 4.27 Windows: `SetControllerLightColor` dies at `FWindowsApplication`, one layer
+above the plugin, and would die again at `FWinDualShock` if it got there. **`SetDeviceProperty`
+is the only surviving route to `scePadSetLightBar` on PC.**
+
+**[derived], and it is the best available explanation of the whole `SonyLightColor` design:** a
+device property is the mechanism for carrying something `IInputInterface` has no *working* typed
+method for. Here it duplicates a typed method that exists — which only makes sense on a build
+where that method is a no-op. **The property is the workaround for the Windows dead end.** Its
+presence is therefore evidence that nobody re-plumbed `FWindowsApplication::SetLightColor`, which
+in turn is evidence that nothing on PC ever tried to use the typed route.
+
+### Where this code comes from: it is Sony/Epic's, not Stray's — HARD, from the game's own config
+
+```ini
+; docs/game-config/Hk_project_Config_DefaultGame.ini:384-385
+[Staging]
++RemapDirectories=(From="Engine/Platforms/PS4/Plugins/Runtime/WinDualShock", To="Engine/Plugins/Runtime/WinDualShock")
+```
+
+The WinDualShock the PC build stages is the **PS4 platform extension's** copy — the NoRedist
+LibScePad drop behind `LIBSCEPAD_PLATFORM_INCLUDE` (`WinDualShock.cpp:11-19`), not the public
+`Engine/Plugins/Runtime/Windows/WinDualShock`. `FPlatformControllers` — the class that holds the
+dispatcher at `0x9FC470` and every `scePadSetLightBar` call site — is therefore shared
+PS4/PS5/Windows platform code, not something Stray wrote.
+
+**[derived]: `SonyLightColor` and `PS5TriggerEffect` are almost certainly PLATFORM names, not
+Stray's.** No public corroboration of either string was found (a targeted search returns only the
+generic `SetDeviceProperty` docs), so this is inference from provenance, not a citation.
+
+**That reframes the question.** "Stray implemented a light bar and never used it" is the wrong
+sentence: nothing about the light-bar machinery in this exe is evidence of a Stray design
+intent — it is what a licensee gets for free by staging Sony's plugin. The trigger half is
+genuinely different, and **that asymmetry is the real signal and it survives**: Stray authored a
+reflected trigger layer of its own (`EPS5TriggerEffectMode`, `EPS5TriggersState`,
+`PS5TriggerEffectData`, `SetPS5TriggersState`, `m_scratchablePS5TriggerEffect`, §1/§13) and
+authored **no light-bar counterpart whatsoever**. A team that builds a bespoke wrapper around one
+half of a platform API and none around the other was not planning to use the other half.
+
+Also HARD, same file family: `DefaultEngine.ini:624` reads
+
+```ini
+[SonyController]
+bDSMotionEvents=True
+```
+
+which is exactly one of the four keys `WinDualShock.cpp:34-47` reads, and the only one Stray
+sets — touch events, touch-axis buttons and mouse events all stay default `false`. The plugin is
+live in the PC build and Stray configured it deliberately.
+
+### The two unexplained call sites — NOT settled, two readings, one cheap test
+
+The RVAs from §1, in address order, with the gaps written out:
+
+| RVA | call | gap to previous |
+|---|---|---|
+| `0x9FC3F4` | `scePadOpen` #1 | |
+| `0x9FC44F` | `scePadSetVibrationMode` | `0x5B` |
+| `0x9FC470` | **dispatcher entry** (`FPlatformControllers::SetDeviceProperty`) | `0x21` |
+| `0x9FC501` | `scePadSetLightBar` #1 | `0x91` from entry |
+| `0x9FC509` | `scePadResetLightBar` #1 | `0x08` |
+| `0x9FC6A9` | `scePadSetTriggerEffect` | `0x1A0` |
+| `0x9FC713` | `scePadGetTriggerEffectState` | `0x6A` |
+| `0x9FCCF1` | **`scePadSetLightBar` #2** | `0x5DE` |
+| `0x9FCD07` | **`scePadResetLightBar` #2** | `0x16` |
+| `0x9FCD6F` | **`scePadSetLightBar` #3** | `0x68` |
+| `0x9FCDA2` | **`scePadResetLightBar` #3** | `0x33` |
+| `0x9FCE54` | `scePadOpen` #2 | `0xB2` |
+
+**[derived] from the arithmetic alone:** the dispatcher spans roughly `0x9FC470`–`0x9FC720` and
+contains all three of its calls, which matches §2 and §5. Then ~`0x5DE` of code with no `scePad`
+call. Then a tight cluster of **two small functions, each containing BOTH a set and a reset**
+(`0x16` and `0x33` apart — an `if`/`else`, not two independent statements), immediately followed
+by a third that opens a pad.
+
+Two readings fit every byte of that, and they make opposite predictions:
+
+* **Reading A — dead platform code (favoured).** `FPlatformControllers` is compiled from shared
+  PS4/PS5/Windows source, so its own `SetLightColor` / `ResetLightColor` (or
+  `SetLightBarColor` / `RestoreLightBar`) members are in the Windows image because the class is,
+  and **nothing on Windows can reach them** because `FWindowsApplication::SetLightColor` is empty
+  and `FWinDualShock` does not override it. Predicts: `scePadSetLightBar` is never called at
+  runtime on PC except through the dispatcher — which no content invokes — i.e. never.
+* **Reading B — pad lifecycle.** The cluster sits immediately before the second `scePadOpen`; a
+  connect/adopt routine that applies a stored or per-user colour, and a close/disconnect routine
+  that resets, would look exactly like this. Predicts: `scePadSetLightBar` **is** called, at pad
+  open / user change / close.
+
+The set-or-reset branch shape is common to both, so it discriminates nothing.
+
+**The one-run test, and the instrument already exists and has already been deployed.**
+`tools/dualsense/libScePad_shim.c:612-613` already wraps both functions with `WRAP(...)`, whose
+macro (`:517-527`) logs the name, all four argument registers and the return code on **every**
+call. Deploy the shim (or, cleaner and needing no rename, resolve both out of the already-mapped
+module from the plugin and log — §16's `scePadGetHandle` route) and walk: boot → main menu →
+gameplay → unplug the pad → replug → alt-tab away and back.
+
+* **Any line at all refutes Reading A** and names the moment and the colour bytes.
+* **No line across all of that** leaves Reading A standing on a measured negative instead of an
+  argument.
+
+**No such log has ever been read.** The shim ran for 35+ minutes across several sessions (§5), so
+the evidence may already have been produced and discarded — but no shim log is committed to this
+repo and none was inspected, so "we would have noticed" is not available as evidence.
+
+The disassembly answer needs §7's Steamless step re-run; then the function bounds containing
+`0x9FCCF1` and `0x9FCD6F`, their callers, and whether either address appears in the
+`FPlatformControllers` vtable, settle it directly.
+
+### The route, end to end
+
+**PS5**, at the same level of citation as §2/§3's trigger chain — note how much of it is unread:
+
+```
+Blueprint or C++
+ ├─ APlayerController::SetControllerLightColor(FColor)          HARD  PlayerController.h:1193
+ │    └─ FSlateApplication::Get().GetInputInterface()           HARD  PlayerController.cpp:4112
+ │         └─ <PS5 application>::SetLightColor(id, FColor)      UNCONFIRMED — NDA platform extension
+ │              └─ FPlatformControllers::SetLightBarColor(...)  UNCONFIRMED — name and signature both
+ │                   └─ scePadSetLightBar(handle, &param)       SOFT
+ └─ IInputInterface::SetDeviceProperty(id, &{FName "SonyLightColor", ...})
+      └─ FPlatformControllers::SetDeviceProperty                HARD on PC (RVA 0x9FC470, §2)
+           └─ enable==0 ? scePadResetLightBar(h) : scePadSetLightBar(h,&param)   HARD on PC
+```
+
+**PC**, which is all we can actually see: the typed route is dead at `FWindowsApplication`
+(HARD); the property route is live and is reachable from a UE4SS plugin (HARD that the branch
+exists, UNCONFIRMED that anything in the process ever calls it).
+
+**`ScePadLightBarParam` — SOFT.** Not read from the shipped `libScePad.dll`: the DLL is not in
+this repo and the box was out of scope. Two independent public reconstructions agree:
+
+```c
+typedef struct { uint8_t r, g, b; uint8_t reserve[1]; } ScePadLightBarParam;   /* 4 bytes */
+int scePadSetLightBar(int handle, ScePadLightBarParam *param);
+int scePadResetLightBar(int handle);
+```
+
+* `WujekFoliarz/duaLib` (a clean-room open re-implementation of libScePad, matching its ABI):
+  `s_SceLightBar { uint8_t r, g, b; }` and `scePadSetLightBar(int handle, s_SceLightBar*)`
+  (`src/include/duaLib.h:189-193, :404-406`); its implementation copies `r`/`g`/`b` straight into
+  the DualSense output state and `scePadResetLightBar` writes RGB `0,0,0`
+  (`src/source/duaLib.cpp:697-721, :742-762`).
+* A public OS_SDK `pad.h` port: `PadColor { uint8_t r, g, b; uint8_t reserve[1]; }` with
+  `typedef PadColor PadLightBarParam`.
+
+They agree that the first three bytes are **R, G, B in that order** and differ only on whether a
+fourth reserve byte exists — irrelevant to a caller that zero-initialises. Result codes worth
+naming in a log (duaLib's own table, SOFT): `0x80920006` `INVALID_LIGHTBAR_SETTING`, `0x80920003`
+`INVALID_HANDLE`, `0x80920007` `DEVICE_NOT_CONNECTED` (the same code §7 measured for audio),
+`0x80920005` `NOT_INITIALIZED`.
+
+**The byte-order trap — [derived], UNCONFIRMED, and it fails as a working feature.** §2 records
+the property's colour at `+0x0c/+0x0d/+0x0e`. Two readings:
+
+* If that field is a UE4 **`FColor`**, its in-memory byte order on little-endian is **B, G, R,
+  A** (that is the declaration order of `FColor`'s members), it is 4-byte aligned — which is
+  exactly why it would land at `+0x0c` after a `uint8` enable at `+0x08` — and the dispatcher
+  must be permuting into Sony's R,G,B.
+* If instead they are three loose bytes, note that §2 also records the **trigger** branch reading
+  three parameter bytes at `+0x0a..+0x0c`, which **overlaps `+0x0c`**. One struct, two overlapping
+  interpretations; the offsets alone cannot separate them.
+
+So do not assume the order. A red/blue swap here returns success, lights the bar, and looks like
+a finished feature — verify on the pad.
+
+**Where the light bar sits in the wire format, for orientation — HARD**, `drivers/hid/hid-playstation.c`:
+the DualSense common output report is 47 bytes (`static_assert`) and ends
+`lightbar_setup, led_brightness, player_leds, lightbar_red, lightbar_green, lightbar_blue`
+(`:288-299`), gated by `valid_flag1` bit 2 `DS_OUTPUT_VALID_FLAG1_LIGHTBAR_CONTROL_ENABLE`
+(`:161`). The five white **player-indicator LEDs are a different field** (`player_leds`, bit 4,
+`:163`) and `scePadSetLightBar` has no parameter for them — "the light bar" and "the player
+number lights" are not the same hardware and only one of them is reachable this way.
+
+### What it would take for us to drive it — NOT BUILT
+
+**(a) Call `scePadSetLightBar` directly on the module the game already maps.** Structurally
+identical to §16's `ApplyAudioRoute`: `GetModuleHandleW(L"libScePad.dll")` +
+`GetProcAddress("scePadSetLightBar" / "scePadResetLightBar")`, with the handle `ScePad::SelectPad`
+already holds from `scePadGetHandle`. Both names are in the shipped DLL's export list (§16) and
+both are already resolved by the game (§1), so nothing new is loaded and no proxy DLL is needed.
+On the order of twenty lines on the existing pad thread.
+
+**(b) Build the licensee `SonyLightColor` property and call the dispatcher.** Needs a route to
+`FWindowsApplication` / `FWinDualShock` / `FPlatformControllers` from UE4SS, plus a struct whose
+field order and colour byte order are both UNCONFIRMED, passed by pointer into NDA code that will
+read past the base `FInputDeviceProperty`. **A wrong layout there is not an error return, it is
+an arbitrary read.**
+
+**(a) is safer and it is not close.** (b)'s only advantage would be inheriting behaviour the game
+already has, and this section's whole finding is that there is no such behaviour to inherit.
+
+Failure modes of (a), in the order they would bite:
+
+* **Two writers of the COLOUR, never of the report.** libScePad stays the single writer of the
+  pad's output reports, so this is §16's situation and not §12's: the worst case is last-writer-
+  wins on a colour, not a corrupted report. If Reading B is right, the game re-asserts its colour
+  at pad open / reconnect and ours is silently lost until re-applied. The mitigation is the one
+  `HidMode` already implements — re-assert on a cadence and on the handle-changed edge.
+* **`HidMode` does not collide, and must not be "tidied" into colliding.** Our HID output report
+  writes `valid_flag0` only (`kValidFlag0Waveform = 0x00`) and leaves `valid_flag1` at zero
+  (`HidMode.hpp:12-30`), so `LIGHTBAR_CONTROL_ENABLE` is never claimed and the zeroed lightbar
+  bytes in our report are ignored by the firmware. **HARD**, from our own source plus the kernel
+  bit table above. A future change that claims flags it does not need would blank the light bar
+  as a side effect.
+* **Reset does not necessarily mean off.** duaLib's `scePadResetLightBar` writes RGB `0,0,0`;
+  Sony's real implementation plausibly restores the per-user default colour instead. **SOFT.**
+  Do not use reset as a way to reach darkness without measuring it.
+* **Steam Input may be a third writer.** §4's working configuration has Steam Input on with
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES=` cleared, so Steam sees the pad too and drives the light
+  bar for its own player indication. **UNCONFIRMED**; it would present as our colour being
+  overwritten on a Steam cadence rather than a game one.
+* **Scope, and this is the one that decides whether to build it at all.** Everything else in this
+  file restores behaviour the game asks for and the PC build drops on the floor. **A light-bar
+  behaviour has no such origin** — nothing found here is a design intent to restore. If one is
+  wanted it has to be justified as an invention, and named as one.
+
+### Verdict
+
+| question | answer | label |
+|---|---|---|
+| Does shipped content ever set the light bar? | **STILL OPEN.** The pak was not searched this session, and the exe-side negative does not cover the stock `SetControllerLightColor` route | the weakening is HARD; the open question is the point |
+| What drives it on PS5? | Unread. 4.27 offers exactly two entry points — the typed `SetLightColor` and the `SonyLightColor` device property — and both terminate at `scePadSetLightBar` / `scePadResetLightBar` | [derived] |
+| Is the "C++ lifecycle only, no content" hypothesis refuted? | **No**, and it is now supported by an argument it did not have before — the authored-layer asymmetry between triggers and light — while its original support (absence of light-bar strings in the exe) is worth materially less | [derived] |
+| Are the two extra call sites explained? | **No.** Two readings survive; one cheap runtime test separates them | UNCONFIRMED |
+
+### The three things that would close it
+
+1. **Pak.** Decompress (`tools/pakextract.py --raw` + `tools/oodle_unblock.py`, §7) and search for
+   `SetControllerLightColor`, `ResetControllerLightColor`, `SonyLightColor`, `LightBar`,
+   `LightColor`, `PadLight`, `ControllerLight`. **`SetControllerLightColor` is the one that
+   matters** — it is the exact route the exe's strings cannot exclude. Keep §2's control
+   discipline: control on something that only exists *inside* cooked assets (`ObjectProperty`,
+   `BoolProperty`), because a raw grep of the pak matches uncompressed index path strings and is
+   therefore not a control at all (§7).
+2. **Runtime.** The shim's existing `WRAP(scePadSetLightBar)` / `WRAP(scePadResetLightBar)` log,
+   read across boot → menu → gameplay → unplug → replug. Separates Reading A from Reading B in
+   one session and needs no new code.
+3. **Disassembly.** Steamless-unpack (§7), then the function bounds and callers of `0x9FCCF1` and
+   `0x9FCD6F`, and whether either is in the `FPlatformControllers` vtable.
+
+### Sources for the non-repo citations
+
+* UE 4.27.2: mirror `AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9` —
+  `Engine/Source/Runtime/ApplicationCore/Public/GenericPlatform/IInputInterface.h`,
+  `.../Public/Windows/WindowsApplication.h`, `.../Private/Windows/WindowsApplication.cpp`,
+  `Engine/Source/Runtime/InputDevice/Public/IInputDevice.h`,
+  `Engine/Source/Runtime/Engine/Classes/GameFramework/PlayerController.h`,
+  `.../Private/PlayerController.cpp`,
+  `Engine/Plugins/Runtime/Windows/WinDualShock/Source/WinDualShock/Private/WinDualShock.cpp`.
+* libScePad ABI reconstructions: <https://github.com/WujekFoliarz/duaLib> and the public OS_SDK
+  `pad.h` port at <https://pastebin.com/VLHUeyX5>.
+* DualSense wire format: `drivers/hid/hid-playstation.c`, mainline Linux.
