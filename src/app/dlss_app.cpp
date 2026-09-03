@@ -1209,7 +1209,10 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				// The engine upscaler seam ([STRAYDLSS] EngineSeam). `orphans` is the number
 				// the whole thing exists for: dispatches the behavioural matcher called the
 				// TAA pass while the engine announced no primary temporal upscale they fit.
-				char seam[256] = {};
+				// 640 to match seamhook::log_report's own buffer: the line grew the
+				// per-reason refusal breakdown and the l1: group, and a truncated status
+				// line is a counter silently missing from automation.
+				char seam[640] = {};
 				if (seamhook::format_report(seam, sizeof(seam)) > 0)
 					std::fprintf(f, "%s\n", seam);
 			}
