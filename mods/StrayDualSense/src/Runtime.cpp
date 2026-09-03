@@ -55,6 +55,9 @@ std::wstring ResolveDir(const std::string& configured, const std::wstring& gameD
 constexpr float        kSubmixLiveThreshold = 1.0e-4f;
 constexpr float        kFastPadPollSeconds = 1.0f;
 constexpr unsigned long kFastPadProbes     = 120;
+// How many times the reroute watchdog will re-submit before it stops and says so. A level
+// load is a handful of events a session; a hundred is a structural fault being papered over.
+constexpr unsigned long kMaxRerouteRearms  = 20;
 
 // The directory above `dir`, with its trailing separator kept. Empty if there is none.
 // <Mods>/StrayDualSense/dlls/ -> <Mods>/StrayDualSense/
@@ -286,8 +289,83 @@ CoilFacts Runtime::CoilFactsNow() const
 
 bool Runtime::SubmixWantsBinding() const
 {
-    return m_config.SubmixTapWanted() && m_tapVibration != nullptr &&
-           !m_submixBound.load(std::memory_order_acquire);
+    if (!m_config.SubmixTapWanted() || m_tapVibration == nullptr)
+        return false;
+    // The REROUTE re-arm is the second reason to want the glue again, and it exists because
+    // the reroute was only ever submitted ONCE. Both halves of it are gated on this function:
+    // the glue's UObject writes (ParentSubmix, OutputVolume) and our RegisterSoundSubmix call.
+    // So once bound, a submix graph rebuilt by a level load could never be repaired, which is
+    // exactly the "worked in BaseMap, silent in 03_Slums" shape.
+    return !m_submixBound.load(std::memory_order_acquire) ||
+           m_rerouteRearmWanted.load(std::memory_order_acquire);
+}
+
+// Watchdog: the tap is bound and the subtree has STOPPED being rendered. Re-arm the reroute
+// so the glue re-writes the UObject links and we re-submit RegisterSoundSubmix.
+//
+// THIS IS NOT A FALLBACK. It does not hand the coils to the asset path or soften strict mode;
+// it repairs the one thing that makes strict mode unreliable. A silent pad stays a silent pad
+// until the submix genuinely renders again.
+void Runtime::RerouteWatchdog(uint64_t now)
+{
+    if (!m_config.submixReroute || m_config.submixRerouteWatchdogSeconds <= 0.0f)
+        return;
+    if (m_tapVibration == nullptr || !m_submixBound.load(std::memory_order_acquire) ||
+        m_submixRefused.load(std::memory_order_acquire))
+        return;
+    if (m_rerouteRearmWanted.load(std::memory_order_acquire))
+        return;   // already asked; waiting for the glue's next game-thread pass
+
+    const uint64_t callbacks = m_tapVibration->Stats().callbacks;
+    if (callbacks != m_watchdogLastCallbacks)
+    {
+        m_watchdogLastCallbacks = callbacks;
+        m_watchdogSinceMs       = now;
+        return;
+    }
+    // Never fire before the first callback has EVER arrived: registration is asynchronous
+    // (the engine runs it on the audio thread), so a freshly bound tap legitimately reads 0
+    // for a frame or two and re-arming there would fight the bind instead of repairing it.
+    if (callbacks == 0)
+    {
+        m_watchdogSinceMs = now;
+        return;
+    }
+    if (m_watchdogSinceMs == 0)
+    {
+        m_watchdogSinceMs = now;
+        return;
+    }
+    const uint64_t stalledMs =
+        static_cast<uint64_t>(m_config.submixRerouteWatchdogSeconds * 1000.0f);
+    if (now - m_watchdogSinceMs < stalledMs)
+        return;
+
+    const unsigned long n = m_rerouteRearms.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > kMaxRerouteRearms)
+    {
+        // Loud once, then stop: something structural is wrong and re-submitting forever would
+        // bury it. m_watchdogSinceMs is left set so this does not repeat every tick.
+        if (n == kMaxRerouteRearms + 1)
+            SDS_LOG_ERROR("submix: the reroute has been re-armed %lu times and the subtree "
+                          "still stops rendering. Giving up on the watchdog for this session - "
+                          "this is not a transient level-load effect. Read the 'submix: "
+                          "REROUTE' lines and SubmixRegisterSoundSubmixSlot.",
+                          kMaxRerouteRearms);
+        return;
+    }
+    const uint64_t stalledForMs = now - m_watchdogSinceMs;   // BEFORE the reset, or it reads 0
+    m_watchdogSinceMs = now;
+    m_rerouteRearmWanted.store(true, std::memory_order_release);
+    SDS_LOG_ERROR("submix: THE SUBTREE HAS STOPPED RENDERING - callbacks stuck at %llu for "
+                  "%.1fs while the tap is bound. The most likely cause is a LEVEL LOAD "
+                  "re-creating the submix graph, which drops the re-parenting we submitted "
+                  "once at bind time. Re-arming the reroute (attempt %lu of %lu): the glue "
+                  "will re-write '%s'.ParentSubmix and we will re-submit RegisterSoundSubmix. "
+                  "The listener is NOT re-registered - it is still attached.",
+                  static_cast<unsigned long long>(callbacks),
+                  static_cast<double>(stalledForMs) / 1000.0, n, kMaxRerouteRearms,
+                  m_config.submixRerouteMaster.c_str());
 }
 
 bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
@@ -297,6 +375,13 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
 {
     if (!SubmixWantsBinding())
         return m_submixBound.load(std::memory_order_acquire);
+
+    // A RE-ARM, not a first bind: the listener is already attached and must NOT be registered
+    // again (UE 4.27's FMixerSubmix::RegisterBufferListener appends without de-duplicating, so
+    // a second registration would deliver every callback twice into one ring). Redo ONLY the
+    // reroute, whose UObject half the glue has already re-written before calling us.
+    const bool rearming = m_submixBound.load(std::memory_order_acquire);
+    m_rerouteRearmWanted.store(false, std::memory_order_release);
 
     const int attempt = m_submixBindAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
 
@@ -390,6 +475,18 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
                              m_config.submixRerouteParent.c_str());
             }
         }
+    }
+
+    if (rearming)
+    {
+        SDS_LOG_WARN("submix: REROUTE RE-SUBMITTED (re-arm %lu). The listener was left alone - "
+                     "it is still registered. If the SUBMIX line's cb= rate comes back within "
+                     "a second or two, a level load really was dropping the re-parenting; if "
+                     "it stays at 0, the reroute is not what is failing.",
+                     m_rerouteRearms.load(std::memory_order_relaxed));
+        m_watchdogLastCallbacks = m_tapVibration->Stats().callbacks;
+        m_watchdogSinceMs       = NowMs();
+        return true;
     }
 
     const char* whyNot = nullptr;
@@ -695,6 +792,7 @@ void Runtime::Tick()
         SubmixStatus();
     }
 
+    RerouteWatchdog(now);
     SubmixWarnIfDue(now);
 }
 
@@ -728,20 +826,38 @@ float Runtime::LiveThreshold() const
 // happens to be playing and therefore cannot distinguish a dead submix from a quiet moment.
 void Runtime::ReportWatch(const WatchVerdict& v)
 {
-    if (v.carried)
+    const double secs = static_cast<double>(v.ms) / 1000.0;
+    if (v.result == WatchResult::Mixed)
     {
-        SDS_LOG_INFO("submix watch '%s': the engine MIXED it - peak %.5f over %.1fs (%d window(s)). "
-                     "This asset reaches the coils.",
-                     v.asset.c_str(), static_cast<double>(v.peak),
-                     static_cast<double>(v.ms) / 1000.0, v.windows);
+        SDS_LOG_INFO("submix watch '%s': the engine MIXED it - peak %.5f over %.1fs "
+                     "(%d window(s), %llu frames). This asset reaches the coils.",
+                     v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
+                     static_cast<unsigned long long>(v.frames));
         return;
     }
-    SDS_LOG_WARN("submix watch '%s': the engine mixed NOTHING - peak %.5f over %.1fs (%d window(s)). "
-                 "The game ASKED for this asset and '%s' stayed silent, so the fault is upstream "
-                 "of the tap: the Blueprint gate (ForcePS5HapticPath / DebugPS5Haptic), the level "
-                 "the game passed, or the routing - not the listener, which is being called.",
-                 v.asset.c_str(), static_cast<double>(v.peak),
-                 static_cast<double>(v.ms) / 1000.0, v.windows, m_config.submixPath.c_str());
+    // THE THIRD STATE, and it is not a statement about the mixer at all. Distinguished
+    // 2026-09-03 after "the engine mixed NOTHING - peak 0.00000 over 1.2s (0 window(s))" was
+    // read as a mixing failure in 03_Slums when what it actually recorded was a tap that
+    // delivered no audio: the subtree was not being rendered.
+    if (v.result == WatchResult::NoData)
+    {
+        SDS_LOG_ERROR("submix watch '%s': NO DATA FROM THE TAP over %.1fs (%d window(s), 0 "
+                      "frames) - this says NOTHING about what the engine mixed. The tap handed "
+                      "us no audio at all, so '%s' is not being RENDERED. Suspect the REROUTE, "
+                      "not the game: a level load re-creates the submix graph and the reroute "
+                      "was only ever submitted once. Check 'submix: REROUTE' and the SUBMIX "
+                      "line's cb= rate; the watchdog re-arms it automatically if "
+                      "SubmixRerouteWatchdogSeconds > 0.",
+                      v.asset.c_str(), secs, v.windows, m_config.submixRerouteMaster.c_str());
+        return;
+    }
+    SDS_LOG_WARN("submix watch '%s': the engine mixed NOTHING - peak %.5f over %.1fs "
+                 "(%d window(s), %llu frames). The tap WAS delivering audio, so this is a real "
+                 "negative: the game ASKED for this asset and '%s' carried silence. The fault "
+                 "is upstream of the tap - the Blueprint gate (ForcePS5HapticPath / "
+                 "DebugPS5Haptic), the level the game passed, or the routing.",
+                 v.asset.c_str(), static_cast<double>(v.peak), secs, v.windows,
+                 static_cast<unsigned long long>(v.frames), m_config.submixPath.c_str());
 }
 
 // The handover. Callbacks alone are not enough: a submix that renders pure silence would
@@ -802,8 +918,9 @@ void Runtime::SubmixStatus()
         bool         haveClosed = false;
         {
             std::lock_guard<std::mutex> lock(m_watchMutex);
-            if (level.frames != 0)
-                m_submixWatch.Sample(level.peak);
+            // ALWAYS sample, frames included — a frameless window is data, and skipping the
+            // call is what made "the tap gave us nothing" print as "the engine mixed nothing".
+            m_submixWatch.Sample(level.peak, level.frames);
             haveClosed = m_submixWatch.Poll(nowMs, closed);
         }
         if (haveClosed)

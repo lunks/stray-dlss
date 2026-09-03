@@ -260,6 +260,11 @@ SubmixWarnSeconds = 10
 ; The 2026-09-03 finding: the vibration subtree is never rendered on PC (dummy endpoint), and
 ; the Blueprints do nothing until DebugPS5Haptic is true. These two switch both on.
 SubmixReroute = $REROUTE
+; The reroute is submitted ONCE at bind, so a LEVEL LOAD that rebuilds the submix graph used to
+; silence the pad for the rest of the session (measured: BaseMap peak 0.708, 03_Slums zero
+; callbacks). If the bound tap's callbacks stall this long, re-arm it. NOT a fallback - strict
+; mode stays strict.
+SubmixRerouteWatchdogSeconds = 5.0
 SubmixRerouteMaster = /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
 SubmixRerouteParent = /Game/Sound/tools/settings/Submix_unused.Submix_unused
 SubmixRegisterSoundSubmixSlot = 14

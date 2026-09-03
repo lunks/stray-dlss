@@ -22,14 +22,40 @@
 
 namespace sds {
 
-// What one watch measured.
+// What one watch CONCLUDED — three states, not two.
+//
+// CORRECTED 2026-09-03, and it is §15's own lesson recurring inside the instrument built to
+// fix §15. This enum used to be the bool `carried`, so a watch that folded in ZERO windows
+// reported `carried = false`, which `ReportWatch` printed as "the engine mixed NOTHING". That
+// sentence is a claim about the MIXER. A watch with no windows has not measured the mixer at
+// all — the tap handed it no frames — and the two worlds have completely different causes:
+//
+//   NoData  the tap delivered no audio while the watch was open. The subtree is not being
+//           rendered, so the suspect is the REROUTE or the binding, NOT the game's mixing.
+//           Measured live in 03_Slums: "peak 0.00000 over 1.2s (0 window(s))".
+//   Silent  the tap delivered frames and their peak stayed under the threshold. THIS is the
+//           real negative, and only this one licenses "the engine mixed nothing".
+//   Mixed   the peak reached the threshold.
+enum class WatchResult
+{
+    NoData,
+    Silent,
+    Mixed,
+};
+
 struct WatchVerdict
 {
     std::string   asset;              // the short asset name, e.g. "Scratch_VIBE"
     float         peak    = 0.0f;     // the highest window peak seen while the watch was open
     int           windows = 0;        // how many status windows were folded in
+    std::uint64_t frames  = 0;        // total frames the tap delivered across those windows
     std::uint64_t ms      = 0;        // how long the watch was open, in ms
-    bool          carried = false;    // peak >= the threshold it was opened with
+    WatchResult   result  = WatchResult::NoData;
+
+    // Kept so existing call sites and tests read naturally; it is now derived, and it is
+    // deliberately FALSE for NoData — "we did not see it mixed" is true there, while
+    // "the engine mixed nothing" is not.
+    bool Carried() const { return result == WatchResult::Mixed; }
 };
 
 class SubmixWatch
@@ -44,12 +70,17 @@ public:
     bool Start(const std::string& asset, std::uint64_t nowMs, std::uint64_t windowMs,
                float threshold, WatchVerdict& closed);
 
-    // One status window's peak. No-op when no watch is open.
+    // One status window: its peak AND how many frames the tap actually delivered. No-op when
+    // no watch is open.
+    //
+    // CALL THIS EVEN WHEN `frames` IS ZERO. The caller used to skip the call entirely on a
+    // frameless window, which is precisely what made "no data" indistinguishable from
+    // "silence" — the watch could not count what it was never told about.
     //
     // KNOWN AND DELIBERATE: the first window folded in straddles the start, so it can carry
     // signal from just BEFORE it. That biases the reading towards "the engine mixed it",
     // which is the safe direction — it can only make a NEGATIVE verdict harder to reach.
-    void Sample(float peak);
+    void Sample(float peak, std::uint64_t frames);
 
     // Closes and reports the watch once `windowMs` has elapsed. Returns false otherwise.
     bool Poll(std::uint64_t nowMs, WatchVerdict& out);
@@ -64,6 +95,7 @@ private:
     float         m_peak      = 0.0f;
     float         m_threshold = 0.0f;
     int           m_windows   = 0;
+    std::uint64_t m_frames    = 0;
     std::uint64_t m_startMs   = 0;
     std::uint64_t m_endMs     = 0;
 };

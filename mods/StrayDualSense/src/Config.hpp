@@ -166,6 +166,16 @@ struct Config
     // -1 = leave the game's answer alone.
     int glyphControllerType = 3;
 
+    // THE REROUTE WATCHDOG. The reroute is submitted ONCE at bind time, and both halves of it
+    // — the glue's ParentSubmix/OutputVolume writes and our RegisterSoundSubmix call — are
+    // gated on SubmixWantsBinding(), which latches false forever after the first bind. So a
+    // submix graph rebuilt by a level load could never be repaired, and the pad went silent
+    // for the rest of the session (measured 2026-09-03: worked in BaseMap, silent in
+    // 03_Slums). If the tap is bound and its callbacks stop advancing for this long, re-arm
+    // the reroute. 0 disables it. This is NOT a fallback — it never gives the coils back to
+    // the asset path; it repairs the thing that makes strict mode unreliable.
+    float submixRerouteWatchdogSeconds = 5.0f;
+
     // ---- controller speaker ----------------------------------------------------------
     bool speaker = true;
 

@@ -11,10 +11,15 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   see §8.
 * **Haptics: WORKING, as real waveforms on the voice coils** — the native DualSense
   mechanism, not motor emulation. See §12, which supersedes the envelope approach in §9.
-* **Controller speaker: REGRESSED, and the cause is identified.** It worked from the
-  `libScePad` shim, which called `scePadSetAudioOutPath(3 = SPEAKER)`; retiring the shim
-  removed the only caller, and the pad's default routing MUTES its internal speaker. The
-  plugin now makes those calls itself, with no proxy DLL. **Not yet run — see §16.**
+* **Controller speaker: WORKING AGAIN, confirmed on the pad 2026-09-03.** It had regressed when
+  the `libScePad` shim was retired, removing the only caller of
+  `scePadSetAudioOutPath(3 = SPEAKER)` — and the pad's default routing MUTES its internal
+  speaker. The plugin now makes those calls itself through `scePadGetHandle`, with no proxy DLL:
+  `scePadSetAudioOutPath(3=SPEAKER)=0x00000000`, `SONY ACCEPTED the route`. See §16.
+* **Coil haptics from the submix: INTERMITTENT.** Confirmed working in `BaseMap` (peak 0.708),
+  then silent for a whole session in `03_Slums`. Two defects found: the watch could not tell
+  "no data" from "silence", and the reroute was only ever submitted once so a level load ended
+  it. Both fixed, neither run. See §17.
 * **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
   would be inventing a feature, not restoring one — no evidence Stray designed a behaviour.
 
@@ -1531,3 +1536,161 @@ grep -n "AUDIO CLAIM"       "$L" | head -3   # only if it escalated to hid
 **And in every case check that `COILS: driven by the SUBMIX` and the peaks are unchanged.** If
 the coils regressed, set `PadSpeakerRoute=sony` (which never writes a HID byte) or `off`, and
 report it — that would be the first evidence against the claim's safety argument.
+
+---
+
+## 17. The 03_Slums silence: the instrument lied, and the reroute was never re-applied — 2026-09-03
+
+### What the log actually said, and what it was read to mean
+
+Strict `submix` + reroute + gate, `03_Slums`, launched from Steam. Every asset the game asked
+for:
+
+```
+submix watch 'generic_hit_01_VIBE': the engine mixed NOTHING - peak 0.00000 over 1.2s (0 window(s))
+submix watch 'CatPurr2_VIBE':       the engine mixed NOTHING - peak 0.00000 over 4.7s
+COILS: NOBODY - the pad is SILENT by configuration (HapticSource=submix, no fallback)
+```
+
+That was read as "the engine is not mixing haptics into the submix", which sent the diagnosis
+upstream to the Blueprint gate. **The line does not say that, and `(0 window(s))` is the tell.**
+
+`Runtime::SubmixStatus` only folded a window into the watch when `level.frames != 0`:
+
+```cpp
+if (level.frames != 0)          // <- the defect
+    m_submixWatch.Sample(level.peak);
+```
+
+So a tap delivering **no audio at all** contributed nothing, `m_windows` stayed 0, `m_peak`
+stayed 0, and `carried = m_peak >= threshold` came out false — printed as a claim about the
+MIXER. **This is §15's own lesson recurring inside the instrument built to fix §15**: a reading
+of zero that cannot distinguish "silence" from "no measurement".
+
+**Fixed (0.3.2).** `WatchVerdict::result` is now a three-state `WatchResult`:
+
+| result | means | licenses |
+|---|---|---|
+| `NoData` | the tap delivered 0 frames while the watch was open | **nothing about mixing.** Suspect the reroute or the binding |
+| `Silent` | frames arrived and their peak stayed under the threshold | the real negative: the game asked and the submix carried silence |
+| `Mixed` | the peak reached the threshold | the asset reaches the coils |
+
+`Sample(peak, frames)` is now called on **every** window, frames included; a frameless window is
+counted but cannot contribute a peak, so it can neither be mistaken for silence nor launder a
+stale meter reading into a signal. Pure and pinned: `tests/test_submix_watch.cpp`.
+
+### And the real bug: the reroute is submitted ONCE, so a level load ends the session
+
+`SubmixWantsBinding()` returned false forever once `m_submixBound` was set, and **both halves of
+the reroute are gated on it**:
+
+* the glue's UObject writes — `Submix_unused.OutputVolume = 0` and
+  `Submix_vibrationMaster.ParentSubmix = Submix_unused` (`Mod.cpp:739-805`, whose own comment
+  says the writes are "idempotent, so it runs every attempt" — but the attempt never came again);
+* our `FAudioDevice::RegisterSoundSubmix` calls, which tell the engine to re-link the live
+  `FMixerSubmix` instances.
+
+A level load rebuilds the submix graph. Nothing re-applied either half, so the subtree stopped
+being rendered and stayed that way for the rest of the session — **exactly** the measured shape:
+peak 0.708 in `BaseMap`, zero callbacks in `03_Slums`.
+
+**Fixed with a watchdog, `SubmixRerouteWatchdogSeconds` (default 5.0).** When the tap is bound,
+not refused, and its callbacks have not advanced for that long *after having advanced at least
+once*, it re-arms: `SubmixWantsBinding()` goes true again, the glue re-writes the UObject links
+and we re-submit `RegisterSoundSubmix`. **The listener is NOT re-registered** — UE 4.27's
+`FMixerSubmix::RegisterBufferListener` appends without de-duplicating, so a second registration
+would deliver every callback twice into one ring. Capped at 20 re-arms, then it says so loudly
+rather than papering over a structural fault.
+
+**This is not a fallback.** It never hands the coils back to the asset path. Strict mode stays
+strict and a silent submix stays a silent pad; the watchdog only repairs the thing that made
+strict mode unreliable.
+
+### The `GetPlatform` question, evaluated — and the premise does not hold on this build
+
+The proposal: replace `ForcePS5HapticPath` (which writes `DebugPS5Haptic` on a
+`BP_HKPlayerController_C` **instance**) with a hook on
+`/Script/Hk_project.HKUtilities:GetPlatform` (a **static** utility, so nothing to go stale).
+
+**The argument's load-bearing claim is that a level transition leaves the instance write stale.
+On this build it cannot.** `ForcePS5HapticPathOnGameThread(context.Context)` is called from the
+PRE-hook of `StartPS5Vibration`, `StopPS5Vibration` and `StartPS5ControllerSound`
+(`Mod.cpp:1004`, `:1025`, `:1050`), and `context.Context` is the UObject the UFunction is
+executing on. So the bool is written **on the live controller, microseconds before the gate that
+reads it, on every single call.** A new controller after a level load gets the write on its very
+first `StartPS5Vibration`. There is no window in which the gate is unset.
+
+That is not theory — it is the §15 `FindFirstOf` fix, which replaced exactly the stale-object
+mechanism being described here.
+
+**And this session's own log confirms the gate worked in `03_Slums`:** `spk[starts=1 played=1
+missing=0 fail=0 endpoint=1]`, the first honoured `StopPS5VibrationOnAudioComponent` this
+project has logged, and four `submix watch` lines — which only open on a vibration start. The
+hooks fired, the gate opened, the Blueprints played. **The tap delivered no frames.** Different
+layer entirely.
+
+Answering the four questions directly:
+
+1. **Does hooking `GetPlatform` open the vibration and speaker paths without `DebugPS5Haptic`?**
+   **Structurally yes, UNVERIFIED live.** §14 established the gate as
+   `(GetPlatform() == PS5) || DebugPS5Haptic`, so satisfying the first disjunct suffices. Only a
+   run proves it.
+2. **Per-decision or cached?** **Per-decision, ~700 calls/minute** (§14, measured). The
+   Blueprints hold it in `CallFunc_GetPlatform_ReturnValue`, a per-execution local, so each
+   execution re-calls the UFunction. **§7's "it fires, but only ~6 times, so the value is
+   evidently cached early" is almost certainly an artifact of two things, neither of which is
+   caching:** the Lua logs at `plat <= 3 or plat % 200 == 0`, so a reader sees ~3-6 lines
+   regardless of the real count; and the Lua writes `ReturnValue:set(PS5)` — **the frame copy**,
+   which §15 measured for `GetGameControllerType` as carrying *garbage* (37) while `RESULT_DECL`
+   held the real answer. So the Lua override probably never took effect at all, and §7's
+   conclusion should be treated as **retracted, not merely unproven**. The plugin already knows
+   the correct target: its glyph post-hook writes `RESULT_DECL` *and* the frame copy.
+3. **What else gates on platform?** **I cannot answer this from here and will not guess.** It
+   needs the pak on the box: decompress, then
+   `grep -c CallFunc_GetPlatform_ReturnValue` across cooked Blueprints and list the owning
+   assets. What is already known: the vibration Blueprints, the speaker Blueprints (§10, and the
+   Lua's own comment at `:246-248`), and `HKUtilities` being a general utility means UI and input
+   are plausible consumers at ~700 calls/minute. **That volume is itself the risk**: whatever
+   those callers are, they are not the haptic path.
+4. **Recommendation: do NOT make it the default, and do not switch the primary mechanism.**
+   Argued:
+   * The stated reason to switch — instance staleness — **is not a real defect here** (point
+     above). Swapping a mechanism that is right by construction for one that is broader and
+     unverified trades a non-problem for an unmeasured risk.
+   * `DebugPS5Haptic` is **narrow and measured**: §14's table shows it flipping
+     `ControllerVibration.IsPlaying()` false→true with `SetSound=2, Play=2`. `GetPlatform` is
+     **broad and unmeasured** — it claims PS5 to every caller, ~700 times a minute.
+   * It is worth building as an **opt-in diagnostic** (`GetPlatform=ps5`, default off), because
+     it would answer Q1 and Q3 in one run and is the same post-hook shape as the existing glyph
+     hook. **I have deliberately not built it in this change**: the house rule is no speculative
+     features, the live bug is elsewhere, and building it now would mix an untested broad
+     override into the run that is supposed to test the watchdog.
+   * If a future run shows the gate genuinely failing to open — `gate[open=0 …]` with vibration
+     starts present — then it becomes the right answer, and the evidence will exist.
+
+**The honest summary: `GetPlatform` is a better emulation of "we are a PS5" and a worse thing to
+turn on blind. `DebugPS5Haptic` is a narrower lie that is measured to work and cannot go stale.**
+
+### The capture that settles the next run
+
+```sh
+L=stray-dualsense.log
+grep -nE "submix watch|NO DATA FROM THE TAP"   "$L" | tail -10
+grep -n  "STOPPED RENDERING\|REROUTE RE-SUBMITTED\|REROUTE submitted" "$L"
+grep -o  "SUBMIX [a-z-]* bound=[0-9] live=[0-9] cb=[0-9]* ([0-9.]*/s)" "$L" | tail -5
+grep -o  "gate\[[^]]*\]" "$L" | tail -3
+```
+
+| what it says | reading |
+|---|---|
+| `submix watch … the engine MIXED it - peak 0.7…` | working; the coils should be felt |
+| `NO DATA FROM THE TAP` then `STOPPED RENDERING` then `REROUTE RE-SUBMITTED` then `cb=` climbing | **the level-load hypothesis is confirmed and the watchdog fixed it** |
+| `NO DATA` and `REROUTE RE-SUBMITTED` but `cb=` stays 0 | the reroute is not what fails; the tap or the device pointer is. Do NOT blame the gate |
+| `the engine mixed NOTHING` with `frames` > 0 | the real negative at last — now the gate and the level the game passed are the suspects |
+| `gate[open=0 …]` with vibration starts | the gate genuinely is not opening; **this** is when `GetPlatform` earns its place |
+
+### UNVERIFIED
+
+Everything here. The watch fix and the watchdog are CI-green and have not run in the game; "a
+level load drops the reroute" remains the leading **hypothesis**, and the watchdog is
+instrumented to confirm or kill it in one run rather than to assume it.

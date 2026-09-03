@@ -120,6 +120,9 @@ private:
     void StartSubmix();
     void SubmixStatus();     // the numbers proof: one log line and one status file line
     void SubmixWarnIfDue(uint64_t now);
+    // Detects "bound, but the subtree has stopped rendering" and re-arms the reroute. NOT a
+    // fallback: it never gives the coils back to the asset path.
+    void RerouteWatchdog(uint64_t now);
     void StartSinkAtHandover(float peak);
     // Config::submixLiveThreshold, clamped to something a float comparison can mean.
     float LiveThreshold() const;
@@ -162,6 +165,13 @@ private:
     std::atomic<bool>  m_submixLive{false};
     std::atomic<bool>  m_submixRefused{false};
     std::atomic<bool>  m_submixRerouted{false};
+    // The reroute re-arm. The reroute is submitted from the game thread by the glue, so the
+    // watchdog (UE4SS update thread) can only ASK; SubmixWantsBinding() then returns true and
+    // the glue's next pass re-writes the UObject links and re-calls BindSubmixTap.
+    std::atomic<bool>          m_rerouteRearmWanted{false};
+    std::atomic<unsigned long> m_rerouteRearms{0};
+    uint64_t                   m_watchdogLastCallbacks = 0;   // update thread only
+    uint64_t                   m_watchdogSinceMs       = 0;   // update thread only
     bool               m_sinkStarted = false;      // UE4SS update thread only
     uint64_t           m_lastSubmixWarnMs = 0;
     std::atomic<int>   m_submixBindAttempts{0};

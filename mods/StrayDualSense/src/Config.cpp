@@ -134,6 +134,7 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixrerouteparent")    submixRerouteParent    = val;
         else if (key == "submixregistersoundsubmixslot") submixRegisterSoundSubmixSlot = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "forceps5hapticpath")     forcePS5HapticPath     = ParseBool(val, forcePS5HapticPath);
+        else if (key == "submixreroutewatchdogseconds") submixRerouteWatchdogSeconds = std::clamp(ParseFloat(val, submixRerouteWatchdogSeconds), 0.0f, 600.0f);
         else if (key == "glyphs")                 glyphControllerType    = ParseGlyphs(val, glyphControllerType);
         else if (key == "submixpath")             submixPath             = val;
         else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
@@ -237,6 +238,7 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     submixLiveThreshold   = fresh.submixLiveThreshold;
     submixWarnSeconds     = fresh.submixWarnSeconds;
     forcePS5HapticPath    = fresh.forcePS5HapticPath;   // read on the game thread per hook
+    submixRerouteWatchdogSeconds = fresh.submixRerouteWatchdogSeconds;
     glyphControllerType   = fresh.glyphControllerType;  // read on the game thread per call
     statusSeconds         = fresh.statusSeconds;
     configReloadSeconds   = fresh.configReloadSeconds;
