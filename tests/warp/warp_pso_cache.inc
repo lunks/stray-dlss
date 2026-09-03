@@ -4,11 +4,13 @@
 // (the stream API), so if our hook copied or rebuilt the desc, or dropped the CACHED_PSO
 // subobject, vkd3d-proton's pipeline cache would be defeated and every material would compile
 // on first sight, every session (the box symptom, facts §32.12). This creates a compute PSO
-// through the patched slot with a REAL CachedPSO blob and asserts, via
-// native::hooks::last_create_forward(), that the exact stream pointer and the exact
+// through the patched slot - once plain, once with the PSO's own CachedPSO blob - and asserts,
+// via native::hooks::last_create_forward(), that the exact stream pointer and the exact
 // {blob, size} we passed reached the runtime.
 //
-// Runs after test_native_hooks_ue4_shaped_frame has installed the hooks.
+// Runs after test_native_hooks_ue4_shaped_frame has installed the hooks. Uses build_probe's
+// root signature so the stream create matches the probe shader (a mismatched root signature
+// makes CreatePipelineState fail before the hook can even forward).
 
 #include "backend_native/d3d12_hooks.hpp"
 
@@ -37,69 +39,66 @@ bool test_pso_cached_blob_passthrough(Gpu &gpu)
 		return true;
 	}
 
-	// A root signature and a compute PSO for the probe shader, created via the STREAM API so a
-	// real CachedPSO blob can be obtained from WARP.
-	D3D12_DESCRIPTOR_RANGE range = {};
-	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-	range.NumDescriptors = 1;
-	D3D12_ROOT_PARAMETER param = {};
-	param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-	param.DescriptorTable.NumDescriptorRanges = 1;
-	param.DescriptorTable.pDescriptorRanges = &range;
-	D3D12_ROOT_SIGNATURE_DESC rd = {};
-	rd.NumParameters = 1;
-	rd.pParameters = &param;
-	ComPtr<ID3DBlob> rsblob, err;
-	HR(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &rsblob, &err));
-	ComPtr<ID3D12RootSignature> rs;
-	HR(gpu.device->CreateRootSignature(0, rsblob->GetBufferPointer(), rsblob->GetBufferSize(), IID_PPV_ARGS(&rs)));
+	// The probe's own root signature + PSO (CreateComputePipelineState, slot 11), so the stream
+	// create below is shader-compatible and actually reaches our hook.
+	Probe p;
+	if (!build_probe(gpu, p))
+	{
+		fail("build_probe failed");
+		return false;
+	}
 
-	struct FirstStream
+	// (1) A plain compute stream (root + CS), no cached blob: proves the stream pointer and the
+	//     compute-shader observation survive our forward on the create path UE4 actually uses.
+	struct PlainStream
 	{
 		StreamSub<ID3D12RootSignature *> root{ D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, {} };
 		StreamSub<D3D12_SHADER_BYTECODE> cs{ D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {} };
-	} first{};
-	first.root.value = rs.Get();
-	first.cs.value.pShaderBytecode = g_warp_probe_dxbc;
-	first.cs.value.BytecodeLength = sizeof(g_warp_probe_dxbc);
-	D3D12_PIPELINE_STATE_STREAM_DESC sd0 = { sizeof(first), &first };
+	} plain{};
+	plain.root.value = p.rs.Get();
+	plain.cs.value.pShaderBytecode = g_warp_probe_dxbc;
+	plain.cs.value.BytecodeLength = sizeof(g_warp_probe_dxbc);
+	D3D12_PIPELINE_STATE_STREAM_DESC sd0 = { sizeof(plain), &plain };
 
-	const native::hooks::ForwardProbe before = native::hooks::last_create_forward();
 	ComPtr<ID3D12PipelineState> pso0;
 	const HRESULT hr0 = dev2->CreatePipelineState(&sd0, IID_PPV_ARGS(&pso0));
-	check(SUCCEEDED(hr0) && pso0, "a compute PSO was created through the stream slot (no cache yet)");
+	check(SUCCEEDED(hr0) && pso0, "a compute PSO was created through the stream slot");
+	if (!pso0)
+	{
+		std::printf("  CreatePipelineState hr=0x%08lx\n", static_cast<unsigned long>(hr0));
+		return false;
+	}
 	{
 		const native::hooks::ForwardProbe f = native::hooks::last_create_forward();
-		std::printf("  first create: stream=%p (want %p) cs_found=%d cached=%p/%zu stream_creates +%llu\n",
-			f.stream, static_cast<const void *>(&first), f.cs_found ? 1 : 0, f.cached_blob, f.cached_size,
-			static_cast<unsigned long long>(f.stream_creates - before.stream_creates));
-		check(f.stream == static_cast<const void *>(&first), "the hook forwarded the caller's exact stream pointer");
+		std::printf("  plain create: stream=%p (want %p) cs_found=%d cached=%p/%zu stream_creates=%llu\n",
+			f.stream, static_cast<const void *>(&plain), f.cs_found ? 1 : 0, f.cached_blob, f.cached_size,
+			static_cast<unsigned long long>(f.stream_creates));
+		check(f.stream == static_cast<const void *>(&plain), "the hook forwarded the caller's exact stream pointer");
 		check(f.cs_found, "the hook found the compute shader in the stream (census works)");
-		check(f.cached_blob == nullptr && f.cached_size == 0, "the first create carried no cached blob");
+		check(f.cached_blob == nullptr && f.cached_size == 0, "the plain create carried no cached blob");
 	}
-	if (!pso0)
-		return false;
 
-	// The real cached blob WARP produced for that PSO.
+	// (2) The real cached blob for that PSO, re-created through the stream with a CACHED_PSO
+	//     subobject: proves the blob pointer and size reach the runtime byte-for-byte.
 	ComPtr<ID3DBlob> cached;
 	const HRESULT hrb = pso0->GetCachedBlob(&cached);
 	if (FAILED(hrb) || !cached || cached->GetBufferSize() == 0)
 	{
-		std::printf("  NOTE: GetCachedBlob unavailable here (hr=0x%08lx); the blob-passthrough half is skipped\n", static_cast<unsigned long>(hrb));
+		std::printf("  NOTE: GetCachedBlob unavailable here (hr=0x%08lx); the blob-passthrough half is skipped, the pointer half above stands\n", static_cast<unsigned long>(hrb));
+		check(drain_validation(gpu, "pso-cache-plain") == 0, "no validation errors from the plain stream create");
 		return true;
 	}
 	const void *const blob_ptr = cached->GetBufferPointer();
 	const std::size_t blob_len = cached->GetBufferSize();
 	std::printf("  cached blob: %p / %zu bytes\n", blob_ptr, blob_len);
 
-	// Create again from a stream that carries that blob in a CACHED_PSO subobject.
 	struct CachedStream
 	{
 		StreamSub<ID3D12RootSignature *> root{ D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, {} };
 		StreamSub<D3D12_SHADER_BYTECODE> cs{ D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {} };
 		StreamSub<D3D12_CACHED_PIPELINE_STATE> cached{ D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, {} };
 	} cs2{};
-	cs2.root.value = rs.Get();
+	cs2.root.value = p.rs.Get();
 	cs2.cs.value.pShaderBytecode = g_warp_probe_dxbc;
 	cs2.cs.value.BytecodeLength = sizeof(g_warp_probe_dxbc);
 	cs2.cached.value.pCachedBlob = blob_ptr;
@@ -108,8 +107,6 @@ bool test_pso_cached_blob_passthrough(Gpu &gpu)
 
 	ComPtr<ID3D12PipelineState> pso1;
 	const HRESULT hr1 = dev2->CreatePipelineState(&sd1, IID_PPV_ARGS(&pso1));
-	// A same-session WARP blob is accepted; a stale one would FAIL (spec), so success itself
-	// says the blob was neither corrupted nor dropped before the runtime saw it.
 	check(SUCCEEDED(hr1) && pso1, "the PSO re-created from its own cached blob succeeded (blob accepted by the runtime)");
 	const native::hooks::ForwardProbe f = native::hooks::last_create_forward();
 	std::printf("  cached create: stream=%p (want %p) cached=%p/%zu (want %p/%zu) cs_found=%d\n",
