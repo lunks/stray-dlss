@@ -16,6 +16,28 @@ snippet binary — cited extensively below because it turns out to cross-validat
 UE5 source read here), and the `dlss-exposure` branch (auditing our exposure handling against the
 UE4 plugin — not duplicated; §3 below covers only what changed for UE5/DLSS4).
 
+**Architecture note, since the companion document is ReShade-era and this one must not silently
+inherit that framing.** `docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md` (2026-08-31) describes "our"
+side as a ReShade add-on intercepting the TAA compute dispatch through ReShade's device/
+command-list event API. **That is no longer how this project loads or hooks.** As of this
+writing we are a **UE4SS C++ plugin** (`mods/StrayDLSS`, built by
+`.github/workflows/dlss-plugin.yml` against RE-UE4SS) loaded in-process on the game's main
+thread, ahead of `D3D12CreateDevice`; the actual D3D12 interception — device/command-queue/
+command-list/swapchain vtable patching, our own descriptor and root-argument shadow
+(`src/backend_native/descriptor_shadow.cpp`, `root_shadow.cpp`), the TAA-dispatch capture, the
+present-twice frame-generation path (`src/backend_native/present_owner.*`, `fg_present.*`) — is
+a plain native hook layer (`src/backend_native/`) that does not depend on ReShade's add-on
+events at all. A `src/backend_reshade/` backend still exists in the tree; it is not how the
+project is run today. `docs/RESEARCH-UE4SS-MIGRATION.md` (2026-09-01, HARD, this repo) is the
+assessment that led to this, and its verdict matters directly for §1 below: **UE4SS itself
+contributes UObject/Blueprint reflection, cvars, and deterministic camera control — it
+"contains no D3D12 or DXGI code whatsoever... and cannot contribute a line of it"** to the
+render-level interception, which remains a plain Win32/D3D12 hook exactly as it was under
+ReShade. Where a claim below depends on this distinction, it says so explicitly; the
+TAA-dispatch interception *technique* itself (identify by hash, capture by register, replace
+the dispatch) is unchanged — only the mechanism that installs the hooks and the process
+that hosts them changed.
+
 **Provenance labels**, per `CLAUDE.md` §0.5: **HARD** — read directly from the source quoted;
 **SOFT** — documentation, release notes, a vendor blog, or a claim whose engine/SDK version
 differs from what we read; **UNCONFIRMED** — searched for and not found, or inferred without a
@@ -44,9 +66,58 @@ lines from build-system churn; no claim below depends on an exact line surviving
 
 ## 1. Where DLSS is placed in the frame
 
-`docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md` §A.1–A.2 and §D.2 already established that
-`ITemporalUpscaler` is a genuine engine interface unreachable from ReShade's D3D12 event model,
-and that nothing here changes that conclusion — it is not re-argued.
+`docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md` §A.1–A.2 and §D.2 established that `ITemporalUpscaler`
+is a genuine engine interface, unreachable from ReShade's D3D12 event model. **That framing is now
+stale in one specific way and needs re-examining, not re-argument-by-inertia, because we are no
+longer a ReShade add-on.** We are a UE4SS C++ plugin: a native DLL loaded in-process, ahead of
+device creation, with UE4SS's UObject/Blueprint reflection and pattern-scan/hook infrastructure
+available as tooling. The honest question is whether that changes the answer, and the honest
+answer has two parts.
+
+**What genuinely changed: nothing about `ITemporalUpscaler` itself is UObject-reflected, so UE4SS's
+own reflection does not reach it — and this project's own prior assessment already establishes
+that precisely, for the adjacent D3D12 problem.** `FSceneViewFamily`, `ITemporalUpscaler` and
+`ISceneViewExtension` are plain internal renderer C++ classes with no `UCLASS`/`UFUNCTION`
+metadata — UE4SS's reflection targets UObjects (as `mods/StrayDualSense` already exercises,
+hooking `COMP_CatScratchableComponent_C:SetPS5TriggerActivated`, a genuine `UFUNCTION`), not
+private renderer-thread C++. `docs/RESEARCH-UE4SS-MIGRATION.md`'s own verdict, reached from
+inside this project for a closely related question, says the same thing in stronger terms: UE4SS
+"contains no D3D12 or DXGI code whatsoever... and cannot contribute a line of it" to the
+render-level interception, which the migration built as "a plain Win32/D3D12 hook layer" instead
+(`src/backend_native/`) — precisely because UE4SS's tooling does not extend to this class of
+internal engine object. `SetTemporalUpscalerInterface` sits in exactly that same class: reaching
+it would need pattern-scanning and hooking a specific, private, renderer-thread function
+(something like `AddPostProcessingPasses` or the game's analogue of
+`SetupMainGameViewFamily`/`BeginRenderViewFamily`), with real UE 4.27.2 struct-layout knowledge of
+`FSceneViewFamily` — not a UFunction call, not a UObject property read, and not anything UE4SS's
+SDK-dumping tooling generates automatically.
+
+**What genuinely did not change: this is now a substantially more *plausible*, still entirely
+*unbuilt*, engineering problem — not a solved one.** Being a native in-process DLL loaded early is
+necessary for this kind of hook and was, in fact, equally true of a ReShade add-on (also a native
+in-process DLL) — so "in-process" alone was never the blocker the earlier framing implied, and is
+not one now either. What UE4SS adds is tooling that lowers the *cost* of the remaining problem:
+AOB/pattern-scan infrastructure, a live SDK dump for this exact game build, and (per the migration
+assessment) a track record of this project already doing the harder, adjacent version of this work
+— its own hand-built descriptor/root-argument shadow replacing ReShade's equivalent
+(`docs/RESEARCH-UE4SS-MIGRATION.md` §1.1, "L, and the only item with real technical risk"). No
+part of that shadow work, and nothing in the current `mods/StrayDLSS/src/Mod.cpp` (94 lines, the
+*only* file that includes a UE4SS header at all — its `on_unreal_init` is empty, and none of the
+render-path code touches a UObject), currently reaches `FSceneViewFamily` or
+`ITemporalUpscaler`. The View constant buffer is still read by raw byte offset
+(`CLAUDE.md` §2.6), and the TAA pass is still identified by DXBC hash and intercepted as a compute
+dispatch (`src/taa_hook.cpp`) — exactly the ReShade-era technique, now installed through our own
+vtable patches instead of ReShade's `addon_event::dispatch`.
+
+**So: reclassify, do not repeat verbatim.** The old framing ("unreachable from ReShade's D3D12
+event model") is not wrong, it is simply the wrong *reason* now — the real constraint was never
+ReShade specifically, it is that `ITemporalUpscaler` is non-reflected internal engine state
+requiring ABI-level knowledge to reach from outside, which is exactly as true for a UE4SS native
+plugin as it was for a ReShade add-on. What UE4SS changes is that the *next* step toward reaching
+it — AOB-scanning and hooking the specific renderer-thread function that registers it — is now a
+scoped, tooled, and precedented kind of work for this project, rather than a wall. **Investigate,
+long-horizon, not now**: this is squarely a candidate for a future `docs/RESEARCH-UE4SS-MIGRATION.md`-
+style assessment of its own, not something to attempt as a side effect of this audit.
 
 **What changed since that read (registration mechanism, UE5.4+):** DLSS SR now registers through
 a real `ISceneViewExtension`, not only through `ICustomStaticScreenPercentage`.
@@ -156,11 +227,17 @@ and the FG path (`StreamlineShaders/Private/VelocityCombinePass.cpp`,
 `0` in this build (`StreamlineViewExtension.cpp:44-46`) — the extension point exists but is
 **compiled out** in the shipped plugin. A title gets reflection-aware motion vectors only by
 authoring its own "guide G-buffer" (`SceneTextures.AlternateMotionVector`) and flipping that
-define — engine-level work, not a config flag. **Investigate, long-horizon, not now**: this is
-the one piece of evidence that NVIDIA's own engineers consider the reflection-motion problem
-real enough to reserve plumbing for, but the plumbing needs the same class of engine access
-`docs/RESEARCH-UE4SS-MIGRATION.md` already exists to evaluate — not reachable from a ReShade
-hook. Worth revisiting only if that migration happens.
+define — engine-level work, not a config flag. **Investigate, long-horizon, not now, and harder
+than §1's `ITemporalUpscaler` question**: this is the one piece of evidence that NVIDIA's own
+engineers consider the reflection-motion problem real enough to reserve plumbing for, but the
+plumbing here is a *compile-time* `#define` inside the engine plugin's own source — it needs a
+new member on `FSceneTextures` and a base-pass write into it, i.e. changes to Stray's actual
+engine build, not merely a hooked function call at runtime. That is a materially harder wall than
+§1's (reaching a runtime-registered interface via a pattern-scanned hook, from our own DLL) — it
+needs the shipped game's engine source or bytecode-level patching of the compiled shader/engine
+binary, neither of which the UE4SS migration (`docs/RESEARCH-UE4SS-MIGRATION.md`) provides or
+was ever scoped to provide. Not reachable by this project's current architecture, UE4SS-based or
+not.
 
 **2.2 — FG's own dilation default is off, opposite of SR's.**
 `r.Streamline.DilateMotionVectors` defaults to **0** (`StreamlineViewExtension.cpp:76-81`,
@@ -339,15 +416,22 @@ separation when a title's UI doesn't carry a clean alpha. **HARD**, and genuinel
 record: **this exact two-hook shape (a pre-UI colour snapshot from inside the engine's
 post-process chain, plus a present-time alpha threshold on the final composited image) is
 precisely the design our own `NgxNRHook=preui` work already reasons toward for the NR
-feedback-loop problem** (`CLAUDE.md`, "The hook site is now a choice"). We cannot reach the first
-half (`SceneColorWithoutHUD`) without engine access — our DXGI-level hook only ever sees the
-*final* composited backbuffer, the same thing Slate's `OnBackBufferReadyToPresent` sees, never
-the pre-UI intermediate. **Investigate, but only as future work**: if the UE4SS migration ever
-happens, this is the exact mechanism to replicate for a true hudless capture; until then, our own
-`preui` render-target-identity heuristic (`NgxNRPreUiBind`) is the closest available substitute
-and there is no cheaper alternative to adopt today. `DLSSG.HUDLess`/`DLSSG.UI`/`DLSSG.UIAlpha`
-(confirmed present, optional, in `docs/STRAY-RENDERING-FACTS.md` §32.2) remain unset by us —
-correctly, since we have no source for them.
+feedback-loop problem** (`CLAUDE.md`, "The hook site is now a choice"). We still cannot reach the
+first half (`SceneColorWithoutHUD`) today — our present hook is at the swapchain/D3D12 level (now
+UE4SS-loaded native code, `src/backend_native/present_owner.*`, not a ReShade proxy, but still
+operating at the same point in the pipeline) and only ever sees the *final* composited backbuffer,
+the same thing Slate's `OnBackBufferReadyToPresent` sees, never the pre-UI intermediate. Reaching
+that intermediate needs exactly the same technique §1 already reclassifies for `ITemporalUpscaler`
+— pattern-scan and hook the specific renderer-thread post-process callback point (Epic's
+`SubscribeToPostProcessingPass`/`EPostProcessingPass::VisualizeDepthOfField` slot, per §5.1 above)
+— which UE4SS's own reflection does not provide automatically, but which our now-native,
+in-process, already-vtable-patching codebase is at least the right *kind* of program to attempt.
+**Investigate, long-horizon, tied to §1's reclassification, not separately actionable today**: our
+own `preui` render-target-identity heuristic (`NgxNRPreUiBind`) remains the closest available
+substitute in the meantime, and there is no cheaper alternative to adopt right now.
+`DLSSG.HUDLess`/`DLSSG.UI`/`DLSSG.UIAlpha` (confirmed present, optional, in
+`docs/STRAY-RENDERING-FACTS.md` §32.2) remain unset by us — correctly, since we have no source
+for them.
 
 **5.3 — `DLSSG.CameraFar`: a concrete, actionable value mismatch.** `docs/STRAY-RENDERING-FACTS.md`
 §32.3 already flagged this as open: *"`sl_consts.h:248-249`... `cameraNear/cameraFar` default
@@ -516,14 +600,18 @@ rather than from this UE plugin wrapper. Not duplicated here.
    since the existing comparison already found no visible difference among J/K/M. §4.
 4. **Record, no action now — the reflection-motion "alternate motion vector" extension point.**
    NVIDIA's own engineers reserved plumbing for exactly the structural problem `CLAUDE.md`
-   already named and accepted as unfixable from our hook; it needs engine-level G-buffer
-   authoring we cannot do via ReShade. Revisit only alongside a UE4SS migration decision. §2.1.
-5. **Record, no action now — the hudless/UI-alpha two-hook design.** If this project ever gains
-   real engine access, this is the exact mechanism (`SceneColorWithoutHUD` from inside the
-   post-process chain + a present-time alpha threshold on the composited backbuffer) to
-   replicate for `NgxNRHook=preui`-style work and for populating `DLSSG.HUDLess`/`UI`/`UIAlpha`.
-   Not adoptable today; our own `preui` render-target-identity heuristic remains the closest
-   available substitute. §5.2.
+   already named and accepted as unfixable from our hook, but this specific plumbing is a
+   compile-time engine `#define` requiring Stray's own engine source — harder than, and not
+   solved by, the UE4SS plugin migration already done. §2.1.
+5. **Record, long-horizon — the hudless/UI-alpha two-hook design and the `ITemporalUpscaler`
+   registration point, together.** Both need the same unbuilt capability: pattern-scanning and
+   hooking a specific, private, renderer-thread C++ function from our now-native, in-process
+   UE4SS plugin, with real UE 4.27.2 struct-layout knowledge — genuinely more plausible than under
+   the old ReShade-add-on framing (see §1's reclassification), but still unbuilt and not a side
+   effect of the UE4SS migration already completed. Worth its own scoped assessment, in the style
+   of `docs/RESEARCH-UE4SS-MIGRATION.md`, if either is ever prioritised. Not adoptable today; our
+   own `preui` render-target-identity heuristic remains the closest available substitute for the
+   NR feedback-loop problem in the meantime. §1, §5.2.
 6. **No action — motion-vector scale convention.** Independently cross-validated correct from
    two unrelated sources (our own §32 binary-string reverse-engineering and this UE5 source
    reading). §2.3.
@@ -538,3 +626,23 @@ rather than from this UE plugin wrapper. Not duplicated here.
     Vulkan queue parallelism.** Either the subject of the forthcoming
     `docs/RESEARCH-STREAMLINE-INTERNALS.md`, or ruled out by this project's own vkd3d-proton /
     fixed-screen-percentage / D3D12-only constraints. §5.7, §6.
+
+---
+
+## Stale-elsewhere note (not fixed here — out of scope for this document)
+
+While correcting this document's own framing to match the current UE4SS/native-backend
+architecture (this document's own "Architecture note," above), the following were noticed
+describing the project as a ReShade add-on in ways that are now inaccurate. Not touched here —
+flagged for whoever next has that document open:
+
+* `docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md` — its entire premise (title, §0, and especially §D,
+  "hook or stage, per feature") is framed against "ReShade's D3D12 event model" as the thing our
+  side is constrained by. The technical content about NVIDIA's *own* plugin architecture (§A-C)
+  is unaffected by this and remains reliable; only the passages characterizing *our* side need
+  the same reclassification this document's §1 applies.
+* `CLAUDE.md` §3 ("How the add-on works") and §5 ("ReShade 6.8 add-on API") describe the
+  interception mechanism as ReShade add-on events (`init_pipeline`, `bind_pipeline`, `dispatch`,
+  etc.) rather than the current native vtable-patch hook layer
+  (`src/backend_native/`) — CLAUDE.md itself says elsewhere that such documents are "corrected in
+  place" as facts change, so this is presumably known and pending, not missed.
