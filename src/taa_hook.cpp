@@ -1726,12 +1726,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							}
 							else
 							{
-								if (!ok)
-									{
-										perf::Scope perf_sr(perf::kNgxSr);
-										ok = ngx::evaluate(native, ei);
-										if (ok) perf::stall_note_evaluate();
-									}
+								// DLSS SR. Ray Reconstruction used to get first refusal here
+								// and SR was its per-frame fallback, which is why this used to
+								// be wrapped in `if (!ok)`. RR's guide source was the heuristic
+								// G-buffer finder, deleted 2026-09-03 (report §13), so SR is
+								// the only evaluate on this path until RR is rewired to the
+								// engine's own named G-buffer textures.
+								{
+									perf::Scope perf_sr(perf::kNgxSr);
+									ok = ngx::evaluate(native, ei);
+									if (ok) perf::stall_note_evaluate();
+								}
 
 								// DLSS Neural Rendering (NGX feature 18) runs at Present, not
 								// here — but its guides can only be captured here. (ngx_nr.hpp)
