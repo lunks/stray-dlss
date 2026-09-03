@@ -1,8 +1,25 @@
 # stray-dlss — agent operating manual
 
-A ReShade **add-on** (not an effect/shader preset) that injects **NVIDIA DLSS Super Resolution**
-into **Stray** (Unreal Engine 4.27.2, **D3D12**) by intercepting the engine's own temporal AA
-compute dispatch and replacing it with an NGX evaluation.
+A **UE4SS C++ plugin** (`mods/StrayDLSS`) that injects **NVIDIA DLSS** — Super Resolution,
+Frame Generation and Neural Rendering — into **Stray** (Unreal Engine 4.27.2, **D3D12**). SR
+replaces the engine's own temporal AA compute dispatch with an NGX evaluation; FG and NR run at
+present time. It loads inside the game process and installs its own D3D12 hooks
+(`src/backend_native/`); it needs no ReShade.
+
+> **CORRECTED 2026-09-03.** This line read "A ReShade **add-on**" until today, long after the
+> plugin became how the project runs. The ReShade add-on still exists as a second host
+> (`src/backend_reshade/`, built as `stray-dlss.addon64`) and is still built and tested, but it
+> is not the shipping configuration and the two must never be run together — that is two drivers
+> of one TAA pass. **Do not read "Config A/B" as "plugin/add-on":** both are *plugin*
+> configurations, and they differ only in whether ReShade is also loaded as `dxgi.dll`
+> (`mods/StrayDLSS/README.md`). ReShade being present under the plugin is supported, so "the
+> plugin host" never implies "no ReShade in the process".
+>
+> The stale self-definition was load-bearing: two research documents inherited ReShade-era
+> FEASIBILITY judgements from it — "we cannot reach X", "that would need the engine" — which were
+> true of an out-of-process add-on and are not true of an in-process plugin with UObject
+> reflection. When reading anything below that reasons from "we are outside the engine", check it
+> against this. Sections 3 and 5 still describe the add-on's event model in places.
 
 Read this file completely before touching anything. It is the contract for how this project is
 built, what is known versus assumed, and what will silently produce a wrong image.
