@@ -1842,8 +1842,72 @@ grep -n "pad audio: scePad\|SONY ACCEPTED" "$L" | head -3                       
 | (5) `=0x80920007` | libScePad believes the pad has no audio (§7): the Proton device tree, not ours |
 | (3) the vibration verdicts differ from `9553b9e`'s | the reroute order change above is the suspect; report it before anything else |
 
+### The downmix now matches the engine's — `docs/RESEARCH-UE-PAD-AUDIO-ENDPOINT.md`
+
+That companion document reads Epic's own source for the endpoint contract the plugin is
+mirroring; its §7 is a gap table against this build and its §8 ranks what to do about them.
+**One HARD gap is closed here, and only that one.** The endpoint submix renders at the DEVICE
+channel count — the `ch=8` every SUBMIX line reports — and `ProcessAudioAndSendToEndpoint`
+folds it to stereo with the engine's AC-3 table before the real PS5 endpoint ever sees it
+(§3.3 there; `AudioMixerChannelMaps.cpp:86-91` @ 4.27, `ToStereoMatrix`, identical numbers in
+5.8's `ChannelMap.cpp:26-31`): `L = FL + 0.707·(C + SL + BL)`, `R = FR + 0.707·(C + SR + BR)`,
+LFE dropped. Our `DownmixToStereo` kept channels 0/1 and discarded the rest, so a haptic send
+that the 3D panner had put behind the cat — and Stray's sends ARE spatialised
+(`PS5VibrationAttenuation`, HARD from the pak) — reached the engine's endpoint at −3 dB and
+reached our coils as exactly zero. Both lanes now fold the engine's way, including its quad
+special case (channels 0 1 2 3 → columns 0 1 4 5, `Get2DChannelMapInternal:379-404`); mono
+still goes to both grips, which the submix cannot produce anyway. Pinned column by column in
+`tests/test_submix_dsp.cpp`. **HARD** that this is the arithmetic the engine applies;
+**SOFT** how much of Stray's haptic content lands outside FL/FR, which is what a run will say.
+
+The doc's other gaps are deliberately NOT addressed here: the container-id endpoint match, the
+40 ms queue-ahead against Epic's ~3-11 ms, the soft clip the engine does not have, and the
+structural one — being the endpoint via a registered `IAudioEndpointFactory` instead of
+tapping a re-parented submix (§8 #2 there, a design that has never been built).
+
+#### Why we REPRODUCE the fold instead of calling the engine's, and what would delete ours
+
+Asked before this landed: we are in the game's process, so use the engine's own mixing code
+rather than copying constants out of it — copied constants rot, and reconstructing what the
+engine already does is the habit this project has been removing. The three routes were checked
+against the 4.27 source; the call chain the endpoint really takes is
+
+```
+FMixerSubmix::ProcessAudioAndSendToEndpoint      AudioMixerSubmix.cpp:1537-1642
+  -> FMixerSubmix::DownmixBuffer(...)                                :1623
+       -> FMixerDevice::Get2DChannelMap(false, in, out, false, map)  :380-385
+       -> Audio::DownmixBuffer(in, out, buf, buf, map.GetData())
+```
+
+**1. Call the engine's downmix — NOT REACHABLE in this build, HARD.** `Audio::DownmixBuffer` is
+`SIGNALPROCESSING_API` and `FMixerDevice::Get2DChannelMap` is a static member of an
+`AUDIOMIXER_API` class; both macros expand to nothing in a monolithic build, and Stray is one
+`Stray-Win64-Shipping.exe`, so neither has an export to import. None of the three candidates is
+virtual either (static, free function, non-virtual member), so there is no devirtualisable call
+to piggyback on the way the tap and the reroute do — this plugin already calls
+`RegisterSubmixBufferListener` by *vtable index* for exactly that reason. What remains is a
+signature scan, and that is the bad half of the trade here: small leaf routines, SIMD variants,
+no anchoring string, `/OPT:ICF` folding, and a wrong match is invoked with raw buffer pointers,
+i.e. memory corruption in the user's game — against eight float constants CI checks column by
+column. Recorded in `SubmixDsp.hpp` as a reproduction of `AudioMixerChannelMaps.cpp:86-91` for
+**engine 4.27.2 specifically**, which will not track a different build.
+
+**2. Have the engine fold for us — IMPOSSIBLE FOR A BUFFER LISTENER, HARD.** An `IAudioEndpoint`
+declares its own channel count and the engine folds and resamples *to* it; a listener gets
+whatever the submix rendered, and `FMixerSubmix::NumChannels` is assigned
+`MixerDevice->GetNumDeviceChannels()` unconditionally (`AudioMixerSubmix.cpp:303`, `:317`,
+`:1073` — 4.27 has no per-submix channel format left), with the listener called with exactly
+that (`:1380`). **There is no property we could write to make this tap deliver stereo**, so on
+the tap architecture the fold has to be ours. Being the endpoint (§8 #2 of the research doc) is
+what would delete this function outright — it is scoped there, it has never been built, and it
+is deliberately not built here.
+
+**Verdict: option 3, knowingly**, with the citation in the code and the two negatives above as
+the reason rather than an omission.
+
 ### UNVERIFIED
 
 Everything in this section beyond the pure functions (`InterleaveLanes`, `StallWatchdog`,
-`JudgeLane`, unit-tested) and the two CI lanes (unit, mingw) that ran locally. The MSVC lane is
-CI's. The speaker lane has never delivered a sample to a pad.
+`JudgeLane`, `DownmixToStereo`, all unit-tested) and the two CI lanes (unit, mingw) that ran
+locally. The MSVC lane is CI's. The speaker lane has never delivered a sample to a pad, and
+no rear-channel haptic has been felt through the new fold.
