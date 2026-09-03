@@ -224,8 +224,11 @@ bool HidMode::WriteLocked(uint8_t flag0, const PadAudioClaim& claim, const char*
     // session's log is unchanged and a claiming session says exactly which bytes went out —
     // a wrong claim must be readable from the log, never inferred from a silent speaker.
     const unsigned long n = m_writes.fetch_add(1, std::memory_order_relaxed) + 1;
-    const int  claimPath = static_cast<int>((claim.audioControl >> 4) & 0x3);
-    char       audio[160] = "";
+    const int claimPath = static_cast<int>((claim.audioControl >> 4) & 0x3);
+    // 256, not 160: PadAudioPathName's longest row is 69 characters and the surrounding text is
+    // ~95, so 160 silently truncated the very line whose whole job is to make a wrong claim
+    // readable. SDS_LOG_* takes no format attribute, so nothing would have warned.
+    char audio[256] = "";
     if (claim.claims)
         std::snprintf(audio, sizeof(audio),
                       " | AUDIO CLAIM flag1=0x%02X audio_control=0x%02X (path %d: %s) "
