@@ -34,20 +34,6 @@ struct ID3D12Resource;
 
 namespace stray_dlss::nr {
 
-// How feature 18 is wired. Both readings of the study are plausible, so both are reachable.
-enum class Topology
-{
-	// (a) DEFAULT. Post-process on the already-upscaled image: Color = our SR/RR output
-	// (output res), Output = our NR texture (output res, 1:1 subrects), Depth/MVec at render
-	// res with MVecScale mapping them onto the output rect. This is the shape the study's
-	// headline describes ("a post-process on top of the game's existing DLSS output", §0.1).
-	post_process,
-	// (b) SR-shaped: Color/Depth/MVec at render res -> Output at output res, i.e. feature 18
-	// does the upscale itself, exactly mirroring the SR contract the addon snapshots off the
-	// game (§2.3). Selectable because §2.3 and §0.1 read differently and only a live run can
-	// settle which the runtime actually wants.
-	sr_shaped,
-};
 
 // [STRAYDLSS] NgxNR, and the overlay checkbox. Callable from ANY thread, and 1 -> 0 destroys
 // nothing on the caller's: it queues a teardown that on_present() executes once the GPU has
@@ -57,7 +43,6 @@ void set_enabled(bool enabled);
 bool enabled();
 // Empty string = the default beside the game executable (where the operator staged it).
 void set_dll_path(const char *utf8_path);
-void set_topology(Topology topology);
 void set_tuning(float intensity, float local_tone_strength, float local_structure_strength);
 
 // The rest of what RenoDX sets and we did not. Names verified present in the 310.8.0 runtime by
@@ -110,91 +95,16 @@ bool preload();
 // device, queue and swapchain have demonstrably worked.
 void set_warmup_frames(unsigned int frames);
 
-// The HDR colour codec's three knobs. The codec is NOT optional: feature 18 is a
-// display-referred image network and we hook a raw linear HDR image, so without the
-// encode/decode pair the network sees an out-of-domain signal and answers near-black (measured:
-// neural output max luminance 0.0026 over the centre crop, red noise on screen). The runtime
-// carries no HDR, colour-space or exposure parameter of its own — established by exhaustive
-// string search over nvngx_dlssnr.dll — so the conversion has to be in our pixels. Math and
-// provenance: src/core/nr_codec.hpp.
-//
-//  paper_white       [STRAYDLSS] NgxNRPaperWhiteScale, default 1.0. The post-exposure value
-//                    treated as display white; the shader's multiplier is 1/paper_white
-//                    (`calcProxyScale` in the reference tree). Values BELOW 1.0 are legal and
-//                    are the likely direction here: Stray's scene colour at our hook point
-//                    already carries UE4's pre-exposure (CLAUDE.md §2.6 row 135.y, ~0.056
-//                    measured live), so it is already small, and our symptom is a near-black
-//                    neural output. Raise it if the proxy looks blown out, lower it if the
-//                    proxy looks black — and read the codec's own input/proxy/output luminance
-//                    line before choosing, which is exactly what it is there for.
-//  color_strength    [STRAYDLSS] NgxNRColorStrength, default 1.0. 0 keeps the ORIGINAL's
-//                    chromaticity and transfers only the network's luminance change; 1 takes
-//                    the network's colour too. Lower it for a colour cast.
-//  transfer_strength [STRAYDLSS] NgxNRTransferStrength, default 1.0. A global lerp back toward
-//                    the untouched original; 0 is an EXACT bypass, bit for bit.
-void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
 
-// [STRAYDLSS] NgxNRExposureSmoothing, default 0.05: per-frame weight of the new exposure sample
-// when NgxNRTrackExposure is on. 1.0 disables smoothing (the old behaviour). NOT cosmetic — see
-// nrc::smooth_exposure_factor: NR keeps its own temporal history, so a scale that moves frame to
-// frame leaves that history in units the current proxy no longer matches.
-void set_exposure_smoothing(float rate);
 
-// [STRAYDLSS] NgxNRScaleResetTolerance, default 0.15: how far the codec scale may drift, as a
-// RATIO, before NR's temporal history is discarded with a forced DLSSNR.Reset. The scale defines
-// the display-referred units that history is accumulated in, so a change invalidates it as
-// surely as a guide-grid change does. 0 disables the latch.
-void set_scale_reset_tolerance(float tolerance);
 
-// [STRAYDLSS] NgxNRTrackExposure, default ON — the reference's `trackAutoExposure`
-// (rtx_neural_rendering.h:137-140), which defaults to true and which we dropped in the port.
-//
-// With it on, the codec's effective scale is the static proxy_scale(paperWhite) MULTIPLIED by the
-// engine's OneOverPreExposure (View row 135.z), so the soft-clip knee follows scene brightness
-// instead of sitting wherever a constant put it. Stray's scene colour at the TAA hook carries
-// UE4's pre-exposure (measured 0.056 live), and the user hand-dialled NgxNRPaperWhiteScale to
-// ~0.1 — an effective scale near 10x, the same order as 1/0.056 ~= 18. That is a person supplying
-// this term manually, and it cannot be right in two differently-lit areas at once, because
-// pre-exposure moves with the scene.
-//
-// TAA SITE ONLY. Post-tonemap the image is already display-referred with no pre-exposure left to
-// undo, and the codec is bypassed there entirely. Math, clamps and the SR-exposure asymmetry:
-// src/core/nr_codec.hpp above proxy_scale_tracked.
-void set_track_exposure(bool enabled);
 
-// WHERE the call comes from. One NR path, two call sites, and the difference between them is
-// entirely the colour pipeline — so it is a parameter rather than a second copy of this module.
-enum class Site
-{
-	// src/taa_hook.cpp, inside the intercepted TAA compute dispatch. `image` is the engine's
-	// `u0`: raw, unbounded, PRE-EXPOSED LINEAR HDR, in D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-	// because the SR/RR evaluate has just written it. The HDR colour codec is MANDATORY here —
-	// feature 18 is a display-referred network and this signal is out of its domain (measured:
-	// neural output max luminance 0.0026, red noise on screen).
-	taa_dispatch,
-	// src/nr_hook.cpp, the PRESENT STAGE: our own command list after the game's last submission
-	// of the frame ([STRAYDLSS] NgxNRHook=present).
-	// `image` is a staging copy of the back buffer: ALREADY TONEMAPPED and display-referred, in
-	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, and left in that state on exit.
-	//
-	// The HDR colour codec is BYPASSED here, deliberately and explicitly. The image is already in
-	// the domain the network was trained on; encoding it a second time would apply the soft clip
-	// and the sRGB curve on top of the game's own tone curve. The residual transfer has nothing
-	// to carry either — with no encode there is no proxy to subtract — so on success the neural
-	// answer is copied over `image` whole, which is correct precisely BECAUSE this site is
-	// terminal: nothing downstream reads it back into the engine's temporal state.
-	post_tonemap,
-};
 
 struct ApplyInputs
 {
-	// The image to improve. Under Site::taa_dispatch this is the engine's `u0` (and NR's Color
-	// under post_process, or the copy-back destination under sr_shaped). Under
-	// Site::post_tonemap it is our staging copy of the back buffer, and it is NR's Color
-	// directly, with no codec in between.
+	// The image to improve: our staging copy of the back buffer. It is NR's Color directly —
+	// display-referred already, so nothing sits between it and the network.
 	ID3D12Resource *image = nullptr;
-	// Render-resolution scene colour — used as NR's Color under sr_shaped only.
-	ID3D12Resource *render_color = nullptr;
 	ID3D12Resource *depth = nullptr;          // render res, reversed-Z
 	ID3D12Resource *motion_vectors = nullptr; // our dense RG16_FLOAT, render-res pixels
 
@@ -210,7 +120,6 @@ struct ApplyInputs
 	// class of bug this project has already been bitten by once.
 	bool reset = false;
 
-	Site site = Site::taa_dispatch;
 
 	// View row 135.z, `OneOverPreExposure`, already parsed by core/view_params.cpp. Used only by
 	// the TAA site's codec, and only when NgxNRTrackExposure is on. <= 0 or non-finite means the
@@ -270,15 +179,13 @@ bool validated();
 // has already been caught by exactly that once: a reset latch put on a continuously varying
 // quantity fired 52 times and made the image worse (CLAUDE.md, "there it is a metronome").
 //
-// Two of the five sources below are on quantities that vary continuously — `codec_scale`, which
-// follows the engine's exposure, and `frame_gap`, which follows how reliably the TAA hook matches
-// — so whether either is a rarity or a metronome is an empirical question. This is the counter
-// that answers it in one session instead of one argument per round trip.
+// `frame_gap` is the one that still follows a continuous quantity — how reliably the TAA hook
+// matches — so whether it is a rarity or a metronome is an empirical question. This is the
+// counter that answers it in one session instead of one argument per round trip.
 struct ResetCounts
 {
 	std::uint32_t frame_gap = 0;   // a frame NR declined, or was never asked about at all
 	std::uint32_t guide_grid = 0;  // the render resolution moved under a fixed output rect
-	std::uint32_t codec_scale = 0; // the exposure-tracked codec scale drifted past the tolerance
 	std::uint32_t camera_cut = 0;  // the engine's own cut signal (CLAUDE.md §2.8)
 	std::uint32_t new_feature = 0; // the first evaluate against a freshly created feature
 };

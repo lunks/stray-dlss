@@ -7,75 +7,17 @@
 // machine discovering them one round trip at a time (CLAUDE.md §0.4). src/nr_hook.cpp does
 // nothing but gather those numbers from D3D12 and act on the verdict.
 //
-// HISTORY, because this file has been emptied once already. It carried a THREE-site choice
-// (`taa` / `present` / `preui`) that was removed on 2026-09-02 when neither post-tonemap site
-// produced a correct frame. What comes back here is not that: `preui` stays deleted, and
-// `present` is now a STAGE on our own present-time command list rather than a ReShade event.
-// The argument for the move, and what is different this time, is on HookMode below.
+// HISTORY, because this file has been through three shapes. It once carried a THREE-site choice
+// (`taa` / `present` / `preui`); `preui` was deleted on 2026-09-02, and `taa` followed once the
+// present STAGE was confirmed correct in the game on 2026-09-03. There is one site now, so there
+// is no mode to choose: what remains is the per-frame admission decision for that site.
 #pragma once
 
 #include <cstdint>
 
 namespace stray_dlss::nrplan {
 
-// [STRAYDLSS] NgxNRHook. WHERE DLSS Neural Rendering runs.
-//
-// THE FIRST PROBLEM, MEASURED (CLAUDE.md, "NR's output feeds the engine's temporal history"). At
-// the TAA site we write the engine's `u0`, and UE 4.27 makes that ONE resource serve two roles:
-// `TemporalAA.cpp:696` is literally `NewHistoryTexture[0] = Outputs.SceneColor =
-// NewHistoryTexture[0];` and `:969` extracts the same texture as the next frame's history. So
-// NR's residual re-enters the engine's temporal state every frame and compounds. Screen-space
-// reflections read that history directly (`ScreenSpaceRayTracing.cpp:596-620`) and the
-// eye-adaptation histogram downsamples it (`PostProcessing.cpp:626-648`). `NgxNRRestoreHistory`
-// exists only to undo that.
-//
-// THE SECOND PROBLEM, which is the one that motivated the move. The TAA site carries raw,
-// unbounded, PRE-EXPOSED LINEAR HDR, and feature 18 is a display-referred network — so the whole
-// HDR codec, `NgxNRPaperWhiteScale` and `NgxNRTrackExposure` with its smoothing and its
-// scale-reset latch exist ONLY to put a linear signal into the network's domain. Every one is a
-// knob that can be wrong, and the scale-reset latch is a DLSSNR.Reset source driven by a
-// continuously varying quantity — which CLAUDE.md has already measured making an image worse
-// ("there it is a metronome"). A sibling implementation reached the same rule from the other
-// direction (Kim2091/dxvk-remix @ gta4-atmos-dlss5, 10fa0368): a display-encoded anchor is a
-// CORRECTNESS REQUIREMENT rather than a tuning choice, and its shipping runtime carries no NR
-// shaders at all — deleting the codec is what shipped there.
-//
-// AT A POST-TONEMAP SITE BOTH PROBLEMS ARE GONE BY CONSTRUCTION. Nothing after the tonemapper is
-// carried into the next frame — every `QueueTextureExtraction` into `PrevFrameViewInfo` sits at
-// `PostProcessing.cpp` 576/599/643 while `AddTonemapPass` is at 777 — and Stray's back buffer is
-// `R10G10B10A2_UNORM` with no `SetColorSpace1` call anywhere, i.e. SDR display-encoded already
-// (docs/STRAY-RENDERING-FACTS.md §33). That IS the network's own domain: no codec, no paper
-// white, no exposure term.
-//
-// WHAT WAS TRIED BEFORE AND FAILED, so this is not a re-run of it. Two post-tonemap sites were
-// built and removed on 2026-09-02: `preui` (the frame's Nth back-buffer render-target bind) died
-// clobbering state the GAME's command list needed, and the old `present` rode
-// `addon_event::reshade_begin_effects`, which never fires with an empty preset. Neither failure
-// generalises to the present STAGE restored here. It records on the present owner's OWN command
-// list (src/backend_native/present_owner.hpp — the one frame generation already drives every
-// frame, which survives ResizeBuffers and the fullscreen transition), where nothing of the game's
-// is bound and there is therefore nothing of the game's to clobber; and it is triggered by
-// `icept::Sink::on_present`, which both hosts deliver unconditionally with no dependency on a
-// loaded effect preset.
-enum class HookMode
-{
-	// Inside the intercepted TAA compute dispatch, writing the engine's `u0`. The shipped
-	// behaviour and, in phase 1, still the DEFAULT: until a run on the box says the stage produces
-	// a correct image, the shipped configuration must stay byte-identical.
-	taa,
-	// Our own command list at Present, over the back buffer. No feedback path, no HDR codec, no
-	// pass identification.
-	present,
-};
 
-// Parses the config string. Anything unrecognised — including an empty value — is `taa`, because
-// the default must be the shipped behaviour and a typo must never silently move the hook.
-HookMode hook_mode_from_string(const char *value);
-const char *hook_mode_name(HookMode mode);
-// True for the site that sees a tonemapped, display-referred image and therefore must NOT run the
-// HDR colour codec (running the soft clip and the sRGB encode over an already-encoded image would
-// apply a transfer that has already been applied).
-bool is_post_tonemap(HookMode mode);
 
 // Why a present-stage frame was, or was not, injected into. Every one is counted and named, for
 // the same reason the TAA path's gate refusals are: a stage that never fires must never be
@@ -202,63 +144,8 @@ struct GuideExtentLatch
 // first frame as a change would put a spurious reset into every session.
 bool latch_guide_extent(GuideExtentLatch &latch, std::uint32_t width, std::uint32_t height);
 
-// ---------------------------------------------------------------------------------------
-// NO CODEC, NO EVALUATE.
-//
-// Feature 18 is a DISPLAY-REFERRED image network. Our hook point — the intercepted TAA dispatch
-// — carries raw, unbounded, PRE-EXPOSED LINEAR HDR, which is not in its domain, and the HDR
-// codec's soft clip and exact sRGB encode are precisely what put it there. The proxy is not a
-// tuning stage that can be skipped; it IS the input contract. Measured with it missing: a neural
-// output whose max luminance read 0.0026 and red noise on the screen.
-//
-// A sibling port of this integration reached the same rule from the other direction. It moved
-// its pass to after the runtime's sRGB encode because feeding the network a linear image made
-// the runtime apply a second gamma curve on top — "lifted blacks and washed out greys in dark
-// scenes, exactly as reported" — and it declines the frames where that encode is suppressed
-// "rather than evaluating on an input domain the model was not trained on"
-// (RemixProjGroup/dxvk-remix, branch dlss-nr @ 2df9c812). Two ports, two hook points, one rule.
-//
-// So every way of arriving at EvaluateFeature without a correct proxy is enumerated here and
-// answered with a refusal rather than a fall-through.
-//
-// SCOPE, restated 2026-09-02 now that the present stage exists: this gate is about the CODEC
-// SITE, not about every site. A post-tonemap image is already display-referred and already in the
-// network's domain, so bypassing the codec there is correct and `codec_site` is simply false —
-// ngx_nr never asks this gate on that path. What the gate still catches is the codec site
-// arriving at the evaluate with no usable proxy.
-// ---------------------------------------------------------------------------------------
-enum class CodecGate
-{
-	evaluate,
-	// This call site does not run the encode/decode pair at all. The present stage legitimately
-	// bypasses the codec and never consults this gate, so reaching `no_codec` means a CODEC site
-	// would have handed the network an un-encoded image.
-	no_codec,
-	// The encode dispatch did not record, so the proxy holds whatever the last frame left.
-	encode_failed,
-	// NgxNRTrackExposure is on and the engine's exposure has never decoded, so the scale — which
-	// DEFINES the display-referred units — is unknown. Substituting the static scale silently
-	// moves the network's input domain, and feature 18's own temporal history was accumulated in
-	// the other one.
-	exposure_unknown,
-	// The scale is pinned at one of nrc's clamps (or is zero/negative/NaN). The proxy is then
-	// flat black or flat white: an image in the right FORMAT carrying no signal.
-	degenerate_scale,
-};
 
-struct CodecGateInputs
-{
-	bool codec_site = true;
-	bool encode_recorded = false;
-	bool track_exposure = true;
-	// Whether a plausible engine exposure has EVER been read this session, not whether this
-	// particular frame's View CB decoded: the smoothed factor legitimately carries across a bad
-	// frame, and one unreadable constant buffer is not an unknown operating point.
-	bool exposure_known = false;
-	float scale = 0.0f;
-};
 
-CodecGate codec_gate(const CodecGateInputs &in);
 
 // Any frame NR declines is a hole in feature 18's own temporal continuity: it reprojects its
 // accumulation with motion vectors describing one frame of motion, and a skipped frame makes

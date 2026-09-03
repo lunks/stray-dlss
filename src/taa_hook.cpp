@@ -2021,155 +2021,20 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 										if (ok) perf::stall_note_evaluate();
 									}
 
-								// DLSS Neural Rendering (NGX feature 18), strictly AFTER
-								// SR/RR: it consumes the image they just wrote into u0 and,
-								// once validated non-degenerate, replaces it. Any failure
-								// leaves the SR/RR image exactly as it is. (src/ngx_nr.hpp)
+								// DLSS Neural Rendering (NGX feature 18) runs at Present, not
+								// here — but its guides can only be captured here. (ngx_nr.hpp)
 								if (ok && nr::enabled())
 								{
-									// PUBLISH THE GUIDES REGARDLESS OF THE HOOK MODE. The present
-									// stage has no way of its own to find the depth and the motion
-									// vectors — this is the only place in the frame where both are
-									// known-good and known-fresh — and publishing unconditionally
-									// means flipping NgxNRHook takes effect on the next frame
-									// rather than on the next launch. `ei.reset` is the camera-cut
+									// PUBLISH THE GUIDES. This is all the TAA hook does for
+									// feature 18: the present stage has no way of its own to find
+									// the depth and the motion vectors, and this is the only place
+									// in the frame where both are known-good and known-fresh. The
+									// evaluate itself happens later in the same frame, over the
+									// back buffer (src/nr_hook.cpp). `ei.reset` is the camera-cut
 									// OR from §2.8 and MUST travel with them: feature 18 keeps its
 									// own temporal history.
 									nrhook::note_guides(ei.depth, ei.motion_vectors,
 										ei.render_width, ei.render_height, ei.reset);
-
-									// ...but only RUN here when the hook is at this site. At
-									// NgxNRHook=present the identical nr::apply runs later in the
-									// same frame, from src/nr_hook.cpp, over the back buffer —
-									// which nothing carries into the engine's temporal state and
-									// which is already display-referred, so the whole HDR codec is
-									// bypassed there. (src/core/nr_hook_plan.hpp)
-									if (nrhook::hook_mode() == nrplan::HookMode::taa)
-									{
-										perf::Scope perf_nr(perf::kNgxNr);
-
-										// END-OF-FRAME HISTORY RESTORE, half one of two.
-										//
-										// `ei.output` is `u0`, and UE 4.27 makes that ONE resource
-										// both this frame's scene colour AND the next frame's
-										// HistoryBuffer[0] (TemporalAA.cpp:696 / :969), which
-										// ScreenSpaceRayTracing.cpp:596-620 reads directly on the
-										// NEXT frame. So NR's residual compounds through the
-										// engine's temporal state — the measured slow drift.
-										//
-										// Copy the PRISTINE image aside here, before the decode
-										// writes into it, and src/nr_history.cpp puts it back at
-										// present, after every same-frame consumer has run. `u0`
-										// is in UNORDERED_ACCESS at this exact point (the SR/RR
-										// evaluate just wrote it through a UAV), which is the one
-										// state the snapshot needs and the one place in the frame
-										// where we know it for certain.
-										//
-										// The rect is the one the decode will write — ngx_nr's
-										// `cw`/`ch`, i.e. the same fd.output_* handed to apply()
-										// below — never the texture's allocation.
-										// ([STRAYDLSS] NgxNRRestoreHistory; default ON.)
-										nrhist::snapshot(native_device, native, ei.output,
-											fd.output_width, fd.output_height);
-
-										nr::ApplyInputs ni;
-										ni.site = nr::Site::taa_dispatch;
-										ni.image = ei.output;
-										ni.render_color = ei.color;
-										ni.depth = ei.depth;
-										ni.motion_vectors = ei.motion_vectors;
-										ni.render_width = ei.render_width;
-										ni.render_height = ei.render_height;
-										ni.output_width = fd.output_width;
-										ni.output_height = fd.output_height;
-										ni.reset = ei.reset;
-										// View row 135.z. Only the TAA site's codec consumes it,
-										// and only when NgxNRTrackExposure is on; a frame whose
-										// View CB did not decode leaves it 0 and the codec falls
-										// back to its static scale.
-										// Row 135.z IS OneOverPreExposure. SceneRendering.cpp:1563-1564
-										// assigns the pair on ADJACENT LINES from the same float:
-										//   PreExposure        = PreExposure;
-										//   OneOverPreExposure = 1.f / PreExposure;
-										// so their product is 1.0 by construction and the layout
-										// is right. An earlier "fix" here derived the reciprocal
-										// instead, on the strength of a measured product of 3.05
-										// — but that was two floats from two DIFFERENT reads, not
-										// a layout error. Reading the row back restores the
-										// self-check below, which is the only runtime detector we
-										// have for a genuinely bad read.
-										// Once per session, print the WHOLE of row 135 from one read
-										// so the [derived] offset validates itself. Expect
-										// (~1.4e-45, P, 1/P, 0.0): .x is an int32 MSAA count
-										// reinterpreted as float and .w is padding. If .x is a
-										// normal float or .w is not zero, we are reading the wrong
-										// row and everything derived from it is suspect.
-										// MEASURED 2026-09-03: this used to fire ONCE per session and only PRINT, which made
-										// it a diagnostic rather than a detector. Two things make that not good enough. The
-										// View CB's register is NOT invariant (b1 in one configuration, b4 in another, §2.3),
-										// so a mid-session re-selection can land on a different buffer; and the per-frame test
-										// that picks the buffer is only a PLAUSIBILITY heuristic (jitter in range, matrices
-										// that look like rotations), which a wrong-but-plausible buffer passes. Row 135 is the
-										// only STRONG check we have - y*z == 1 by construction (SceneRendering.cpp:1563-1564
-										// assigns the pair on adjacent lines from one float) - so it now runs on EVERY read.
-										// Cost: three float comparisons on bytes already memcpy'd, against a ~1.5 ms intercept.
-										// .x is int32 NumSceneColorMSAASamples reinterpreted, so it is a denormal for any small
-										// NON-ZERO count and exactly 0.0 when the count is 0. The one-shot version rejected the
-										// zero case; both are valid and a naive test would call a good buffer bad.
-										// It WARNS and keeps going rather than refusing, because one strict comparison must not
-										// cost a frame of DLSS; only a sustained run of failures degrades the exposure to
-										// UNKNOWN, a path that already exists (the codec falls back to its static scale and
-										// NR's gate counts it as exposure-unknown).
-										constexpr unsigned kRow135GraceFrames = 8;
-										static bool s_row135_seen = false;
-										static bool s_row135_last_ok = false;
-										static unsigned s_row135_bad_run = 0;
-										bool row135_ok = false;
-										if (view_ok)
-										{
-											const auto &r = view.pre_exposure_row;
-											const bool x_ok = (r.x == 0.0f) || (r.x > 0.0f && r.x < 1e-30f);
-											const double product = static_cast<double>(r.y) * static_cast<double>(r.z);
-											const bool product_ok = product > 0.999 && product < 1.001;
-											const bool w_ok = r.w == 0.0f;
-											row135_ok = x_ok && product_ok && w_ok;
-											s_row135_bad_run = row135_ok ? 0u : s_row135_bad_run + 1u;
-											// Log the first verdict and every CHANGE of verdict, never per frame.
-											if (!s_row135_seen || row135_ok != s_row135_last_ok)
-											{
-												s_row135_seen = true;
-												s_row135_last_ok = row135_ok;
-												STRAY_LOG_WARN("View row 135 self-check %s: x=%.9g y=%.6f z=%.6f w=%.9g | "
-													"y*z=%.6f (want 1.0, exact by construction) | x denormal-or-zero=%d "
-													"(int32 MSAA count reinterpreted) | w==0=%d (padding). All three must "
-													"hold or kPreExposureRow is the wrong offset and everything derived "
-													"from it is suspect; after %u consecutive failures the exposure is "
-													"treated as unknown.",
-													row135_ok ? "PASSES" : "FAILS",
-													static_cast<double>(r.x), static_cast<double>(r.y),
-													static_cast<double>(r.z), static_cast<double>(r.w), product,
-													x_ok ? 1 : 0, w_ok ? 1 : 0, kRow135GraceFrames);
-											}
-										}
-										// A sustained self-check failure means we do not know the exposure; 0 is the
-										// codec's own "unknown" value and makes it fall back to its static scale.
-										ni.one_over_pre_exposure =
-											(view_ok && s_row135_bad_run <= kRow135GraceFrames)
-												? view.one_over_pre_exposure : 0.0f;
-										// The pair being reciprocals is what makes this free: a
-										// product that is not 1 means the read is bad, whatever
-										// the cause.
-										ni.pre_exposure_ok =
-											view_ok && ue4::pre_exposure_plausible(view);
-										const bool nr_applied = nr::apply(
-											native_device, native, ni);
-										// Half two of the history restore: only a frame NR really
-										// modified needs putting back. A refusal (warmup,
-										// validating, degenerate, codec failure) leaves `u0`
-										// exactly as SR/RR wrote it, and restoring it would be a
-										// 66 MB copy of identical pixels.
-										nrhist::note_nr_applied(nr_applied);
-									}
 								}
 							}
 							if (ok)

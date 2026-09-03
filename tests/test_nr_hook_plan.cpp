@@ -60,36 +60,8 @@ GuideState good_guides(std::uint64_t sequence = 100)
 
 } // namespace
 
-TEST_CASE("the hook mode defaults to taa for every unrecognised value")
-{
-	// PHASE 1 SHIPS taa. A typo in the ini must not silently move the hook to a site no run on the
-	// box has yet judged.
-	CHECK(hook_mode_from_string(nullptr) == HookMode::taa);
-	CHECK(hook_mode_from_string("") == HookMode::taa);
-	CHECK(hook_mode_from_string("taa") == HookMode::taa);
-	CHECK(hook_mode_from_string("Present") == HookMode::taa); // case-sensitive, like NgxNRTopology
-	CHECK(hook_mode_from_string("nonsense") == HookMode::taa);
-	// `preui` was a real mode until 2026-09-02 and is NOT coming back. An ini left over from that
-	// era must land on the shipped default, not on the present stage.
-	CHECK(hook_mode_from_string("preui") == HookMode::taa);
 
-	CHECK(hook_mode_from_string("present") == HookMode::present);
-}
 
-TEST_CASE("mode names round-trip, so a log line is unambiguous about which path drew the image")
-{
-	for (const HookMode m : { HookMode::taa, HookMode::present })
-		CHECK(hook_mode_from_string(hook_mode_name(m)) == m);
-}
-
-TEST_CASE("the HDR codec applies to the TAA site only")
-{
-	// The codec turns raw unbounded pre-exposed linear HDR into a display-referred proxy. The back
-	// buffer is ALREADY display-referred, so running it there would apply the soft clip and the
-	// sRGB encode a second time on top of the game's own tone curve.
-	CHECK(is_post_tonemap(HookMode::taa) == false);
-	CHECK(is_post_tonemap(HookMode::present));
-}
 
 TEST_CASE("every plan result has a distinct name")
 {
@@ -274,80 +246,10 @@ TEST_CASE("the guide-extent latch reacts to either axis alone")
 // on" (RemixProjGroup/dxvk-remix @ 2df9c812).
 // ---------------------------------------------------------------------------------------
 
-TEST_CASE("the codec gate lets a well-formed frame through")
-{
-	CodecGateInputs in;
-	in.codec_site = true;
-	in.encode_recorded = true;
-	in.track_exposure = true;
-	in.exposure_known = true;
-	in.scale = 8.0f;
-	CHECK(codec_gate(in) == CodecGate::evaluate);
-}
 
-TEST_CASE("a site that cannot run the codec never evaluates")
-{
-	// The post-tonemap sites were removed on 2026-09-02, but the enum value that reaches this
-	// code still exists, so the branch that would evaluate on an un-encoded image is still
-	// reachable. It must refuse rather than quietly run the raw-HDR path.
-	CodecGateInputs in;
-	in.codec_site = false;
-	in.encode_recorded = true;
-	in.exposure_known = true;
-	in.scale = 8.0f;
-	CHECK(codec_gate(in) == CodecGate::no_codec);
-}
 
-TEST_CASE("an encode that did not record never evaluates")
-{
-	CodecGateInputs in;
-	in.encode_recorded = false;
-	in.exposure_known = true;
-	in.scale = 8.0f;
-	CHECK(codec_gate(in) == CodecGate::encode_failed);
-}
 
-TEST_CASE("tracking exposure with no exposure ever read never evaluates")
-{
-	// With NgxNRTrackExposure on, the codec's operating point IS the engine's exposure. A frame
-	// whose View constant buffer has never decoded leaves that term unknown, and the old
-	// behaviour — silently substituting the static scale — puts the network in a DIFFERENT input
-	// domain from the one its own temporal history was accumulated in, with no diagnostic.
-	CodecGateInputs in;
-	in.encode_recorded = true;
-	in.track_exposure = true;
-	in.exposure_known = false;
-	in.scale = 8.0f;
-	CHECK(codec_gate(in) == CodecGate::exposure_unknown);
 
-	// With tracking OFF the static scale is the whole answer by design, so the same frame is
-	// fine — the exposure term is not unknown, it is not part of the definition.
-	in.track_exposure = false;
-	CHECK(codec_gate(in) == CodecGate::evaluate);
-}
-
-TEST_CASE("a scale pinned at either clamp never evaluates")
-{
-	// nrc::proxy_scale clamps to [1e-6, 1e6], so a degenerate operating point arrives as a value
-	// sitting exactly on a bound rather than as a zero or a NaN. At 1e-6 the proxy is flat black
-	// and at 1e6 it is flat white; in both cases the network is shown no image at all.
-	CodecGateInputs in;
-	in.encode_recorded = true;
-	in.track_exposure = true;
-	in.exposure_known = true;
-
-	in.scale = stray_dlss::nrc::kScaleMin;
-	CHECK(codec_gate(in) == CodecGate::degenerate_scale);
-	in.scale = stray_dlss::nrc::kScaleMax;
-	CHECK(codec_gate(in) == CodecGate::degenerate_scale);
-	in.scale = 0.0f;
-	CHECK(codec_gate(in) == CodecGate::degenerate_scale);
-	in.scale = -1.0f;
-	CHECK(codec_gate(in) == CodecGate::degenerate_scale);
-
-	in.scale = 1.0f;
-	CHECK(codec_gate(in) == CodecGate::evaluate);
-}
 
 TEST_CASE("a declined frame forces DLSSNR.Reset on the next evaluate, exactly once")
 {

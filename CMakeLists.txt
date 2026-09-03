@@ -79,8 +79,6 @@ add_library(stray_dlss_core STATIC
     src/core/gbuffer_classify.hpp
     src/core/envbrdf.cpp
     src/core/envbrdf.hpp
-    src/core/nr_codec.cpp
-    src/core/nr_codec.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -91,8 +89,6 @@ add_library(stray_dlss_core STATIC
     src/core/present_plan.hpp
     src/core/fg_plan.cpp
     src/core/fg_plan.hpp
-    src/core/nr_history_plan.cpp
-    src/core/nr_history_plan.hpp
     src/core/ring.hpp
     src/host/ini.cpp
     src/host/ini.hpp
@@ -229,10 +225,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/gbuffer_finder.hpp
         src/gbuffer_resolve.cpp
         src/gbuffer_resolve.hpp
-        src/nr_codec_pass.cpp
-        src/nr_codec_pass.hpp
-        src/nr_history.cpp
-        src/nr_history.hpp
         src/nr_hook.cpp
         src/nr_hook.hpp
         src/nr_stage.cpp
@@ -312,14 +304,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
                    main cs_5_0 g_gbuffer_resolve_dxbc)
-    # The DLSS-NR HDR colour codec. Both halves include shaders/nr_codec.hlsli, which is named
-    # as an extra dependency so editing the shared transfer functions rebuilds both.
-    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
-                   main cs_5_0 g_nr_encode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
-    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
-                   main cs_5_0 g_nr_decode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -397,9 +381,6 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         tests/warp/log_stub.cpp
         src/mv_resolve.cpp
         src/d3d12_restore.cpp
-        # The DLSS-NR codec pass, for the deferred-destruction test (warp_nr_lifetime.inc). It is
-        # the only NR code the harness can link: everything else on that path needs NGX.
-        src/nr_codec_pass.cpp
         # The NR present stage's D3D12 half: the staging texture and the two copies. NGX-free on
         # purpose (src/nr_stage.hpp), which is the only reason the harness can judge it at all.
         src/nr_stage.cpp
@@ -426,12 +407,6 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/warp_probe.hlsl"
                    main cs_5_0 g_warp_probe_dxbc)
-    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
-                   main cs_5_0 g_nr_encode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
-    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
-                   main cs_5_0 g_nr_decode_dxbc
-                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
 
     target_include_directories(stray_dlss_warp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -471,11 +446,9 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_pass_walk.cpp
         tests/test_gbuffer_classify.cpp
         tests/test_envbrdf.cpp
-        tests/test_nr_codec.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_params.cpp
-        tests/test_nr_history_plan.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp
         tests/test_intercept_types.cpp

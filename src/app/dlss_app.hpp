@@ -13,7 +13,7 @@
 namespace stray_dlss::app {
 
 // Which events the host has to deliver, decided from the ini (HashShaders, PassFinder,
-// GBufferFinder, NgxRR, NgxNRHook). Registering the pipeline events is not free under
+// GBufferFinder, NgxRR). Registering the pipeline events is not free under
 // ReShade — it drops the PSO cache (docs/RESEARCH.md §2.5) — which is why this is a decision
 // rather than "everything, always".
 struct EventNeeds
@@ -40,23 +40,11 @@ struct NrLive
 	int   style = 0;
 	bool  auto_mask = true;
 	bool  ui_correction = true;
-	float paper_white = 1.0f;
-	// The reference's `trackAutoExposure`, default TRUE there and here. See ngx_nr.hpp.
-	bool  track_exposure = true;
-	float color_strength = 1.0f;
-	float transfer_strength = 1.0f;
-	bool  smooth_exposure = true;     // the toggle; when off the rate is forced to 1.0
-	float scale_reset_tol = 0.15f;    // ratio drift before NR's history is discarded; 0 = never
-	float exposure_smoothing = 0.05f; // per-frame weight of the new exposure sample; 1.0 = off
 	float mvec_scale = 0.0f; // 0 = use the built-in default (1.0)
 	int   mv_convention = 0;  // index into kMvConventions
 	bool  mv_invert_x = false;
 	bool  mv_invert_y = false;
 	bool  mv_legacy_clip = false; // reproduce the pre-row_major transposed camera branch
-	// [STRAYDLSS] NgxNRRestoreHistory, default OFF (histplan::Config carries the reasoning).
-	// Live, and deliberately so: it is the A/B for the SSR drift. Overwritten at startup with
-	// what the ini said. (src/nr_history.hpp)
-	bool  restore_history = false;
 };
 
 // Which branch of the resolve gets its sign flipped (mv_resolve.hpp). Four entries.

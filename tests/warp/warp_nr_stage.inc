@@ -207,7 +207,7 @@ bool readback_rgba8(Gpu &gpu, ID3D12Resource *src, UINT w, UINT h,
 	return true;
 }
 
-// How many references OTHER than the one this test holds. Same probe warp_nr_lifetime.inc uses.
+// How many references OTHER than the one this test holds. Reference-count probe: AddRef then Release returns the prior count.
 ULONG stage_foreign_refs(IUnknown *obj)
 {
 	obj->AddRef();
@@ -224,7 +224,7 @@ bool test_nr_present_stage_round_trip(Gpu &gpu)
 	// THE PROBE, on the format that actually matters. Reported rather than asserted: WARP's answer
 	// for R10G10B10A2_UNORM is WARP's, and the target is an RTX 4090 through vkd3d-proton. What
 	// this pins is that the probe RUNS and answers, which is what the gate consumes.
-	const stray_dlss::nrp::TypedUavSupport probe =
+	const stray_dlss::nrstage::TypedUavSupport probe =
 		stray_dlss::nrstage::probe(gpu.device.Get(), DXGI_FORMAT_R10G10B10A2_UNORM);
 	check(probe.queried, "CheckFeatureSupport answered for R10G10B10A2_UNORM (Stray's back-buffer "
 		"format) — view/store are what nrplan::plan_post_tonemap gates on");

@@ -11,13 +11,11 @@
 
 #include "app/dlss_app.hpp"
 #include "backend_native/native_backend.hpp"
-#include "core/nr_history_plan.hpp"
 #include "core/taa_hashes.hpp"
 #include "host/config.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_nr.hpp"
-#include "nr_history.hpp"
 #include "shader_dump.hpp"
 
 #include <descriptor_tracking.hpp>
@@ -404,68 +402,7 @@ void draw_nr_controls()
 		nr::set_enabled(g_nr_ui.enabled);
 	}
 
-	// THE SSR-DRIFT A/B. `u0` is both this frame's scene colour and the next frame's
-	// HistoryBuffer[0] (TemporalAA.cpp:696/:969), so NR's residual re-enters the engine's
-	// temporal state and compounds. With this on, the pristine pre-NR image is copied aside
-	// inside the TAA dispatch and copied back at present — after every same-frame consumer has
-	// run, so the DISPLAYED frame is identical either way and only the drift changes. Live on
-	// purpose: turning it off mid-session and watching a wet floor or the menu's light shafts is
-	// the measurement. (src/nr_history.hpp)
-	const nrhist::Counters histc = nrhist::counters();
-	changed |= ImGui::Checkbox("Restore engine history (keeps NR out of TAA history)",
-		&g_nr_ui.restore_history);
-	ImGui::Text("  snapshots %llu  restores %llu  harmful misses %llu%s",
-		static_cast<unsigned long long>(histc.snapshots),
-		static_cast<unsigned long long>(histc.restores),
-		static_cast<unsigned long long>(histc.harmful_misses),
-		histc.harmful_misses != 0 ? "  <-- frames whose residual DID reach the history" : "");
-	for (int i = 0; i < histplan::kStepCount; ++i)
-	{
-		const std::uint32_t total = histc.snapshot_reasons[i] + histc.restore_reasons[i];
-		if (total != 0 && i != static_cast<int>(histplan::Step::ok))
-			ImGui::Text("    %-20s %u",
-				histplan::step_name(static_cast<histplan::Step>(i)), total);
-	}
 
-	ImGui::TextUnformatted("HDR colour codec");
-	// Below 1.0 is legal and is the useful direction here: the shader's multiplier is
-	// 1/paperWhite, so raising this multiplies the colour DOWN, and Stray's scene colour already
-	// carries UE4's pre-exposure. The soft clip saturates at an input near 3.474, so there is no
-	// point going far above that.
-	changed |= ImGui::SliderFloat("Paper white", &g_nr_ui.paper_white, 0.01f, 8.0f, "%.3f");
-	// With tracking ON the engine's OneOverPreExposure supplies the ~18x this scene needs, so
-	// paper white should sit near 1.0; with it OFF the user has to supply that factor by hand,
-	// which is how ~0.1 came to look best. Read the "NR codec scale" line to see the split.
-	changed |= ImGui::Checkbox("Track engine exposure (TAA site only)",
-		&g_nr_ui.track_exposure);
-	// 0 keeps the ORIGINAL's chromaticity and carries only the network's luminance change — the
-	// escape hatch for a colour cast.
-	changed |= ImGui::SliderFloat("Colour strength", &g_nr_ui.color_strength, 0.0f, 1.0f, "%.2f");
-	// 0 is an EXACT bit-for-bit bypass, which makes it the honest A/B against "NR off".
-	changed |= ImGui::SliderFloat("Transfer strength", &g_nr_ui.transfer_strength, 0.0f, 1.0f,
-		"%.2f");
-	// 1.0 reproduces the unsmoothed behaviour. Lower is steadier; NR's own history is
-	// accumulated at this scale, so jitter here shows up as flicker that intensity amplifies.
-	changed |= ImGui::Checkbox("Smooth exposure", &g_nr_ui.smooth_exposure);
-	if (g_nr_ui.smooth_exposure)
-	{
-		ImGui::SameLine();
-		changed |= ImGui::SliderFloat("rate", &g_nr_ui.exposure_smoothing, 0.002f, 1.0f, "%.4f");
-	}
-	// How far the scale may drift before NR's history is thrown away. Measured live: the
-	// exposure factor swings ~20% during normal play, so a tight tolerance resets the history
-	// many times a minute — which is its own flicker source. 0 disables the latch entirely and
-	// lets the history ride through the drift instead.
-	changed |= ImGui::SliderFloat("Scale reset tol (0=never)", &g_nr_ui.scale_reset_tol, 0.0f,
-		2.0f, "%.2f");
-
-	// THE MOTION KNOB. Our motion vectors are render-resolution (1920x1080) while the colour is
-	// the output rect (3840x2160). Whether the runtime wants them in the guide's own pixels
-	// (1.0, since MVecSubrectWidth/Height already declare that rect) or in colour pixels (2.0)
-	// is NOT documented for this leaked runtime, and it is exactly the kind of error that looks
-	// perfect on a still frame and noisy in motion — a still frame needs no reprojection at all.
-	// 0 means "use the built-in default"; try 1.0 against 2.0 while panning the camera.
-	ImGui::Separator();
 	ImGui::TextUnformatted("Motion");
 	changed |= ImGui::SliderFloat("MVec scale (0=auto)", &g_nr_ui.mvec_scale, 0.0f, 4.0f, "%.2f");
 	// NOTE: this also affects DLSS SR, which consumes the same resolve — so a change here is not
@@ -541,18 +478,6 @@ void draw_nr_controls()
 	ImGui::Separator();
 	if (ImGui::Button("Save to ReShade.ini"))
 	{
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPaperWhiteScale", g_nr_ui.paper_white);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTrackExposure",
-			g_nr_ui.track_exposure ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRColorStrength", g_nr_ui.color_strength);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRTransferStrength",
-			g_nr_ui.transfer_strength);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRExposureSmoothing",
-			g_nr_ui.exposure_smoothing);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRScaleResetTolerance",
-			g_nr_ui.scale_reset_tol);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSmoothExposure",
-			g_nr_ui.smooth_exposure ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRIntensity", g_nr_ui.intensity);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalTone", g_nr_ui.local_tone);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRLocalStructure",
@@ -569,8 +494,6 @@ void draw_nr_controls()
 			g_nr_ui.auto_mask ? 1 : 0);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRUICorrection",
 			g_nr_ui.ui_correction ? 1 : 0);
-		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRRestoreHistory",
-			g_nr_ui.restore_history ? 1 : 0);
 		STRAY_LOG_WARN("NR: live settings saved to ReShade.ini.");
 	}
 	ImGui::SameLine();

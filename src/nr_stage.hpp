@@ -24,7 +24,7 @@
 // range here to lose (docs/STRAY-RENDERING-FACTS.md §33: R10G10B10A2_UNORM, no SetColorSpace1).
 #pragma once
 
-#include "nr_codec_pass.hpp" // nrp::TypedUavSupport, the ONE typed-UAV probe in this codebase
+#include "core/nr_lifetime.hpp"
 
 #include <cstdint>
 
@@ -33,6 +33,22 @@ struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 
 namespace stray_dlss::nrstage {
+
+// The three bits CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) reports about a format's
+// typed-UAV behaviour, kept separate rather than collapsed to one bool so a caller's log can name
+// WHICH half is missing. It lived in the HDR colour codec until that was deleted (the present
+// stage needs no codec); the probe itself is unchanged.
+struct TypedUavSupport
+{
+	bool queried = false; // false = CheckFeatureSupport itself failed
+	bool view = false;    // D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW
+	bool load = false;    // D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+	bool store = false;   // D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE
+};
+
+// THE single typed-UAV probe in this codebase. `format` is a DXGI_FORMAT, taken as an int so this
+// header stays free of <dxgi.h>.
+TypedUavSupport probe_typed_uav(ID3D12Device *device, int format);
 
 // The state our staging copy rests in between frames, and the state NVIDIA's guide wants an NGX
 // input in (docs/RESEARCH.md §3.5). Keeping the resting state equal to the NGX state means the
@@ -68,7 +84,7 @@ ID3D12Resource *staging();
 // The typed-UAV verdict for `dxgi_format`, cached and LOGGED ONCE per format. "The back buffer is
 // R10G10B10A2_UNORM and this device cannot store to it through a typed UAV" is precisely the kind
 // of fact that must not have to be inferred from a black screen (CLAUDE.md §0.2).
-nrp::TypedUavSupport probe(ID3D12Device *device, int dxgi_format);
+TypedUavSupport probe(ID3D12Device *device, int dxgi_format);
 
 // back buffer -> staging. `colour_state` is the D3D12_RESOURCE_STATES the back buffer is in when
 // we are called, and it is put back into it before this returns.

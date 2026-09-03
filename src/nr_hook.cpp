@@ -17,7 +17,6 @@
 namespace stray_dlss::nrhook {
 namespace {
 
-std::atomic<int> g_mode{ static_cast<int>(nrplan::HookMode::taa) };
 // D3D12_RESOURCE_STATE_PRESENT == D3D12_RESOURCE_STATE_COMMON == 0. See nr_hook.hpp.
 std::atomic<std::uint32_t> g_bb_state{ 0 };
 
@@ -112,15 +111,7 @@ void issue_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, std::ui
 
 } // namespace
 
-void set_hook_mode(nrplan::HookMode mode)
-{
-	g_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
-}
 
-nrplan::HookMode hook_mode()
-{
-	return static_cast<nrplan::HookMode>(g_mode.load(std::memory_order_relaxed));
-}
 
 void set_back_buffer_state(std::uint32_t states)
 {
@@ -136,8 +127,6 @@ void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
 	// wiring is needed if the mode ever becomes live-toggleable, but at `taa` the promise is that
 	// the shipped configuration is byte-identical — and the references taken below, however cheap,
 	// are not nothing. One relaxed atomic load is.
-	if (hook_mode() != nrplan::HookMode::present)
-		return;
 
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
 
@@ -177,8 +166,6 @@ void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
 void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 {
 	// Inert and free at every other mode: no counters, no probe, no allocation.
-	if (hook_mode() != nrplan::HookMode::present)
-		return;
 
 	// Retire staging textures a resize superseded, whatever this frame then decides. Cheap, and it
 	// must happen even on a frame the gate refuses.

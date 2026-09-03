@@ -38,7 +38,7 @@ std::vector<Retired> g_retired;
 Stats g_stats;
 
 DXGI_FORMAT g_probed_format = DXGI_FORMAT_UNKNOWN;
-nrp::TypedUavSupport g_probe;
+TypedUavSupport g_probe;
 
 char g_last_error[192] = "";
 
@@ -88,7 +88,27 @@ void transition(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res, D3D12_RESOU
 
 } // namespace
 
-nrp::TypedUavSupport probe(ID3D12Device *device, int dxgi_format)
+TypedUavSupport probe_typed_uav(ID3D12Device *device, int format)
+{
+	TypedUavSupport out;
+	if (device == nullptr)
+		return out;
+
+	D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+	support.Format = static_cast<DXGI_FORMAT>(format);
+	if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+			sizeof(support))))
+		return out; // queried stays false: "the device would not answer", not "unsupported"
+
+	out.queried = true;
+	out.view = (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+	out.load = (static_cast<UINT>(support.Support2) & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+	out.store = (static_cast<UINT>(support.Support2) & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+	return out;
+}
+
+
+TypedUavSupport probe(ID3D12Device *device, int dxgi_format)
 {
 	const auto fmt = static_cast<DXGI_FORMAT>(dxgi_format);
 	std::lock_guard<std::mutex> lock(g_mutex);
@@ -96,7 +116,7 @@ nrp::TypedUavSupport probe(ID3D12Device *device, int dxgi_format)
 		return g_probe;
 
 	g_probed_format = fmt;
-	g_probe = nrp::probe_typed_uav(device, dxgi_format);
+	g_probe = probe_typed_uav(device, dxgi_format);
 	STRAY_LOG_INFO("NR stage: typed-UAV probe on the back buffer's format %u (%s) — queried=%d "
 		"typedUavView=%d typedLoad=%d typedStore=%d. NGX writes DLSSNR.Output through a typed "
 		"UAV, so VIEW and STORE decide; a missing typed LOAD is harmless here because the runtime "
@@ -278,7 +298,7 @@ void shutdown()
 	g_stats.live_retired = 0;
 	g_stats.bytes = 0;
 	g_probed_format = DXGI_FORMAT_UNKNOWN;
-	g_probe = nrp::TypedUavSupport{};
+	g_probe = TypedUavSupport{};
 }
 
 Stats stats()

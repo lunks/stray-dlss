@@ -50,17 +50,12 @@ namespace { char g_err[64] = "<ngx disabled>"; }
 void set_enabled(bool) {}
 bool enabled() { return false; }
 void set_dll_path(const char *) {}
-void set_topology(Topology) {}
 void set_tuning(float, float, float) {}
 void set_renodx_tuning(float, unsigned int, unsigned int, unsigned int) {}
 void set_style(unsigned int) {}
 void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
-void set_codec_tuning(float, float, float) {}
-void set_exposure_smoothing(float) {}
-void set_scale_reset_tolerance(float) {}
-void set_track_exposure(bool) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present(ID3D12CommandQueue *) {}
 void shutdown() {}
@@ -83,6 +78,19 @@ bool validated() { return false; }
 
 namespace stray_dlss::nr {
 namespace {
+
+// Exact piecewise sRGB decode, the surviving fragment of the deleted HDR colour codec. The
+// luminance diagnostic reports the neural output both as a display code value and decoded to
+// linear, and the network answers in true sRGB rather than an x^2.2 approximation.
+float srgb_decode_channel(float c)
+{
+	c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+	if (c <= 0.04045f)
+		return c / 12.92f;
+	const float shoulder = (c + 0.055f) / 1.055f;
+	return std::pow(shoulder > 0.0f ? shoulder : 0.0f, 2.4f);
+}
+
 
 // --- the DLSSNR.* parameter namespace (docs/RESEARCH-RENODX-DLSS5.md §2.2, HARD) ---
 // The public SDK has no DLSSNR helper, so every key is set by name. Names are verbatim from
@@ -162,7 +170,6 @@ bool g_use_direct = false;
 // it, so this flag pairs the two and we never cross-call.
 bool g_params_from_snippet = false;
 bool g_enabled = false;
-Topology g_topology = Topology::post_process;
 // Defaults are RenoDX's own shipped [RenoDX.DLSS5] values, not invented ones: NRIntensity=1.05,
 // NRLocalTone=1.74, NRSkinStructure=1.33, NRPreset=1, NRAutoMask=1, NRUICorrection=1.
 float g_intensity = 1.0f;
@@ -182,20 +189,10 @@ float g_mvec_scale_override = 0.0f;
 // because the reference multiplies it by its tonemapper's auto-exposure texture, which we have
 // no access to at a TAA-dispatch hook. It is 1.0 here because it is neutral and because the
 // direction this title needs is unknown until the codec's own luminance line is read once.
-// Running smoothed exposure factor. See nrc::smooth_exposure_factor for why this must not be
 // used raw: NR's own temporal history is accumulated at whatever scale was in force, so a scale
 // that jitters frame to frame leaves that history in the wrong units.
-float g_exposure_smoothed = 0.0f;
 // The codec scale NR's current temporal history was accumulated at, and how far it may drift
-// before that history is discarded. See nrc::codec_scale_invalidates_history.
-float g_scale_latched = 0.0f;
-float g_scale_tolerance = 0.15f; // [STRAYDLSS] NgxNRScaleResetTolerance; 0 disables the latch
-float g_exposure_rate = 0.05f; // [STRAYDLSS] NgxNRExposureSmoothing; 1.0 = off
-float g_paper_white = 1.0f;
-float g_color_strength = 1.0f;
-float g_transfer_strength = 1.0f;
 // Default ON, matching the reference's own `trackAutoExposure` default. See ngx_nr.hpp.
-bool g_track_exposure = true;
 // NR's OWN temporal accumulation is keyed on the COLOUR grid, so nothing in the feature notices
 // when the GUIDE grid moves underneath it — and ours moves whenever the screen percentage does
 // (1920x1080 guides at 50%, 2688x1512 at 70%, both of which this project runs). The reference
@@ -229,7 +226,6 @@ bool g_new_feature_reset = false;
 // answers and no amount of argument does. Build the counter before you need it.
 std::atomic<std::uint32_t> g_reset_frame_gap{0};
 std::atomic<std::uint32_t> g_reset_guide_grid{0};
-std::atomic<std::uint32_t> g_reset_codec_scale{0};
 std::atomic<std::uint32_t> g_reset_camera_cut{0};
 std::atomic<std::uint32_t> g_reset_new_feature{0};
 // The rect the codec actually processed this frame — the OUTPUT subrect, which can be smaller
@@ -285,7 +281,6 @@ struct CropReadback
 	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
 CropReadback g_crop_input;  // the engine's linear HDR image, before the encode
-CropReadback g_crop_proxy;  // what we actually handed the network
 CropReadback g_crop_neural; // what it answered
 // The crop's own extent, for the diagnostic line. Written on the recording thread before the
 // release-store that publishes `in_flight`, read on the present thread after the acquire-load —
@@ -294,7 +289,6 @@ std::uint32_t g_validate_crop_w = 0, g_validate_crop_h = 0;
 // Whether the frame that armed the validation ran the HDR codec. Post-tonemap there is no proxy
 // and no paper white, so the codec half of the luminance line would be a lie — and a diagnostic
 // that lies is worse than one that is absent. Same publication discipline as the fields above.
-bool g_validate_codec = false;
 int g_validate_presents_left = 0;
 
 std::atomic<std::uint64_t> g_applied{ 0 };
@@ -598,9 +592,11 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	// Under post_process the network works at OUTPUT resolution (Color is already upscaled),
 	// so Width/Height are the output rect and Scale is 1. Under sr_shaped it upscales, so
 	// Width/Height are the render rect.
-	const bool post = g_topology == Topology::post_process;
-	const std::uint32_t in_w = post ? out_w : render_w;
-	const std::uint32_t in_h = post ? out_h : render_h;
+	// The network works at OUTPUT resolution: Color is already upscaled when it reaches us, so
+	// Width/Height are the output rect and the scaling ratio is 1. (DLSSNR.ScalingRatio is inert
+	// in this runtime anyway: read, then overwritten with 1.0f.)
+	const std::uint32_t in_w = out_w;
+	const std::uint32_t in_h = out_h;
 
 	{
 		nrparam::Entry entries[nrparam::kMaxCreateEntries];
@@ -679,7 +675,6 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 	// graveyard and are freed at a present the fence has passed.
 	bury(g_nr_output, "neural output texture (resolution change)");
 	bury(g_crop_input.buffer, "validation crop: colour input");
-	bury(g_crop_proxy.buffer, "validation crop: proxy");
 	bury(g_crop_neural.buffer, "validation crop: neural output");
 	g_validation.store(Validation::pending, std::memory_order_release);
 
@@ -800,16 +795,11 @@ bool copy_crop(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resou
 // SAME centred box, so their luminances are directly comparable. Until this passes, NR runs but
 // the decode never touches the engine image.
 void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
-                      ID3D12Resource *image, D3D12_RESOURCE_STATES image_state, bool with_proxy)
+                      ID3D12Resource *image, D3D12_RESOURCE_STATES image_state)
 {
 	if (g_validation.load(std::memory_order_acquire) != Validation::pending ||
 		g_nr_output == nullptr || image == nullptr)
 		return;
-	// The proxy only exists when the codec ran. At a post-tonemap site there is none, and its
-	// absence must not block the verdict — the neural crop is what the verdict rests on.
-	if (with_proxy && nrp::proxy() == nullptr)
-		return;
-
 	// Centre the crop on the rect the codec PROCESSED, not on the texture allocation: UE4's
 	// scene targets can be left larger than the current view rect, and a crop centred on the
 	// allocation would land outside the region NGX wrote.
@@ -838,20 +828,14 @@ void begin_validation(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	}
 	if (!copy_crop(device, cmd, image, g_nr_format, box, image_state, g_crop_input))
 		release(g_crop_input.buffer);
-	if (with_proxy &&
-		!copy_crop(device, cmd, nrp::proxy(), kProxyReadbackFormat, box,
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_crop_proxy))
-		release(g_crop_proxy.buffer);
-
 	g_validate_crop_w = crop_w;
 	g_validate_crop_h = crop_h;
-	g_validate_codec = with_proxy;
 	g_validate_presents_left = kValidateLatency;
 	// Publish LAST: everything above must be visible to the present thread that sees this.
 	g_validation.store(Validation::in_flight, std::memory_order_release);
 	STRAY_LOG_INFO("NR: validating the neural output (%ux%u crop centred on the %ux%u processed "
-		"rect, with matching colour-input and proxy crops). Until it passes, NR runs but the "
-		"decode does NOT touch the screen - a degenerate runtime cannot show a black frame.",
+		"rect, with a matching colour-input crop). Until it passes, NR runs but the "
+		"write-back does NOT touch the screen - a degenerate runtime cannot show a black frame.",
 		crop_w, crop_h, rect_w, rect_h);
 }
 
@@ -970,7 +954,6 @@ void set_enabled(bool value)
 }
 
 bool enabled() { return g_enabled; }
-void set_topology(Topology topology) { g_topology = topology; }
 void set_mvec_scale_override(float scale) { g_mvec_scale_override = scale; }
 const char *last_error() { return g_last_error; }
 bool validated() { return g_validation.load(std::memory_order_acquire) == Validation::ok; }
@@ -1014,7 +997,6 @@ ResetCounts reset_counters()
 	ResetCounts c;
 	c.frame_gap = g_reset_frame_gap.load(std::memory_order_relaxed);
 	c.guide_grid = g_reset_guide_grid.load(std::memory_order_relaxed);
-	c.codec_scale = g_reset_codec_scale.load(std::memory_order_relaxed);
 	c.camera_cut = g_reset_camera_cut.load(std::memory_order_relaxed);
 	c.new_feature = g_reset_new_feature.load(std::memory_order_relaxed);
 	return c;
@@ -1022,27 +1004,8 @@ ResetCounts reset_counters()
 
 void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
 
-void set_track_exposure(bool enabled) { g_track_exposure = enabled; }
 
-void set_exposure_smoothing(float rate) { g_exposure_rate = rate; }
-void set_scale_reset_tolerance(float tol) { g_scale_tolerance = tol; }
 
-void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
-{
-	g_paper_white = paper_white;
-	// Both strengths are lerp weights and are meaningless outside [0,1]; the reference tree
-	// clamps them the same way through its RTX_OPTION min/max.
-	g_color_strength = color_strength < 0.0f ? 0.0f : (color_strength > 1.0f ? 1.0f : color_strength);
-	g_transfer_strength = transfer_strength < 0.0f ? 0.0f
-		: (transfer_strength > 1.0f ? 1.0f : transfer_strength);
-	STRAY_LOG_INFO("NR codec: paperWhite=%.4f -> scale=%.4f, colorStrength=%.2f, "
-		"transferStrength=%.2f. The codec is MANDATORY: feature 18 is a display-referred "
-		"network and our hook point carries raw linear HDR, so without it the network answers "
-		"near-black. transferStrength=0 is an exact bypass if you need one.",
-		static_cast<double>(g_paper_white),
-		static_cast<double>(nrc::proxy_scale(g_paper_white, 1.0f)),
-		static_cast<double>(g_color_strength), static_cast<double>(g_transfer_strength));
-}
 
 // The CHEAP half: LoadLibrary + export resolution + the identity IAT patch. No GPU contact, no
 // Init_Ext. Safe to call at device init, but off by default — see ngx_nr.hpp for why the init
@@ -1158,7 +1121,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 			"a teardown or a feature release is queued and is waiting on the GPU fence.");
 
 	// The pass's deferred frees are decided against the same timeline this module owns.
-	nrp::set_timeline(g_timeline);
 
 	// WHICH COLOUR PIPELINE. One NR path, two call sites, and this is the only place they differ.
 	//
@@ -1171,7 +1133,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	//                  apply that transfer twice. The network sees the image itself, and its
 	//                  answer is copied back whole rather than differenced — which is only safe
 	//                  because this site is TERMINAL (nothing carries it into the next frame).
-	const bool codec = in.site == Site::taa_dispatch;
 
 	// WHY THERE IS NO BLANKET `if (!codec) refuse` HERE, and why there WAS one between 2026-09-02
 	// and 2026-09-02.
@@ -1196,21 +1157,12 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// meaningless post-tonemap, where there is nothing left to upscale and the whole image is one
 	// rect. Refuse loudly rather than fall back to the raw-HDR path, which is the exact
 	// configuration that produced red noise and a 0.0026 neural output (src/core/nr_codec.hpp).
-	const bool post = g_topology == Topology::post_process;
-	if (!post)
-		return refuse_pre_evaluate(kRefCodecTopology,
-			"NgxNRTopology=sr cannot use the HDR colour codec: the residual transfer needs the "
-			"proxy, the neural answer and the original to be the same pixels, and sr-shaped puts "
-			"the colour input at render resolution and the output at display resolution. Use "
-			"NgxNRTopology=post.");
 	ID3D12Resource *colour = in.image;
 
 	// The state `image` arrives in and must be left in. Documented in ngx_nr.hpp's Site enum and
 	// enforced by the caller on both sides; the barriers below and the validation crop both
 	// depend on getting it right.
-	const D3D12_RESOURCE_STATES image_state = codec
-		? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-		: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	const D3D12_RESOURCE_STATES image_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 	// A mipped / arrayed / multisampled colour input is the one hazard we cannot fix by
 	// allocating our own texture, and feeding one is a documented DXGI_ERROR_DEVICE_HUNG rather
@@ -1245,122 +1197,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_codec_rect_w = cw;
 	g_codec_rect_h = ch;
 
-	float codec_scale = 0.0f;
-	if (codec)
-	{
-		// --- HDR colour codec, stage 1 of 2 ---
-		//
-		// Feature 18 is a DISPLAY-REFERRED image network and `in.image` is unbounded pre-exposed
-		// linear HDR, so what the snippet gets is the PROXY, never the engine's raw image.
-		// Nothing below reads `in.image` again until the decode. (src/core/nr_codec.hpp)
-		if (!nrp::initialise(device, in.image, cw, ch))
-			return refuse_pre_evaluate(kRefCodecFailed, nrp::last_error());
-
-		// TRACKED EXPOSURE. `1.0f` is the fallback paper white, not an exposure — see
-		// nrc::proxy_scale's signature.
-		const float static_scale = nrc::proxy_scale(g_paper_white, 1.0f);
-		// Only feed the smoother a pair that checks out. A stale or zero read would otherwise
-		// walk the running value somewhere wrong and stay there, and NGX silently rewrites a
-		// zero InPreExposure to 1.0 rather than complaining. On a bad frame we simply keep the
-		// previous smoothed value — the scene has not changed brightness in one frame anyway.
-		if (g_track_exposure && in.pre_exposure_ok)
-		{
-			g_exposure_smoothed = nrc::smooth_exposure_factor(g_exposure_smoothed,
-				in.one_over_pre_exposure, g_exposure_rate);
-		}
-		else if (!g_track_exposure)
-		{
-			// Drop the running value while tracking is OFF so re-enabling ADOPTS the current
-			// frame instead of resuming from a stale one and ramping. The user observed exactly
-			// this: turning tracking off made the artefact appear at once, and toggling it back
-			// on cleared it — the toggle was re-syncing a value that had gone stale. Making the
-			// re-sync automatic means it cannot go stale in the first place.
-			g_exposure_smoothed = 0.0f;
-		}
-		codec_scale = g_track_exposure
-			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, g_exposure_smoothed)
-			: static_scale;
-
-		// The decomposition, once. When the user reports "paper white 0.1 looks best", this line
-		// is what says whether tracking has made 1.0 the new correct value.
-		static bool s_scale_logged = false;
-		if (!s_scale_logged)
-		{
-			s_scale_logged = true;
-			STRAY_LOG_WARN("NR codec scale: paperWhite=%.4f -> staticScale=%.4f x exposure=%.4f "
-				"(1/PreExposure, derived from View row 135.y; tracking=%s%s) = EFFECTIVE %.4f. The 0.75 "
-				"soft-clip knee is what this has to land the frame near. Stray's scene colour "
-				"here carries UE4's pre-exposure (~0.056 measured), so an untracked scale near "
-				"1.0 shows the network a nearly black image — which is why hand-dialling paper "
-				"white to ~0.1 looked best before this existed.",
-				static_cast<double>(g_paper_white), static_cast<double>(static_scale),
-				static_cast<double>(in.one_over_pre_exposure),
-				g_track_exposure ? "on" : "OFF",
-				g_track_exposure && !(in.one_over_pre_exposure > 0.0f)
-					? ", but the View CB was unreadable so the STATIC scale was used" : "",
-				static_cast<double>(codec_scale));
-		}
-		const bool encode_ok = nrp::record_encode(cmd, in.image, cw, ch, codec_scale,
-			g_color_strength, g_transfer_strength);
-		colour = nrp::proxy();
-
-		// NO CODEC, NO EVALUATE. Every way of reaching EvaluateFeature without a correct proxy is
-		// enumerated by nrplan::codec_gate and refused here, because the proxy is not a tuning
-		// stage — it IS the input contract of a display-referred network, and the alternative is
-		// the raw-HDR path that measured a 0.0026 neural output with red noise on screen.
-		//
-		// `exposure_known` is deliberately "has a plausible exposure EVER been read", not "did
-		// this frame's View CB decode": the smoothed factor legitimately carries across one bad
-		// frame, and dropping NR for a single unreadable constant buffer would be worse than the
-		// problem. What it catches is the case where the scale's exposure term was never defined
-		// at all and the static scale was quietly substituted for it — a different input domain
-		// from the one feature 18's own history was accumulated in.
-		nrplan::CodecGateInputs gi;
-		gi.codec_site = true;
-		gi.encode_recorded = encode_ok && colour != nullptr;
-		gi.track_exposure = g_track_exposure;
-		gi.exposure_known = g_exposure_smoothed > 0.0f;
-		gi.scale = codec_scale;
-		const nrplan::CodecGate gate = nrplan::codec_gate(gi);
-		if (gate != nrplan::CodecGate::evaluate)
-		{
-			// Nothing has been transitioned yet, so there is no barrier to unwind — the refusal
-			// is recorded before the proxy is put into NON_PIXEL_SHADER_RESOURCE, on purpose.
-			switch (gate)
-			{
-			case nrplan::CodecGate::exposure_unknown:
-				return refuse_pre_evaluate(kRefExposureUnknown,
-					"NgxNRTrackExposure is on but the engine's exposure (View row 135.z) has "
-					"never decoded, so the codec's scale — which DEFINES the display-referred "
-					"units the network and its history work in — is unknown. Evaluating on the "
-					"static scale instead would silently move the input domain. If this never "
-					"clears, the View constant buffer is not being read (check the 'View row 135' "
-					"line); [STRAYDLSS] NgxNRTrackExposure=0 makes the static scale the whole "
-					"answer by design and lifts this gate.");
-			case nrplan::CodecGate::degenerate_scale:
-				return refuse_pre_evaluate(kRefDegenerateScale,
-					"the codec scale is pinned at one of nrc's clamps, so the proxy is flat black "
-					"or flat white: the right format carrying no image.");
-			case nrplan::CodecGate::no_codec:
-				return refuse_pre_evaluate(kRefNoCodec,
-					"this call site does not run the HDR codec, so there is no proxy to hand the "
-					"network.");
-			case nrplan::CodecGate::encode_failed:
-			case nrplan::CodecGate::evaluate:
-			default:
-				return refuse_pre_evaluate(kRefCodecFailed,
-					encode_ok ? "the codec produced no proxy texture." : nrp::last_error());
-			}
-		}
-
-		// NVIDIA's guide wants NGX inputs in NON_PIXEL_SHADER_RESOURCE. The proxy is ours, so
-		// this costs nothing and removes one way to get a silently black result
-		// (docs/RESEARCH.md §3.5). It MUST be undone on every path out of the evaluate below, or
-		// the recorded state diverges from the resource's real state.
-		nrp::transition_proxy(cmd, /*to_shader_resource=*/true);
-	}
-	// else: `colour` is `in.image` itself, already display-referred and already in
-	// NON_PIXEL_SHADER_RESOURCE — the caller put it there, for exactly this reason.
 
 	// Motion vectors are ours: dense RG16_FLOAT in RENDER-resolution pixels, y-down.
 	//
@@ -1428,18 +1264,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	//
 	// So latch the scale and force ONE reset when it drifts past the tolerance, the same shape
 	// as the guide-extent latch below. With smoothing on, this should fire rarely.
-	if (nrc::codec_scale_invalidates_history(g_scale_latched, codec_scale, g_scale_tolerance))
-	{
-		reset = true;
-		g_reset_codec_scale.fetch_add(1, std::memory_order_relaxed);
-		STRAY_LOG_WARN("NR: the codec scale moved %.4f -> %.4f (past the %.0f%% tolerance). "
-			"Feature 18's temporal accumulation is in display-referred units DEFINED by that "
-			"scale, so it is stale; DLSSNR.Reset is forced for this one frame.",
-			static_cast<double>(g_scale_latched), static_cast<double>(codec_scale),
-			static_cast<double>(g_scale_tolerance * 100.0f));
-	}
-	if (reset || g_scale_latched <= 0.0f)
-		g_scale_latched = codec_scale;
 
 	if (nrplan::latch_guide_extent(g_guide_latch, in.render_width, in.render_height))
 	{
@@ -1490,23 +1314,10 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	// One line per SITE, not one per session: `taa` and a post-tonemap mode describe genuinely
 	// different pixels, so a session that switched between them must not report only the first.
-	static bool s_params_logged[2] = {};
-	const int site_index = codec ? 0 : 1;
-	if (!s_params_logged[site_index])
+	static bool s_params_logged = false;
+	if (!s_params_logged)
 	{
-		s_params_logged[site_index] = true;
-		if (codec)
-			STRAY_LOG_INFO("NR params [site=taa-dispatch]: topology=post-process Color=%p = the "
-				"CODEC PROXY (%ux%u, FP16, sRGB-encoded soft-clipped, paperWhite=%.4f "
-				"scale=%.4f) NOT the raw HDR image %p; Depth=%p (%ux%u) MVec=%p (%ux%u, scale "
-				"%.3f/%.3f) Output=%p (%ux%u) depthInverted=1 reset=%d intensity=%.2f",
-				static_cast<void *>(colour), cw, ch, static_cast<double>(g_paper_white),
-				static_cast<double>(codec_scale), static_cast<void *>(in.image),
-				static_cast<void *>(in.depth), in.render_width, in.render_height,
-				static_cast<void *>(in.motion_vectors), in.render_width, in.render_height,
-				scale_x, scale_y, static_cast<void *>(g_nr_output), in.output_width,
-				in.output_height, reset ? 1 : 0, g_intensity);
-		else
+		s_params_logged = true;
 			STRAY_LOG_INFO("NR params [site=post-tonemap]: HDR CODEC BYPASSED (the image is "
 				"already display-referred; encoding it again would apply the tone transfer "
 				"twice, and there is no pre-exposure left to undo, so NgxNRPaperWhiteScale and "
@@ -1535,8 +1346,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// NON_PIXEL_SHADER_RESOURCE while the next frame's encode transitions it out of
 	// UNORDERED_ACCESS. That mismatch is a validation error on WARP and undefined behaviour on
 	// the target, where there is no debug layer to say so.
-	if (codec)
-		nrp::transition_proxy(cmd, /*to_shader_resource=*/false);
 
 	if (NVSDK_NGX_FAILED(result))
 	{
@@ -1588,27 +1397,13 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (g_validation.load(std::memory_order_acquire) != Validation::ok)
 	{
 		if (g_validation.load(std::memory_order_acquire) == Validation::pending)
-			begin_validation(device, cmd, in.image, image_state, /*with_proxy=*/codec);
+			begin_validation(device, cmd, in.image, image_state);
 		if (g_validation.load(std::memory_order_acquire) == Validation::failed)
 			return refuse(kRefDegenerate,
 				"the neural output validated as black/degenerate.");
 		return refuse(kRefValidating, "the neural output is still being validated.");
 	}
 
-	if (codec)
-	{
-		// --- HDR colour codec, stage 2 of 2 ---
-		//
-		// Validated, so carry the network's change back onto the engine image IN PLACE. This
-		// replaces the full-RGBA CopyResource this used to end with, which was wrong twice over:
-		// it discarded the HDR range (the network's answer is display-referred and bounded to
-		// [0,1]) and it overwrote the alpha channel with the network's meaningless one — and on
-		// this title that resource becomes the next frame's TAA history (CLAUDE.md §2.9), so the
-		// engine would have read the damage straight back in.
-		if (!nrp::record_decode(cmd, in.image, g_nr_output, cw, ch))
-			return refuse(kRefCodecFailed, nrp::last_error());
-	}
-	else
 	{
 		// POST-TONEMAP: a whole copy, and the reasons the TAA site cannot do this do not apply.
 		//
@@ -1649,15 +1444,10 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	}
 
 	g_applied.fetch_add(1, std::memory_order_relaxed);
-	static bool s_applied_logged[2] = {};
-	if (!s_applied_logged[site_index])
+	static bool s_applied_logged = false;
+	if (!s_applied_logged)
 	{
-		s_applied_logged[site_index] = true;
-		if (codec)
-			STRAY_LOG_WARN("NR APPLIED [site=taa-dispatch]: the DLSS Neural Rendering result is "
-				"now carried onto the SR/RR image as a residual (validated non-degenerate), "
-				"preserving its HDR range and its alpha. First occurrence only.");
-		else
+		s_applied_logged = true;
 			STRAY_LOG_WARN("NR APPLIED [site=post-tonemap]: the DLSS Neural Rendering result is "
 				"now copied over the back-buffer image (validated non-degenerate). No HDR codec "
 				"and no residual: the image was already display-referred, and this site is "
@@ -1724,7 +1514,7 @@ CropLuma drain_crop(CropReadback &crop)
 					double lin[3];
 					for (int i = 0; i < 3; ++i)
 						lin[i] = static_cast<double>(
-							nrc::srgb_decode_channel(static_cast<float>(c[i])));
+							srgb_decode_channel(static_cast<float>(c[i])));
 					const double linear = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
 					if (linear > out.linear)
 						out.linear = linear;
@@ -1819,12 +1609,10 @@ void on_present(ID3D12CommandQueue *queue)
 		return;
 
 	advance_timeline(queue);
-	nrp::set_timeline(g_timeline);
 
 	// Everything the GPU has passed, in one place and on one thread.
 	retire_keep_alive(/*all=*/false);
 	collect_graves();
-	nrp::collect();
 
 	// FEATURE 18'S RELEASE. Gated on both halves: the present boundary (we are on it) and the
 	// queue having completed the last evaluate. See nrlife::feature_release_ready.
@@ -1840,9 +1628,7 @@ void on_present(ID3D12CommandQueue *queue)
 			// the graveyard, so a frame recorded moments ago is still safe.
 			bury(g_nr_output, "neural output texture (teardown)");
 			bury(g_crop_input.buffer, "validation crop: colour input (teardown)");
-			bury(g_crop_proxy.buffer, "validation crop: proxy (teardown)");
 			bury(g_crop_neural.buffer, "validation crop: neural output (teardown)");
-			nrp::request_shutdown();
 			g_nr_width = g_nr_height = 0;
 			g_nr_format = DXGI_FORMAT_UNKNOWN;
 			g_validation.store(Validation::pending, std::memory_order_release);
@@ -1859,10 +1645,8 @@ void on_present(ID3D12CommandQueue *queue)
 
 	const CropLuma neural = drain_crop(g_crop_neural);
 	const CropLuma input = drain_crop(g_crop_input);
-	const CropLuma proxy = drain_crop(g_crop_proxy);
 	const double max_luma = neural.raw;
 
-	if (!g_validate_codec)
 	{
 		// POST-TONEMAP: no codec ran, so there is no proxy and paper white means nothing here.
 		// Report only what was actually measured — the image the network was shown, and what it
@@ -1876,40 +1660,6 @@ void on_present(ID3D12CommandQueue *queue)
 			g_validate_crop_w, g_validate_crop_h,
 			input.raw, input.known ? "" : " (NOT DECODED)",
 			neural.raw, neural.known ? "" : " (NOT DECODED)", neural.linear);
-	}
-	else
-	{
-		// THE line that chooses NgxNRPaperWhiteScale, and the reason all three crops are taken
-		// over the same texels. Reading only the neural output told us it was near black (0.0026)
-		// but not why, and every guess at the scale costs a round trip on a machine we do not
-		// have.
-		//
-		// How to read it. `input` is scene-linear HDR; `proxy` and `output` are sRGB-DECODED, so
-		// all three are linear and directly comparable. Below the soft-clip knee the codec is
-		// just a multiply, so `proxy` should be about `input x scale`; if it is far below the
-		// 0.75 knee the network is being shown a black image and paper white must come DOWN
-		// (scale = 1/paperWhite). If `proxy` is pinned at 1.0 the frame is crushed into the
-		// shoulder and paper white must go UP. A healthy proxy with a black output means the
-		// fault is the runtime, not the codec.
-		const float scale = nrc::proxy_scale(g_paper_white, 1.0f);
-		const bool can_suggest = input.known && input.raw > 0.0;
-		const double want_scale = can_suggest
-			? static_cast<double>(nrc::kSoftClipKnee) / input.raw : -1.0;
-		STRAY_LOG_WARN("NR CODEC LUMINANCE [site=taa-dispatch] (max Rec.709 over one %ux%u centre "
-			"crop, all linear): colour INPUT %.6f (scene-linear HDR%s) -> encoded PROXY %.6f "
-			"(sRGB-decoded%s, raw code value %.6f) -> neural OUTPUT %.6f (sRGB-decoded%s, raw "
-			"%.6f). paperWhite=%.4f effectiveScale=%.4f colorStrength=%.2f transferStrength=%.2f. "
-			"Below the %.2f knee the proxy is just input x scale, so to put this frame's peak AT "
-			"the knee use scale ~%.4f, i.e. NgxNRPaperWhiteScale ~%.4f. A -1 means that crop was "
-			"not captured or its format could not be decoded.",
-			g_validate_crop_w, g_validate_crop_h,
-			input.raw, input.known ? "" : ", NOT DECODED",
-			proxy.linear, proxy.known ? "" : ", NOT DECODED", proxy.raw,
-			neural.linear, neural.known ? "" : ", NOT DECODED", neural.raw,
-			static_cast<double>(g_paper_white), static_cast<double>(scale),
-			static_cast<double>(g_color_strength), static_cast<double>(g_transfer_strength),
-			static_cast<double>(nrc::kSoftClipKnee),
-			want_scale, can_suggest ? 1.0 / want_scale : -1.0);
 	}
 
 	if (!neural.known)
@@ -1926,9 +1676,7 @@ void on_present(ID3D12CommandQueue *queue)
 		g_validation.store(Validation::ok, std::memory_order_release);
 		STRAY_LOG_WARN("NR VALIDATED [site=%s]: neural output max luminance %.6f over the centre "
 			"crop (> %.0e). The result will now reach the screen %s.",
-			g_validate_codec ? "taa-dispatch" : "post-tonemap", max_luma, kLumaFloor,
-			g_validate_codec ? "as a residual carried onto the SR/RR image"
-				: "as a copy over the back-buffer image");
+			"post-tonemap", max_luma, kLumaFloor, "as a copy over the back-buffer image");
 	}
 	else
 	{
@@ -1953,9 +1701,7 @@ void shutdown()
 			static_cast<unsigned int>(g_graves.size()));
 	release_feature_now("shutdown");
 	release(g_crop_input.buffer);
-	release(g_crop_proxy.buffer);
 	release(g_crop_neural.buffer);
-	nrp::shutdown();
 	release(g_nr_output);
 	for (Grave &g : g_graves)
 		g.obj->Release();

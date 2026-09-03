@@ -24,7 +24,6 @@
 #include "ngx_fg.hpp"
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
-#include "nr_history.hpp"
 #include "nr_hook.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
@@ -229,14 +228,9 @@ void apply_nr_live_impl()
 		static_cast<unsigned int>(g_nr_ui.preset < 0 ? 0 : g_nr_ui.preset),
 		g_nr_ui.auto_mask ? 1u : 0u, g_nr_ui.ui_correction ? 1u : 0u);
 	nr::set_style(static_cast<unsigned int>(g_nr_ui.style < 0 ? 0 : (g_nr_ui.style > 2 ? 2 : g_nr_ui.style)));
-	nr::set_codec_tuning(g_nr_ui.paper_white, g_nr_ui.color_strength, g_nr_ui.transfer_strength);
 	// The checkbox is the A/B; the slider only matters while it is on. Forcing exactly 1.0 when
 	// off reproduces the unsmoothed behaviour bit for bit rather than approximately.
-	nr::set_exposure_smoothing(g_nr_ui.smooth_exposure ? g_nr_ui.exposure_smoothing : 1.0f);
-	nr::set_scale_reset_tolerance(g_nr_ui.scale_reset_tol);
-	nr::set_track_exposure(g_nr_ui.track_exposure);
 	nr::set_mvec_scale_override(g_nr_ui.mvec_scale);
-	nrhist::set_enabled(g_nr_ui.restore_history);
 
 	// Branch flip, then the global axis flips on top of both.
 	const bool flip_sparse = g_nr_ui.mv_convention == 1 || g_nr_ui.mv_convention == 3;
@@ -281,7 +275,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	{
 
 		std::lock_guard<std::mutex> lock(g_state.mutex);
-		nrhist::shutdown();
 		ngxfg::shutdown();
 		// The present stage records onto a command list of its own and hands work to nr::,
 		// so it must be torn down before nr:: is.
@@ -495,14 +488,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	host::cfg::get_string("NgxNRDll", nr_dll, sizeof(nr_dll));
 	nr::set_dll_path(nr_dll);
 
-	// [STRAYDLSS] NgxNRTopology: "post" (default) = feature 18 post-processes our already
-	// upscaled output; "sr" = feature 18 takes the render-res SR contract and upscales
-	// itself. Both readings of the study are plausible (§0.1 vs §2.3), so both are reachable
-	// and the active one is logged.
-	char nr_topology[16] = "post";
-	host::cfg::get_string("NgxNRTopology", nr_topology, sizeof(nr_topology));
-	const bool nr_sr_shaped = std::strcmp(nr_topology, "sr") == 0;
-	nr::set_topology(nr_sr_shaped ? nr::Topology::sr_shaped : nr::Topology::post_process);
 
 	// Live quality knobs (the study's DLSSNR.* tuning parameters, §2.2).
 	// Defaults are RenoDX's own shipped [RenoDX.DLSS5] values rather than a neutral 1.0 — we
@@ -561,30 +546,16 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// small, which is the direction our failure points. Do not guess: the codec logs the colour
 	// input, the encoded proxy and the neural output luminance over one crop on one line, and
 	// suggests the scale that puts the proxy at the 0.75 soft-clip knee. Read that first.
-	g_nr_ui.paper_white = host::cfg::get_float("NgxNRPaperWhiteScale", g_nr_ui.paper_white);
 	// [STRAYDLSS] NgxNRTrackExposure, default ON: multiply the codec's proxy scale by the
 	// engine's OneOverPreExposure so the soft-clip knee follows scene brightness. We dropped this
 	// in the port; without it there is no single paper white that is right in both a dark room
 	// and a bright street, because UE4's pre-exposure moves with the scene. (ngx_nr.hpp)
-	int nr_track_exposure = g_nr_ui.track_exposure ? 1 : 0;
-	nr_track_exposure = host::cfg::get_int("NgxNRTrackExposure", nr_track_exposure);
-	g_nr_ui.track_exposure = nr_track_exposure != 0;
 	// 0 keeps the ORIGINAL's chromaticity and transfers only the network's luminance change —
 	// the escape hatch for a colour cast. 1 takes the network's colour too.
-	g_nr_ui.color_strength = host::cfg::get_float("NgxNRColorStrength", g_nr_ui.color_strength);
 	// A global lerp back toward the untouched original; 0 is an EXACT bit-for-bit bypass, which
 	// makes it the honest A/B against "NR off" without changing anything else.
-	g_nr_ui.transfer_strength = host::cfg::get_float("NgxNRTransferStrength", g_nr_ui.transfer_strength);
-	g_nr_ui.exposure_smoothing = host::cfg::get_float("NgxNRExposureSmoothing", g_nr_ui.exposure_smoothing);
-	g_nr_ui.scale_reset_tol = host::cfg::get_float("NgxNRScaleResetTolerance", g_nr_ui.scale_reset_tol);
-	int nr_smooth = g_nr_ui.smooth_exposure ? 1 : 0;
-	nr_smooth = host::cfg::get_int("NgxNRSmoothExposure", nr_smooth);
-	g_nr_ui.smooth_exposure = nr_smooth != 0;
 	g_nr_ui.enabled = ngx_nr;
 	apply_nr_live_impl();
-	const float nr_paper_white = g_nr_ui.paper_white;
-	const float nr_color_strength = g_nr_ui.color_strength;
-	const float nr_transfer_strength = g_nr_ui.transfer_strength;
 
 	if (ngx_nr)
 	{
@@ -595,13 +566,7 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			"'NR CODEC LUMINANCE' for the one that picks paperWhite.",
 			nr_sr_shaped ? "sr-shaped" : "post-process",
 			nr_intensity, nr_local_tone, nr_local_structure, nr_mvec_scale,
-			nr_paper_white, g_nr_ui.track_exposure ? 1 : 0, nr_color_strength,
-			nr_transfer_strength);
 		if (nr_sr_shaped)
-			STRAY_LOG_ERROR("NgxNRTopology=sr is INCOMPATIBLE with the HDR colour codec and NR "
-				"will refuse every frame ('codec-topology'). The codec's residual transfer needs "
-				"the proxy, the neural answer and the original to be the same pixels, which "
-				"sr-shaped does not give it. Use NgxNRTopology=post.");
 		// [STRAYDLSS] NgxNRPreload, default ON: LoadLibrary + export resolution + the
 		// identity IAT patch at device init — matching RenoDX's "signed NR runtime
 		// (nvngx_dlssnr.dll) pre-loaded at device init". All of it is pure memory work with
@@ -1074,7 +1039,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// the screen. The queue is what makes "the GPU is done with this" answerable at all
 	// (src/core/nr_lifetime.hpp); with none, NR falls back to a conservative present ring.
 	nr::on_present(pc.queue);
-	// THE NR PRESENT STAGE ([STRAYDLSS] NgxNRHook=present); inert and free at the default `taa`.
+	// THE NR PRESENT STAGE: where DLSS Neural Rendering actually runs.
 	//
 	// STRICTLY AFTER nr::on_present, and that ordering is load-bearing rather than tidy.
 	// nr::on_present signals the NR lifetime fence on this queue and advances the timeline, but
@@ -1096,7 +1061,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// command list, which the D3D12 present path flushes at dxgi_swapchain.cpp:1009 — after this
 	// event and after the game has submitted every command list of the frame to the same queue,
 	// so the copy executes after every same-frame consumer of `u0`. (src/nr_history.hpp)
-	nrhist::on_present(pc);
 
 	perf::on_present(g_state.dispatches_seen.load(std::memory_order_relaxed),
 		taa_hook::diagnostics().large_dispatches);
@@ -1433,15 +1397,13 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			const nr::ResetCounts rc = nr::reset_counters();
 			STRAY_LOG_INFO("[%s] NR RESETS: total=%u  from: frame-gap=%u guide-grid=%u "
 				"codec-scale=%u camera-cut=%u new-feature=%u", when,
-				rc.frame_gap + rc.guide_grid + rc.codec_scale + rc.camera_cut + rc.new_feature,
-				rc.frame_gap, rc.guide_grid, rc.codec_scale, rc.camera_cut, rc.new_feature);
+				rc.frame_gap + rc.guide_grid + rc.camera_cut + rc.new_feature,
+				rc.frame_gap, rc.guide_grid, rc.camera_cut, rc.new_feature);
 
 			// THE PRESENT STAGE's own gate, which sits IN FRONT of nr::apply and therefore in
 			// front of every counter above. Without this line "NR applied=0" cannot be told apart
 			// from "the stage never got as far as asking", which is the exact ambiguity the TAA
 			// path's gate refusals exist to remove.
-			if (nrhook::hook_mode() == nrplan::HookMode::present)
-			{
 				const nrhook::Counters sc = nrhook::counters();
 				char line[512];
 				int stage_off = std::snprintf(line, sizeof(line),
@@ -1461,7 +1423,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 							nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)),
 							sc.reasons[i]);
 				STRAY_LOG_INFO("%s", line);
-			}
 		}
 	}
 
@@ -1535,85 +1496,8 @@ EventNeeds DlssApp::configure_events()
 		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
 			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
 	}
-	// [STRAYDLSS] NgxNRHook: taa (DEFAULT) | present. Where DLSS Neural Rendering runs. The whole
-	// argument for moving it, and what is different from the two post-tonemap sites that were
-	// built and removed on 2026-09-02, is on nrplan::HookMode in src/core/nr_hook_plan.hpp.
-	{
-		char nr_hook[16] = "taa";
-		host::cfg::get_string("NgxNRHook", nr_hook, sizeof(nr_hook));
-		const nrplan::HookMode mode = nrplan::hook_mode_from_string(nr_hook);
-		nrhook::set_hook_mode(mode);
-
 		// [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which
-		// IS D3D12_RESOURCE_STATE_COMMON). Only consulted at NgxNRHook=present. See nr_hook.hpp.
-		const int bb_state = host::cfg::get_int("NgxNRStageBackBufferState", 0);
 		nrhook::set_back_buffer_state(bb_state < 0 ? 0u : static_cast<std::uint32_t>(bb_state));
-
-		STRAY_LOG_WARN("NgxNRHook=%s (read as \"%s\"). %s", nrplan::hook_mode_name(mode), nr_hook,
-			mode == nrplan::HookMode::taa
-				? "DLSS Neural Rendering runs inside the intercepted TAA dispatch, writing the "
-				  "engine's u0 — which UE 4.27 also extracts as the next frame's temporal history, "
-				  "so NR's answer compounds; and that image is raw linear HDR, so the whole HDR "
-				  "codec and its exposure loop are in the path. This is the shipped default and "
-				  "the fallback."
-				: "DLSS Neural Rendering runs as a PRESENT STAGE on our own command list, over the "
-				  "back buffer, after the game's last submission of the frame. No feedback path by "
-				  "construction (nothing after the tonemapper is carried forward), NO HDR CODEC "
-				  "(the back buffer is already display-referred, so NgxNRPaperWhiteScale, "
-				  "NgxNRTrackExposure and their reset latch are all inert), and no pass "
-				  "identification. The HUD IS in the image at this site — DLSSNR.UICorrection is "
-				  "sent, effect UNCONFIRMED. Watch the periodic NR STAGE line.");
-
-		// [STRAYDLSS] NgxNRRestoreHistory, default ON. Keeps NR's residual out of the engine's
-		// temporal history at the `taa` site by snapshotting u0 before the decode and putting it
-		// back at present. Read alongside the hook mode because it is only meaningful for one of
-		// them, and inert (loudly) for the other two. Full argument: src/nr_history.hpp.
-		bool restore_history = false;
-		restore_history = host::cfg::get_bool("NgxNRRestoreHistory", restore_history);
-		// FORCED OFF at the present stage, and it is not a preference: the whole point of that
-		// site is that there is no feedback path to close (every QueueTextureExtraction into
-		// PrevFrameViewInfo sits at PostProcessing.cpp 576/599/643 while AddTonemapPass is at
-		// 777), and nothing writes u0 there for it to snapshot. Leaving it armed would cost two
-		// 66 MB copies a frame for nothing and would be recorded against a resource this site
-		// never touched.
-		if (mode == nrplan::HookMode::present && restore_history)
-		{
-			restore_history = false;
-			STRAY_LOG_WARN("NgxNRRestoreHistory=1 is IGNORED at NgxNRHook=present: a post-tonemap "
-				"site has no feedback path to close by construction, and NR never writes u0 there, "
-				"so there is nothing to snapshot or put back.");
-		}
-		nrhist::set_enabled(restore_history);
-		g_nr_ui.restore_history = restore_history;
-
-		// The one hypothesis in that path: which D3D12_RESOURCE_STATES u0 is in at present time,
-		// where the restore copy is recorded on a different command list from the snapshot. 0
-		// keeps the derived default (0xC0 = NON_PIXEL|PIXEL_SHADER_RESOURCE); the derivation is
-		// in src/nr_history.cpp and is echoed in full on the first restore.
-		int restore_state_bits = 0;
-		restore_state_bits = host::cfg::get_int("NgxNRRestoreState", restore_state_bits);
-		nrhist::set_image_state_at_present(restore_state_bits <= 0
-			? 0u : static_cast<unsigned int>(restore_state_bits));
-
-		STRAY_LOG_WARN("NgxNRRestoreHistory=%d (DEFAULT IS 0/OFF). %s Turning it ON copies "
-				"the pre-NR image of u0 aside inside the TAA dispatch and copies it back at "
-				"present, so UE 4.27's TemporalAAHistory.RT[0] — which "
-				"ScreenSpaceRayTracing.cpp:596-620 reads on the NEXT frame — never holds the "
-				"neural residual; the DISPLAYED frame is unchanged either way, because every "
-				"same-frame consumer of u0 has already run by Present. It is OFF by default "
-				"because the SSR fade stopped reproducing on 2026-09-01 and the restore rests on "
-				"an INFERRED state for u0 at present (assumed 0x%X; [STRAYDLSS] NgxNRRestoreState "
-				"overrides) — four UE 4.27 source anchors, no measurement. Flip it live in the "
-				"DLSS Neural Rendering overlay the moment the fade returns; the whole diagnosis "
-				"is in src/nr_history.hpp.",
-				restore_history ? 1 : 0,
-				restore_history
-					? "ENABLED, so the engine's temporal history is being kept pristine."
-					: "Off, so NR's residual re-enters the engine's temporal state every frame "
-					  "exactly as it did before this feature existed — which is the SHIPPED "
-					  "behaviour, not a fault.",
-				nrhist::image_state_at_present());
-	}
 
 	if (pass_finder_enabled)
 		needs.pass_finder_events = true;

@@ -5,7 +5,7 @@
 // inside the intercepted TAA dispatch only because that is where we already had a hook. Every
 // painful thing about it follows from that one choice. The full argument, both problems it
 // removes, and what is different from the two post-tonemap sites that were built and deleted on
-// 2026-09-02, are on `nrplan::HookMode` in src/core/nr_hook_plan.hpp. Read that first.
+// 2026-09-02, are in src/core/nr_hook_plan.hpp. Read that first.
 //
 // WHAT THIS FILE IS. The stage's live half: it takes the guides the TAA hook publishes, asks the
 // pure gate whether this frame may be injected into, and — if so — drives
@@ -29,9 +29,6 @@ namespace stray_dlss::nrhook {
 
 // --- configuration, read once at startup ---
 
-// [STRAYDLSS] NgxNRHook = taa | present. Anything unrecognised is `taa`.
-void set_hook_mode(nrplan::HookMode mode);
-nrplan::HookMode hook_mode();
 
 // [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which IS
 // D3D12_RESOURCE_STATE_COMMON — the same value, 0).
