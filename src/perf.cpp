@@ -110,6 +110,18 @@ std::uint64_t now_ns()
 			Clock::now().time_since_epoch()).count());
 }
 
+// Wall clock (Unix epoch seconds, microsecond resolution). The rest of this file uses a
+// steady clock, which is right for measuring intervals and useless for correlating with
+// anything outside the process. A [stall] line has to be lined up against thread-state
+// samples, the kernel log and pipewire counters, so it carries this as well.
+// (facts 32.15: attributing the stall needed the timestamp tailed off the log live, because
+// the line did not carry one.)
+double wall_clock_s()
+{
+	return std::chrono::duration<double>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 } // namespace
 
 void set_enabled(bool enabled)
@@ -179,7 +191,7 @@ void stall_note_orig(Orig which, std::uint64_t ns) { if (g_stall_watch.load(std:
 
 // Emits one line when this present's interval is a stall, then resets the per-frame state.
 // Called from on_present with the interval already computed.
-void stall_check_and_reset(std::uint64_t frame_ns)
+void stall_check_and_reset(std::uint64_t frame_ns, std::uint64_t frame_no)
 {
 	if (!g_stall_watch.load(std::memory_order_relaxed))
 		return;
@@ -207,7 +219,8 @@ void stall_check_and_reset(std::uint64_t frame_ns)
 		}
 		static const char *bn[kBucketCount] = { "dispatch", "mv", "gbuf", "ngx_sr", "ngx_rr", "ngx_nr",
 			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve" };
-		STRAY_LOG_WARN("[stall] frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
+		STRAY_LOG_WARN("[stall] f=%llu t=%.6f frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
+			static_cast<unsigned long long>(frame_no), wall_clock_s(),
 			frame_ns * ms, median * ms, static_cast<double>(frame_ns) / static_cast<double>(median),
 			static_cast<unsigned long long>(g_stalls_seen),
 			static_cast<unsigned long long>(g_fr_pso_creates.load()), static_cast<unsigned long long>(g_fr_pso_compute.load()),
@@ -249,7 +262,7 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 		g_worst_frame_ns.store(frame_ns, std::memory_order_relaxed);
 
 	// Stall attribution: one line when this interval is >3x the running median.
-	stall_check_and_reset(frame_ns);
+	stall_check_and_reset(frame_ns, g_total_frames_reported + g_present_count + 1);
 	{
 		const std::uint64_t ms = frame_ns / 1000000ull;
 		g_frame_hist[ms < 128 ? static_cast<int>(ms) : 128]++;
