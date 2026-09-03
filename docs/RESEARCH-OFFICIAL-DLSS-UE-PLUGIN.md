@@ -1,68 +1,51 @@
-# How NVIDIA's own Unreal Engine plugins integrate DLSS
+# How NVIDIA's own Unreal Engine DLSS plugin does it
 
-**Question this answers.** This project injects DLSS into Stray (UE 4.27.2, D3D12) from outside the
-engine, by intercepting the engine's `FTAAStandaloneCS` compute dispatch. We are deciding whether
-each of our three features should stay a **HOOK** — recorded into the game's own command list,
-inside a dispatch the engine scheduled for something else — or become a **STAGE** — our own command
-list at a point we choose. Before deciding: *how does NVIDIA do it, when it has the engine's
-cooperation?*
+Research for the **hook versus stage** decision. This project injects DLSS into Stray (UE 4.27.2,
+D3D12) from outside the engine, by intercepting the engine's own `FTAAStandaloneCS` compute
+dispatch. Before deciding whether each of our three features should stay a **HOOK** (recorded into
+the game's command list, inside a dispatch the engine scheduled for something else) or become a
+**STAGE** (our own command list at a point we choose), we wanted to know what NVIDIA's official
+plugin actually does.
 
-Written 2026-09-02. Every claim is labelled:
+**Provenance labels**, per `CLAUDE.md` §0.5:
 
-* **HARD** — read directly from Epic's engine source, or from NVIDIA's own published documentation.
-* **SOFT** — read from a third-party mirror of NVIDIA's plugin, or from a blog/forum.
-* **UNCONFIRMED** — believed but not established from any source read here.
+* **HARD** — read directly from UE 4.27.2 engine source, from NVIDIA's own plugin source with its
+  copyright header intact, or from NVIDIA's own Streamline documentation.
+* **SOFT** — a blog post, a forum, a vendor marketing page, or a claim resting on a mirror whose
+  authenticity is established but whose engine version differs from ours.
+* **UNCONFIRMED** — searched for and not found, or inferred without a citation.
 
----
+## 0. Sources, and how far each can be trusted
 
-## 0. The four findings that bear on hook-versus-stage
+| Source | What it is | Trust |
+|---|---|---|
+| `AlexMercer-MA/UnrealEngine-4.27` | Public mirror of UE 4.27.2. **Version confirmed in this browse**: `Engine/Build/Build.version` reads `MajorVersion 4, MinorVersion 27, PatchVersion 2, BranchName "++UE4+Release-4.27"` | **HARD** for anything quoted from it |
+| `flygod1159/Nvidia-DLSS-Plugin` | Genuine NVIDIA DLSS UE plugin source. Every file carries `Copyright (c) 2020 NVIDIA CORPORATION` and the full NVIDIA proprietary notice; the module layout is NVIDIA's own (`DLSS`, `DLSSBlueprint`, `DLSSEditor`, `DLSSUtility`, `NGXD3D11RHI`, `NGXD3D12RHI`, `NGXRHI`, `NGXVulkanRHI`). It is **not** a stub or a reimplementation | **HARD** that this is NVIDIA's code; **SOFT** that it applies to 4.27 — see below |
+| `mrcasty/DLSS4-alpha-unreal` | A DLSS4 / UE 5.6-era patch layer whose inner `plugins/DLSS/Source/` tree mirrors the above. Its README says it requires the official binaries | **SOFT**, and adds nothing the first mirror does not |
+| Epic's documentation portal | `dev.epicgames.com` pages on temporal upscalers and on anti-aliasing | **HARD** for what Epic asserts, but the pages are UE5-era |
+| `NVIDIA-RTX/Streamline` | NVIDIA's own public SDK documentation | **HARD** |
 
-1. **Our SR placement is the same as the official plugin's, to within a fraction of the frame.**
-   UE 4.27 calls exactly **one** temporal upscaler per view, at exactly one point, and a
-   third-party plugin gets there by *substituting the pointer* rather than by adding a pass. The
-   engine's `FTAAStandaloneCS` does not run when a custom upscaler is installed. We achieve the
-   same net effect by suppressing that dispatch and writing its output ourselves. **The official
-   architecture does not merely permit our SR placement, it is the same placement.** (§A.2, §A.3.)
-
-2. **The official plugin is a HOOK too, and its state restore is two lines.** NVIDIA records the
-   NGX evaluate onto **the engine's own D3D12 command list** and afterwards calls only
-   `StateCache.ForceSetComputeRootSignature()` and rebinds the descriptor cache to the current
-   command list. It restores nothing else — because UE's `FD3D12StateCache` is an *invalidation*
-   cache that re-issues every binding on the next draw. We restore a long list by hand only because
-   we are outside that cache and cannot invalidate it. The hook itself is not the unusual part of
-   our design; the manual restore is. (§A.5.)
-
-3. **`ITemporalUpscaler` is a real, usable extension point — and it is unreachable from a
-   DLL-injection add-on without executing engine code.** It is not exported, not a COM interface
-   and not discoverable at runtime; registration means calling
-   `FSceneViewFamily::SetTemporalUpscalerInterface` on the game thread with a pointer to a C++
-   object whose vtable matches the exact engine build. Reaching it from an injected DLL means
-   locating that method in the shipping binary and constructing an ABI-compatible object — a UE4SS
-   / signature-scanning problem, not a ReShade one. It is not free, but it is not fantasy either.
-   (§A.1, §E.2.)
-
-4. **NVIDIA's own frame-generation plugin puts its capture exactly where we want to move NR: the
-   very end of the post-process chain, post-tonemap and pre-UI.** The Streamline UE plugin
-   subscribes to `EPostProcessingPass::VisualizeDepthOfField`, which is the **last** entry of that
-   enum in 4.27, captures `SceneColorAfterTonemap`, and copies it into a texture it names
-   `Streamline.SceneColorWithoutHUD`. That is the `preui` site this project already hypothesised,
-   chosen by NVIDIA for the same reason: it is after everything the engine feeds back, and before
-   the HUD. (§B.1, §B.3, §E.3.)
+**The one version caveat that matters.** The plugin mirror is UE5-era: its `AddPasses` returns
+`ITemporalUpscaler::FOutputs`, whereas 4.27.2's interface writes through out-parameters. The
+plugin is written to compile against both engine generations — `DLSSDenoiser.h:44-54` branches on
+`ENGINE_MAJOR_VERSION` with an `#error` for anything but 4 or 5 — so the **architecture** it shows
+is the one it also used on 4.27, but any exact signature quoted from it is UE5's. Every structural
+claim below is anchored in the 4.27.2 engine source independently.
 
 ---
 
-## A. DLSS Super Resolution in the official UE plugin
+## A. DLSS Super Resolution in the official plugin
 
-### A.1 The extension point is `ITemporalUpscaler`, registered per view family
+### A.1 The extension point is `ITemporalUpscaler`, and it is a renderer interface, not a view extension
 
-**HARD.** UE 4.27.2, `Engine/Source/Runtime/Renderer/Private/PostProcess/TemporalAA.h:146-186`:
+**HARD.** UE 4.27.2 declares the interface in
+`Engine/Source/Runtime/Renderer/Private/PostProcess/TemporalAA.h:147-186` — note **`Private/`**, not
+`Public/`; the header moved to `Renderer/Public/TemporalUpscaler.h` in UE5:
 
 ```cpp
-/** Interface for the main temporal upscaling algorithm. */
 class RENDERER_API ITemporalUpscaler
 {
 public:
-
     struct FPassInputs
     {
         bool bAllowDownsampleSceneColor;
@@ -73,7 +56,6 @@ public:
     };
 
     virtual ~ITemporalUpscaler() {};
-
     virtual const TCHAR* GetDebugName() const = 0;
 
     virtual void AddPasses(
@@ -95,19 +77,18 @@ public:
 extern RENDERER_API const ITemporalUpscaler* GTemporalUpscaler;
 ```
 
-Three details matter.
+**What `AddPasses` receives is exactly three textures** — scene colour, scene depth, scene velocity
+— plus two downsample hints. **No jitter, no matrices, no exposure, no mip bias.** Everything else
+the implementation needs it reads off `FViewInfo` itself. That is worth sitting with: the official
+extension point hands over no more engine state than our dispatch hook already captures. It hands
+over *less*, and NVIDIA's implementation goes to `View` for the rest, exactly as we go to the View
+constant buffer.
 
-* **In 4.27 `AddPasses` returns `void` and writes through four out-parameters.** In UE 5.x it was
-  changed to return an `FOutputs` struct with `FullRes` / `HalfRes` members. Any plugin source you
-  read must be matched to the engine version; the two signatures are not interchangeable. (HARD for
-  4.27; the 5.x form is quoted in §A.4 from a plugin mirror.)
-* **The interface receives exactly the three textures we capture ourselves** — scene colour, scene
-  depth, scene velocity — and nothing else. Everything else it needs it reads off `FViewInfo`.
-* **`OutSceneColorHalfResTexture` is an output the implementation may decline.** Note the
-  correspondence to `u1` in our own hook: the engine asks the temporal pass to optionally produce
-  the half-resolution scene colour as a by-product.
+**What it returns** is the upscaled colour texture, the output view rect, and optionally a
+half-resolution copy. `SceneColorTexture` is an in/out: the caller passes `&SceneColor.Texture` and
+the upscaler overwrites it.
 
-**HARD.** Registration, `Engine/Source/Runtime/Engine/Public/SceneView.h:1807-1817`:
+**Registration is per view family, one-shot.** `Engine/Source/Runtime/Engine/Public/SceneView.h`:
 
 ```cpp
 FORCEINLINE void SetTemporalUpscalerInterface(const ITemporalUpscaler* InTemporalUpscalerInterface)
@@ -115,30 +96,19 @@ FORCEINLINE void SetTemporalUpscalerInterface(const ITemporalUpscaler* InTempora
     check(InTemporalUpscalerInterface);
     checkf(TemporalUpscalerInterface == nullptr, TEXT("View family already had a temporal upscaler assigned."));
     TemporalUpscalerInterface = InTemporalUpscalerInterface;
-}
-
-FORCEINLINE const ITemporalUpscaler* GetTemporalUpscalerInterface() const
-{
-    return TemporalUpscalerInterface;
-}
-```
-
-It is **per `FSceneViewFamily`, set once, and asserts on a second assignment**. One upscaler per
-view family, no stacking.
-
-**SOFT** (third-party mirror of NVIDIA's plugin — see §D for provenance). The plugin's own class,
-`DLSS/Source/DLSS/Private/DLSSUpscaler.h:80`:
-
-```cpp
-class DLSS_API FDLSSUpscaler final : public ITemporalUpscaler, public ICustomStaticScreenPercentage, public ICustomResourcePool
-```
-
-and it registers itself through the *screen-percentage* callback rather than a view extension —
-`DLSSUpscaler.cpp:565-604`, inside `SetupMainGameViewFamily(FSceneViewFamily& ViewFamily)`:
-
-```cpp
-checkf(GCustomStaticScreenPercentage == this, TEXT("GCustomStaticScreenPercentage is not set to a DLSS upscaler. Please check that only one upscaling plugin is active."));
+}                                                             // SceneView.h:1807-1812
 ...
+const ITemporalUpscaler* TemporalUpscalerInterface;           // SceneView.h:1847, private
+```
+
+`ISpatialUpscaler` is a **separate** pair of slots on the same class (`SceneView.h:1819-1838`,
+primary and secondary). Our work maps onto the temporal slot only.
+
+**How NVIDIA's plugin actually registers.** `DLSSUpscaler.cpp:567-604`, in
+`FDLSSUpscaler::SetupMainGameViewFamily` — which is an override of `ICustomStaticScreenPercentage`,
+a *different* engine interface whose whole job is to be called once per game view family:
+
+```cpp
 ViewFamily.SetTemporalUpscalerInterface(GetUpscalerInstanceForViewFamily(this, DLSSQuality));
 
 if (ViewFamily.EngineShowFlags.ScreenPercentage && !ViewFamily.GetScreenPercentageInterface())
@@ -149,14 +119,21 @@ if (ViewFamily.EngineShowFlags.ScreenPercentage && !ViewFamily.GetScreenPercenta
 }
 ```
 
-So the plugin sets **two** interfaces on the family: the upscaler, and the screen-percentage driver
-that makes the engine render at the fraction DLSS asked for. It does not implement
-`ISceneViewExtension` for Super Resolution at all — that is the *frame generation* plugin's
-mechanism (§B).
+**HARD** (NVIDIA's source). The class declaration is
+`class DLSS_API FDLSSUpscaler final : public ITemporalUpscaler, public ICustomStaticScreenPercentage, public ICustomResourcePool`
+(`DLSSUpscaler.h:80`). So the plugin plugs into **three** engine interfaces: the temporal upscaler
+slot for the pass itself, the static-screen-percentage hook to install itself and to *set the render
+resolution* from the DLSS quality mode, and a resource-pool tick for NGX lifetime.
 
-### A.2 It replaces TAA/TAAU completely. Decisive quote
+Note what this means for the render resolution: **the plugin chooses it.** It does not adapt to a
+screen percentage the game set; it installs an `FLegacyScreenPercentageDriver` with the fraction
+`NGX_DLSS_GET_OPTIMAL_SETTINGS` recommends for the selected quality mode.
 
-**HARD.** `Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessing.cpp:523-567`, inside
+### A.2 It replaces the engine's temporal pass completely. The `FTAAStandaloneCS` dispatch never runs
+
+**This is the load-bearing finding, and the engine source is unambiguous.**
+
+**HARD**, `Engine/Source/Runtime/Renderer/Private/PostProcess/PostProcessing.cpp:522-567`, inside
 `AddPostProcessingPasses`:
 
 ```cpp
@@ -175,45 +152,33 @@ if (AntiAliasingMethod == AAM_TemporalAA)
     RDG_EVENT_SCOPE_CONDITIONAL(
         GraphBuilder,
         UpscalerToUse != DefaultTemporalUpscaler,
-        "ThirdParty %s %dx%d -> %dx%d",
-        UpscalerToUse->GetDebugName(),
-        View.ViewRect.Width(), View.ViewRect.Height(),
-        View.GetSecondaryViewRectSize().X, View.GetSecondaryViewRectSize().Y);
+        "ThirdParty %s %dx%d -> %dx%d", ... );
 
     ITemporalUpscaler::FPassInputs UpscalerPassInputs;
-
     UpscalerPassInputs.bAllowDownsampleSceneColor = bAllowSceneDownsample;
-    UpscalerPassInputs.DownsampleOverrideFormat = DownsampleOverrideFormat;
-    UpscalerPassInputs.SceneColorTexture = SceneColor.Texture;
-    UpscalerPassInputs.SceneDepthTexture = SceneDepth.Texture;
-    UpscalerPassInputs.SceneVelocityTexture = Velocity.Texture;
+    UpscalerPassInputs.DownsampleOverrideFormat   = DownsampleOverrideFormat;
+    UpscalerPassInputs.SceneColorTexture          = SceneColor.Texture;
+    UpscalerPassInputs.SceneDepthTexture          = SceneDepth.Texture;
+    UpscalerPassInputs.SceneVelocityTexture       = Velocity.Texture;
 
     UpscalerToUse->AddPasses(
-        GraphBuilder,
-        View,
-        UpscalerPassInputs,
-        &SceneColor.Texture,
-        &SecondaryViewRect,
-        &HalfResolutionSceneColor.Texture,
-        &HalfResolutionSceneColor.ViewRect);
+        GraphBuilder, View, UpscalerPassInputs,
+        &SceneColor.Texture, &SecondaryViewRect,
+        &HalfResolutionSceneColor.Texture, &HalfResolutionSceneColor.ViewRect);
 }
 ```
 
-**`UpscalerToUse` is a single pointer and there is exactly one `AddPasses` call.** It is either the
-engine's default or the plugin's — never both. There is no "run TAA then run DLSS", and no
-fall-through.
+There is **no branch between "built-in TAA" and "custom upscaler."** The engine's own TAA is itself
+an `ITemporalUpscaler` implementation, and `UpscalerToUse` selects one object. Exactly one
+`AddPasses` runs.
 
-**HARD.** What the default is, `TemporalAA.cpp:1523-1573`:
+`TemporalAA.cpp:1523-1574` is the default:
 
 ```cpp
 class FDefaultTemporalUpscaler : public ITemporalUpscaler
 {
 public:
-
-    virtual const TCHAR* GetDebugName() const
-    {
-        return TEXT("FDefaultTemporalUpscaler");
-    }
+    virtual const TCHAR* GetDebugName() const { return TEXT("FDefaultTemporalUpscaler"); }
 
     virtual void AddPasses(...) const final
     {
@@ -231,424 +196,332 @@ public:
 };
 ```
 
-and `AddGen4MainTemporalAAPasses` is what eventually calls `::AddTemporalAAPass`
-(`TemporalAA.cpp:1490`) — the function that dispatches `FTAAStandaloneCS`. Its config selection,
-`TemporalAA.cpp:1446-1448`, is the same line this project already documents:
+`AddGen4MainTemporalAAPasses` (`TemporalAA.cpp:1433-1519`) calls `::AddTemporalAAPass` at
+`TemporalAA.cpp:1490`, and `AddTemporalAAPass` (`TemporalAA.cpp:629-978`) is the function that
+issues the `FTAAStandaloneCS` dispatch — **the exact dispatch this project intercepts.**
 
-```cpp
-TAAParameters.Pass = View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale
-    ? ETAAPassConfig::MainUpsampling
-    : ETAAPassConfig::Main;
+> **So when NVIDIA's plugin is registered, `FTAAStandaloneCS` is never dispatched at all.** The
+> engine calls `FDLSSUpscaler::AddPasses` in its place. The official architecture is a *replacement*,
+> not an *interception*: the shader we hook does not run in the official configuration.
+
+The selecting cvar is `r.TemporalAA.Upscaler` (`TemporalAA.cpp:70-76`), default **1**:
+
+```
+ 0: Forces the default temporal upscaler of the renderer;
+ 1: GTemporalUpscaler which may be overridden by a third party plugin (default).
 ```
 
-**So the engine's own TAA is itself an `ITemporalUpscaler` implementation.** Installing DLSS
-substitutes one implementation of one slot for another. This is precisely Epic's own description.
+Do not confuse it with `r.TemporalAA.Upsampling`, the cvar this project already depends on
+(`CLAUDE.md` §2.3.1, §4). They are different cvars with different jobs: `Upsampling` decides whether
+the primary screen-percentage method is `TemporalUpscale`, `Upscaler` decides which
+`ITemporalUpscaler` object gets called.
 
-**HARD** (Epic's published documentation, *Temporal Upscalers in Unreal Engine*,
-`https://dev.epicgames.com/documentation/en-us/unreal-engine/temporal-upscalers-in-unreal-engine`):
+**And NVIDIA's plugin asserts on the first of those.** `DLSSUpscaler.cpp:317-318`:
+
+```cpp
+checkf(!PassInputs.bAllowDownsampleSceneColor, TEXT("The DLSS plugin does not support downsampling the scenecolor. Please set r.TemporalAA.AllowDownsampling=0"));
+checkf(View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale, TEXT("DLSS requires TemporalUpscale. If you hit this assert, please set r.TemporalAA.Upscale=1"));
+```
+
+**HARD.** DLSS requires `EPrimaryScreenPercentageMethod::TemporalUpscale` — the same engine state
+`CLAUDE.md` §5 establishes Stray is already in at every screen percentage, because Stray ships
+`r.TemporalAA.Upsampling=True`. Our target game is, by the plugin's own precondition, in a valid
+configuration for official DLSS.
+
+**Epic's own documentation agrees**, though it is UE5-era. **HARD** as a statement by Epic, from
+"Temporal Upscalers in Unreal Engine" (`dev.epicgames.com/documentation/en-us/unreal-engine/temporal-upscalers-in-unreal-engine`):
 
 > "Temporal upscalers all work the same with Unreal Engine, whether they are Unreal Engine 4's
 > Temporal Anti-Aliasing Upscaling (TAAU), Unreal Engine 5's Temporal Super Resolution, or a
 > third-party distributed plugins such as NVIDIA's DLSS 2+ Super Resolution, AMD's FSR 2.0+, and
 > Intel's XeSS."
 
-> "They all plug into the post-processing chain in the same location — between Depth of Field and
-> Motion Blur."
+and the API reference for `ITemporalUpscaler::AddPasses`:
 
-**HARD.** There is also a kill switch, `TemporalAA.cpp:70-77`:
+> "Adds the necessary passes into RDG for temporal upscaling the rendering resolution to desired
+> output res."
 
-```cpp
-static TAutoConsoleVariable<int32> CVarUseTemporalAAUpscaler(
-    TEXT("r.TemporalAA.Upscaler"),
-    1,
-    TEXT("Choose the upscaling algorithm.\n")
-    TEXT(" 0: Forces the default temporal upscaler of the renderer;\n")
-    TEXT(" 1: GTemporalUpscaler which may be overridden by a third party plugin (default)."),
-    ECVF_RenderThreadSafe);
-```
+### A.3 Where it sits in the chain: after depth of field, before motion blur, bloom and the tonemapper
 
-`r.TemporalAA.Upscaler=0` forces the engine's own path regardless of what any plugin registered.
-
-### A.3 Where it sits, and therefore what colour space it works in
-
-**HARD.** Reading `PostProcessing.cpp` in order within `AddPostProcessingPasses`:
+**HARD**, all from `PostProcessing.cpp`, same function, absolute line numbers:
 
 | Line | Pass |
 |---|---|
-| 490 | `DiaphragmDOF::AddPasses(...)` — **depth of field** |
-| 508-514 | post-process material chain, `BL_BeforeTonemapping` |
-| **523-567** | **the temporal upscaler — engine TAA or the plugin** |
-| 588-599 | post-process material chain, `BL_SSRInput` (extracted for next frame) |
-| 603-624 | **motion blur** |
-| 710 | `AddBloomPass(...)` — **bloom** |
-| 777 | `AddTonemapPass(...)` — **tonemapper** |
-| 785-795 | FXAA |
-| 809-819 | `EPass::VisualizeDepthOfField` — the last pass of the chain |
+| 490 | `DiaphragmDOF::AddPasses(...)` — depth of field |
+| **523-567** | **the `ITemporalUpscaler::AddPasses` call** |
+| 620 | `AddMotionBlurPass(...)` |
+| 710 | `AddBloomPass(...)` |
+| 777 / 844 | `AddTonemapPass(...)` (two branches) |
 
-Epic's "between Depth of Field and Motion Blur" is exactly right for 4.27, and the ordering has a
-consequence that decides everything downstream:
+Epic states the same thing in prose, **HARD** as Epic's assertion, from "Anti-Aliasing and Upscaling
+in Unreal Engine": the upscalers "all plug into the post-processing chain in the same location —
+between Depth of Field and Motion Blur."
 
-**The temporal upscaler runs BEFORE bloom and BEFORE the tonemapper. Its input and output are
-linear HDR scene colour, pre-tonemap, carrying UE4's pre-exposure.** Its input is at the **primary**
-(render) view rect; its output is at the **secondary** (display) view rect, which the very next line
-records:
+**Therefore the official plugin's input and output are pre-tonemap, scene-linear HDR** — the same
+colour space our hook sees, because it is *the same point in the frame*. Neither Epic page states
+the colour space in those words; that specific phrasing is **UNCONFIRMED** from Epic, but it follows
+directly from the ordering above, which is HARD, and it matches this project's own measurements
+(`CLAUDE.md` §2.3: `R16G16B16A16_FLOAT` scene colour carrying pre-exposure).
 
-```cpp
-//! SceneColorTexture is now upsampled to the SecondaryViewRect. Use SecondaryViewRect for input / output.
-SceneColor.ViewRect = SecondaryViewRect;
-```
-
-**SOFT.** The plugin's own read of exposure confirms it treats the input as pre-exposed
-(`DLSSUpscaler.cpp:441-444`, and `NGXD3D12RHI.cpp:292-293`):
+Resolution: input at render resolution (`View.ViewRect`), output at the secondary/output rect. The
+plugin computes both in its own pass-parameter struct, `DLSSUpscaler.cpp:52-56`:
 
 ```cpp
-const FVector2D JitterOffset = View.TemporalJitterPixels;
-...
-const float PreExposure = View.PreExposure;
-```
-
-```cpp
-DlssEvalParams.pInExposureTexture = InArguments.bUseAutoExposure ? nullptr : GetD3D12TextureFromRHITexture(InArguments.InputExposure, InArguments.GPUNode)->GetResource()->GetResource();
-DlssEvalParams.InPreExposure = InArguments.PreExposure;
-```
-
-Note it hands NGX **both** — the engine's eye-adaptation texture *and* the scalar `PreExposure` —
-and switches the texture off only when the `r.NGX.DLSS.AutoExposure` cvar is set. That is a
-materially richer exposure story than our `AutoExposure` feature flag, and it is available to the
-plugin because it is inside the engine and can call `GetEyeAdaptationTexture(GraphBuilder, View)`.
-
-### A.4 Jitter, velocity, mip bias, screen percentage: who does what
-
-**Jitter — the engine computes it, the plugin passes it through untouched. HARD + SOFT.**
-
-Engine side, `SceneVisibility.cpp:3183-3186` and `:3327-3330`:
-
-```cpp
-bool bTemporalUpsampling = View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale;
-
-// Apply a sub pixel offset to the view.
-if (View.AntiAliasingMethod == AAM_TemporalAA && ViewState && (CVarTemporalAASamplesValue > 0 || bTemporalUpsampling) && View.bAllowTemporalJitter)
-```
-
-```cpp
-View.TemporalJitterSequenceLength = TemporalAASamples;
-View.TemporalJitterIndex = TemporalSampleIndex;
-View.TemporalJitterPixels.X = SampleX;
-View.TemporalJitterPixels.Y = SampleY;
-```
-
-Plugin side (SOFT), `DLSSUpscaler.cpp:441` reads `View.TemporalJitterPixels` and
-`NGXD3D12RHI.cpp:296-297` assigns it straight across with **no sign flip and no scaling**:
-
-```cpp
-DlssEvalParams.InJitterOffsetX = InArguments.JitterOffset.X;
-DlssEvalParams.InJitterOffsetY = InArguments.JitterOffset.Y;
-```
-
-This is independent confirmation of `CLAUDE.md` §2.7. `View.TemporalJitterPixels` is the same
-quantity we read out of the View constant buffer as `TemporalAAParams.zw`.
-
-**Velocity — the plugin runs its own resolve pass. SOFT.** `DLSSUpscaler.cpp:339`:
-
-```cpp
-FRDGTextureRef CombinedVelocityTexture = AddVelocityCombinePass(GraphBuilder, View, PassInputs.SceneDepthTexture, PassInputs.SceneVelocityTexture, bDilateMotionVectors);
-```
-
-`DLSS/Shaders/Private/VelocityCombine.usf` does exactly what our resolve pass does — reconstruct
-camera motion from depth and `View.ClipToPrevClip`, override it where the sparse buffer is valid,
-and convert to pixels:
-
-```hlsl
-float4 ThisClip = float4(PosN.xy, PosN.z, 1);
-float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
-float2 PrevScreen = PrevClip.xy / PrevClip.w;
-float2 BackN = PosN.xy - PrevScreen;
-...
-float4 VelocityN = VelocityTexture.SampleLevel(VelocityTextureSampler, NearestBufferUV + VelocityOffset, 0);
-bool DynamicN = VelocityN.x > 0.0;
-if (DynamicN)
+FDLSSPassParameters(const FViewInfo& View)
+    : InputViewRect(View.ViewRect)
+    , OutputViewRect(FIntPoint::ZeroValue, View.GetSecondaryViewRectSize())
 {
-    BackN = DecodeVelocityFromTexture(VelocityN).xy;
-}
-BackTemp = BackN * CombinedVelocity_ViewportSize;
-
-OutVelocityCombinedTexture[OutputPixelPos].xy = -BackTemp * float2(0.5, -0.5);
-```
-
-Three corroborations of our own implementation, all previously derived rather than seen:
-`mul(v, M)` row-vector convention on `ClipToPrevClip`; the strict `> 0.0` red-channel validity
-test; and the final `-BackTemp * float2(0.5, -0.5)` scale-and-sign. The shader `#error`s on
-non-inverted Z, exactly as `TAAStandalone.usf` does.
-
-The output goes to the **top-left corner** of its own texture, and the plugin then tells NGX the
-motion-vector subrect starts at the origin and the scale is unity —
-`NGXD3D12RHI.cpp:286-288, 299-300`:
-
-```cpp
-// The VelocityCombine pass puts the motion vectors into the top left corner
-DlssEvalParams.InMVSubrectBase.X = 0;
-DlssEvalParams.InMVSubrectBase.Y = 0;
-...
-DlssEvalParams.InMVScaleX = InArguments.MotionVectorScale.X;
-DlssEvalParams.InMVScaleY = InArguments.MotionVectorScale.Y;
-```
-
-with `DLSSArguments.MotionVectorScale = FVector2D(1.0f, 1.0f);` set unconditionally at
-`DLSSUpscaler.cpp:473`. **Subrect plus unit scale — never both.** This is the same rule this
-project learned the hard way for feature 18's `MVecScaleX/Y`.
-
-**Mip bias — entirely the engine's, gated on temporal upscaling. HARD.**
-`SceneVisibility.cpp:3238-3245`:
-
-```cpp
-else if (View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale)
-{
-    ...
-    View.MaterialTextureMipBias = -(FMath::Max(-FMath::Log2(EffectivePrimaryResolutionFraction), 0.0f) ) + CVarMinAutomaticViewMipBiasOffset.GetValueOnRenderThread();
-    View.MaterialTextureMipBias = FMath::Max(View.MaterialTextureMipBias, CVarMinAutomaticViewMipBias.GetValueOnRenderThread());
 }
 ```
 
-The plugin contains no mip-bias code at all (`grep -i mipbias` over `DLSSUpscaler.cpp` is empty).
-It gets the correct bias for free by putting the view on the `TemporalUpscale` path.
-
-**Screen percentage and `r.TemporalAA.Upsampling` — the plugin hard-requires the upscale path.
-SOFT.** `DLSSUpscaler.cpp:317-318`, the first two lines of `AddPasses`:
+And its `GetOutputExtent()` (`DLSSUpscaler.cpp:132-145`) is a **line-for-line copy of UE's own
+`FTAAPassParameters::GetOutputExtent()`**, including the `Max(InputExtent, QuantizedUpscaleViewSize)`
+that `CLAUDE.md` §5 dissects at length:
 
 ```cpp
-// For TAAU, this can happen with screen percentages larger than 100%, so not something that DLSS viewports are setup with
-checkf(!PassInputs.bAllowDownsampleSceneColor,TEXT("The DLSS plugin does not support downsampling the scenecolor. Please set r.TemporalAA.AllowDownsampling=0"));
-checkf(View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale, TEXT("DLSS requires TemporalUpscale. If you hit this assert, please set r.TemporalAA.Upscale=1"));
+FIntPoint InputExtent = SceneColorInput->Desc.Extent;
+FIntPoint QuantizedPrimaryUpscaleViewSize;
+QuantizeSceneBufferSize(OutputViewRect.Size(), QuantizedPrimaryUpscaleViewSize);
+return FIntPoint(FMath::Max(InputExtent.X, QuantizedPrimaryUpscaleViewSize.X),
+                 FMath::Max(InputExtent.Y, QuantizedPrimaryUpscaleViewSize.Y));
 ```
 
-This is the same constraint `CLAUDE.md` §4 documents for us, asserted by NVIDIA rather than
-inferred. It also independently confirms the finding in `CLAUDE.md` §5 that **200% can never
-work** — downsampling is refused outright.
+Our own matcher's `Max()` analysis was reasoning about NVIDIA's own arithmetic without knowing it.
 
-The plugin sets the resolution fraction itself, via `FLegacyScreenPercentageDriver` with
-`GetOptimalResolutionFractionForQuality(DLSSQuality)` (`DLSSUpscaler.cpp:597-602`), where the
-fraction comes from `NGX_DLSS_GET_OPTIMAL_SETTINGS`. And it validates it — `DLSSUpscaler.cpp:398`:
+### A.3.1 The official plugin writes its output into the engine's TAA history — the same feedback node we sit on
+
+**HARD**, `DLSSUpscaler.cpp:519-536`, at the end of `AddDLSSPass`:
 
 ```cpp
-checkf(DestRect.Width()  < 100 || GetMinResolutionFractionForQuality(DLSSQualityMode) - 0.01f <= ScaleX && ScaleX <= GetMaxResolutionFractionForQuality(DLSSQualityMode) + 0.01f, TEXT("The current resolution fraction %f is out of the supported DLSS range [%f ... %f] for quality mode %d."), ...);
-```
-
-**Camera cut. SOFT.** `DLSSUpscaler.cpp:380`:
-
-```cpp
-const bool bCameraCut = !InputHistory.IsValid() || View.bCameraCut || !OutputHistory;
-```
-
-Two of the three terms in our own OR (`CLAUDE.md` §2.8), from inside the engine where
-`InputHistory.IsValid()` is directly readable. Our third term — "the history or velocity SRV is a
-1×1 texture" — exists only because we must infer `!InputHistory.IsValid()` from the outside. That
-is a genuine information deficit of the hook approach, and our proxy for it is a good one.
-
-### A.5 The official plugin is a HOOK, and its state restore is two lines
-
-This is the finding with the most direct bearing on our decision.
-
-**SOFT.** `DLSS/Source/NGXD3D12RHI/Private/NGXD3D12RHI.cpp:204-317`. `ExecuteDLSS` is invoked from
-inside an RDG pass lambda via `RHICmdList.EnqueueLambda`, and it evaluates NGX onto the engine's
-own command list:
-
-```cpp
-NVSDK_NGX_Result ResultEvaluate = NGX_D3D12_EVALUATE_DLSS_EXT(
-    D3DGraphicsCommandList,
-    InDLSSState->DLSSFeature->Feature,
-    InDLSSState->DLSSFeature->Parameter,
-    &DlssEvalParams
-);
-checkf(NVSDK_NGX_SUCCEED(ResultEvaluate), TEXT("NGX_D3D12_EVALUATE_DLSS_EXT failed! (%u %s), %s"), ResultEvaluate, GetNGXResultAsString(ResultEvaluate), *InDLSSState->DLSSFeature->Desc.GetDebugDescription());
-InDLSSState->DLSSFeature->Tick(FrameCounter);
-
-Device->GetCommandContext().StateCache.ForceSetComputeRootSignature();
-Device->GetCommandContext().StateCache.GetDescriptorCache()->SetCurrentCommandList(Device->GetCommandContext().CommandListHandle);
-```
-
-**That is the entire post-NGX state restore: force the compute root signature to be re-set, and
-point the descriptor cache at the current command list.** No descriptor heaps, no PSO, no root
-parameters, no topology, no viewports, no render targets.
-
-The reason is not that NGX clobbers less than we think. It is that UE's `FD3D12StateCache` is a
-*lazy* cache: it remembers what it believes is bound and re-issues anything it does not believe is
-current before the next draw or dispatch. Telling it "your compute root signature belief is stale"
-is enough to make it re-bind everything on that path. **NVIDIA does not restore state; it
-invalidates a cache and lets the engine restore state.**
-
-We cannot do that, because we are not inside `FD3D12StateCache` and have no way to reach it. Our
-long manual restore is the price of being outside the engine, not evidence that we chose a stranger
-place to hook. The hook site itself is the same one NVIDIA uses.
-
-Also note what is **not** there: NVIDIA does not create its own command list, does not fence, and
-does not defer to Present. The official Super Resolution integration is a hook, recorded inline,
-mid-frame, on the engine's queue.
-
-**SOFT.** The plugin also allocates its own output rather than writing over the input,
-`DLSSUpscaler.cpp:406-412`:
-
-```cpp
-FRDGTextureDesc SceneColorDesc = FRDGTextureDesc::Create2D(
-    OutputExtent,
-    PF_FloatRGBA,
-    FClearValueBinding::Black,
-    TexCreate_ShaderResource | TexCreate_UAV);
-
-const TCHAR* OutputName = TEXT("DLSSOutputSceneColor");
-```
-
-**This is a real architectural difference from us and it is worth naming.** The plugin returns a
-*new* texture to the caller; RDG then routes it onward. We write into `u0`, the engine's existing
-TAA output — which on this title is also the next frame's `HistoryBuffer[0]` and this frame's scene
-colour (`CLAUDE.md` §2.9). The plugin never has to think about that because it never writes into a
-resource with two roles. **Our feedback-node problem is a consequence of writing in place, and the
-official plugin does not have it.**
-
----
-
-## B. DLSS Frame Generation in the official plugin (Streamline)
-
-### B.1 It does NOT use `ITemporalUpscaler`. It uses an `ISceneViewExtension`
-
-**HARD, negative result, stated honestly.** The public `NVIDIA-RTX/Streamline` repository does not
-mention `ITemporalUpscaler`, `ISceneViewExtension`, or any Unreal-specific hook point anywhere in
-`docs/` or `README.md`. The only Unreal reference is an `EngineType::eUnreal` enum value in
-`docs/ProgrammingGuide.md` used so `slInit`'s `Preferences::engine` can be set for telemetry.
-Streamline itself is engine-agnostic and hooks D3D/DXGI/Vulkan directly. **The Streamline repo
-therefore cannot confirm what the UE plugin's own hook point is** — that lives in the
-Marketplace-distributed plugin, not in the SDK.
-
-**SOFT** (third-party mirror, §D). It is an `ISceneViewExtension`.
-`Plugins/Streamline/Source/StreamlineCore/Private/StreamlineViewExtension.h:31-54` (class at :31, `SubscribeToPostProcessingPass` at :54, UE4 branch at :42):
-
-```cpp
-class FStreamlineViewExtension final : public FSceneViewExtensionBase
+if (!View.bStatePrevViewInfoIsReadOnly && OutputHistory)
 {
-public:
-    FStreamlineViewExtension(const FAutoRegister& AutoRegister, FStreamlineRHI* InStreamlineRHI);
+    OutputHistory->SafeRelease();
 
-    virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override;
-    virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override;
-    virtual void SetupViewPoint(APlayerController* Player, FMinimalViewInfo& InViewInfo) override;
-    virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override;
-    ...
-    virtual void SubscribeToPostProcessingPass(EPostProcessingPass Pass, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled) override;
-```
+    GraphBuilder.QueueTextureExtraction(Outputs.SceneColor, &OutputHistory->RT[0]);
 
-Note the file is version-guarded for UE4 (`#if ENGINE_MAJOR_VERSION == 4 typedef
-FRHICommandListImmediate FGraphBuilderOrCmdList;`), so this architecture is applicable to 4.27, not
-only to UE5.
+    OutputHistory->ViewportRect = DestRect;
+    OutputHistory->ReferenceBufferSize = OutputExtent;
+}
 
-The two plugins also explicitly know about each other. **SOFT**, from the DLSS plugin's `NGXRHI.cpp`
-in a UE5.6-era mirror: *"Streamline plugin also uses NGX so it's not safe for us to call NGX
-shutdown functions from this plugin when Streamline is enabled"*, guarded by
-`IPluginManager::Get().FindPlugin(TEXT("StreamlineCore"))`. **Super Resolution and Frame Generation
-are two separate plugins with two separate engine hooks, sharing only the NGX runtime.**
-
-### B.2 Where Streamline hooks presentation: interposer by default, manual hooking optional
-
-**HARD**, `docs/ProgrammingGuideManualHooking.md` and `include/sl_hooks.h` in `NVIDIA-RTX/Streamline`
-(version 2.12.0).
-
-Default mode: **Streamline is a swapchain and device interposer.** `sl.interposer.dll` stands in for
-`dxgi.dll` / `vulkan-1.dll` and intercepts, per the `enum class FunctionHookID` in `sl_hooks.h`:
-`IDXGIFactory::CreateSwapChain*`, `IDXGISwapChain::Present` and `Present1`, `GetBuffer`,
-`ResizeBuffers*`, `GetCurrentBackBufferIndex`, `SetFullscreenState`,
-`ID3D12Device::CreateCommandQueue`, and the Vulkan present/swapchain equivalents.
-
-Manual hooking (`PreferenceFlag::eUseManualHooking`, set before `slInit`) replaces the global hook
-with explicit calls. There is **no** `slSetPresentCallback` or `slHookSwapchainPresent`; the actual
-API is:
-
-* `slUpgradeInterface(&ptr)` — hand Streamline a native pointer and get an SL proxy back in its
-  place.
-* `slGetNativeInterface(proxy, &native)` — the reverse.
-* The host then routes each `FunctionHookID` call to the proxy at the point its own engine would
-  have called the native API.
-
-Quoted verbatim from `ProgrammingGuideManualHooking.md`:
-
-> "you must ensure the common plugin's `presentCommon()` function is called every frame... the
-> recommended approach is to call `slUpgradeInterface` immediately after creating the frame
-> presentation interface (e.g., the swapchain on DirectX), so Streamline can integrate with your
-> presentation path and invoke `presentCommon()`."
-
-In manual mode Streamline can no longer track resource or command-list state, so the host must
-supply correct `D3D12_RESOURCE_STATES` on every `sl::Resource` tag and must restore command-list
-state after `slEvaluateFeature` itself. **That is the same bargain we make: leave the automatic
-path and you inherit the state bookkeeping.**
-
-### B.3 The buffers, and when each is tagged
-
-**HARD**, `docs/ProgrammingGuideDLSS_G.md` §5.0 "TAG ALL REQUIRED RESOURCES", §5.1 "REQUIRED AND
-OPTIONAL RESOURCES", §5.2 "TAGGING RECOMMENDATIONS".
-
-| Buffer | Notes (verbatim where quoted) |
-|---|---|
-| `Backbuffer` | auto-intercepted via the SL swapchain; tag `sl::kBufferTypeBackbuffer` only to pass subrect info |
-| `sl::kBufferTypeDepth` | "Same depth data used to generate motion vector data... same set of requirements as DLSS-SR, and the same depth can be used for both." |
-| `sl::kBufferTypeMvec` | dense camera + dynamic-object motion, same requirements as SR |
-| `sl::kBufferTypeHUDLessColor` | "The scene color *before* any UI/HUD elements are drawn." |
-| `sl::kBufferTypeUIColorAndAlpha` **or** `sl::kBufferTypeUIAlpha` | "If both buffers are tagged, Streamline will use the UI Alpha buffer." |
-| `sl::kBufferTypeBidirectionalDistortionField` | optional, only for strong post-process distortion |
-
-**When.** Tagging is `slSetTagForFrame(*currentFrame, viewport, tags[], count, cmdList)`, called as
-each resource becomes ready. Depth and motion vectors are tagged together right after they are
-generated; **hudless colour is tagged "After post-processing pass but before UI/HUD is added"**; the
-UI buffer is tagged whenever its target is populated. §5.2, verbatim:
-
-> "tagged buffers are used during the `Swapchain::Present` call. If the tagged buffers are going to
-> be reused, destroyed or changed in any way before the frame is presented, their life-cycle needs
-> to be specified correctly."
-
-The recommended default lifecycle is `sl::ResourceLifecycle::eValidUntilPresent`. And a rule that
-matches our own gameplay gate: **if validity cannot be guaranteed — loading, paused, menu, cutscene
-— every tag must be set to a null pointer.**
-
-**The blending contract**, verbatim from the §5.1 table row "UI Alpha OR UI Color and Alpha":
-
-> "`UI Alpha` is a single channel containing only the alpha values (0.0 to 1.0) of the UI... `UI
-> Color and Alpha` also contains the RGB color of the UI... Prefer `UI Alpha` (single channel) for
-> performance when available. If both are tagged, only `UI Alpha` will be used. Must be 0.0 for
-> pixels with no UI elements. Alpha must be non-zero for pixels with UI. Values provided must
-> respect the standard blending formula: `Final_Color.RGB = UI.RGB + (1 - UI.Alpha) x Hudless.RGB`.
-> When UI color is provided, the RGB channels must be pre-multiplied by alpha."
-
-### B.4 What happens when the UI cannot be separated
-
-**HARD**, `ProgrammingGuideDLSS_G.md` §5.1, hudless row, verbatim:
-
-> "Should contain the full viewable scene, without any HUD/UI elements in it. **If some HUD/UI
-> elements are unavoidably included, expect some image quality degradation on those elements**"
-
-NVIDIA's documentation does not use the word "ghosting"; it states the cost as image-quality
-degradation **localised to the HUD/UI pixels**, which is the same phenomenon. The upside of getting
-it right is stated in §6.6:
-
-> "When both Hudless and a UI buffer are tagged, User Interface Recomposition can be enabled... the
-> HUD and scene are interpolated separately and composited later, providing significantly-improved
-> UI interpolation quality"
-
-at "slight performance and memory cost". A checklist item at the top of the same document adds the
-hard constraint: *"Ensure extent resolution or resource size, whichever is in use, for `Hudless`
-and `UI Color and Alpha` buffers exactly match that of backbuffer."*
-
-**Where the plugin actually captures hudless colour. SOFT, and this is the finding worth keeping.**
-`StreamlineViewExtension.cpp:508-516`:
-
-```cpp
-void FStreamlineViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass Pass, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
+if (!View.bStatePrevViewInfoIsReadOnly && OutputCustomHistoryInterface)
 {
-    if (Pass == EPostProcessingPass::VisualizeDepthOfField)
+    if (!OutputCustomHistoryInterface->GetReference())
     {
-        check(StreamlineRHIExtensions);
-        check(StreamlineRHIExtensions->IsStreamlineAvailable());
-        InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FStreamlineViewExtension::PostProcessPassAtEnd_RenderThread));
+        (*OutputCustomHistoryInterface) = new FDLSSUpscalerHistory(DLSSState);
     }
 }
 ```
 
-**HARD** — why that pass. `Engine/Source/Runtime/Engine/Public/SceneViewExtension.h:101-108`:
+with `OutputHistory` bound at `DLSSUpscaler.cpp:326` to
+`&(View.ViewState->PrevFrameViewInfo.TemporalAAHistory)`.
+
+**The official plugin extracts DLSS's own output as `TemporalAAHistory.RT[0]`.** That is the exact
+resource `CLAUDE.md` §5 identifies as the one screen-space reflections read next frame
+(`ScreenSpaceRayTracing.cpp:596-620`). NVIDIA does deliberately what our `u0` write does as a
+side effect. It is not an accident of our hook point and it is not something the official
+architecture avoids — it is the contract.
+
+The plugin *also* keeps a second, private history: `FDLSSUpscalerHistory` implements the engine's
+`ICustomTemporalAAHistory` interface (`DLSSUpscalerHistory.h:29-30`) and carries the `FDLSSStateRef`
+— the NGX feature handle. So there are two histories, the engine-visible colour texture and the
+opaque NGX state, and the plugin threads both.
+
+### A.4 Jitter, velocity, exposure, mip bias and the screen-percentage settings
+
+**Jitter — passed straight through, unmodified.** `DLSSUpscaler.cpp:441` and `:471`:
+
+```cpp
+const FVector2D JitterOffset = View.TemporalJitterPixels;
+...
+DLSSArguments.JitterOffset = JitterOffset;
+```
+
+**HARD**, and it confirms `CLAUDE.md` §2.7's rule from NVIDIA's own code: `TemporalJitterPixels` is
+what NGX wants, with no sign flip and no scaling.
+
+**Velocity — a dedicated combine pass, and it is the shader our resolve was modelled on.**
+`DLSSUpscaler.cpp:337-344`:
+
+```cpp
+const bool bDilateMotionVectors = CVarNGXDLSSDilateMotionVectors.GetValueOnRenderThread() != 0;
+FRDGTextureRef CombinedVelocityTexture = AddVelocityCombinePass(GraphBuilder, View, PassInputs.SceneDepthTexture, PassInputs.SceneVelocityTexture, bDilateMotionVectors);
+DLSSParameters.SceneColorInput = PassInputs.SceneColorTexture;
+DLSSParameters.SceneVelocityInput = CombinedVelocityTexture;
+DLSSParameters.SceneDepthInput = PassInputs.SceneDepthTexture;
+DLSSParameters.bHighResolutionMotionVectors = bDilateMotionVectors;
+```
+
+The cvar, `DLSSUpscaler.cpp:77-82`, defaults to **dilated high-resolution** vectors:
+
+```
+r.NGX.DLSS.DilateMotionVectors
+ 0: pass low resolution motion vectors into DLSS
+ 1: pass dilated high resolution motion vectors into DLSS. This can help with improving image quality of thin details. (default)
+```
+
+The non-dilated branch of `DLSS/Shaders/Private/VelocityCombine.usf` is the arithmetic
+`CLAUDE.md` §5 already tells us to copy rather than invent, and here it is at the source:
+
+```hlsl
+float4 EncodedVelocity = VelocityTexture[PixelPos];
+float Depth = DepthTexture[PixelPos].x;
+
+float2 Velocity;
+if (all(EncodedVelocity.xy > 0))
+{
+    Velocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
+}
+else
+{
+    float4 ClipPos;
+    ClipPos.xy = SvPositionToScreenPosition(float4(PixelPos.xy, 0, 1)).xy;
+    ClipPos.z = Depth;
+    ClipPos.w = 1;
+
+    float4 PrevClipPos = mul(ClipPos, View.ClipToPrevClip);
+
+    if (PrevClipPos.w > 0)
+    {
+        float2 PrevScreen = PrevClipPos.xy / PrevClipPos.w;
+        Velocity = ClipPos.xy - PrevScreen.xy;
+    }
+    else
+    {
+        Velocity = EncodedVelocity.xy;
+    }
+}
+
+float2 OutVelocity = Velocity * float2(0.5, -0.5) * View.ViewSizeAndInvSize.xy;
+OutVelocityCombinedTexture[OutputPixelPos].xy = -OutVelocity;
+```
+
+Note `mul(ClipPos, View.ClipToPrevClip)` — the **row-vector** convention, matching `CLAUDE.md` §5's
+rule and the transposition fix this project already landed. Note also the `PrevClipPos.w > 0` guard
+and the final negation with `(0.5, -0.5)`. **HARD**, and it is the direct upstream of our resolve
+shader.
+
+**The scale is 1.0, and that is deliberate.** `DLSSUpscaler.cpp:473-474`:
+
+```cpp
+DLSSArguments.MotionVectorScale = FVector2D(1.0f, 1.0f);
+DLSSArguments.bHighResolutionMotionVectors = Inputs.bHighResolutionMotionVectors;
+```
+
+**HARD**, and it independently confirms the third gotcha in `CLAUDE.md` §5 ("Declaring a guide's
+subrect AND scaling its vectors double-counts"): NVIDIA sends 1.0 and describes the vectors'
+resolution with a separate flag, never by scaling.
+
+**Exposure — the plugin sends BOTH a scalar and a texture, and defaults to letting NGX ignore
+them.** `DLSSUpscaler.cpp:444-445`, `:493-497`:
+
+```cpp
+const float PreExposure = View.PreExposure;
+const bool bUseAutoExposure = CVarNGXDLSSAutoExposure.GetValueOnRenderThread() != 0;
+...
+check(PassParameters->EyeAdaptation);
+PassParameters->EyeAdaptation->MarkResourceAsUsed();
+DLSSArguments.InputExposure = PassParameters->EyeAdaptation->GetRHI();
+DLSSArguments.PreExposure = PreExposure;
+DLSSArguments.bUseAutoExposure = bUseAutoExposure;
+```
+
+with the cvar (`DLSSUpscaler.cpp:84-88`) defaulting to **1**:
+
+```
+r.NGX.DLSS.AutoExposure
+0: Use the engine-computed exposure value for input images to DLSS - in some cases this may reduce artifacts
+1: Enable DLSS internal auto-exposure instead of the application provided one (default)
+```
+
+**HARD.** So the official default is the same `AutoExposure` flag this project ships
+(`CLAUDE.md` §5, feature flags `0x4B`), and NVIDIA treats the engine-exposure path as the *fallback
+for artifacts*, not the primary. That is useful context for our own finding that the NGX
+exposure-texture path measured inert.
+
+**Mip bias is not computed per pass. It is a global cvar override set once at module startup.**
+`DLSS/Source/DLSS/Private/DLSS.cpp:459-468`:
+
+```cpp
+// If DLSS mip bias override is enabled, we unconditionally override it here on module startup even if DLSS is not supported.
+// This way you won't see inconsistent behavior for something like TAAU depending on whether DLSS is supported on the current system.
+if (CVarNGXDLSSAdjustMipBiasOffsetEnable.GetValueOnGameThread())
+{
+    static IConsoleVariable* CVarMinAutomaticViewMipBiasOffset = IConsoleManager::Get().FindConsoleVariable(TEXT("r.ViewTextureMipBias.Offset"));
+    if (CVarMinAutomaticViewMipBiasOffset != nullptr)
+    {
+        CVarMinAutomaticViewMipBiasOffset->Set(-1.0f, EConsoleVariableFlags::ECVF_SetByCommandline);
+    }
+}
+
+static auto* CVarTemporalAAAllowDownsampling = IConsoleManager::Get().FindConsoleVariable(TEXT("r.TemporalAA.AllowDownsampling"));
+if (CVarTemporalAAAllowDownsampling != nullptr)
+{
+    CVarTemporalAAAllowDownsampling->Set(0);
+}
+```
+
+**HARD**, and it is a genuinely useful piece of intelligence: the official plugin does **not** compute
+a DLSS-specific mip bias. It leans on UE's existing automatic view mip bias (which already accounts
+for the screen percentage) and merely shifts its floor by −1.0. It also forces
+`r.TemporalAA.AllowDownsampling=0` globally, which is the precondition its own `AddPasses` asserts.
+Both are ordinary cvar writes, reachable from an injected DLL through `Engine.ini [SystemSettings]`
+exactly as `CLAUDE.md` §2.2 describes.
+
+**`r.TemporalAA.Upsampling` itself is never referenced by the `ITemporalUpscaler` call site.**
+`PostProcessing.cpp` mentions only `r.TemporalAA.Upscaler`. **UNCONFIRMED** whether the plugin reads
+`Upsampling` anywhere; what it does instead is assert on the *consequence*
+(`PrimaryScreenPercentageMethod == TemporalUpscale`) and install its own screen-percentage driver.
+
+### A.5 The one thing the plugin does NOT do through `ITemporalUpscaler`: denoising
+
+**HARD.** `DLSS/Source/DLSS/Private/DLSSDenoiser.h:29-30`:
+
+```cpp
+// wrapper for the default denoiser to add TAA after some passes
+class DLSS_API FDLSSDenoiser final : public IScreenSpaceDenoiser
+```
+
+The DLSS2/3-era plugin registers a **second, separate** engine extension point for denoising —
+`IScreenSpaceDenoiser`, the interface behind `FSSDTemporalAccumulationCS`, the shader family this
+project measured and named in `CLAUDE.md` §2.3. NVIDIA's own architecture already treats
+"upscale" and "denoise" as two distinct slots in the frame, filled by two distinct objects.
+
+Neither mirror contains DLSS Ray Reconstruction or `DLSSD`. `gh search code` for `DLSSD` /
+`RayReconstruction` across `mrcasty/DLSS4-alpha-unreal` returns nothing despite its DLSS4 vintage,
+whose scope its own README limits to an alpha-channel fix. **So the UE extension point for RR is
+UNCONFIRMED from these mirrors.**
+
+## B. DLSS Frame Generation in the official plugin (Streamline)
+
+**Source**: `NVIDIA-RTX/Streamline`, `docs/ProgrammingGuideDLSS_G.md` and
+`docs/ProgrammingGuideManualHooking.md`, Streamline version 2.12.0 (both files carry that version
+header). **HARD** throughout unless marked.
+
+### B.1 Not `ITemporalUpscaler`. A swapchain-level API, engine-agnostic, fed by `ISceneViewExtension` in Unreal
+
+The DLSS-G guide never mentions Unreal Engine, `ITemporalUpscaler` or `ISceneViewExtension` — it is
+written entirely in terms of the engine-agnostic Streamline (`sl::`) API: `slSetTagForFrame`,
+`slDLSSGSetOptions`, `slEvaluateFeature`, `slSetConstants`. **UNCONFIRMED from this doc** how any
+specific engine wires it up, by construction — this is the SDK layer beneath the engine, not an
+engine integration.
+
+Epic's own FAQ closes that gap directly, and this is the mechanism the task set out to establish.
+**HARD**, Epic Games, "Temporal Super Resolution Frequently Asked Questions for Unreal Engine"
+(`dev.epicgames.com/documentation/unreal-engine/temporal-super-resolution-frequently-asked-questions-for-unreal-engine`),
+under "Can TSR work with third-party frame interpolation / generation?":
+
+> "The frame interpolation / generation plugin [is] free to access depth and motion vector because
+> of `ISceneViewExtensions` without needing to set up a `ITemporalUpscaler` to replace TSR."
+
+So Epic states explicitly, for its own engine, that frame generation is architecturally
+**independent of the temporal-upscaler slot** — a *different* extension point,
+`ISceneViewExtension`, supplies the buffers. This project's own hook (§2.3) captures depth and
+velocity at the TAA dispatch; the official architecture instead has a scene-view extension read
+them wherever the engine already produces them, with no need to sit inside — or replace — the
+upscale pass at all.
+
+**Confirmed independently in UE 4.27.2's own source**, and it is a stronger form of the same fact
+than a doc quote: `Engine/Source/Runtime/Engine/Public/SceneViewExtension.h:101-108` defines
 
 ```cpp
 enum class EPostProcessingPass : uint32
@@ -661,254 +534,295 @@ enum class EPostProcessingPass : uint32
 };
 ```
 
-`VisualizeDepthOfField` is the **last** entry before `MAX`. Subscribing after it means running at
-the very end of the post-processing chain — after motion blur, after the tonemapper, after FXAA,
-and before Slate draws the UI. The method's own name says so: `PostProcessPassAtEnd_RenderThread`.
+with `virtual void SubscribeToPostProcessingPass(EPostProcessingPass Pass, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled) {}` (`:161`) as one of `ISceneViewExtension`'s
+overridable hooks, alongside `PrePostProcessPass_RenderThread` (`:156`) which hands the extension
+`const FPostProcessingInputs& Inputs` directly. `PostProcessing.cpp:460-465` calls
+`View.Family->ViewExtensions[ViewExt]->SubscribeToPostProcessingPass(...)` for every registered
+extension, for every one of those four pass points, every frame — **this exists in 4.27.2 itself**,
+not just in the UE5 branch Epic's FAQ describes. A view extension in this engine version can
+already read depth, velocity and scene colour, and inject work after motion blur or after the
+tonemapper, with no `ITemporalUpscaler` registration and no replacement of anything.
 
-**SOFT.** What it does there, `StreamlineViewExtension.cpp:604, 638-650, 748`:
+### B.2 Presentation: an automatic swapchain interposer by default, or explicit hooks under manual mode — never a game-thread dispatch inside another pass
 
-```cpp
-// input color
-FRDGTextureRef SceneColorAfterTonemap = SceneColor.Texture;
-check(SceneColorAfterTonemap);
+**HARD**, `ProgrammingGuideDLSS_G.md:618`, §6.7: *"DLSS-G intercepts `IDXGISwapChain::Present` and
+when using Vulkan `vkQueuePresentKHR` and `vkAcquireNextImageKHR` calls and executes them
+asynchronously."* Default integration is a **swapchain proxy**: the game calls the DXGI/Vulkan
+present functions it always called, and Streamline's interposer (`sl.interposer.dll`) is what
+actually receives them.
+
+`ProgrammingGuideManualHooking.md` documents the alternative, for hosts that cannot tolerate a
+global API-redirection proxy (§0: *"unnecessary overhead caused by the entire API redirection
+through SL proxies"* and *"problems with tools and 3rd party libraries which do not expect to
+receive SL proxies as inputs"*). Manual hooking is not a different *place* in the frame — it is a
+different *mechanism* for reaching the same seven call sites, enumerated exhaustively in
+`FunctionHookID` (§2.0):
+
+```
+eIDXGIFactory_CreateSwapChain, eIDXGIFactory_CreateSwapChainForHwnd,
+eIDXGIFactory_CreateSwapChainForCoreWindow,
+eIDXGISwapChain_Present, eIDXGISwapChain_Present1, eIDXGISwapChain_GetBuffer,
+eIDXGISwapChain_ResizeBuffers, eIDXGISwapChain_ResizeBuffers1,
+eIDXGISwapChain_GetCurrentBackBufferIndex, eIDXGISwapChain_SetFullscreenState,
+eID3D12Device_CreateCommandQueue, eVulkan_Present, eVulkan_CreateSwapchainKHR, ...
 ```
 
-```cpp
-FRDGTextureRef SLSceneColorWithoutHUD = SceneColor.Texture;
+The host must route each of those specific calls through an SL-provided proxy obtained via
+`slUpgradeInterface`/`slGetNativeInterface` and, critically, **must itself invoke the common
+plugin's `presentCommon()` exactly once per frame** (§2.0, boxed WARNING) — manual hooking still
+funnels through the same internal present-time entry point, it just removes SL's own DXGI/Vulkan
+proxy layer for every *other* call. **Either way, DLSS-G's evaluate happens at present, on
+Streamline's own command list/queue plumbing — never inside a game-authored dispatch the way this
+project's SR and NR hooks currently do.** That is the one point on which our own FG (already a
+stage on our own command list at Present, per this project's design) already matches the official
+architecture exactly.
 
-const bool bTagSceneColorWithoutHUD = GIsEditor ? CVarStreamlineTagEditorSceneColorWithoutHUD.GetValueOnRenderThread() : CVarStreamlineTagSceneColorWithoutHUD.GetValueOnRenderThread();
-if(bTagSceneColorWithoutHUD)
-{
-    FRDGTextureDesc Desc = SceneColor.Texture->Desc;
-    EnumAddFlags(Desc.Flags, TexCreate_ShaderResource | TexCreate_UAV);
-    EnumRemoveFlags(Desc.Flags, TexCreate_Presentable);
-    EnumRemoveFlags(Desc.Flags, TexCreate_ResolveTargetable);
-    SLSceneColorWithoutHUD = GraphBuilder.CreateTexture(Desc, TEXT("Streamline.SceneColorWithoutHUD"));
-    AddDrawTexturePass(GraphBuilder, ViewInfo, SceneColor.Texture, SLSceneColorWithoutHUD, FIntPoint::ZeroValue, FIntPoint::ZeroValue, FIntPoint::ZeroValue);
-}
+**State restore after evaluate is the host's job, spelled out precisely, and it is our own restore
+list.** `ProgrammingGuideManualHooking.md` §7.0, verbatim:
+
+> "When manual hooking is used the host application is no longer using an SL proxy for the command
+> lists (CL), hence it is not possible for SL to restore the CL state after each `slEvaluateFeature`
+> call."
+
+followed by the exact restoration code SL performs internally in the non-manual path — descriptor
+heaps, root signature, every root parameter type (descriptor table, CBV, SRV, UAV, 32-bit
+constants), and PSO/state-object:
+
+```cpp
+if (cmdList->m_numHeaps > 0)      cmdList->SetDescriptorHeaps(cmdList->m_numHeaps, cmdList->m_heaps);
+if (cmdList->m_rootSignature)     cmdList->SetComputeRootSignature(cmdList->m_rootSignature);
+                                   // ... root descriptor tables, CBVs, SRVs, UAVs, 32-bit constants
+if (cmdList->m_pso)               cmdList->SetPipelineState(cmdList->m_pso);
+if (cmdList->m_so)                static_cast<ID3D12GraphicsCommandList4*>(cmdList)->SetPipelineState1(cmdList->m_so);
 ```
 
+closing with: *"Failure to restore command list(buffer) state correctly will cause your
+application to crash or misbehave in some other form."*
+
+**This is independent confirmation, from NVIDIA's own SDK, of the exact hazard `CLAUDE.md` §5
+calls "the number-one corruption risk"** for our own NGX evaluate: descriptor heaps, root
+signature, PSO, root params. NVIDIA's own interposer carries this same list as a first-class,
+documented responsibility for any evaluate call, whether ours or theirs.
+
+### B.3 The buffer contract: exact timing, the blending formula, and the documented cost of not separating UI
+
+**HARD**, `ProgrammingGuideDLSS_G.md` §5.1–5.2. Required: Depth, Motion Vectors, and the backbuffer
+(captured automatically by the swapchain proxy). For quality, **critically** two more:
+
+> "For the best image quality, it is **critical** to provide a Hudless (pre-UI) buffer and a UI
+> buffer. The frame generation algorithm can use these resources to reduce distortion of HUD
+> elements during interpolation.
+>
+> - **Hudless** - The scene color *before* any UI/HUD elements are drawn.
+> - **UI Buffer** - Choose one of: **UI Alpha** (Preferred, single-channel, most performant) or
+>   **UI Color and Alpha** (full 4-channel). *If both buffers are tagged, Streamline will use the UI
+>   Alpha buffer.*"
+
+The tagging-time instruction, embedded directly in the code sample (§5.2), states exactly where in
+the frame each capture must happen:
+
 ```cpp
-TexturesToTag.Add({ bTagSceneColorWithoutHUD ? PassParameters->SceneColorWithoutHUD->GetRHI() : nullptr, SceneColor.ViewRect, EStreamlineResource::HUDLessColor});
+// After post-processing pass but before UI/HUD is added tag the hud-less buffer
+sl::ResourceTag hudLessTag = sl::ResourceTag {&hudLess, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent };
 ```
 
-It **copies** the post-tonemap scene colour into a texture it owns rather than tagging the engine's,
-because the engine will keep using and recycling the original. Depth and motion vectors are pulled
-from `FSceneTextures` in the same callback, with a UE4-specific branch
-(`FSceneRenderTargets::Get(GraphBuilder.RHICmdList)`).
+i.e. **after** the full post-process chain (tonemap, bloom, colour grading — everything) and
+**before** UI compositing. That is a *different* point in the frame from where DLSS SR sits
+(§A.3: between depth of field and motion blur, pre-tonemap linear HDR) — confirming that Super
+Resolution and Frame Generation are tapped at two structurally different stages even inside one
+official pipeline, consistent with B.1's finding that FG does not go through the upscaler slot at
+all.
 
-**So the official frame-generation integration is a hybrid, and this is the shape that matters
-for us:** *guides are captured by a mid-frame render-thread hook; the feature itself is evaluated
-in the presentation path* by the interposer, at Present, from the tags. Capture where the data is;
-evaluate where the frame is.
+**The blending contract is a literal formula, and the constraint is Porter-Duff over-compositing,
+stated exactly** (§5.1 table, "UI Alpha OR UI Color and Alpha" row):
 
-### B.5 DLSS Super Resolution's own tagging, for contrast
+> "Must be 0.0 for pixels with no UI elements. Alpha must be non-zero for pixels with UI. Values
+> provided must respect the standard blending formula:
+> `Final_Color.RGB = UI.RGB + (1 - UI.Alpha) x Hudless.RGB`. When UI color is provided, the RGB
+> channels must be pre-multiplied by alpha."
 
-**HARD**, `docs/ProgrammingGuideDLSS.md` §4.0. SR needs `sl::kBufferTypeScalingInputColor`,
-`sl::kBufferTypeScalingOutputColor`, `sl::kBufferTypeDepth`, `sl::kBufferTypeMvec`, and optionally
-`sl::kBufferTypeExposure` (1×1). There is **no HUD or UI concept at all** — SR runs pre-composite,
-on the render, not on the presented backbuffer. It is evaluated with
-`slEvaluateFeature(sl::kFeatureDLSS, ...)` at the point in the pipeline where the engine's own
-upscale would otherwise run, and **the host is explicitly responsible for restoring command-list
-state afterward** (§7). The same division of labour as the UE plugin's `ForceSetComputeRootSignature`.
+**Enabling this fully — "User Interface Recomposition" — is opt-in and interpolates the HUD and
+scene as two separate streams**, §6.6:
+
+> "When both Hudless and a UI buffer are tagged, User Interface Recomposition can be enabled by
+> setting `DLSSGOptions::enableUserInterfaceRecomposition = eTrue`. When enabled, the HUD and scene
+> are interpolated separately and composited later, providing significantly-improved UI
+> interpolation quality. Using user interface recomposition has a slight performance and memory
+> cost."
+
+### B.4 What happens when a title cannot separate UI — the documented cost
+
+**HARD**, §5.1, the "Hudless" row of the requirements table, stated as a direct consequence rather
+than a separate fallback mode:
+
+> "Should contain the full viewable scene, without any HUD/UI elements in it. **If some HUD/UI
+> elements are unavoidably included, expect some image quality degradation on those elements.**"
+
+There is no documented alternate code path for "can't separate UI" — Hudless/UI tagging is simply
+optional (only Depth, Motion Vectors and the backbuffer are marked required in §5.1), and omitting
+it is the fallback: DLSS-G still runs, generated frames still interpolate the *whole* composited
+image including any UI baked into it, and the cost is confined to whatever moved with the UI
+during interpolation (ghosting/smearing on HUD elements, since the interpolator has no way to know
+those pixels should not move with the scene). The integration checklist (§0.0) lists "All the
+required inputs are passed to Streamline: depth buffers, motion vectors, HUD-less color buffers"
+as a checklist item, not gated behind a hard requirement — consistent with Hudless being a quality
+opt-in, not a functional prerequisite.
+
+**One more documented failure mode worth carrying into this project's own thinking**, §5.2:
+
+> "If validity of tagged resources cannot be guaranteed (for example game is loading, paused, in
+> menu, playing a video cut scene etc.) all tags should be set to null pointers to avoid stability
+> or IQ issues."
+
+— the same menu/load-screen caution this project already independently discovered and encodes in
+`CLAUDE.md` §2.4 and §5 ("the menu runs the TAA pass too... at uncapped fps").
 
 ---
 
 ## C. DLSS Ray Reconstruction, briefly
 
-**HARD**, `docs/ProgrammingGuideDLSS_RR.md` in `NVIDIA-RTX/Streamline` (feature
-`kFeatureDLSS_RR`, header `sl_dlss_d.h`). Ray Reconstruction **replaces the game's denoiser and the
-upscaler at the same time.** Its §4.1 tag list is materially larger than Super Resolution's: diffuse
-albedo, specular albedo, normals, roughness, colour input, motion vectors, depth, specular motion
-vector reflections, specular hit distance, plus optional transparency-overlay,
-colour-before-transparency, subsurface and depth-of-field guides, plus the output. It consumes
-G-buffer material data a plain upscaler never needs, and it takes **noisy** ray-traced input
-directly rather than sitting after a separately denoised buffer.
+**Source**: `NVIDIA-RTX/Streamline`, `docs/ProgrammingGuideDLSS_RR.md`, same version 2.12.0.
+**HARD.**
 
-**SOFT.** In the UE plugin, the analogous engine seam for "replace the denoiser" already exists and
-NVIDIA already uses it. `DLSS/Source/DLSS/Private/DLSSDenoiser.h:29-31`:
+**RR occupies the SAME call site as the temporal upscaler — it is chosen INSTEAD of TAAU, not
+layered after a denoiser.** §7.0, "ADD DLSS-RR TO THE RENDERING PIPELINE", is explicit and the
+sample code makes the substitution literal:
+
+> "On your rendering thread, call `slEvaluateFeature` at the appropriate location where up-scaling
+> is happening."
 
 ```cpp
-// wrapper for the default denoiser to add TAA after some passes
-class DLSS_API FDLSSDenoiser final : public IScreenSpaceDenoiser
+if(useDLSSD)
 {
-public:
-    FDLSSDenoiser(const IScreenSpaceDenoiser* InWrappedDenoiser, const FDLSSUpscaler* InUpscaler);
+    const sl::BaseStructure* inputs[] = {&myViewport};
+    if(SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), myCmdList)))
+    {
+        // Handle error
+    }
+    else
+    {
+        // IMPORTANT: Host is responsible for restoring state on the command list used
+        restoreState(myCmdList);
+    }
+}
+else
+{
+    // Default up-scaling pass like for example TAAU goes here
+}
 ```
 
-In the Super Resolution plugin this class only *wraps* the engine's denoiser; the interesting part
-is that `IScreenSpaceDenoiser` is a per-signal interface (`DenoiseReflections`,
-`DenoiseDiffuseIndirect`, `DenoiseAmbientOcclusion`, …), not a whole-image one. **Ray Reconstruction
-is therefore not a post-process filter bolted after the upscaler; it is a replacement for a set of
-engine passes that each have their own inputs.** That is the published architecture our own neural
-pass is nearest to, and it is a reminder that RR's power comes from being fed G-buffer guides at the
-point the denoisers run — not from being applied to a finished image.
+**"Default up-scaling pass like for example TAAU goes here" is the single most important line for
+this section**: it places DLSS-RR in exactly the branch that would otherwise hold the engine's own
+temporal upscaler — the same slot `ITemporalUpscaler::AddPasses` fills in Unreal (§A.2). RR is not
+a post-process layered after the denoiser and the upscaler; it **is** the denoiser-and-upscaler,
+called once, in their place.
 
-Relevant to our own measured result in `CLAUDE.md` — that suppressing UE's
-`FSSDTemporalAccumulationCS` while DLSS SR ran made shimmer 3.4× worse — this is exactly what the
-published architecture predicts: SR is not a denoiser, and the only NVIDIA feature that claims that
-job is RR, which demands the guides UE's denoisers already have and SR never sees.
+**Its inputs confirm the same reframing.** §4.1.5, "Color Input": *"This is the **Noisy Ray Traced
+Input Color**. Any standard 3-channel format provided at input resolution"* — i.e. RR's colour
+input is explicitly the **undenoised** signal, at render resolution, not a post-SSD image. §4.1.14,
+"Output": *"Destination for the Denoised full resolution frame"* — denoised **and** upscaled to
+output resolution in one evaluate. Between those two it also takes diffuse albedo, specular
+albedo, packed normal+roughness, specular motion vectors and specular hit distance (§4.1.1–4.1.9)
+— G-buffer-shaped guides a screen-space denoiser and an upscaler would each want separately, fed to
+one network instead of two passes.
 
----
+State restoration after RR's evaluate is the identical documented obligation as DLSS-G's (§7.0
+again references `ProgrammingGuideManualHooking.md` §7.0 directly): *"host is responsible for
+restoring the command buffer(list) state after calling `slEvaluate`."*
 
-## D. Sources and provenance
+**Consequence for how we should read our own NR path.** This project's neural-rendering feature
+(feature 18, `CLAUDE.md`'s extensive NR sections) is architecturally closer to DLSS-RR than to
+DLSS-SR or DLSS-G — a display-adjacent neural pass consuming colour plus guides, once — but our
+current hook site (immediately after SR, still pre-tonemap) is **not** where the official RR
+pipeline puts the analogous pass. RR's own contract wants the noisy, undenoised, pre-upscale
+colour as input, i.e. it replaces the upscale-and-denoise step in the same place `ITemporalUpscaler`
+would sit (§A.3) — not a stage bolted on after it. Neither Streamline guide describes anything
+resembling this project's own HDR soft-clip/sRGB codec (§2.9 "The near-black NR output..." in
+`CLAUDE.md`), because RR's networks are trained end-to-end on the noisy/denoised domain directly
+rather than being handed a display-referred proxy of a already-upscaled image — a structural
+difference this project's own investigation already discovered from first principles and is worth
+keeping in mind as a difference, not an oversight, of our own port.
 
-| Source | What it is | Label |
-|---|---|---|
-| `AlexMercer-MA/UnrealEngine-4.27` | Public mirror of Epic's UE4 source. Verified: `Engine/Build/Build.version` reads `MajorVersion 4, MinorVersion 27, PatchVersion 2, BranchName "++UE4+Release-4.27"` | **HARD** |
-| `NVIDIA-RTX/Streamline` `docs/*.md` | NVIDIA's own published SDK documentation, v2.12.0. The repo ships both PDFs and Markdown twins; the Markdown was read | **HARD** |
-| `dev.epicgames.com` documentation | Epic's own published docs | **HARD** |
-| `flygod1159/Nvidia-DLSS-Plugin` | Third-party GitHub upload of NVIDIA's DLSS plugin. `DLSS.uplugin` reads `VersionName 2.3.2`, `EngineVersion 5.0.0`, `CreatedBy "NVIDIA"`. Source is version-guarded for UE4 (`#if ENGINE_MAJOR_VERSION == 4` branches throughout `DLSSDenoiser.h`), so the same tree targets 4.26/4.27 | **SOFT** |
-| `Adriwin06/Ultimate-CommonUI-Menu-System` | A UE project with NVIDIA's DLSS **and** Streamline plugins vendored under `Plugins/`. Used for `StreamlineViewExtension.{h,cpp}`. UE4 branches present | **SOFT** |
+## D. What this means for stray-dlss: hook or stage, per feature
 
-**Why the plugin mirrors are SOFT even though they read as genuine.** They carry real NVIDIA
-copyright headers, use RDG and NGX APIs correctly, are internally consistent with each other and
-with Epic's public API surface, and match Epic's published description of the integration. But they
-are not an NVIDIA-controlled distribution channel and no signature or checksum was verified. Treat
-every quote from them as strong corroboration, never as the sole basis for a decision.
+Grounded in A–C above, not opinion. Each answer cites the finding it rests on.
 
-**Two version caveats a reader must carry.** First, `ITemporalUpscaler::AddPasses` returns `void`
-with out-parameters in 4.27 and an `FOutputs` struct in UE 5.x; the plugin mirror read here is the
-5.x form, so its signature does **not** match the 4.27 interface quoted in §A.1. Second, in the
-newest plugins (UE 5.6-era) `FDLSSUpscaler` no longer derives from `ITemporalUpscaler` directly — a
-separate `FDLSSSceneViewFamilyUpscaler` does. Neither change alters any conclusion here, but both
-would break a naive copy of the code.
+**1. Super Resolution: our placement is the same point in the frame as the official plugin's, but
+reached by a different mechanism — and the official architecture gives no support for moving it.**
 
-**One thing that stayed UNCONFIRMED.** The `NVIDIA-RTX/Streamline` repository does not document the
-Unreal plugin's own hook point. §B.1's claim that Frame Generation uses `ISceneViewExtension` rests
-on the plugin mirror alone, corroborated by the fact that Streamline is engine-agnostic and could
-not plausibly do it any other way. If that claim ever becomes load-bearing for a decision, it wants
-a primary source.
+Colour space, resolution semantics and even the destination resource match exactly. Official DLSS
+SR runs between depth of field and motion blur, pre-tonemap, scene-linear HDR (§A.3) — precisely
+where our `FTAAStandaloneCS` hook already sits, because that dispatch *is* the pass being replaced.
+Official DLSS SR also writes its result into `TemporalAAHistory.RT[0]` (§A.3.1), the identical
+resource our `u0` write feeds into next frame's history — NVIDIA does this on purpose, not as a
+side effect of a hook point it didn't choose. So there is no daylight between "where NVIDIA's SR
+sits" and "where our SR sits": placement is right.
 
----
+The *mechanism* differs, and that difference is the entire hook-versus-native-extension question.
+Official SR reaches this point by being called from a first-class `ITemporalUpscaler::AddPasses`
+invocation the engine itself branches to (§A.2) — a real RDG pass, with `FViewInfo` handed in
+directly, no descriptor-table archaeology required. We reach the same point by intercepting a
+compute dispatch the engine issued for its *own* TAA and substituting our work inside it, then
+reading the View constant buffer by raw offset because nothing hands us an `FViewInfo`. **Nothing
+in A–C suggests our SR should become "a stage" in the sense of moving to a different point in the
+frame** — the frame position is right. What differs from official is only *how* we arrive there,
+and there is no ReShade-reachable way to arrive by the official route (see point 3).
 
-## E. What this means for this project
+**2. `ITemporalUpscaler` is real, engine-native, and reachable only by hooking the engine itself —
+not by anything ReShade's D3D12 event model exposes.**
 
-### E.1 Our SR placement is the official placement. Keep it
+The interface (§A.1) is registered on `FSceneViewFamily` before `AddPostProcessingPasses` runs,
+via `SetTemporalUpscalerInterface()` — a plain C++ virtual-dispatch call the engine's own game-
+thread view-family setup code makes (`ICustomStaticScreenPercentage::SetupMainGameViewFamily` in
+NVIDIA's plugin, §A.1). Everything about it — the header it's declared in
+(`Renderer/Private/PostProcess/TemporalAA.h`, not even a public header in 4.27.2), the `FViewInfo&`
+and `FRDGBuilder&` parameters `AddPasses` receives, the `FSceneViewFamily` member it plugs into —
+is pure engine C++ state, invisible to a graphics-API interception layer. ReShade's add-on events
+(`init_pipeline`, `bind_pipeline`, `dispatch`, ...) operate at the D3D12 command-list level and
+never see an `FViewInfo`, an `FSceneViewFamily`, or an `FRDGBuilder`; there is no `QueryInterface`
+or descriptor trick that reaches them, because they are never marshalled through D3D12 at all.
 
-**Yes, and not approximately.** The official plugin's `AddPasses` receives scene colour, scene depth
-and scene velocity, at the primary view rect, in linear pre-tonemap HDR carrying pre-exposure, and
-returns an image at the secondary view rect. Our hook intercepts the dispatch that consumes exactly
-those three textures at exactly that point and produces exactly that output. The engine's own TAA is
-one implementation of that slot and DLSS is another; the plugin swaps the pointer, we suppress the
-dispatch. **The net frame graph is the same.**
+**Using the real extension point from an injected DLL would require actual code execution inside
+the engine's own address space with knowledge of its C++ types and symbol layout** — the kind of
+access this project's UE4SS migration research (`docs/RESEARCH-UE4SS-MIGRATION.md`) already exists
+to evaluate, not something reachable while staying inside ReShade's device/command-list hooking
+model. This is a materially bigger step than converting a hook into a same-API-level "stage" (a
+different D3D12 command list at a different D3D12-visible point, e.g. present); it is a change of
+*what kind of program* is doing the interception. Worth naming as a real third option distinct from
+"hook vs. stage," but not something decidable from ReShade alone.
 
-The differences that remain are real but are consequences of being outside the engine, not of having
-picked a different site:
+**3. Ray Reconstruction, the closest official analogue to our NR, sits at the SAME pre-tonemap slot
+SR does — and Frame Generation's post-tonemap tap is a read-only capture, not a neural pass.**
 
-| | Official plugin | Us |
-|---|---|---|
-| Where NGX is recorded | the engine's D3D12 command list | the engine's D3D12 command list |
-| Output resource | a **new** RDG texture, `DLSSOutputSceneColor` | **in place** into the engine's `u0` |
-| State restore | invalidate `FD3D12StateCache` (2 calls) | save and restore ~8 categories by hand |
-| Camera cut | `!InputHistory.IsValid() \|\| View.bCameraCut` | plus a 1×1-SRV proxy for the first term |
-| Exposure | eye-adaptation texture **and** scalar `PreExposure` | `AutoExposure` flag |
-| Jitter | `View.TemporalJitterPixels`, passed through | `TemporalAAParams.zw`, passed through — identical |
-| Mip bias | free, from the engine | free, from the engine |
+This bears directly on the "should NR move to a post-tonemap, pre-UI stage" question, and the
+honest answer has two parts.
 
-**Nothing here argues for moving SR to a stage.** A stage at Present would be strictly worse: the
-image there is post-tonemap and display-resolution, which is not what a super-resolution feature
-consumes, and the engine's own TAA would still be running. **SR must stay a hook.**
+*Nothing in the official architecture puts a neural pass where we're considering moving ours.*
+DLSS-RR replaces the upscale-and-denoise step in the identical slot as SR — "Default up-scaling
+pass like for example TAAU goes here" is the alternate branch to RR's evaluate (§C) — consuming
+undenoised, pre-upscale colour, not a display-referred image. The only official feature that
+touches anything post-tonemap is Frame Generation, and what it takes there is a **read-only
+Hudless capture** of the fully composited pre-UI frame (§B.3: "after post-processing pass but
+before UI/HUD is added") — not a neural network evaluate that writes a residual back into the
+frame graph. So moving our NR post-tonemap would not be reproducing anything NVIDIA does; it would
+be a bespoke placement, justified entirely by our own measured feedback-loop problem
+(`CLAUDE.md`'s SSR/eye-adaptation sections), not by precedent.
 
-The one change §A.5 does suggest is worth weighing on its own merits: **writing to a scratch texture
-and copying, rather than writing into `u0` in place.** The official plugin never touches a resource
-with two roles, which is why it has no feedback-node problem. That is a smaller and better-understood
-change than moving the hook.
+*That said, the case for it stands on its own, and the official docs strengthen one part of it
+independently.* `CLAUDE.md` already derives, from UE 4.27.2 source, that nothing after the
+tonemapper is carried into next frame's `PrevFrameViewInfo` — a genuine engine fact, not an
+official-plugin fact, and it is what makes a post-tonemap NR site free of the feedback loop our
+pre-tonemap NR hook has. NVIDIA's own state-restoration requirement (§B.2: heaps, root signature,
+every root-parameter kind, PSO) applies identically wherever a neural evaluate is injected — moving
+NR's *hook site* changes nothing about that cost, because it is a property of running NGX from
+outside engine-authored command recording, not of *where* in the frame that happens. So: no
+official precedent for the destination, but no official obstacle either, and the reasons this
+project already has for the move (feedback-loop closure, HDR codec no longer needed once
+display-referred) stand independent of anything found here.
 
-### E.2 `ITemporalUpscaler` is reachable in principle, and here is the actual cost
-
-An injected DLL *could* use it. What it would take, all established above:
-
-1. **Get a pointer to the live `FSceneViewFamily`** on the game thread, before rendering begins. The
-   plugin does this from `ICustomStaticScreenPercentage::SetupMainGameViewFamily`, a callback we do
-   not receive. An injected DLL would have to reach the family another way — hooking a renderer
-   entry point that takes one.
-2. **Call `FSceneViewFamily::SetTemporalUpscalerInterface`.** It is `FORCEINLINE`
-   (`SceneView.h:1807`), so there is no exported symbol to import and probably no out-of-line copy
-   to call. In practice this means writing the `TemporalUpscalerInterface` member directly at its
-   offset in the family — a structure-offset problem, solvable but build-specific.
-3. **Supply an object whose vtable matches `ITemporalUpscaler` for this exact engine build**, and
-   whose `AddPasses` can accept an `FRDGBuilder&`, an `FViewInfo&` and RDG texture refs, and build
-   RDG passes. That is the expensive part: it means linking against, or reimplementing, enough of
-   RDG to add a pass — and RDG's internals are not ABI-stable across builds.
-4. **Set the screen-percentage interface too**, or the engine will not render at a reduced
-   resolution and there will be nothing to upscale.
-
-**Verdict: possible, and out of proportion to the benefit.** What it would buy is the two-line state
-restore, the real `InputHistory.IsValid()`, and the eye-adaptation texture. What it would cost is an
-RDG-compatible object built against a specific licensee build of 4.27.2, in a project whose only
-feedback loop is a log file from another machine. Our dispatch hook already gets the same pixels at
-the same point. **Do not pursue this for SR.** It is worth recording as the answer to "is there a
-supported seam", because there is, and because a future UE4SS-hosted plugin — which already executes
-inside the game's address space and already resolves engine symbols — changes the arithmetic enough
-that the question should be re-asked then, not now.
-
-### E.3 Yes: the official architecture supports SR staying put while NR moves post-tonemap
-
-This is the clearest answer the research gives, and it comes from NVIDIA's own choices rather than
-from our reasoning about them.
-
-**NVIDIA splits by what the feature consumes, not by convenience.**
-
-* **Super Resolution** consumes render-resolution, pre-tonemap, linear HDR scene colour plus depth
-  and velocity. It is hooked **mid-frame, inline, on the engine's command list**, at the temporal
-  upscale slot. (§A)
-* **Frame Generation** consumes display-resolution, **post-tonemap**, display-referred colour with
-  the HUD separated. Its guides are captured by a render-thread callback at
-  `EPostProcessingPass::VisualizeDepthOfField` — **the last pass of the chain, after the tonemapper,
-  before the UI** — and the feature is evaluated in the **presentation path**. (§B)
-
-Two features from one vendor, in one engine, deliberately hooked at two different points, because
-they eat different images. **That is exactly the split we are considering.**
-
-For our neural pass specifically, three things follow:
-
-1. **The post-tonemap, pre-UI site is not exotic — it is where NVIDIA puts its own post-tonemap
-   consumer.** `EPostProcessingPass::VisualizeDepthOfField` being last in the enum
-   (`SceneViewExtension.h:101-108`, HARD) makes "after the whole post chain, before Slate" a
-   *named* place in the engine, not a heuristic. Our `preui` back-buffer-ordinal detector is trying
-   to find that same boundary from outside; the ordinal is our proxy for a seam the engine actually
-   has.
-2. **A post-tonemap site removes the HDR codec problem by construction, not by tuning.** Feature 18
-   is display-referred; the engine's post-tonemap colour is display-referred. Every one of our
-   codec's moving parts — the soft-clip knee, the paper-white scale, exposure tracking — exists only
-   because our current site hands the network raw pre-exposed linear HDR. NVIDIA's post-tonemap
-   consumer needs none of that. Our own `CLAUDE.md` already documents that the codec is bypassed at
-   the post-tonemap sites; this research says that is the intended shape, not a shortcut.
-3. **NVIDIA copies rather than writing in place, and it does so precisely because the engine will
-   reuse the original.** `Streamline.SceneColorWithoutHUD` is a fresh texture filled by
-   `AddDrawTexturePass`. Our history-restore workaround is the in-place version of the same idea,
-   paid for every frame with two full-rect copies and one unverified resource-state assumption. A
-   post-tonemap stage needs neither, because nothing after the tonemapper is carried into the next
-   frame.
-
-**And one caution that cuts the other way.** NVIDIA does the post-tonemap capture from an
-`ISceneViewExtension` callback **inside the render thread's RDG graph** — a place where the engine
-hands it a well-defined `FScreenPassTexture` and manages barriers. Our `preui` site is a
-render-target *identity* test on the game's command list, with the resource state inferred rather
-than given. The site is right; the mechanism for reaching it is strictly harder from outside, and
-that difficulty is where our risk actually lives. It is the same difficulty that made the first
-`preui` attempt wreck a frame.
-
-### E.4 Frame generation: our stage is already the official shape
-
-Our FG runs as a stage on our own command list at Present. Streamline's default mode is a swapchain
-interposer that runs at Present; its manual-hooking mode requires the host to route present through
-`slUpgradeInterface` and guarantees `presentCommon()` runs every frame. **Presentation is where FG
-belongs, in NVIDIA's architecture and in ours.** No change indicated.
-
-The one gap worth naming: NVIDIA's FG gets **hudless colour and a UI alpha buffer**, tagged
-separately, with a stated blending contract and a documented quality cost for failing to separate
-them (§B.3, §B.4). Anything we do at Present sees the composited frame. That is a real quality
-ceiling on any injected FG, and it is documented by NVIDIA rather than speculative — "expect some
-image quality degradation on those elements". Knowing the exact contract
-(`Final_Color.RGB = UI.RGB + (1 - UI.Alpha) x Hudless.RGB`) at least tells us what a hudless capture
-would have to look like if we ever tried to produce one.
-
-### E.5 Summary table
-
-| Feature | Ours today | Official | Verdict |
-|---|---|---|---|
-| Super Resolution | hook, engine's command list, in the TAA dispatch | hook, engine's command list, at the temporal upscale slot | **Same. Keep it a hook.** |
-| Neural Rendering | hook, immediately after SR, linear pre-tonemap `u0` | no direct analogue; RR replaces the *denoisers*, and Streamline's post-tonemap consumer captures at the end of the post chain | **Site is wrong for a display-referred network. A post-tonemap, pre-UI stage is the officially-shaped placement.** |
-| Frame Generation | stage, our own command list, at Present | interposer or manual hook, at Present | **Same. Keep it a stage.** |
+**4. Frame Generation already matches the official architecture, and that is worth stating plainly
+rather than re-deriving.** DLSS-G's evaluate happens at present time, through either an automatic
+swapchain interposer or explicit manual-hook calls funnelled through the same `presentCommon()`
+(§B.2) — never inside a game-authored dispatch. This project's FG already runs as a stage on its
+own command list at Present. That is the one feature where "should this be a stage" is already
+settled, by both the official architecture and our own implementation, in the same direction.
