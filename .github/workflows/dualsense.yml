@@ -128,7 +128,7 @@ jobs:
               // an unresolved submix rather than register with a null one, which the engine
               // reads as the MASTER submix.
               if (sds::Rt().SubmixWantsBinding())
-                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, false, nullptr, 0);
+                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, false, nullptr, nullptr, nullptr, 0);
               sds::Rt().Shutdown();
           }
           BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
