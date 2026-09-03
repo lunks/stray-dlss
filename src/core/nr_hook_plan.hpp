@@ -104,4 +104,27 @@ struct EvaluateGapLatch
 void note_evaluate_gap(EvaluateGapLatch &latch);
 bool take_evaluate_reset(EvaluateGapLatch &latch);
 
+// THE HOLE THE REFUSAL PATH CANNOT SEE.
+//
+// note_evaluate_gap() is reached only from inside nr::apply(), so it covers exactly the frames NR
+// was ASKED about and declined. It cannot cover the frames NR was never asked about at all, and
+// those are not rare: apply() is called only when the TAA pass was intercepted AND the SR/RR
+// evaluate succeeded (src/taa_hook.cpp), and NgxNR=0 -> 1 deliberately KEEPS the existing feature
+// and its accumulated history across a gap of arbitrary length (nr::set_enabled). On every one of
+// those frames feature 18's history stands still while the world moves, and the next evaluate
+// reprojects across the whole gap with motion vectors that describe one frame.
+//
+// The sibling port does not need this because its pass is a fixed pipeline stage that runs every
+// frame, so its sticky flag sees every frame by construction:
+//
+//   "The snippet's temporal history is only meaningful if the evaluation before this one produced
+//    it [...] Sticky rather than a one-shot, so a run of failures keeps it armed until one
+//    succeeds."   (Kim2091/dxvk-remix @ gta4-atmos-dlss5, rtx_neural_uplift.h:214-226)
+//
+// Ours is a hook, not a stage, so the equivalent has to be asserted at the frame boundary: one
+// call per present, saying whether an evaluate actually happened in it. Idempotent with
+// note_evaluate_gap — a frame that declined has already armed the latch, and arming it twice is
+// still one reset.
+void note_frame_boundary(EvaluateGapLatch &latch, bool evaluated_this_frame);
+
 } // namespace stray_dlss::nrplan

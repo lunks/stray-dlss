@@ -152,3 +152,45 @@ TEST_CASE("a declined frame forces DLSSNR.Reset on the next evaluate, exactly on
 	CHECK(take_evaluate_reset(latch));
 	CHECK(take_evaluate_reset(latch) == false);
 }
+
+TEST_CASE("a frame NR was never ASKED about is a gap too")
+{
+	// The refusal path only fires from inside apply(), which is reached only when the TAA pass
+	// was intercepted and the SR/RR evaluate succeeded. Every other frame is invisible to it —
+	// and CLAUDE.md measures evaluates tracking dispatches at 99.7%, so those frames exist.
+	EvaluateGapLatch latch;
+
+	// A frame that evaluated arms nothing.
+	note_frame_boundary(latch, /*evaluated_this_frame=*/true);
+	CHECK(take_evaluate_reset(latch) == false);
+
+	// A frame that did not — with no refusal recorded anywhere, because apply() never ran —
+	// still arms the next evaluate.
+	note_frame_boundary(latch, /*evaluated_this_frame=*/false);
+	CHECK(take_evaluate_reset(latch));
+	CHECK(take_evaluate_reset(latch) == false);
+}
+
+TEST_CASE("a run of un-evaluated frames still costs exactly one reset")
+{
+	// NgxNR toggled off and back on keeps the feature and its history (nr::set_enabled), so the
+	// gap can be thousands of frames. It is still one hole and one reset.
+	EvaluateGapLatch latch;
+	for (int i = 0; i < 500; ++i)
+		note_frame_boundary(latch, /*evaluated_this_frame=*/false);
+	CHECK(take_evaluate_reset(latch));
+	CHECK(take_evaluate_reset(latch) == false);
+}
+
+TEST_CASE("the frame boundary only ever ARMS - it never clears a pending reset")
+{
+	// take_evaluate_reset() runs BEFORE the NGX call, so by the time the frame boundary is
+	// reached the reset has already been consumed. If the evaluate then failed, refuse_pre_evaluate
+	// re-armed the latch on purpose; a boundary that "saw an evaluate" must not undo that.
+	EvaluateGapLatch latch;
+	CHECK(take_evaluate_reset(latch) == false);
+
+	note_evaluate_gap(latch); // the evaluate failed and re-armed
+	note_frame_boundary(latch, /*evaluated_this_frame=*/true);
+	CHECK(take_evaluate_reset(latch)); // still armed
+}

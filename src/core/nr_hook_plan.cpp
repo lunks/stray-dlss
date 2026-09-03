@@ -41,4 +41,13 @@ bool take_evaluate_reset(EvaluateGapLatch &latch)
 	return pending;
 }
 
+void note_frame_boundary(EvaluateGapLatch &latch, bool evaluated_this_frame)
+{
+	// Only ever ARMS. A frame that did evaluate must not clear a pending reset, because the
+	// evaluate itself already consumed it (take_evaluate_reset runs before the NGX call) and a
+	// later failure in the same frame re-arms it deliberately.
+	if (!evaluated_this_frame)
+		latch.reset_pending = true;
+}
+
 } // namespace stray_dlss::nrplan
