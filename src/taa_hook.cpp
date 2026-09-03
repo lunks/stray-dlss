@@ -55,6 +55,14 @@ std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
 // Non-zero is the fix working: each one is a frame the old search would have taken the wrong
 // View for, and refused the real TAA dispatch over.
 std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
+// THE SEARCH'S OWN COST. Every bound root CBV the scan TRIES — one describe_resource and one
+// 2448-byte buffer read each — which is the work identity from the engine would replace. Against
+// the dispatch count it is candidates-per-dispatch, so "deleting the search saves X" becomes
+// arithmetic over a measurement rather than over a guess. Read it beside the criterion-4 note in
+// docs/RESEARCH-ENGINE-TAA-HOOK.md §15.4: the shadow's expensive half is the SRV/UAV table walk,
+// which colour-by-register and the u0 output still require, so this number bounds the saving from
+// above and is expected to be small against `shadow-copy`.
+std::atomic<std::uint64_t> g_view_cb_reads{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -698,6 +706,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
+		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
@@ -1968,6 +1977,11 @@ void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
+}
+
+std::uint64_t view_cb_read_count()
+{
+	return g_view_cb_reads.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

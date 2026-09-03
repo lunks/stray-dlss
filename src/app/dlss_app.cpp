@@ -1131,13 +1131,19 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		std::uint64_t r135_bad = 0;
 		std::uint64_t wrong_view = 0;
 		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view);
+		// What the search costs: one describe_resource + one 2448-byte read per candidate tried.
+		// This is the ONLY work that replacing the search with identity from the engine retires,
+		// so it bounds that saving from above (report §15.4).
+		const std::uint64_t cb_reads = taa_hook::view_cb_read_count();
 		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0)
 			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
 				"(candidates that were A View buffer but not THIS view - the search skipped "
-				"them; each was an unclaimed frame before facts 36.18)%s", when,
+				"them; each was an unclaimed frame before facts 36.18) | cbReads=%llu (what the "
+				"search costs: one describe+2448B read each)%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
 				static_cast<unsigned long long>(wrong_view),
+				static_cast<unsigned long long>(cb_reads),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"

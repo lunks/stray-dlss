@@ -991,6 +991,41 @@ tally on the periodic `[view]` line.
 > (`FSceneView::ViewUniformBuffer` matched against the bound CBV) is demoted from a correctness
 > fix to a **performance** change: it is what would let the descriptor shadow leave the hot path.
 > No urgency, and no reason to take risk for it.
+>
+> > **BOTH HALVES OF THAT PARAGRAPH ARE WRONG, AND THE SAME DAY OVERTURNED THEM (2026-09-03).**
+> > Kept verbatim because reading a correct measurement too broadly is the mistake worth seeing.
+> >
+> > **"The search is right" was too broad.** Row 135 proves the buffer IS **a** View uniform
+> > buffer; a shadow or capture view satisfies all three predictions, *because it is one*. The
+> > search was then measured taking a 4088x4088 view's buffer on ~1.2% of frames — and that WAS
+> > the flicker (facts §36.18-36.19). **A self-validating check tells you what KIND of thing you
+> > have, never WHICH one.**
+> >
+> > **"A performance change" was wrong too, and it was repeated as the justification for weeks.**
+> > `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §1.3 ranked the CB search as what keeps the descriptor
+> > shadow's 2.287 ms write side alive; read against `native_backend.cpp:174-308` it holds **one of
+> > nine root hooks and none of `shadow-copy`'s 1.644 ms**, which is the SRV/UAV table walk that
+> > colour-by-register and the output UAV `u0` still require. Replacing the search would save well
+> > under 0.5 ms of 2.9 ms. That document is corrected in place; the arithmetic is
+> > `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15.4.
+> >
+> > **So the justification is purely CORRECTNESS, and the open question is narrow:**
+> > `view_fits_dispatch` catches an impostor whose rect is LARGER than the dispatch covers; one
+> > that is SMALLER passes plausibility, row 135 and the fit bound alike and still wins on a lower
+> > root parameter. That subset is being counted now. **Zero means the search's answer was forced
+> > and there is nothing to fix. Non-zero means slot order has been choosing a temporal consumer's
+> > jitter, `ClipToPrevClip` and `CameraCut`** — §5's compounding-error class — and the
+> > replacement is worth building.
+> >
+> > **And the replacement is not the obvious one.** `FRHIUniformBuffer` has **no**
+> > `GetNativeResource` virtual (unlike `FRHITexture`, which is why L1 was cheap), and
+> > `FD3D12UniformBuffer`'s `ResourceLocation` offset is gated on `USE_STATIC_ROOT_SIGNATURE`, a
+> > build define we cannot observe. Two nested layout derivations with no self-validating constant
+> > is what §9 of the seam report forbids. The one defensible route DISCOVERS both offsets and
+> > validates them against five independent predictions — including the engine's own
+> > `OffsetFromBaseOfResource` matching our resource registry's bit for bit — exactly as the
+> > vtable scan validates against 0.5 and 2.0. Full design, guards and ladder:
+> > `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15. **Nothing of it is built.**
 
 **The method is the transferable part, and it cost nothing.** The predicate already existed; only
 the log line was missing. One line settled a question that would otherwise have justified a new
@@ -1315,6 +1350,36 @@ and the oracle is wrong. Also measured: ReShade's `init_resource`/`destroy_resou
 never carried the swapchain's back buffers, so a liveness set fed by them calls the back buffers
 dead. **The native backend (`[STRAYDLSS] NativeMode=drive`) is the one that survives all three
 hazards; the ReShade backend remains the default only until Stage 4.**
+
+**DO WE STILL NEED THE DESCRIPTOR SHADOW? Audited consumer by consumer 2026-09-03 — YES, and for
+exactly one reason (`docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §13).** It costs **2.913 ms/frame, 14% of
+a 20.2 ms frame**, and that has repeatedly been treated as a debt the engine seam would pay off. It
+will not. Three separate mechanisms get called "the shadow" and their consumers are almost disjoint:
+
+* **The descriptor shadow proper — `shadow-write` + `shadow-copy`, 1.694 ms, 58% of the total — has
+  exactly ONE reader on the shipping path**: the SRV/UAV table walk that names the output UAV `u0`
+  and scene colour by register. The differential observer needs `NativeMode=observe`; the pass
+  finder is off by default and its native `resolve_graphics_srvs` is not even implemented.
+* **`restore_game_compute_state` does NOT touch it.** It calls `root::snapshot` and replays opaque
+  table handles, so it keeps the **root** shadow (0.681 ms) alive and none of the 1.694 ms. That
+  correction matters because the restore was assumed to be the biggest consumer; the table walk is.
+* **`u0` has no engine route.** `AddPasses` writes `*OutSceneColorTexture`, but it is the
+  graph-allocated post-chain scene colour, so its `ResourceRHI` is assigned inside
+  `FRDGBuilder::Execute` — the window `docs/RESEARCH-ENGINE-TAA-HOOK.md` §14.2 enumerates and finds
+  to have no hookable point. The two things that would work are `r.RHICmdBypass=1` (disables the RHI
+  thread process-wide) and authoring our own RDG pass (§4.3: a template over shader-parameter
+  metadata, no ABI). **Both refused.**
+* **And the SR path cannot move to our own command list the way the NR stage did.** Present is the
+  wrong point in the frame (post, tonemap and next frame's SSR all read `u0` before it), and a
+  mid-frame `ExecuteCommandLists` of our own list would run BEFORE the game's still-unsubmitted
+  work, since one queue executes in submission order. **Ordering, and it is decisive.**
+
+**What can still be done, today and without the box:** stop shadowing RTV/DSV heaps unless
+`PassFinder` is on (their only readers are off), and add a read-bit per slot so the derived claim
+that **~2% of the 4059 descriptors copied per frame are ever looked up** becomes a measurement.
+**What must NOT be done:** storing dst→src and resolving lazily at lookup. That is ReShade's design
+and facts §16 convicted it over 137 811 slots — D3D12 copies descriptors by value, and a shadow that
+does the same is right.
 
 ### ReShade 6.8 add-on API
 

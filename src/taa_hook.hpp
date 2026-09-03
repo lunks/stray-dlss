@@ -111,4 +111,13 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
 
+// WHAT THE VIEW-CB SEARCH ITSELF COSTS: every bound root CBV it TRIED, one describe_resource and
+// one 2448-byte buffer read each. Divided by the dispatch count it is candidates-per-dispatch,
+// and it is the only part of the descriptor machinery that replacing the search with identity
+// from the engine would actually retire. **It bounds that saving from above, and the bound is
+// low** — the shadow's expensive half is `shadow-copy`, the SRV/UAV table walk that
+// colour-by-register and the `u0` output still require whatever happens to the CB search.
+// docs/RESEARCH-ENGINE-TAA-HOOK.md §15.4 has the arithmetic.
+std::uint64_t view_cb_read_count();
+
 } // namespace stray_dlss::taa_hook
