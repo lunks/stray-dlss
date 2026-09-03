@@ -2789,10 +2789,81 @@ count (four newer announcements), with the present counter only as an eight-pres
 so the correlation never depends on how presents relate to frames. The counter was renamed
 `lookalikesRefused` in the report line; `unclaimed` is the error metric.
 
-### 36.5 What is still UNCONFIRMED
+### 36.5 What was still UNCONFIRMED after §36.1-36.4
 
-* The cause of the 73 `unclaimed` (0.85%). Candidates: the two-present retire window of the
-  version that ran (announcements straddling a present under an RHI thread), and frames whose
-  announced dispatch the structural matcher itself rejected. The retire change addresses the
-  first; the authoritative mode's periodic `[seam]` line reports the number directly.
-* `EngineSeam=3` (the announcement as the gate) has not run on the box at the time of writing.
+* The cause of the 73 `unclaimed` (0.85%). **Answered in §36.7.**
+* `EngineSeam=3` (the announcement as the gate). **Answered in §36.6.**
+
+### 36.6 `EngineSeam=3` is authoritative and correct (2026-09-03, main menu, no injected input)
+
+A Steam launch sitting in the main menu, DLL from CI run 33786788579 (`5ccf0a5`):
+
+```
+ENGINE SEAM MODE: authoritative ([STRAYDLSS] EngineSeam=3, EngineSeamFallback=1)
+ENGINE SEAM FOUND: ITemporalUpscaler vtable at 0x6ffffb3b1730 (base=0x6ffff7680000, 82 MB in 186.5 ms) ... candidates: name=1 getDebugName=1 vtable=1
+ENGINE SEAM INSTALLED ... MODE=AUTHORITATIVE
+ENGINE SEAM AUTHORITATIVE: first announced pass claimed - 0x901e041a7cadc9db, 480x270 groups, engine rect 3840x2160, matcher rect 3840x2160, render 1920x1080, cooked-hash=yes
+DLSS did not run for pass 0xe3ddca4be9830076: the engine's ITemporalUpscaler::AddPasses announced no primary temporal upscale this dispatch fits ([STRAYDLSS] EngineSeam=3)
+DLSS did not run for pass 0x42af595f8ff91038: (same)
+```
+
+* The discovery numbers reproduce across launches at a different base (`0x6ffff7680000` here
+  against `0x6ffff7140000` in §36.1); the vtable's image offset is the same `0x3D31730`.
+* **Both look-alikes are now refused by the engine's answer rather than by the cooked-hash
+  whitelist.** That is the whole point of level 3: the hash table is an assertion.
+* The engine's rect and the matcher's rect agreed exactly (3840x2160) on the claimed pass, and
+  the pass is the expected `0x901e041a7cadc9db` at 480x270 groups.
+* **The seam fires on frame 0**, so the entire verdict is readable from the main menu.
+
+### 36.7 `unclaimed` IS the user's "DLSS flip", and it is the input gate, not identity
+
+Six consecutive periodic lines from that session, with NR's own counters beside them:
+
+```
+[seam] frame  600: announced= 603 claimed= 601 unclaimed= 0 orphans=0 lookalikesRefused=0
+[seam] frame 1200: announced=1203 claimed=1197 unclaimed= 3 orphans=0 lookalikesRefused=0
+[seam] frame 1800: announced=1803 claimed=1794 unclaimed= 6 orphans=0 lookalikesRefused=392
+[seam] frame 2400: announced=2403 claimed=2390 unclaimed=10 orphans=0 lookalikesRefused=656
+[seam] frame 3000: announced=3003 claimed=2975 unclaimed=25 orphans=0 lookalikesRefused=909
+[seam] frame 3600: announced=3603 claimed=3553 unclaimed=47 orphans=0 lookalikesRefused=1130
+
+[frame 1200] NR STAGE: ... guides-absent=121 guides-stale=6   NR RESETS: total=8  from: frame-gap=7
+[frame 3600] NR STAGE: ... guides-absent=121 guides-stale=50  NR RESETS: total=47 from: frame-gap=45
+```
+
+**`unclaimed` tracks `guides-stale` tracks NR `frame-gap` resets at every checkpoint**, and the
+rate accelerates: 0 in the first 600 frames, 22 in the last 600. The chain is:
+
+> engine announced -> no dispatch we accepted -> SR skipped the frame -> the TAA hook published
+> no guides -> the NR present stage declined (`guides-stale`) -> the next NR evaluate carries
+> `DLSSNR.Reset` -> a whole-screen discontinuity.
+
+`guides-absent=121` is startup and constant; it is not part of this.
+
+**The only per-pass refusal logged for the real pass in that whole session:**
+
+```
+DLSS did not run for pass 0x901e041a7cadc9db: its depth or velocity SRV is missing or not known
+live. First occurrence for this pass and reason only.
+```
+
+printed **once, by design** — which is why the RATE was invisible for as long as it was. So
+identity was solved and **acceptance of the INPUTS was not**: the heuristic still decided the
+register roles and still took ReShade's `view->resource` map as the liveness authority, on a
+frame the engine had already named. The menu is where it bites hardest — scene colour is
+`R11G11B10` there and the CRT/video surfaces churn resources every frame.
+
+**SOFT** that the liveness rule is the whole of it; the per-reason counters added in the same
+change (`notClaimed` / `claimedButNoSR: deadInputs, roleUnresolved, mvFailed, createFailed,
+evalFailed` / `evaluated`, all continuous) are what settle it in one menu launch.
+
+### 36.8 What is still UNCONFIRMED
+
+* **The L1 offsets.** `FRDGResource::ResourceRHI` at +16 and `FRHITexture::GetNativeResource` at
+  vtable slot 7 are [derived] from UE 4.27.2's Shipping layout and have not been seen on this
+  executable. The `ENGINE SEAM L1` first-resolve line and the `[seam]` line's `l1: resolved= /
+  partial= / fellBack=` group are what confirm or refute them; a wrong offset falls back and is
+  counted, and cannot reach DLSS, because every resolved pointer must be one our own resource
+  registry already knows.
+* Whether `unclaimed` reaches 0 with the engine's inputs in place, and whether `guides-stale`
+  and `frame-gap` follow it down.

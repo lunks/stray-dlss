@@ -32,7 +32,7 @@ not re-litigated below.
 | Rung | What it is | Feasible? | Status |
 |---|---|---|---|
 | **L0 ORACLE** | Stand in for `FDefaultTemporalUpscaler::AddPasses` via its vtable; read the engine's own output rect and input textures; cross-check the heuristic matcher against it | **Yes, and cheaply.** One string anchor, one qword patch, three exact self-checks, no code signature, no engine headers | **MEASURED ON THE BOX 2026-09-03** (§10, facts §36): found at every stage with one candidate, installed, forwarding, `orphans=0` over 8570 announcements, two look-alikes caught. **Now THE GATE**: `EngineSeam=3` is the default and DLSS SR runs only on the announced dispatch |
-| **L1 IDENTIFY** | Map the `FRDGTextureRef`s L0 hands us to `ID3D12Resource*` so interception targets the engine's resources by identity | **Probably, and the last hop is trivial** — `FRHITexture::GetNativeResource()` is a virtual returning `ID3D12Resource*`. Two derived offsets stand in the way, and the RDG resource is null at `AddPasses` time for graph-allocated textures | **Not built.** Needs L0's log first: the same log line that proves L0 also says whether the RHI pointers are non-null there |
+| **L1 IDENTIFY** | Map the `FRDGTextureRef`s L0 hands us to `ID3D12Resource*` so interception targets the engine's resources by identity | **Yes** — `FRHITexture::GetNativeResource()` is a virtual returning `ID3D12Resource*`; two derived offsets, and the null-at-`AddPasses` problem is solved by resolving at CLAIM time instead | **BUILT** (§11), `EngineSeamInputs=1`. The offsets are still [derived]; a failure falls back and is counted |
 | **L2 OWN IT** | Register our own `ITemporalUpscaler` on the view family and implement `AddPasses` | **The registration is feasible and is NOT the hard part.** Implementing `AddPasses` from an injected DLL means authoring RDG passes and reading `FViewInfo`, and `FViewInfo` is a Renderer-private class of ~180 heavily `#if`-conditioned members. **Do not attempt the full replacement.** The *useful half of L2 is already what L0 does* | **Subsumed.** See §4.3 |
 
 **The load-bearing discovery, and it is the reason L0 is worth doing at all:**
@@ -689,3 +689,106 @@ follow-up once a level-3 session has come back with `unclaimed=0` and DLSS on th
 The one row that stays regardless is the liveness check on the announced pass's own resources:
 the announcement says *which* dispatch, not that its resources are alive under ReShade's stale
 view map.
+
+
+---
+
+## 11. L1, and what level 3 exposed (2026-09-03)
+
+`EngineSeam=3` ran on the box from the main menu. It is authoritative and correct — and it
+showed that **identity was only half the problem**. Full lines in facts §36.6-36.8.
+
+### 11.1 The measurement
+
+`orphans=0` throughout, both look-alikes refused by the engine's answer rather than by the hash
+list, the claimed pass exactly `0x901e041a7cadc9db` at 480x270 groups with the engine's rect and
+the matcher's rect agreeing. And yet:
+
+```
+[seam] frame  600: announced= 603 claimed= 601 unclaimed= 0  ...
+[seam] frame 3600: announced=3603 claimed=3553 unclaimed=47 ...
+
+[frame 1200] NR STAGE: ... guides-stale=6   NR RESETS: total=8  from: frame-gap=7
+[frame 3600] NR STAGE: ... guides-stale=50  NR RESETS: total=47 from: frame-gap=45
+```
+
+**`unclaimed` ~ `guides-stale` ~ NR `frame-gap` at every checkpoint, accelerating.** The engine
+announced its primary upscale, we did not intercept it, SR skipped the frame, the TAA hook
+published no guides, NR declined and its next evaluate carried a `DLSSNR.Reset` — a whole-screen
+discontinuity. That is the flip the user reports, and it is now a counter rather than a story.
+
+### 11.2 The cause: the heuristic still gated the INPUTS
+
+Level 3 replaced the heuristic as the authority on *which dispatch*. It did not touch the two
+things that decide whether that dispatch is usable:
+
+* **the register walk** that assigns depth / velocity / colour / output roles, and
+* **`is_resource_live`**, i.e. ReShade's `view->resource` map, as the liveness authority.
+
+The only per-pass refusal logged for the real pass all session was *"its depth or velocity SRV is
+missing or not known live"* — printed **once, by design**, which is exactly why the rate stayed
+invisible. The menu is the worst case for it: scene colour is `R11G11B10` there and the animated
+CRT/video surfaces churn resources every frame.
+
+### 11.3 Fix one: every unclaimed frame explains itself
+
+The `[seam]` line now carries continuous per-reason counters, split by how far the frame got:
+
+```
+| notClaimed: noDispatch=N | claimedButNoSR: deadInputs=N roleUnresolved=N mvFailed=N
+  createFailed=N evalFailed=N | evaluated=N | l1: resolved=N partial=N fellBack=N
+```
+
+`noDispatch` is the ledger's `unclaimed` — the matcher rejected the real dispatch, so it never
+reached `claim()`. The `claimedButNoSR` group is a claimed engine dispatch failing downstream.
+**Their sum is the number of frames that published no guides**, which is what NR reports as
+`guides-stale`. The once-per-pass WARN stays: it answers "which gate", the counters answer "how
+often", and conflating them is what cost this round trip.
+
+### 11.4 Fix two: L1 — the engine's own textures
+
+`AddPasses` hands us `FPassInputs{SceneColorTexture, SceneDepthTexture, SceneVelocityTexture}`.
+Those are now resolved **at claim time** — during graph execution, which is where a
+graph-allocated texture finally has an RHI resource (§4.2's obstacle 2, solved by moving the read
+rather than by guessing):
+
+```
+FRDGTexture* --(+16)--> FRHITexture* --(vptr, slot 7)--> GetNativeResource() --> ID3D12Resource*
+```
+
+When they resolve they **replace** the register-role guesses and the liveness verdict for that
+frame. The justification is not convenience: *a resource the engine is about to bind is alive by
+construction*, and no `view->resource` map can be more authoritative than the engine naming it.
+The heuristic's answer is kept as an **assertion** — one WARN per session when the two differ,
+naming both pointers — and as a **counted fallback**.
+
+**Both offsets are [derived] and UNCONFIRMED on this executable**, so the live path is guarded in
+depth and the pure part is fully testable:
+
+* `seam::resolve_rhi_fn` walks the chain through caller-supplied `read_u64` / `is_code`
+  callbacks and returns a **status**, never dereferencing anything itself. All seven outcomes are
+  exercised against a synthetic object graph in `tests/test_engine_seam.cpp` — including
+  `rhi_null`, which is the AddPasses-time case the design exists to avoid.
+* Live, a wrong offset must pass **five** filters to do harm: alignment and canonical range on
+  every pointer; the vtable inside the game's own module; the function pointer inside an
+  executable section; and finally the returned `ID3D12Resource*` must be one **our own resource
+  registry already knows is live**. Anything else falls back and increments `l1: fellBack`.
+
+`[STRAYDLSS] EngineSeamInputs` (default 1) turns L1 off without leaving level 3, so the two
+changes can be separated on the box.
+
+### 11.5 The test, and it needs no input
+
+**Target: `unclaimed=0` in the main menu**, with `guides-stale` and NR `frame-gap` following it
+to 0. A Steam launch that sits in the menu is the whole test — the seam fires on frame 0 and the
+menu runs the TAA pass. Read, in order:
+
+1. `ENGINE SEAM L1: first resolve of the engine's own FPassInputs ...` — the three pointers with
+   their chain status and whether the registry recognised each. **This line is what confirms the
+   two [derived] offsets.** Its absence, or `registered=0`, means L1 never engaged and the
+   `l1: fellBack=` counter will say so.
+2. `[seam] frame N: ... unclaimed=0 ... | claimedButNoSR: all zero | l1: resolved=N`.
+3. `NR STAGE: ... guides-stale=0` and `NR RESETS: ... frame-gap=0`.
+
+If `unclaimed` is still non-zero, the breakdown now says which of the six gates to fix, which is
+the thing this round trip bought whatever else it settles.

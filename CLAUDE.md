@@ -540,6 +540,22 @@ Config and saves live in the **Proton prefix**:
 > readable from the main menu — the seam fires on frame 0 — and the periodic `[seam]` line's
 > `unclaimed` must stay 0 (`lookalikesRefused` is expected to grow: that is the two passes above
 > being told no, every frame). Nothing below is deleted yet; under level 3 it is bypassed.
+>
+> **AND LEVEL 3 EXPOSED THE OTHER HALF (2026-09-03, facts §36.6-36.8).** Identity was solved and
+> the frames still flipped: `unclaimed` ~ NR `guides-stale` ~ NR `frame-gap` resets at every
+> checkpoint, accelerating, because the heuristic still gated **acceptance of the INPUTS** — the
+> register walk for the roles and ReShade's `view->resource` map for liveness — on a dispatch the
+> engine had already named. The one refusal logged for the real pass was *"depth or velocity SRV
+> missing or not known live"*, printed **once by design**, so the rate was invisible. **L1 fixes
+> it**: `AddPasses` hands us `FPassInputs`, and those three `FRDGTexture*` are resolved at CLAIM
+> time (`ResourceRHI`@16 -> the `FRHITexture` vptr -> `GetNativeResource` at slot 7 ->
+> `ID3D12Resource*`) and REPLACE the role guesses and the liveness verdict — a resource the engine
+> is about to bind is alive by construction. The heuristic stays as an assertion and as a counted
+> fallback (`[STRAYDLSS] EngineSeamInputs`, default 1). **Both offsets are [derived] and
+> UNCONFIRMED on this exe**; a wrong one must pass five guards, the last being that our own
+> registry recognises the pointer, or it falls back and is counted. The `[seam]` line now carries
+> continuous per-reason counters (`notClaimed` / `claimedButNoSR` / `evaluated` / `l1:`) — the
+> WARN says *which* gate, the counters say *how often*, and conflating them cost a round trip.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
