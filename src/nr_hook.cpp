@@ -193,7 +193,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	g_bb_h.store(src.Height, std::memory_order_relaxed);
 	g_bb_fmt.store(static_cast<std::uint32_t>(src.Format), std::memory_order_relaxed);
 
-	const nrp::TypedUavSupport uav = nrstage::probe(device, static_cast<int>(src.Format));
+	const nrstage::TypedUavSupport uav = nrstage::probe(device, static_cast<int>(src.Format));
 
 	nrplan::ColourDesc cd;
 	cd.width = static_cast<std::uint32_t>(src.Width);
@@ -264,9 +264,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	nrstage::record_capture(cmd, colour, bb_state, issue_barrier, &bctx);
 
 	nr::ApplyInputs ni;
-	ni.site = nr::Site::post_tonemap;
 	ni.image = staging;
-	ni.render_color = nullptr;
 	ni.depth = guides.depth;
 	ni.motion_vectors = guides.motion_vectors;
 	ni.render_width = guides.render_width;
@@ -279,13 +277,12 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// accumulation, so dropping this on the way to a new site would reintroduce exactly the bug
 	// the TAA path already fixed once.
 	ni.reset = guides.reset;
-	// THE HDR CODEC IS BYPASSED HERE and every codec term with it: the back buffer is
+	// THERE IS NO HDR CODEC ON THIS PATH, and that is why this site exists. The back buffer is
 	// R10G10B10A2_UNORM with no SetColorSpace1 anywhere, i.e. SDR display-encoded already
-	// (docs/STRAY-RENDERING-FACTS.md §33), which is the network's own domain. Encoding it again
-	// would apply a transfer that has already been applied. So one_over_pre_exposure stays 0 and
-	// pre_exposure_ok stays false — not "unknown", but "there is no pre-exposure here to undo".
-	ni.one_over_pre_exposure = 0.0f;
-	ni.pre_exposure_ok = false;
+	// (docs/STRAY-RENDERING-FACTS.md §33), which is the network's own domain — so the frame goes
+	// to feature 18 exactly as the game drew it. The soft-clip/sRGB proxy and the residual
+	// transfer existed only to make the TAA site's raw pre-exposed linear HDR presentable to a
+	// display-referred network; that site is gone and they went with it (2026-09-03).
 	// 0 = "derive", which reaches the same 1.0 the TAA site's live A/B settled on. The gate's
 	// colour/guide ratio is REPORTED (plan.mvec_scale_*, in the periodic line) rather than sent,
 	// so the two can be compared on the box before either is changed. See nrplan::Plan.

@@ -587,9 +587,6 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 		return false;
 	}
 
-	// Under post_process the network works at OUTPUT resolution (Color is already upscaled),
-	// so Width/Height are the output rect and Scale is 1. Under sr_shaped it upscales, so
-	// Width/Height are the render rect.
 	// The network works at OUTPUT resolution: Color is already upscaled when it reaches us, so
 	// Width/Height are the output rect and the scaling ratio is 1. (DLSSNR.ScalingRatio is inert
 	// in this runtime anyway: read, then overwritten with 1.0f.)
@@ -618,9 +615,9 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	g_params->Set(kStyle, g_style);
 
 	STRAY_LOG_WARN("NR: creating NGX feature 18 (Reserved18 / DLSSNR) %ux%u -> %ux%u, "
-		"topology=%s, intensity=%.2f localTone=%.2f localStructure=%.2f skinStructure=%.2f "
+		"intensity=%.2f localTone=%.2f localStructure=%.2f skinStructure=%.2f "
 		"preset=%u style=%u autoMask=%u uiCorrection=%u scalingRatio=%.3f...",
-		in_w, in_h, out_w, out_h, post ? "post-process" : "sr-shaped",
+		in_w, in_h, out_w, out_h,
 		g_intensity, g_local_tone, g_local_structure, g_skin_structure,
 		g_preset, g_style, g_auto_mask, g_ui_correction,
 		out_w > 0 && in_w > 0 ? static_cast<double>(out_w) / static_cast<double>(in_w) : 1.0);

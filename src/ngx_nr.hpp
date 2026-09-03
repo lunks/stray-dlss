@@ -120,19 +120,9 @@ struct ApplyInputs
 	// class of bug this project has already been bitten by once.
 	bool reset = false;
 
-
-	// View row 135.z, `OneOverPreExposure`, already parsed by core/view_params.cpp. Used only by
-	// the TAA site's codec, and only when NgxNRTrackExposure is on. <= 0 or non-finite means the
-	// View constant buffer was not readable this frame, and the codec falls back to its static
-	// scale rather than multiplying by a garbage value.
-	float one_over_pre_exposure = 0.0f;
-	// ue4::pre_exposure_plausible on the View CB this frame. False means keep the previous
-	// smoothed exposure rather than walking it somewhere wrong on a stale read.
-	bool pre_exposure_ok = false;
-
-	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from the topology", which is
-	// what BOTH sites pass today and which reaches 1.0 — the value the user's own live A/B settled
-	// on (CLAUDE.md, 2026-09-01), overturning a code-reading argument for the ratio. The present
+	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive", which is what the present
+	// stage passes today and which reaches 1.0 — the value the user's own live A/B settled on
+	// (CLAUDE.md, 2026-09-01), overturning a code-reading argument for the ratio. The present
 	// stage's colour rect is the BACK BUFFER's, which is not necessarily the TAA output rect the
 	// guides were sized against, so its gate COMPUTES the ratio and reports it in the periodic NR
 	// STAGE line rather than sending it: the two numbers can then be compared on the box before
