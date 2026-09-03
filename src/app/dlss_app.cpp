@@ -94,6 +94,11 @@ struct State
 	std::atomic<bool> ngx_enabled{ false };
 	std::atomic<bool> ngx_attempted{ false };
 	std::atomic<uint32_t> shader_census{ 0 };
+
+	// [STRAYDLSS] StatusFile / StatusFileFrames. The status file is rewritten every N
+	// presents; turn it off (or raise the interval) when chasing a periodic hitch.
+	std::atomic<bool> status_file_enabled{ true };
+	std::atomic<uint32_t> status_file_frames{ 30 };
 };
 
 State g_state;
@@ -332,6 +337,22 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool ngx_evaluate = false;
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
 	taa_hook::set_ngx_evaluate(ngx_evaluate);
+
+	// [STRAYDLSS] StageFile, default ON: the per-dispatch crash breadcrumb
+	// (stray-dlss-stage.txt). Turn this off when chasing a periodic hitch.
+	taa_hook::set_stage_file(host::cfg::get_bool("StageFile", true));
+
+	// [STRAYDLSS] StatusFile, default ON: the machine-readable heartbeat rewritten every
+	// StatusFileFrames presents (stray-dlss-status.txt). Turn StatusFile off, or raise
+	// StatusFileFrames, when chasing a periodic hitch — this is a per-N-frames file write.
+	g_state.status_file_enabled.store(host::cfg::get_bool("StatusFile", true), std::memory_order_relaxed);
+	{
+		int status_file_frames = 30;
+		status_file_frames = host::cfg::get_int("StatusFileFrames", status_file_frames);
+		if (status_file_frames < 1)
+			status_file_frames = 1;
+		g_state.status_file_frames.store(static_cast<uint32_t>(status_file_frames), std::memory_order_relaxed);
+	}
 
 	// DLSS Frame Generation's NGX half (src/ngx_fg.hpp). The present-twice path itself is the
 	// present owner's ([STRAYDLSS] NgxFG, read there); these are the feature's own knobs. The
@@ -1117,8 +1138,12 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		gbuffer_finder::on_present(frame);
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
-	// looking at the screen. Rewritten in place every 30 frames; cheap and always current.
-	if ((frame % 30) == 0)
+	// looking at the screen. Rewritten in place every StatusFileFrames presents (default 30);
+	// cheap and always current. [STRAYDLSS] StatusFileFrames (default 30) sets the cadence;
+	// the census below (read by the overlay/log via DlssApp::status()) keeps updating on that
+	// cadence regardless. [STRAYDLSS] StatusFile (default ON) gates only the file WRITE — turn
+	// it off, or raise StatusFileFrames, when chasing a periodic hitch.
+	if ((frame % g_state.status_file_frames.load(std::memory_order_relaxed)) == 0)
 	{
 		uint32_t census = 0;
 		{
@@ -1128,7 +1153,8 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		g_state.shader_census.store(census, std::memory_order_relaxed);
 
 		std::FILE *f = nullptr;
-		if (fopen_s(&f, "stray-dlss-status.txt", "w") == 0 && f != nullptr)
+		if (g_state.status_file_enabled.load(std::memory_order_relaxed) &&
+			fopen_s(&f, "stray-dlss-status.txt", "w") == 0 && f != nullptr)
 		{
 			std::fprintf(f, "frame=%llu\n", static_cast<unsigned long long>(frame));
 			std::fprintf(f, "shader_census=%u\n", census);

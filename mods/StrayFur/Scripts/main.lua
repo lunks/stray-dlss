@@ -29,6 +29,12 @@
 ------------------------------------------------------------------ configuration
 local TIER1 = true          -- apply the HD-screenshot material scalars
 local TIER2 = true          -- raise shell count / length
+-- The fallback poll (below, under "triggers"): one FindFirstOf + reflection walk every
+-- POLL_INTERVAL_MS on the game thread. Turn POLL_ENABLED off when chasing a periodic hitch —
+-- NotifyOnNewObject alone may not catch every spawn (see the UNCONFIRMED note below), so
+-- this is a diagnostic knob, not a safe default to ship off.
+local POLL_ENABLED     = true
+local POLL_INTERVAL_MS = 2000
 -- MEASURED on the first launch (2026-09-02): the PLAYER cat ships LayerCount=16,
 -- FurLength=1.15, ShellBias=1.0, MinScreenSize=0 - twice the companion cats' 8. So 16 was
 -- a no-op; anything that should be felt as "more fur" has to go above it.
@@ -206,16 +212,20 @@ pcall(function()
     log("registered NotifyOnNewObject for BP_CatPawn_C")
 end)
 
--- Fallback: poll for a live pawn. One FindFirstOf every 2 s ON THE GAME THREAD, idempotent
--- via `done`.
-LoopAsync(2000, function()
-    pcall(function()
-        ExecuteInGameThread(function()
-            local ok, pawn = pcall(function() return FindFirstOf("BP_CatPawn_C") end)
-            if ok and pawn and pawn:IsValid() then pcall(applyTo, pawn) end
+-- Fallback: poll for a live pawn. One FindFirstOf every POLL_INTERVAL_MS ON THE GAME THREAD,
+-- idempotent via `done`. Gated by POLL_ENABLED (configuration, above).
+if POLL_ENABLED then
+    LoopAsync(POLL_INTERVAL_MS, function()
+        pcall(function()
+            ExecuteInGameThread(function()
+                local ok, pawn = pcall(function() return FindFirstOf("BP_CatPawn_C") end)
+                if ok and pawn and pawn:IsValid() then pcall(applyTo, pawn) end
+            end)
         end)
+        return false   -- keep looping; level loads recreate the pawn
     end)
-    return false   -- keep looping; level loads recreate the pawn
-end)
+else
+    log("POLL_ENABLED=false: relying on NotifyOnNewObject only")
+end
 
 log(string.format("loaded: tier1=%s tier2=%s layers=%d", tostring(TIER1), tostring(TIER2), LAYERS))
