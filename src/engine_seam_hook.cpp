@@ -70,7 +70,6 @@ std::uint64_t g_outcomes[static_cast<std::size_t>(seam::SeamRefusal::count)] = {
 std::uint64_t g_l1_resolved = 0;      // all three of colour/depth/velocity came back registered
 std::uint64_t g_l1_partial = 0;       // depth+velocity resolved, colour did not
 std::uint64_t g_l1_fell_back = 0;     // neither depth nor velocity resolved; heuristic used
-std::uint64_t g_l1_chain[static_cast<std::size_t>(seam::RhiChain::count)] = {};
 bool g_l1_first_logged = false;
 bool g_l1_disagree_logged = false;
 
@@ -454,10 +453,6 @@ std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &regis
 	std::uint64_t rhi = 0;
 	std::uint64_t fn = 0;
 	status = seam::resolve_rhi_fn(reader, rdg, &rhi, &fn);
-	{
-		std::lock_guard<std::mutex> lock(g_mutex);
-		++g_l1_chain[static_cast<std::size_t>(status)];
-	}
 	if (status != seam::RhiChain::ok)
 		return 0;
 

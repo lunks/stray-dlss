@@ -2028,16 +2028,19 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								fd.output_width, fd.output_height);
 						}
 
-						if (seam_gate == seam::Gate::engine &&
-							(!dims_ok || colour == nullptr || output == nullptr))
+						// ensure_feature is called EXACTLY ONCE per dispatch. It creates and
+						// releases the NGX feature, so calling it twice to answer "did it
+						// fail?" separately from "shall we evaluate?" would have doubled the
+						// create/release traffic on every frame.
+						const bool roles_ok =
+							dims_ok && colour != nullptr && output != nullptr;
+						const bool feature_ok = roles_ok && ngx::ensure_feature(native, fd);
+						if (seam_gate == seam::Gate::engine && !roles_ok)
 							seamhook::note_outcome(seam::SeamRefusal::role_unresolved);
-						else if (seam_gate == seam::Gate::engine && dims_ok &&
-							colour != nullptr && output != nullptr &&
-							!ngx::ensure_feature(native, fd))
+						else if (seam_gate == seam::Gate::engine && !feature_ok)
 							seamhook::note_outcome(seam::SeamRefusal::create_failed);
 
-						if (dims_ok && colour != nullptr && output != nullptr &&
-							ngx::ensure_feature(native, fd))
+						if (feature_ok)
 						{
 							// Our resolve just wrote the motion vectors as a UAV; NGX reads
 							// them as a shader resource. Without this the state is simply
