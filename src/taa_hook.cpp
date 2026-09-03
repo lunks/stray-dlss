@@ -55,28 +55,6 @@ std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
 // Non-zero is the fix working: each one is a frame the old search would have taken the wrong
 // View for, and refused the real TAA dispatch over.
 std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
-// [STRAYDLSS] ViewCbAudit (default 1). Keeps scanning the bound constant buffers after the
-// winner so the SILENT half of the wrong-view bug can be measured. Costs one extra
-// describe_resource + 2448-byte read per surviving candidate per candidate dispatch; set 0 to
-// restore the old stop-at-the-winner scan exactly.
-bool g_view_cb_audit = true;
-// THE RESIDUE, and it is the number this audit exists for. `ambiguous` counts candidate
-// dispatches where two DISTINGUISHABLE View buffers both survived plausibility, row 135 and the
-// fit bound, so slot order alone decided which view DLSS was told about. `ambiguousClaimed`
-// restricts that to dispatches that went on to claim the ENGINE's own announcement, i.e. the
-// real primary temporal upscale — that is the count of frames where DLSS SR may have been fed
-// another view's jitter, ClipToPrevClip and CameraCut with nothing firing. `single` is the
-// forced case: exactly one survivor, so the search had no choice to get wrong.
-std::atomic<std::uint64_t> g_view_single{ 0 };
-std::atomic<std::uint64_t> g_view_ambiguous{ 0 };
-std::atomic<std::uint64_t> g_view_ambiguous_claimed{ 0 };
-std::atomic<std::uint32_t> g_view_ambiguous_logged{ 0 };
-constexpr std::uint32_t kViewAmbiguousLogLimit = 4;
-// Every bound root CBV the search TRIES, i.e. one describe_resource + one 2448-byte read each.
-// This is the search's own cost, and it is what identity-from-the-engine would replace: divide it
-// by the dispatch count to get candidates per dispatch. Without it "deleting the search saves X"
-// is arithmetic over a guess.
-std::atomic<std::uint64_t> g_view_cb_reads{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -715,22 +693,11 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// Try every bound constant buffer and keep the first that decodes to a plausible View.
 	// Guessing a register would be fragile: b3, b4 and b5 have all been observed carrying it
 	// on different passes.
-	//
-	// THE SCAN NO LONGER STOPS AT THE WINNER, and that is the whole point of ViewCbAudit. The
-	// first surviving candidate is still what DLSS gets — behaviour is byte-identical — but the
-	// scan continues far enough to answer whether the choice was FORCED or merely FIRST. See
-	// `ue4::view_params_equivalent`: a second surviving, distinguishable candidate means slot
-	// order decided which view's jitter, ClipToPrevClip and CameraCut reached DLSS, and nothing
-	// has ever counted that. Stops at the second one; it only needs to know "more than one".
 	ue4::ViewParams view{};
 	bool view_ok = false;
-	ue4::ViewParams runner_up{};
-	std::uint32_t runner_up_reg = 0;
-	bool ambiguous = false;
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
-		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
@@ -744,28 +711,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// be larger than the dispatch covers cannot be this one.
 		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			// COUNTED ONLY BEFORE THE WINNER, so `wrongView` keeps the meaning it had when the
-			// scan stopped there: "an impostor the old first-plausible rule WOULD have taken".
-			// A candidate on a later root parameter could never have won under either rule, so
-			// counting it would inflate the number and read as a regression across builds.
-			if (!view_ok)
-				g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
-			continue;
-		}
-		if (view_ok)
-		{
-			// A SECOND survivor. If it decodes to the same view the winner did (two root
-			// parameters onto one suballocation, or two identical copies) the choice was not a
-			// choice; if it does not, the search picked one of two possible answers by slot
-			// order alone and DLSS was told about whichever came first.
-			if (!ue4::view_params_equivalent(view, candidate))
-			{
-				ambiguous = true;
-				runner_up = candidate;
-				runner_up_reg = cb.first;
-			}
-			if (ambiguous)
-				break;
+			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
 			continue;
 		}
 		view = candidate;
@@ -773,8 +719,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
-		if (!g_view_cb_audit)
-			break;
+		break;
 	}
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
@@ -790,55 +735,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			g_view_row135_ok.fetch_add(1, std::memory_order_relaxed);
 		else
 			g_view_row135_bad.fetch_add(1, std::memory_order_relaxed);
-	}
-
-	// THE AMBIGUITY LEDGER — the QUIET half of facts 36.18, which nothing has ever counted.
-	// `wrongView` counts impostors the fit bound threw out; this counts the ones it CANNOT throw
-	// out, because their rect is smaller than the dispatch covers. Recorded here and attributed
-	// to the engine's announcement further down: an ambiguity on a CLAIMED dispatch is an
-	// ambiguity on the real primary temporal upscale, and that is the number that says whether
-	// slot order was ever choosing DLSS SR's jitter, ClipToPrevClip and CameraCut for us.
-	if (view_ok && g_view_cb_audit)
-	{
-		if (ambiguous)
-		{
-			g_view_ambiguous.fetch_add(1, std::memory_order_relaxed);
-			// The first few in full: the counters cannot say HOW different the runner-up was,
-			// and that is what decides whether this ever mattered.
-			const std::uint32_t n = g_view_ambiguous_logged.fetch_add(1, std::memory_order_relaxed);
-			if (n < kViewAmbiguousLogLimit)
-				STRAY_LOG_WARN("VIEW CB AMBIGUOUS #%u on a %ux%u-group dispatch of 0x%016llx: TWO "
-					"distinguishable View buffers both survived plausibility, row 135 AND the "
-					"%ux%u fit bound, so SLOT ORDER picked. chosen b%u view=%.0fx%.0f "
-					"buffer=%.0fx%.0f jitter=%.4f,%.4f preExp=%.6f cut=%.1f | runnerUp b%u "
-					"view=%.0fx%.0f buffer=%.0fx%.0f jitter=%.4f,%.4f preExp=%.6f cut=%.1f. If "
-					"this dispatch claims the engine's announcement, DLSS SR was handed whichever "
-					"came first - view_fits_dispatch cannot separate these. Logged %ux.",
-					n + 1u, x, y, static_cast<unsigned long long>(hash), x * 8u, y * 8u,
-					b.view_cb_register,
-					static_cast<double>(view.view_size_and_inv_size.x),
-					static_cast<double>(view.view_size_and_inv_size.y),
-					static_cast<double>(view.buffer_size_and_inv_size.x),
-					static_cast<double>(view.buffer_size_and_inv_size.y),
-					static_cast<double>(view.temporal_aa_params.z),
-					static_cast<double>(view.temporal_aa_params.w),
-					static_cast<double>(view.pre_exposure),
-					static_cast<double>(view.camera_cut),
-					runner_up_reg,
-					static_cast<double>(runner_up.view_size_and_inv_size.x),
-					static_cast<double>(runner_up.view_size_and_inv_size.y),
-					static_cast<double>(runner_up.buffer_size_and_inv_size.x),
-					static_cast<double>(runner_up.buffer_size_and_inv_size.y),
-					static_cast<double>(runner_up.temporal_aa_params.z),
-					static_cast<double>(runner_up.temporal_aa_params.w),
-					static_cast<double>(runner_up.pre_exposure),
-					static_cast<double>(runner_up.camera_cut),
-					kViewAmbiguousLogLimit);
-		}
-		else
-		{
-			g_view_single.fetch_add(1, std::memory_order_relaxed);
-		}
 	}
 
 	// The signature matcher needs the render rect. Prefer the View buffer; fall back to the
@@ -907,13 +803,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
-		// THE RESIDUE, attributed. An ambiguity anywhere is context; an ambiguity on the
-		// dispatch that claimed the ENGINE'S OWN announcement is a frame where DLSS SR's view
-		// was chosen by root-parameter order between two candidates nothing could separate.
-		// This counter is what "was the quiet half of the wrong-view bug also part of the
-		// flicker?" reduces to, and it must be read before the CB search is deleted.
-		if (ambiguous && view_ok && g_view_cb_audit && seam_verdict.announced)
-			g_view_ambiguous_claimed.fetch_add(1, std::memory_order_relaxed);
 		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
 		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
 		// no RHI resource at AddPasses time has one now. Each is validated against our own
@@ -2079,20 +1968,6 @@ void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
-}
-
-void set_view_cb_audit(bool enabled)
-{
-	g_view_cb_audit = enabled;
-}
-
-void view_ambiguity_counters(std::uint64_t &single, std::uint64_t &ambiguous,
-                             std::uint64_t &ambiguous_claimed, std::uint64_t &cb_reads)
-{
-	single = g_view_single.load(std::memory_order_relaxed);
-	ambiguous = g_view_ambiguous.load(std::memory_order_relaxed);
-	ambiguous_claimed = g_view_ambiguous_claimed.load(std::memory_order_relaxed);
-	cb_reads = g_view_cb_reads.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

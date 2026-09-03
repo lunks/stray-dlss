@@ -120,46 +120,6 @@ bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint3
 	return w <= static_cast<float>(covered_w) && h <= static_cast<float>(covered_h);
 }
 
-namespace {
-
-// Exact equality on a float pair. NaN never compares equal, which is the right answer here:
-// a candidate carrying NaN in a field DLSS consumes is not "the same view" as anything.
-bool same2(const Float4 &a, const Float4 &b)
-{
-	return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
-}
-
-} // namespace
-
-bool view_params_equivalent(const ViewParams &a, const ViewParams &b)
-{
-	// Only the fields that reach a temporal consumer. Two buffers that agree on all of these
-	// produce the same DLSS evaluate whichever one the search picks, so the choice is not a
-	// choice and must not be counted as ambiguity.
-	if (!same2(a.view_size_and_inv_size, b.view_size_and_inv_size))
-		return false;
-	if (!same2(a.buffer_size_and_inv_size, b.buffer_size_and_inv_size))
-		return false;
-	if (!same2(a.view_rect_min, b.view_rect_min))
-		return false;
-	if (!same2(a.temporal_aa_jitter, b.temporal_aa_jitter))
-		return false;
-	if (!same2(a.temporal_aa_params, b.temporal_aa_params))
-		return false;
-	if (a.camera_cut != b.camera_cut)
-		return false;
-	if (a.pre_exposure != b.pre_exposure)
-		return false;
-	// ClipToPrevClip is the one that compounds through the accumulation (CLAUDE.md §5), so it
-	// is compared in full rather than trusted to follow from the rest.
-	for (int k = 0; k < 16; ++k)
-	{
-		if (a.clip_to_prev_clip.m[k] != b.clip_to_prev_clip.m[k])
-			return false;
-	}
-	return true;
-}
-
 bool pre_exposure_plausible(const ViewParams &p)
 {
 	// DELIBERATELY NOT part of view_params_plausible, which gates the ENTIRE DLSS path: rows
