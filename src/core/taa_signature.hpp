@@ -164,8 +164,8 @@ void set_extra_ssd_hashes(const std::uint64_t *hashes, std::size_t count);
 // fits the signature; otherwise the only structural 1x1-RGBA32F binding is accepted, so a
 // permutation with shifted registers still yields the texture. Used as DLSS's exposure
 // texture under [STRAYDLSS] NgxExposure=texture — the official UE plugin passes exactly
-// this texture, unmodified, as pInExposureTexture (DLSSUpscaler.cpp:1075-1089 /
-// NGXD3D12RHI.cpp:267-269, v3.7.3 mirror, fetched 2026-08-31).
+// this texture, unmodified, as pInExposureTexture (DLSSUpscaler.cpp:1111-1115 /
+// NGXD3D12RHI.cpp:275-276, plugin v8.3.0-NGX310.4.0, re-verified 2026-09-03).
 std::uint64_t find_eye_adaptation_srv(const std::vector<BoundTexture> &srvs);
 
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)

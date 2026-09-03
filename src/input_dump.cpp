@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <d3d12.h>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -35,6 +36,10 @@ struct Pending
 
 std::mutex g_mutex;
 std::vector<Pending> g_pending;
+// Drained even with dumping DISABLED. capture_texel() is deliberately callable without
+// NgxDumpInputs (the exposure diagnostic uses it on its own), and a queued readback that is
+// never drained is a leaked D3D12 resource, not merely a missing log line.
+std::atomic<unsigned int> g_pending_count{0};
 
 } // namespace
 
@@ -122,6 +127,7 @@ bool capture(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resourc
 
 	const std::lock_guard<std::mutex> lock(g_mutex);
 	g_pending.push_back(p);
+	g_pending_count.store(static_cast<unsigned int>(g_pending.size()), std::memory_order_relaxed);
 	return true;
 }
 
@@ -198,12 +204,13 @@ bool capture_texel(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 
 	const std::lock_guard<std::mutex> lock(g_mutex);
 	g_pending.push_back(p);
+	g_pending_count.store(static_cast<unsigned int>(g_pending.size()), std::memory_order_relaxed);
 	return true;
 }
 
 void on_present()
 {
-	if (!g_enabled)
+	if (g_pending_count.load(std::memory_order_relaxed) == 0)
 		return;
 	const std::lock_guard<std::mutex> lock(g_mutex);
 	for (auto it = g_pending.begin(); it != g_pending.end();)
@@ -222,8 +229,15 @@ void on_present()
 			{
 				float rgba[4] = {};
 				std::memcpy(rgba, data, sizeof(rgba));
-				STRAY_LOG_INFO("EXPOSURE TEXEL %s: R=%.6f G=%.6f B=%.6f A=%.6f "
-					"(resource=0x%llx)", it->file, rgba[0], rgba[1], rgba[2], rgba[3],
+				// DLSS reads the FIRST channel only ("Only the first channel is sampled in
+				// the texture so multiple formats will work" — DLSS Programming Guide
+				// 310.6.0 §3.9), so R is the number that matters. G/B/A are printed anyway
+				// because on the engine's RGBA32F they are real data, and on a single-channel
+				// format they are padding — which the format field distinguishes.
+				STRAY_LOG_INFO("EXPOSURE TEXEL %s: R=%.6f (the only channel DLSS samples) "
+					"G=%.6f B=%.6f A=%.6f fmt=%d (resource=0x%llx)", it->file, rgba[0],
+					rgba[1], rgba[2], rgba[3],
+					static_cast<int>(it->footprint.Footprint.Format),
 					static_cast<unsigned long long>(it->resource_ptr));
 				const D3D12_RANGE no_write = { 0, 0 };
 				it->readback->Unmap(0, &no_write);
@@ -234,6 +248,8 @@ void on_present()
 			}
 			it->readback->Release();
 			it = g_pending.erase(it);
+			g_pending_count.store(static_cast<unsigned int>(g_pending.size()),
+				std::memory_order_relaxed);
 			continue;
 		}
 		if (SUCCEEDED(it->readback->Map(0, &read_range, &data)) && data != nullptr)
@@ -259,6 +275,8 @@ void on_present()
 		}
 		it->readback->Release();
 		it = g_pending.erase(it);
+		g_pending_count.store(static_cast<unsigned int>(g_pending.size()),
+			std::memory_order_relaxed);
 	}
 }
 

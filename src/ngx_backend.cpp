@@ -46,8 +46,11 @@ const char *last_error() { return "<ngx disabled>"; }
 namespace { RRStatus g_rr_status; }
 void set_rr_mode(int) {}
 int rr_mode() { return 0; }
-void set_exposure_from_texture(bool) {}
-bool exposure_from_texture() { return false; }
+void set_exposure_mode(exposure::Mode) {}
+exposure::Mode exposure_mode() { return exposure::Mode::automatic; }
+void set_exposure_value_multiplier(float) {}
+float exposure_value_multiplier() { return 1.0f; }
+int preset() { return 0; }
 void set_snippet_path(const char *) {}
 void set_exposure_scale(float) {}
 float exposure_scale() { return 1.0f; }
@@ -103,7 +106,14 @@ FeatureDesc g_feature_desc;
 char g_last_error[256] = "";
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
-bool g_exposure_from_texture = false;
+exposure::Mode g_exposure_mode = exposure::Mode::automatic;
+
+// NVSDK_NGX_DLSS_Feature_Flags_AutoExposure is duplicated into the core library so it builds
+// without the NGX headers. If NVIDIA ever renumbers it, this fails the build rather than
+// silently creating the feature with the wrong flag.
+static_assert(exposure::kAutoExposureFlag ==
+	static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure),
+	"exposure::kAutoExposureFlag no longer matches nvsdk_ngx_defs.h");
 
 // --- NGX snippet search paths (ngx_backend.hpp: set_snippet_path) ---
 //
@@ -190,8 +200,10 @@ void build_snippet_paths()
 		}
 	}
 }
-// [STRAYDLSS] NgxExposureScale (ngx_backend.hpp): InExposureScale under texture mode.
+// [STRAYDLSS] NgxExposureScale (ngx_backend.hpp): InExposureScale under a texture mode.
 float g_exposure_scale = 1.0f;
+// [STRAYDLSS] NgxExposureValue (ngx_backend.hpp): the owned texel's consume-test multiplier.
+float g_exposure_value_multiplier = 1.0f;
 
 // --- Ray Reconstruction state ([STRAYDLSS] NgxRR) ---
 int g_rr_mode = 0;
@@ -590,10 +602,13 @@ void set_snippet_path(const char *utf8_path)
 		std::snprintf(g_snippet_path_override, sizeof(g_snippet_path_override), "%s", utf8_path);
 }
 
-void set_exposure_from_texture(bool use_texture) { g_exposure_from_texture = use_texture; }
-bool exposure_from_texture() { return g_exposure_from_texture; }
+void set_exposure_mode(exposure::Mode mode) { g_exposure_mode = mode; }
+exposure::Mode exposure_mode() { return g_exposure_mode; }
 void set_exposure_scale(float scale) { g_exposure_scale = scale; }
 float exposure_scale() { return g_exposure_scale; }
+void set_exposure_value_multiplier(float m) { g_exposure_value_multiplier = m; }
+float exposure_value_multiplier() { return g_exposure_value_multiplier; }
+int preset() { return g_preset; }
 
 void release_feature_rr()
 {
@@ -746,7 +761,10 @@ bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 	eval.InReset = in.base.reset ? 1 : 0;
 	eval.InMVScaleX = 1.0f;
 	eval.InMVScaleY = 1.0f;
-	eval.InPreExposure = in.base.pre_exposure;
+	// Guarded exactly as on the SR path: an unvalidated row 135 yields a deliberate 1.0, not
+	// whatever the row happened to hold. RR takes no exposure TEXTURE, so InPreExposure is the
+	// only exposure input it has and getting it wrong has nowhere else to be corrected.
+	eval.InPreExposure = exposure::sr_pre_exposure(in.base.pre_exposure, in.base.pre_exposure_ok);
 	eval.InFrameTimeDeltaInMsec = in.frame_time_delta_ms;
 	// Deliberately NO pInExposureTexture here even under NgxExposure=texture: "Exposure,
 	// Auto-Exposure, Sharpness ... are not supported by DLSS Ray Reconstruction" (RR guide
@@ -869,16 +887,47 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	// DoSharpening — deprecated and inert. AutoExposure (1<<6 = 0x40, nvsdk_ngx_defs.h:297)
 	// only under NgxExposure=auto: in texture mode the engine's eye-adaptation texture is
 	// the exposure source and the flag must be ABSENT — exactly the official UE plugin's
-	// pair (NGXRHI.cpp:537-546: `bUseAutoExposure ? Flags_AutoExposure : 0`).
-	create.InFeatureCreateFlags =
-		NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-		(g_exposure_from_texture ? 0 : NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
-	STRAY_LOG_INFO("DLSS SR create flags: IsHDR|MVLowRes|DepthInverted%s = 0x%02x "
-		"(NgxExposure=%s)", g_exposure_from_texture ? "" : "|AutoExposure",
+	// pair (NGXRHI.cpp:550-565: `bUseAutoExposure ? Flags_AutoExposure : 0`).
+	create.InFeatureCreateFlags = static_cast<int>(
+		static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_IsHDR) |
+		static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) |
+		static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) |
+		exposure::create_flag_bits(g_exposure_mode));
+
+	// ONE line that carries the whole exposure configuration, unconditionally, every session.
+	// The old line hardcoded the string "createFlags=0x0b" into the diagnostic and printed the
+	// mode as a two-valued word — so a log could not distinguish "texture mode was configured"
+	// from "texture mode was configured AND the runtime was ever going to honour it". That
+	// ambiguity is how "the texture mode measured inert" became a belief with no measurement
+	// behind it.
+	const int resolved = exposure::resolved_preset(g_preset, derived);
+	const exposure::PresetExposure support =
+		exposure::preset_exposure_support(g_preset, derived);
+	STRAY_LOG_INFO("DLSS EXPOSURE: mode=%s flags=0x%02x (AutoExposure %s) preset=%s(%d) "
+		"quality=%s presetSupportsExposureInput=%s scale=%.4f valueMul=%.4f",
+		exposure::mode_name(g_exposure_mode),
 		static_cast<unsigned>(create.InFeatureCreateFlags),
-		g_exposure_from_texture ? "texture" : "auto");
+		exposure::create_flag_bits(g_exposure_mode) != 0 ? "SET" : "dropped",
+		exposure::preset_letter(resolved), resolved, dlss_quality_name(derived),
+		support == exposure::PresetExposure::supported ? "yes"
+			: (support == exposure::PresetExposure::not_supported ? "NO" : "unknown"),
+		static_cast<double>(g_exposure_scale),
+		static_cast<double>(g_exposure_value_multiplier));
+
+	// DLSS Programming Guide 310.6.0 §3.9: "Only supported by Presets J and K. Preset L always
+	// uses AutoExposure." A texture mode on any other preset is a configuration that cannot
+	// work, and it is the single best explanation on record for the 2026-08-31 observation
+	// (flag dropped, healthy texture passed every frame, indicator still reading Auto Exposure:
+	// ON). We WARN rather than silently switching the preset: quietly repairing a config is how
+	// a session ends up measuring something other than what it was asked to measure.
+	if (exposure::exposure_will_be_ignored(g_exposure_mode, g_preset, derived))
+		STRAY_LOG_WARN("NgxExposure=%s is INERT on preset %s: the DLSS Programming Guide "
+			"(310.6.0 §3.9) states exposure input is \"Only supported by Presets J and K\" and "
+			"that \"Preset L always uses AutoExposure\". This %s feature resolves to preset %s. "
+			"Set [STRAYDLSS] NgxPreset=11 (K) to make the exposure texture reachable, or "
+			"NgxExposure=auto to stop paying for a texture nothing reads.",
+			exposure::mode_name(g_exposure_mode), exposure::preset_letter(resolved),
+			dlss_quality_name(derived), exposure::preset_letter(resolved));
 
 	result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &g_feature, g_feature_params, &create);
 	if (NVSDK_NGX_FAILED(result) || g_feature == nullptr)
@@ -930,17 +979,34 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	// Our resolve already emits pixel-space motion vectors, so no further scaling.
 	eval.InMVScaleX = 1.0f;
 	eval.InMVScaleY = 1.0f;
-	eval.InPreExposure = in.pre_exposure;
-	// NgxExposure=texture: the eye-adaptation texture via NVSDK_NGX_Parameter_ExposureTexture
-	// (helpers.h:466). NGX reads channel 0 of the 1x1 RGBA32F with a formatted read — the
-	// plugin ships UE's RGBA32F eye-adaptation texture unconverted, the existence proof.
-	// InExposureScale carries [STRAYDLSS] NgxExposureScale (default 1.0, behaviourally the
-	// old 0->1.0 mapping): DLSS multiplies the texture value by it (:508). The scale is the
-	// functional consume test — a wrong value must move the image if the texture is read.
-	// Only when a texture is actually present; with none, leave 0 so the auto path is
-	// byte-identical to before.
-	eval.pInExposureTexture = in.exposure;
-	eval.InExposureScale = in.exposure != nullptr ? g_exposure_scale : 0.0f;
+	// Every exposure decision comes from one pure function so it is pinned by CI rather than
+	// re-derived here. In particular InPreExposure is now GUARDED: the SR path used to forward
+	// View row 135.y with no plausibility check while the NR path gated the same row, so a
+	// misread reached DLSS silently — and a misread of 0 becomes a literal 1.0 at
+	// helpers.h:507, telling DLSS the colour buffer carries no pre-exposure when it carries
+	// ~0.45. (src/core/exposure_plan.hpp)
+	const exposure::EvalPlan plan = exposure::plan_evaluate(g_exposure_mode,
+		in.exposure != nullptr, in.pre_exposure, in.pre_exposure_ok, g_exposure_scale);
+	eval.InPreExposure = plan.pre_exposure;
+	// NVSDK_NGX_Parameter_ExposureTexture (helpers.h:466). Guide 310.6.0 §3.9: "Only the first
+	// channel is sampled in the texture so multiple formats will work" — so the engine's
+	// RGBA32F and our own R32_FLOAT are both legal, and §3.4 puts it in the same
+	// NON_PIXEL_SHADER_RESOURCE class as colour and depth.
+	eval.pInExposureTexture = plan.pass_texture ? in.exposure : nullptr;
+	eval.InExposureScale = plan.exposure_scale;
+
+	if (plan.degraded)
+	{
+		// A creation-time flag cannot be un-set per frame, so this frame gets DLSS's default
+		// exposure of 1.0 rather than the auto path. Count it: an exposure experiment whose
+		// texture went missing half the time must not read as a clean negative.
+		static unsigned int s_degraded = 0;
+		if (++s_degraded <= 3 || (s_degraded % 600) == 0)
+			STRAY_LOG_WARN("DLSS EXPOSURE degraded: NgxExposure=%s but no exposure texture this "
+				"frame (%u so far). AutoExposure is a CREATE flag and cannot be restored per "
+				"frame, so DLSS uses its default exposure of 1.0 for these frames.",
+				exposure::mode_name(g_exposure_mode), s_degraded);
+	}
 
 	const NVSDK_NGX_Result result =
 		NGX_D3D12_EVALUATE_DLSS_EXT(cmd, g_feature, g_feature_params, &eval);
