@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Print (and optionally assert) the PDB path a PE records in its debug directory.
 
-WHY THIS EXISTS. UE4SS hardcodes `Mods/<Name>/dlls/main.dll` (UE4SSProgram.cpp: both the
-mods.txt and enabled.txt discovery loops skip anything that is not a directory, and CppMod
-then opens `dlls/main.dll` inside), so EVERY C++ mod in this repository loads as a module
-literally named `main`. A UE4 crash dump prints that module name and an offset:
+WHY THIS EXISTS. Every C++ mod this repository ships is deployed as `Mods/<Name>/dlls/main.dll`
+and therefore loads as a module literally named `main`. A UE4 crash dump prints that module name
+and an offset:
 
     main    0x00006ffff4720000 + 771f6
 
@@ -18,6 +17,13 @@ hand. That happened on 2026-09-03 and cost real time.
 Both plugin CMakeLists therefore pass `/PDBALTPATH:<Name>.pdb` (which changes the recorded
 string only, never the file on disk) and both workflows ship the PDB under that same name.
 This script is the check that the two halves agree, run in CI against the built DLL.
+
+The deeper fix would be not to be called `main` at all, and it is available: at the UE4SS SHA
+this project pins (68caddcf), `CppMod.cpp:24-35` tries `dlls/main.dll` FIRST and falls back to
+`dlls/<ModName>.dll`, warning "dlls folder must contain either main.dll or {}". So shipping
+`dlls/StrayDLSS.dll` with NO main.dll beside it would make the dump say `StrayDLSS` outright.
+That is a deployment change touching every install path on the box, so it is recorded here
+rather than taken; the PDB name is the fix that changes nothing about how the mod loads.
 
     tools/pe_debug_dir.py <pe-file> [--expect StrayDLSS.pdb]
 

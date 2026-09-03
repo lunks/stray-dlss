@@ -707,9 +707,9 @@ the UE4 minidump (`Saved/Crashes/UE4CC-…EA9444C2…`, the 02:41 run) against t
 it. HARD unless marked.
 
 > **The PDB is no longer called `main.pdb`, and neither is a module named `main` ambiguous any
-> more (2026-09-03).** UE4SS hardcodes `<Mods>/<Name>/dlls/main.dll`, so both C++ plugins load as
-> a module literally named `main` — and a UE4 dump (`main 0x00006ffff4720000 + 771f6`) could not
-> say which. Working that out cost real time on 2026-09-03, and symbolizing then only worked after
+> more (2026-09-03).** Both C++ plugins are deployed as `<Mods>/<Name>/dlls/main.dll`, so both
+> load as a module literally named `main` — and a UE4 dump (`main 0x00006ffff4720000 + 771f6`)
+> could not say which. Working that out cost real time on 2026-09-03, and symbolizing then only worked after
 > the shipped `main.pdb` was renamed by hand to the basename the DLL's debug directory recorded
 > (`…\build\StrayDLSS\StrayDLSS.pdb`, an absolute path from the CI machine). Two changes:
 > both plugins link with `/PDBALTPATH:<Name>.pdb` so the debug directory records a **bare**
@@ -720,6 +720,15 @@ it. HARD unless marked.
 > base can simply be matched. The **export directory** already carried `StrayDLSS.dll` /
 > `StrayDualSense.dll` (the link-time name survives the rename to `main.dll`) — a second,
 > independent way to identify a deployed `main.dll`.
+>
+> **HARD, and NOT acted on: the name `main` is not actually forced.** `CppMod.cpp:24-35` at the
+> pinned UE4SS SHA 68caddcf tries `dlls/main.dll` first and then `dlls/<ModName>.dll`, warning
+> *"dlls folder must contain either main.dll or {}"*; only the mod DIRECTORY scan is rigid
+> (`UE4SSProgram.cpp` skips non-directories in the mods.txt and enabled.txt loops). So shipping
+> `dlls/StrayDLSS.dll` with **no main.dll beside it** — main.dll wins if both exist — would make
+> every future dump say `StrayDLSS` outright and need no PDB trick at all. It is a deployment
+> change across every install path on the box (CI staging, `deploy-submix-spike.sh`, whatever is
+> already installed), so it is recorded as available rather than taken.
 
 **The faulting instruction.** Exception thread context: `Rip = libvkd3d-1.dll+0x3e7b0`,
 `Rcx = 0`, code `c0000005` reading `0x0`. That RVA is `vkd3d_instance_get_vk_instance`, whose

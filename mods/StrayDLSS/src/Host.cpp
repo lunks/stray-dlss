@@ -383,8 +383,9 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 	STRAY_LOG_INFO("StrayDLSS %s attaching (UE4SS C++ mod, the HOST): mod dir %s, game dir %s",
 		STRAY_DLSS_PLUGIN_VERSION_STRING, sds::Narrow(mod_dir).c_str(), sds::Narrow(game_dir).c_str());
 
-	// WHO IS `main`. UE4SS hardcodes <Mods>/<Name>/dlls/main.dll, so this plugin and
-	// StrayDualSense both load as a module literally named `main`, and a UE4 crash dump says
+	// WHO IS `main`. This plugin ships as <Mods>/StrayDLSS/dlls/main.dll and StrayDualSense as
+	// <Mods>/StrayDualSense/dlls/main.dll, so both load as a module literally named `main`
+	// (UE4SS CppMod.cpp:24-35 prefers main.dll; <ModName>.dll is only a fallback), and a dump says
 	// only `main 0x00006ffff4720000 + 771f6` - which mod that was cost real time to work out
 	// on 2026-09-03. The dump prints the module's BASE next to the offset, so one line here
 	// settles it: if the base matches, the crash is ours and the offset is the RVA. Symbolize

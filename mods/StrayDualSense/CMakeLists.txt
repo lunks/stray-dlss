@@ -173,10 +173,10 @@ if(MSVC)
     # `D:\a\stray-dlss\stray-dlss\build\StrayDualSense\StrayDualSense.pdb`. That string is what a symbolizer
     # looks for, so it has to be a name the shipped tree actually has.
     #
-    # It matters here because UE4SS hardcodes <Mods>/<Name>/dlls/main.dll (UE4SSProgram.cpp
-    # skips non-directories in both discovery loops; CppMod then opens dlls/main.dll), so BOTH
-    # C++ plugins in this repository load as a module named `main` and a UE4 dump can only say
-    # `main 0x... + 771f6`. The recorded PDB name is then the one thing left in the file that
+    # It matters here because both C++ plugins in this repository are deployed as
+    # <Mods>/<Name>/dlls/main.dll (CppMod.cpp:24-35 at UE4SS 68caddcf prefers main.dll and only
+    # falls back to <ModName>.dll), so both load as a module named `main` and a UE4 dump can only
+    # say `main 0x... + 771f6`. The recorded PDB name is then the one thing left in the file that
     # says which mod it is - and on 2026-09-03 symbolizing only worked after the shipped
     # main.pdb was renamed by hand to the basename recorded here.
     #

@@ -481,8 +481,8 @@ jobs:
           "dll=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         id: verify
 
-      # UE4SS hardcodes <Mods>/<Name>/dlls/main.dll, so a UE4 crash dump can only say
-      # `main 0x... + 771f6` and both C++ plugins in this repository answer to that name. The PDB
+      # Both C++ plugins in this repository ship as <Mods>/<Name>/dlls/main.dll, so a UE4 crash
+      # dump can only say `main 0x... + 771f6` and both answer to that name. The PDB
       # path stamped into the PE's debug directory is what a symbolizer resolves against, so it
       # must be a bare `StrayDLSS.pdb` (the name the artifact ships) rather than the linker's
       # default absolute build path. Assert it on the BUILT DLL: a change that renamed only the
