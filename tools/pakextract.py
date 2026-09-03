@@ -99,9 +99,22 @@ with open(PAK, 'rb') as f:
             print(f"SKIP (non-encoded) {full}", file=sys.stderr); continue
         e, _ = decode_entry(encoded, eoff)
         # The data section repeats a serialised FPakEntry header before the payload.
-        hdr = 8 + 8 + 8 + 4 + 20 + 1
+        #
+        # FPakEntry::Serialize order: Offset(8) Size(8) UncompressedSize(8)
+        # CompressionMethodIndex(4) Hash(20) [blocks: int32 count + count*(int64,int64)]
+        # bEncrypted(1) CompressionBlockSize(4). The last two are written UNCONDITIONALLY.
+        #
+        # FIXED 2026-09-03: this used to read `hdr = 49` for an uncompressed entry, omitting
+        # the trailing CompressionBlockSize uint32, so every method-0 payload came out shifted
+        # 4 bytes early AND 4 bytes short. Compressed entries were right by accident, because
+        # their `+= 4 + 4 + n*16` folded that same 4 into the block-array term. Caught by
+        # asserting the UE4 package magic 0x9E2A83C1 on the output: 104/104 compressed assets
+        # passed and 124/124 uncompressed ones failed with the magic sitting at offset 4.
+        # 4,257 of the pak's 23,846 .uasset entries are method 0, so any earlier content search
+        # was blind to 18% of them.
+        hdr = 8 + 8 + 8 + 4 + 20 + 1 + 4
         if e['method'] != 0:
-            hdr += 4 + 4 + len(e['blocks']) * 16
+            hdr += 4 + len(e['blocks']) * 16
         f.seek(e['offset'] + hdr)
         raw = f.read(e['size'])
         if RAW_MODE:
