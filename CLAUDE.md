@@ -648,12 +648,24 @@ Config and saves live in the **Proton prefix**:
 > says …52FB62F0.` The register walk was feeding DLSS SR a velocity resource **the engine did not
 > bind**. A wrong velocity is a motion-vector error, and §5's rule is that those compound through
 > the accumulation and read as drift and instability rather than as a motion-vector bug — so this
-> is now the **leading candidate for the flicker**, and L1 replaces it with the engine's answer.
-> UNCONFIRMED that it *is* the flicker: the image has not been judged since.
+> is a real defect, and L1 replaces it with the engine's answer.
 >
-> **The one gap left is `unclaimed` (~1.2%, all `noDispatch`)** — the engine announced and no
-> dispatch we accepted ever claimed, so those frames ran the engine's own TAA. That is UPSTREAM
-> of L1, in the matcher that decides which dispatch may call `claim()`, and it is the next thing.
+> **IT IS NOT THE FLICKER (retracted 2026-09-03, facts §36.13.1).** This line called it the
+> leading candidate; the user has since judged the image with the engine's velocity in use and
+> the flicker persists. **`unclaimed` is the flicker** — see the note below on it.
+>
+> **`unclaimed` (~1.2%, all `noDispatch`) IS THE VISIBLE FLICKER**, on the user's own judgement
+> and corroborated by arithmetic: 204 events over ~317 s is **0.64/s, one every ~1.6 s**, which is
+> the cadence they have reported since before the seam existed. On such a frame the engine's own
+> TAA runs instead of DLSS SR, so the image changes hands for one frame. **Success is
+> `unclaimed = 0`, judged by eye, not by reading the counter.**
+>
+> **MEASURED 2026-09-03, and it names the cause:** `nearMiss` tracks `unclaimed` exactly, so the
+> real dispatch — the announced 480x270 groups — IS arriving and **our own matcher refuses it**
+> with *"dispatch covers less than the view rect - downsampling, not TAA upscaling"*. That gate
+> needs the View CB to report a render rect wider than 3840. It is the same shape as
+> `trust_registers`: **a heuristic still GATING what the engine has already answered**, when
+> `EngineSeam=3` is documented to make the structural signature an assertion.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does

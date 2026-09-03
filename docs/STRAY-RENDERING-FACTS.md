@@ -3107,11 +3107,19 @@ what reached DLSS SR — and the engine says it was not the resource it bound as
 `SceneVelocityTexture`. A wrong velocity texture is a **motion-vector** error, and this project's
 own rule (§5) is that *bad motion vectors do not produce one bad frame, they compound through the
 accumulation* and surface as drift, smearing and instability rather than as anything shaped like a
-motion-vector bug. It is therefore the **leading candidate for the flicker the user still reports**,
-and L1 replaces it with the engine's own answer on every claimed frame.
+motion-vector bug, and it is a real defect that L1 replaces with the engine's own answer on every
+claimed frame.
 
-**Not yet confirmed** that this is the flicker: it is one assertion, once per session, and the
-image has not been judged since. That judgement is the next thing worth a launch.
+> **IT IS NOT THE FLICKER — RETRACTED 2026-09-03, by the user's own judgement of the image.**
+> This paragraph called it "the leading candidate for the flicker" the same day. **The user has
+> now looked, with the engine's velocity in use, and the flicker is still there**: *"the unclaimed
+> frames are 99% the flicker (they still happen)"*. See §36.17 — `unclaimed` is the defect, and
+> it is arithmetically corroborated (204 events over ~317 s ≈ 0.64/s, a blip every ~1.6 s, which
+> is the cadence the user has reported since before the seam work existed).
+>
+> **The lesson is the one this file keeps re-learning:** a real defect found while hunting another
+> is not thereby the other one's cause. The wrong velocity was worth fixing on its own terms and
+> should have been recorded as that, not promoted to a suspect because it was the defect in hand.
 
 ### 36.14 The View CB search is EXONERATED — row 135 never fails (2026-09-03)
 
@@ -3189,3 +3197,58 @@ unaffected. Set NgxRR=0 to make that the deliberate configuration and silence th
 Prime directive 2 satisfied: a feature that cannot work says so at ERROR rather than quietly doing
 nothing. `ngx::` still probes DLSSD availability at startup (`DLSS RR (DLSSD) available=1 …
 [NgxRR=0]`), which is the NGX half that was deliberately kept.
+
+### 36.17 `unclaimed` IS THE VISIBLE FLICKER, and our own matcher causes it (2026-09-03)
+
+**The user judged the image** with L1 live and the engine's velocity in use:
+*"the unclaimed frames are 99% the flicker (they still happen)"*.
+
+**The arithmetic corroborates it independently.** 204 unclaimed over 16 803 frames at 53.3 fps is
+≈317 s of session, i.e. **0.64 events per second — one every ~1.6 s**, which is the cadence the
+user has reported since before the engine seam existed. The mechanism needs no invention: on an
+unclaimed frame the engine's own TAA runs instead of DLSS SR, so the image changes hands for one
+frame — a discontinuity at exactly that rate.
+
+**This retires the wrong-velocity suspicion of §36.13.1.** That is a real defect and L1 fixes it,
+but the flicker persists with the engine's velocity in use, so it was never the cause.
+
+#### The cause, measured in one launch
+
+DLL `e4c91181…` (`e6bfdb4`), menu, no injected input:
+
+```
+[seam] frame 14400: announced=14403 claimed=14265 unclaimed=135 orphans=0
+  | notClaimed: noDispatch=135 nearMiss=138 | ...
+
+ENGINE SEAM NEAR MISS #1: a dispatch of 480x270 groups arrived while an announcement expecting
+exactly that was pending, and OUR MATCHER REFUSED IT - verdict=no_match
+reason="dispatch covers less than the view rect - downsampling, not TAA upscaling"
+```
+
+**`nearMiss` tracks `unclaimed` exactly** (138 against 135; the 3 is the retire lag, the same lag
+`announced` shows over `claimed`). So:
+
+* **Hypothesis 3 is EXCLUDED.** The engine is not announcing upscales that never dispatch. The
+  real primary temporal upscale arrives every time, with exactly the announced group counts.
+* **The cause is ours.** `match_taa_dispatch` refuses it, and names the gate:
+  `group_count_x < group_count(view_width)` — the lower bound that exists to reject 200%
+  downsampling (§"200% can never work"). The dispatch covers 3840x2160, so for that to fire the
+  **View CB must be reporting a render rect wider than 3840** on those frames.
+
+#### What row 135 did and did not prove
+
+§36.14's `ok=64044 bad=0` says the buffer we read **is a View uniform buffer**. It does **not**
+say it is *this view's* — a scene-capture or second-view CB would satisfy the same three
+predictions. So a render rect over 3840 on a minority of frames is entirely compatible with a
+clean row-135 record, and the exoneration in §36.14 must be read as the narrower claim.
+
+#### The shape of the bug, which is one this project has already fixed once
+
+`EngineSeam=3` is documented — in CLAUDE.md §2.3 and in the ini — as making the cooked-hash table
+and the structural signature **assertions, never gates**. But `claim()` is only offered to a
+dispatch the structural matcher has already accepted, so **the structural matcher is still a
+gate**, and on ~1.2% of frames it overrides an answer the engine had already given.
+
+That is the identical shape to the `trust_registers` bug fixed in §13.4: a heuristic still
+deciding something the engine has authoritatively answered. The design intent was never carried
+through to the claim call site.
