@@ -1159,27 +1159,29 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	//                  because this site is TERMINAL (nothing carries it into the next frame).
 	const bool codec = in.site == Site::taa_dispatch;
 
-	// NO CODEC, NO EVALUATE — the site half of the rule, asked of the same pure gate that decides
-	// the rest of it (src/core/nr_hook_plan.hpp). The post-tonemap sites were removed on
-	// 2026-09-02 and nothing passes Site::post_tonemap today, but the branch below that would
-	// hand the network an image the codec never touched is still reachable code, and a
-	// display-referred network fed an un-encoded image is exactly the failure this project spent
-	// a session diagnosing. Refuse it here rather than leave a fall-through for a future caller
-	// to walk into.
-	// nrplan::codec_gate answers `no_codec` for exactly this input and is tested per reason; the
-	// check is made here, before anything is recorded, so no barrier needs unwinding.
-	if (!codec)
-		return refuse_pre_evaluate(kRefNoCodec,
-			"this call site does not run the HDR codec, and feature 18 is a display-referred "
-			"network: without the soft-clip + sRGB proxy its input is out of domain. The "
-			"post-tonemap sites that legitimately bypassed the codec were removed on 2026-09-02.");
+	// WHY THERE IS NO BLANKET `if (!codec) refuse` HERE, and why there WAS one between 2026-09-02
+	// and 2026-09-02.
+	//
+	// The rule the codec gate enforces is "a DISPLAY-REFERRED network must not be handed an
+	// out-of-domain image". At the TAA site the image is raw linear HDR, so the codec IS the input
+	// contract and skipping it is the failure this project spent a session diagnosing (a neural
+	// output whose max luminance read 0.0026, red noise on screen). At the present stage the image
+	// is Stray's back buffer — R10G10B10A2_UNORM with no SetColorSpace1 call anywhere, i.e. SDR
+	// display-encoded (docs/STRAY-RENDERING-FACTS.md §32) — which is ALREADY the network's domain,
+	// and encoding it again would apply the transfer twice. Same rule, opposite action.
+	//
+	// While the post-tonemap sites did not exist, refusing every non-codec call was the correct
+	// way to keep a future caller from walking into the raw-HDR path. Now that exactly one such
+	// caller exists and is display-referred by construction, the refusal would refuse the correct
+	// configuration. nrplan::codec_gate still enumerates every way the CODEC site can reach the
+	// evaluate without a proxy, and is consulted below.
 
 	// The residual needs the proxy, the neural answer and the original to be the SAME pixels.
 	// sr-shaped puts Color at render resolution and Output at display resolution, so there is no
 	// per-pixel correspondence to subtract across and no residual exists to carry. It is equally
-	// meaningless post-tonemap, where there is nothing left to upscale. Refuse loudly rather than
-	// fall back to the raw-HDR path, which is the exact configuration that produced red noise and
-	// a 0.0026 neural output (src/core/nr_codec.hpp).
+	// meaningless post-tonemap, where there is nothing left to upscale and the whole image is one
+	// rect. Refuse loudly rather than fall back to the raw-HDR path, which is the exact
+	// configuration that produced red noise and a 0.0026 neural output (src/core/nr_codec.hpp).
 	const bool post = g_topology == Topology::post_process;
 	if (!post)
 		return refuse_pre_evaluate(kRefCodecTopology,

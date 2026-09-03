@@ -1,15 +1,176 @@
-// NR's OWN temporal history, and the guide grid it was accumulated against. Pure; tested.
+// WHERE DLSS Neural Rendering is injected, whether a given frame may be injected into, and the
+// guide grid its own temporal history was accumulated against. Pure; tested.
 //
-// This header once also carried the three-site choice for DLSS Neural Rendering (`taa` /
-// `present` / `preui`). The two post-tonemap sites were REMOVED on 2026-09-02: neither ever
-// produced a correct frame on the box (`preui` wrecked one, `present` depends on a ReShade
-// event that never fires with an empty preset), NR runs at exactly one site — inside the
-// intercepted TAA dispatch — and that site is what every measured session used.
+// WHY THIS IS A PURE MODULE. Every precondition of the present stage — the back buffer's shape,
+// the freshness of the guides, the format's typed-UAV support — is a decision that can be made
+// from plain numbers. Keeping them here means CI proves the refusal rules instead of the user's
+// machine discovering them one round trip at a time (CLAUDE.md §0.4). src/nr_hook.cpp does
+// nothing but gather those numbers from D3D12 and act on the verdict.
+//
+// HISTORY, because this file has been emptied once already. It carried a THREE-site choice
+// (`taa` / `present` / `preui`) that was removed on 2026-09-02 when neither post-tonemap site
+// produced a correct frame. What comes back here is not that: `preui` stays deleted, and
+// `present` is now a STAGE on our own present-time command list rather than a ReShade event.
+// The argument for the move, and what is different this time, is on HookMode below.
 #pragma once
 
 #include <cstdint>
 
 namespace stray_dlss::nrplan {
+
+// [STRAYDLSS] NgxNRHook. WHERE DLSS Neural Rendering runs.
+//
+// THE FIRST PROBLEM, MEASURED (CLAUDE.md, "NR's output feeds the engine's temporal history"). At
+// the TAA site we write the engine's `u0`, and UE 4.27 makes that ONE resource serve two roles:
+// `TemporalAA.cpp:696` is literally `NewHistoryTexture[0] = Outputs.SceneColor =
+// NewHistoryTexture[0];` and `:969` extracts the same texture as the next frame's history. So
+// NR's residual re-enters the engine's temporal state every frame and compounds. Screen-space
+// reflections read that history directly (`ScreenSpaceRayTracing.cpp:596-620`) and the
+// eye-adaptation histogram downsamples it (`PostProcessing.cpp:626-648`). `NgxNRRestoreHistory`
+// exists only to undo that.
+//
+// THE SECOND PROBLEM, which is the one that motivated the move. The TAA site carries raw,
+// unbounded, PRE-EXPOSED LINEAR HDR, and feature 18 is a display-referred network — so the whole
+// HDR codec, `NgxNRPaperWhiteScale` and `NgxNRTrackExposure` with its smoothing and its
+// scale-reset latch exist ONLY to put a linear signal into the network's domain. Every one is a
+// knob that can be wrong, and the scale-reset latch is a DLSSNR.Reset source driven by a
+// continuously varying quantity — which CLAUDE.md has already measured making an image worse
+// ("there it is a metronome"). A sibling implementation reached the same rule from the other
+// direction (Kim2091/dxvk-remix @ gta4-atmos-dlss5, 10fa0368): a display-encoded anchor is a
+// CORRECTNESS REQUIREMENT rather than a tuning choice, and its shipping runtime carries no NR
+// shaders at all — deleting the codec is what shipped there.
+//
+// AT A POST-TONEMAP SITE BOTH PROBLEMS ARE GONE BY CONSTRUCTION. Nothing after the tonemapper is
+// carried into the next frame — every `QueueTextureExtraction` into `PrevFrameViewInfo` sits at
+// `PostProcessing.cpp` 576/599/643 while `AddTonemapPass` is at 777 — and Stray's back buffer is
+// `R10G10B10A2_UNORM` with no `SetColorSpace1` call anywhere, i.e. SDR display-encoded already
+// (docs/STRAY-RENDERING-FACTS.md §32). That IS the network's own domain: no codec, no paper
+// white, no exposure term.
+//
+// WHAT WAS TRIED BEFORE AND FAILED, so this is not a re-run of it. Two post-tonemap sites were
+// built and removed on 2026-09-02: `preui` (the frame's Nth back-buffer render-target bind) died
+// clobbering state the GAME's command list needed, and the old `present` rode
+// `addon_event::reshade_begin_effects`, which never fires with an empty preset. Neither failure
+// generalises to the present STAGE restored here. It records on the present owner's OWN command
+// list (src/backend_native/present_owner.hpp — the one frame generation already drives every
+// frame, which survives ResizeBuffers and the fullscreen transition), where nothing of the game's
+// is bound and there is therefore nothing of the game's to clobber; and it is triggered by
+// `icept::Sink::on_present`, which both hosts deliver unconditionally with no dependency on a
+// loaded effect preset.
+enum class HookMode
+{
+	// Inside the intercepted TAA compute dispatch, writing the engine's `u0`. The shipped
+	// behaviour and, in phase 1, still the DEFAULT: until a run on the box says the stage produces
+	// a correct image, the shipped configuration must stay byte-identical.
+	taa,
+	// Our own command list at Present, over the back buffer. No feedback path, no HDR codec, no
+	// pass identification.
+	present,
+};
+
+// Parses the config string. Anything unrecognised — including an empty value — is `taa`, because
+// the default must be the shipped behaviour and a typo must never silently move the hook.
+HookMode hook_mode_from_string(const char *value);
+const char *hook_mode_name(HookMode mode);
+// True for the site that sees a tonemapped, display-referred image and therefore must NOT run the
+// HDR colour codec (running the soft clip and the sRGB encode over an already-encoded image would
+// apply a transfer that has already been applied).
+bool is_post_tonemap(HookMode mode);
+
+// Why a present-stage frame was, or was not, injected into. Every one is counted and named, for
+// the same reason the TAA path's gate refusals are: a stage that never fires must never be
+// indistinguishable from a stage that fired and did nothing.
+enum class PlanResult
+{
+	ok = 0,
+	// The host handed us no back buffer, no device, or no command list to record on.
+	no_colour,
+	// Mipped, arrayed or multisampled. A mipped input to feature 18 is a documented
+	// DXGI_ERROR_DEVICE_HUNG a few seconds later, not an error return.
+	mipped_colour,
+	// A zero-sized target, which is what a minimised or mid-resize swapchain looks like.
+	zero_extent,
+	// The back buffer's format cannot be written through a typed UAV. Our staging pair is
+	// allocated in the BACK BUFFER's own format so both transfers are plain same-format copies,
+	// and NGX writes DLSSNR.Output through a typed UAV — so a format the device cannot store to is
+	// the "black output with no further indication" class of failure (CLAUDE.md §0.2). Refuse
+	// loudly rather than allocate a texture the driver will reject or the runtime will not fill.
+	no_typed_uav_store,
+	// No TAA dispatch has published guides yet this session (a loading screen, the first frames,
+	// or a session in which the TAA pass is never matched).
+	guides_absent,
+	// Guides exist but this trigger has already consumed them. The depth and motion vectors must
+	// describe the frame we are about to modify, and a capture used once is by definition older.
+	guides_stale,
+	// Our own staging colour texture could not be allocated. Its own name rather than a reused
+	// one, because "the driver refused an allocation" and "the host handed us nothing" want
+	// completely different responses.
+	staging_failed,
+};
+
+// NOTE: the count is duplicated in src/core/nr_hook_plan.cpp's kPlanResultNames — change both
+// together. Same discipline as nr::kNrRefusalNames.
+constexpr int kPlanResultCount = 8;
+const char *plan_result_name(PlanResult result);
+
+// What D3D12 told us about the colour target we were handed.
+struct ColourDesc
+{
+	std::uint32_t width = 0;
+	std::uint32_t height = 0;
+	std::uint32_t mip_levels = 1;
+	std::uint32_t array_size = 1;
+	std::uint32_t sample_count = 1;
+	// The three bits CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) reports, kept separate
+	// rather than collapsed to one bool so the log can say WHICH half is missing. Only the view
+	// and store bits are load-bearing — NGX reads DLSSNR.Color through its own CUDA-texture path,
+	// so a missing typed LOAD is worth a warning and nothing more.
+	bool typed_uav_view = false;
+	bool typed_uav_load = false;
+	bool typed_uav_store = false;
+	bool live = false; // the host reported a back buffer AND a command list to record on
+};
+
+// The per-frame capture the TAA path publishes.
+//
+// `sequence` is a PUBLICATION COUNTER, deliberately not a present index. Freshness is then "has
+// this capture been consumed yet?", which is independent of the order in which a host fires its
+// present callback relative to the frame's TAA dispatch. A frame with no TAA dispatch at all (a
+// loading screen) simply does not advance the counter, so it refuses as stale without needing a
+// separate test.
+struct GuideState
+{
+	bool published = false;
+	bool have_depth = false;
+	bool have_motion = false;
+	std::uint64_t sequence = 0;
+	std::uint32_t render_width = 0;
+	std::uint32_t render_height = 0;
+};
+
+struct Plan
+{
+	PlanResult result = PlanResult::no_colour;
+	std::uint32_t width = 0;
+	std::uint32_t height = 0;
+	// The COLOUR/GUIDE ratio, which is what DLSSNR.MVecScaleX/Y is documented to want: the
+	// snippet works on the colour grid while our vectors are on the guide grid.
+	//
+	// CONTESTED, and that is why it is computed here and carried as data rather than baked in. A
+	// live A/B on the user's machine (CLAUDE.md, 2026-09-01) found 1.0 visibly more stable than
+	// the ratio at the TAA site, and ngx_nr.cpp sends 1.0 there for that reason — we already
+	// declare the guides' own rect through DLSSNR.MVecSubrectWidth/Height, so a runtime that
+	// normalises by the subrect would apply the ratio twice. The stage therefore leaves
+	// nr::ApplyInputs::mvec_scale_* at 0 ("derive"), which reaches the same 1.0, and this field is
+	// reported in the log so the two numbers can be compared on the box before anything changes.
+	float mvec_scale_x = 1.0f;
+	float mvec_scale_y = 1.0f;
+};
+
+// The whole gate, in one place. `last_consumed_sequence` is the highest guide publication this
+// trigger has already used; anything at or below it is stale. Zero means "nothing consumed yet".
+Plan plan_post_tonemap(const ColourDesc &colour, const GuideState &guides,
+                       std::uint64_t last_consumed_sequence);
 
 // Feature 18 is NOT a per-frame spatial filter. It keeps an internal accumulator: it consumes
 // motion vectors and depth (which a spatial-only network would not need) and exposes
@@ -59,13 +220,19 @@ bool latch_guide_extent(GuideExtentLatch &latch, std::uint32_t width, std::uint3
 //
 // So every way of arriving at EvaluateFeature without a correct proxy is enumerated here and
 // answered with a refusal rather than a fall-through.
+//
+// SCOPE, restated 2026-09-02 now that the present stage exists: this gate is about the CODEC
+// SITE, not about every site. A post-tonemap image is already display-referred and already in the
+// network's domain, so bypassing the codec there is correct and `codec_site` is simply false —
+// ngx_nr never asks this gate on that path. What the gate still catches is the codec site
+// arriving at the evaluate with no usable proxy.
 // ---------------------------------------------------------------------------------------
 enum class CodecGate
 {
 	evaluate,
-	// This call site does not run the encode/decode pair at all. The post-tonemap sites that
-	// legitimately bypassed the codec were removed on 2026-09-02, so reaching this now means an
-	// un-encoded image would have been handed to the network.
+	// This call site does not run the encode/decode pair at all. The present stage legitimately
+	// bypasses the codec and never consults this gate, so reaching `no_codec` means a CODEC site
+	// would have handed the network an un-encoded image.
 	no_codec,
 	// The encode dispatch did not record, so the proxy holds whatever the last frame left.
 	encode_failed,

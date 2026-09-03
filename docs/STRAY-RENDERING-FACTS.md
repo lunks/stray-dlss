@@ -1180,3 +1180,38 @@ morning 113-117. stray-bench.sh writes a per-cycle accumulation snapshot (NATIVE
 native-hooks buckets, NATIVE DRIVE, live-resource/root-signature counts) to stray-bench-accum.log
 so the bisection can see whether any counter climbs monotonically while fps falls (a leak) versus
 moves with the host load (contention).
+
+---
+
+## 32. The back buffer is SDR display-encoded: R10G10B10A2_UNORM with no SetColorSpace1 (2026-09-02)
+
+Recorded here because a whole feature rests on it — the DLSS Neural Rendering PRESENT STAGE
+(`[STRAYDLSS] NgxNRHook=present`, `src/nr_hook.hpp`) bypasses the HDR colour codec entirely on
+the strength of this section, and if it is wrong the network is handed a doubly-encoded image
+and the symptom is "it looks washed out", not an error.
+
+**HARD, from this document's own §1 and from ReShade's log of every session:** every swapchain
+Stray creates is `NewFormat = 24` = `DXGI_FORMAT_R10G10B10A2_UNORM`, `BufferCount = 3`, at
+3840x2160 and at 2560x1440. Ten bits per channel is a *precision* choice, not an HDR one.
+
+**The colour space is what settles it, and the evidence is an ABSENCE.** A D3D12 swapchain is
+`DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709` — plain sRGB/Rec.709, SDR — until the application calls
+`IDXGISwapChain3::SetColorSpace1` to say otherwise; HDR10 output specifically requires
+`RGB_FULL_G2084_NONE_P2020`. **Stray never calls it.** Carried from the frame-generation work on
+the `dlss-fg` branch, where the swapchain vtable is patched slot by slot and every call the game
+makes through it is logged.
+
+**PROVENANCE, stated plainly: this half is SOFT on `nr-present-stage`.** The measurement was made
+on another branch and is repeated here rather than re-run; nothing in this worktree has observed
+it. It is also consistent with the compositor setup (gamescope's `--hdr-itm-enabled` is
+inverse *tone mapping* — it takes an SDR image and expands it, which is only needed because the
+game hands it one), but that is corroboration, not proof.
+
+**Why it matters, in one line:** feature 18 is a display-referred network trained on sRGB, so at
+the TAA site (raw linear HDR) the soft-clip + sRGB proxy IS the input contract, and at the back
+buffer it would be a *second* application of a transfer the game's tonemapper already applied.
+Same rule, opposite action — see `nrplan::HookMode` in `src/core/nr_hook_plan.hpp`.
+
+**What would falsify it:** a `SetColorSpace1(RGB_FULL_G2084_NONE_P2020)` in a log from this
+title, or a present-stage image that looks *flat and washed out* rather than merely HUD-processed.
+The first thing to try then is not the codec but `NgxNRHook=taa`, which is unaffected.

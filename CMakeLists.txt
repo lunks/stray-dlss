@@ -229,6 +229,10 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/nr_codec_pass.hpp
         src/nr_history.cpp
         src/nr_history.hpp
+        src/nr_hook.cpp
+        src/nr_hook.hpp
+        src/nr_stage.cpp
+        src/nr_stage.hpp
         src/ext_unhook.cpp
         src/ext_unhook.hpp
         src/input_dump.cpp
@@ -386,6 +390,9 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         # The DLSS-NR codec pass, for the deferred-destruction test (warp_nr_lifetime.inc). It is
         # the only NR code the harness can link: everything else on that path needs NGX.
         src/nr_codec_pass.cpp
+        # The NR present stage's D3D12 half: the staging texture and the two copies. NGX-free on
+        # purpose (src/nr_stage.hpp), which is the only reason the harness can judge it at all.
+        src/nr_stage.cpp
         # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
         # 2026-09-02), so the harness that links present_owner must also link perf.
         src/perf.cpp

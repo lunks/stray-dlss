@@ -1,12 +1,228 @@
-// The guide-extent latch that forces a reset of NR's own temporal accumulation when the guide
-// grid moves under it. (The post-tonemap hook sites this file also covered were removed on
-// 2026-09-02; NR runs at the TAA site only.)
+// The gate that decides whether a present-stage frame may be handed to DLSS Neural Rendering, the
+// site selection in front of it, and the guide-extent latch that forces a reset of NR's own
+// temporal accumulation when the guide grid moves under it.
+//
+// Every one of these refusals is a thing that would otherwise be discovered on the user's machine,
+// one expensive round trip at a time (CLAUDE.md §0.1). Pinning them here is the whole reason the
+// logic lives in src/core/.
 #include <doctest/doctest.h>
 
 #include "core/nr_codec.hpp"
 #include "core/nr_hook_plan.hpp"
 
+#include <cstring>
+// The range-for over a braced list in the mode round-trip test needs this explicitly on
+// libstdc++; libc++ happens to pull it in transitively, which is exactly the kind of difference
+// the Linux lane exists to catch.
+#include <initializer_list>
+
 using namespace stray_dlss::nrplan;
+
+namespace {
+
+constexpr float kTol = 1e-5f;
+
+bool near_enough(float a, float b, float tol = kTol)
+{
+	return (a > b ? a - b : b - a) <= tol;
+}
+
+// A back buffer that passes everything, so each test can spoil exactly one thing. The extent and
+// the shape are Stray's own (CLAUDE.md §2.1: 3840x2160, R10G10B10A2_UNORM, 3 buffers).
+ColourDesc good_colour()
+{
+	ColourDesc c;
+	c.width = 3840;
+	c.height = 2160;
+	c.mip_levels = 1;
+	c.array_size = 1;
+	c.sample_count = 1;
+	c.typed_uav_view = true;
+	c.typed_uav_load = true;
+	c.typed_uav_store = true;
+	c.live = true;
+	return c;
+}
+
+// Guides as the TAA path publishes them at 50% screen percentage (CLAUDE.md §2.3.1).
+// `sequence` is a publication counter, so 0 means "never published".
+GuideState good_guides(std::uint64_t sequence = 100)
+{
+	GuideState g;
+	g.published = true;
+	g.have_depth = true;
+	g.have_motion = true;
+	g.sequence = sequence;
+	g.render_width = 1920;
+	g.render_height = 1080;
+	return g;
+}
+
+} // namespace
+
+TEST_CASE("the hook mode defaults to taa for every unrecognised value")
+{
+	// PHASE 1 SHIPS taa. A typo in the ini must not silently move the hook to a site no run on the
+	// box has yet judged.
+	CHECK(hook_mode_from_string(nullptr) == HookMode::taa);
+	CHECK(hook_mode_from_string("") == HookMode::taa);
+	CHECK(hook_mode_from_string("taa") == HookMode::taa);
+	CHECK(hook_mode_from_string("Present") == HookMode::taa); // case-sensitive, like NgxNRTopology
+	CHECK(hook_mode_from_string("nonsense") == HookMode::taa);
+	// `preui` was a real mode until 2026-09-02 and is NOT coming back. An ini left over from that
+	// era must land on the shipped default, not on the present stage.
+	CHECK(hook_mode_from_string("preui") == HookMode::taa);
+
+	CHECK(hook_mode_from_string("present") == HookMode::present);
+}
+
+TEST_CASE("mode names round-trip, so a log line is unambiguous about which path drew the image")
+{
+	for (const HookMode m : { HookMode::taa, HookMode::present })
+		CHECK(hook_mode_from_string(hook_mode_name(m)) == m);
+}
+
+TEST_CASE("the HDR codec applies to the TAA site only")
+{
+	// The codec turns raw unbounded pre-exposed linear HDR into a display-referred proxy. The back
+	// buffer is ALREADY display-referred, so running it there would apply the soft clip and the
+	// sRGB encode a second time on top of the game's own tone curve.
+	CHECK(is_post_tonemap(HookMode::taa) == false);
+	CHECK(is_post_tonemap(HookMode::present));
+}
+
+TEST_CASE("every plan result has a distinct name")
+{
+	// The names reach the user through the periodic NR STAGE line; two reasons sharing a name
+	// would make a refusal undiagnosable from the log alone.
+	for (int i = 0; i < kPlanResultCount; ++i)
+	{
+		const char *a = plan_result_name(static_cast<PlanResult>(i));
+		REQUIRE(a != nullptr);
+		CHECK(std::strcmp(a, "?") != 0);
+		for (int j = i + 1; j < kPlanResultCount; ++j)
+			CHECK(std::strcmp(a, plan_result_name(static_cast<PlanResult>(j))) != 0);
+	}
+	CHECK(std::strcmp(plan_result_name(static_cast<PlanResult>(kPlanResultCount)), "?") == 0);
+}
+
+TEST_CASE("a healthy 4K back buffer over 1080p guides is accepted, and reports ratio 2.0")
+{
+	const Plan p = plan_post_tonemap(good_colour(), good_guides(7), 6);
+	CHECK(p.result == PlanResult::ok);
+	CHECK(p.width == 3840);
+	CHECK(p.height == 2160);
+	// The colour/guide ratio is REPORTED, not sent — the stage passes 0 ("derive") to nr::apply,
+	// which reaches 1.0, the value the user's own live A/B settled on. This pins the number the
+	// periodic line prints so the two can be compared on the box.
+	CHECK(near_enough(p.mvec_scale_x, 2.0f));
+	CHECK(near_enough(p.mvec_scale_y, 2.0f));
+}
+
+TEST_CASE("the reported ratio is computed, never hardcoded: 70% screen percentage gives 1.42857")
+{
+	// This project runs both 50% and 70% (CLAUDE.md §5, "70% is the highest working setting").
+	GuideState g = good_guides(1);
+	g.render_width = 2688;
+	g.render_height = 1512;
+	const Plan p = plan_post_tonemap(good_colour(), g, 0);
+	CHECK(p.result == PlanResult::ok);
+	CHECK(near_enough(p.mvec_scale_x, 3840.0f / 2688.0f));
+	CHECK(near_enough(p.mvec_scale_y, 2160.0f / 1512.0f));
+	CHECK(near_enough(p.mvec_scale_x, 1.4285714f, 1e-4f));
+}
+
+TEST_CASE("a colour target the host could not supply is refused before anything else is looked at")
+{
+	// `live` carries "the host gave us a back buffer AND a command list", so it is answered first
+	// and the rest of the desc is not to be trusted until it passes.
+	ColourDesc c = good_colour();
+	c.live = false;
+	c.width = 0; // would otherwise report zero-extent
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::no_colour);
+}
+
+TEST_CASE("a zero-sized target is refused (a minimised or mid-resize swapchain)")
+{
+	ColourDesc c = good_colour();
+	c.width = 0;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::zero_extent);
+	c = good_colour();
+	c.height = 0;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::zero_extent);
+}
+
+TEST_CASE("a mipped, arrayed or multisampled colour target is refused, never passed through")
+{
+	// A mipped input to feature 18 is a documented DXGI_ERROR_DEVICE_HUNG arriving seconds later,
+	// not an error return. A log line costs a frame; a hung GPU costs a power cycle.
+	ColourDesc c = good_colour();
+	c.mip_levels = 4;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::mipped_colour);
+	c = good_colour();
+	c.array_size = 2;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::mipped_colour);
+	c = good_colour();
+	c.sample_count = 4;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::mipped_colour);
+}
+
+TEST_CASE("typed UAV STORE is mandatory and typed UAV LOAD is not")
+{
+	// NGX writes DLSSNR.Output through a typed UAV, so store and the view bit decide. It reads
+	// DLSSNR.Color through its own CUDA-texture path, so refusing for a missing typed LOAD would
+	// be a needless refusal — and a needless refusal costs a round trip to discover.
+	ColourDesc c = good_colour();
+	c.typed_uav_store = false;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::no_typed_uav_store);
+
+	c = good_colour();
+	c.typed_uav_view = false;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::no_typed_uav_store);
+
+	c = good_colour();
+	c.typed_uav_load = false;
+	CHECK(plan_post_tonemap(c, good_guides(), 0).result == PlanResult::ok);
+}
+
+TEST_CASE("guides that were never published, or are half-published, are refused as absent")
+{
+	GuideState g = good_guides();
+	g.published = false;
+	CHECK(plan_post_tonemap(good_colour(), g, 0).result == PlanResult::guides_absent);
+
+	g = good_guides();
+	g.have_depth = false;
+	CHECK(plan_post_tonemap(good_colour(), g, 0).result == PlanResult::guides_absent);
+
+	g = good_guides();
+	g.have_motion = false;
+	CHECK(plan_post_tonemap(good_colour(), g, 0).result == PlanResult::guides_absent);
+
+	g = good_guides();
+	g.render_width = 0;
+	CHECK(plan_post_tonemap(good_colour(), g, 0).result == PlanResult::guides_absent);
+
+	// Sequence 0 is "never published", whatever the other flags say.
+	g = good_guides(0);
+	CHECK(plan_post_tonemap(good_colour(), g, 0).result == PlanResult::guides_absent);
+}
+
+TEST_CASE("each guide capture is consumable exactly once")
+{
+	// Freshness is "has this capture been used yet?", NOT "does its present index match?" — which
+	// keeps the gate independent of the order in which a host fires its present callback relative
+	// to the frame's TAA dispatch. A one-frame-old depth buffer produces a plausible-looking wrong
+	// image rather than an error, so there is no age to tolerate.
+	CHECK(plan_post_tonemap(good_colour(), good_guides(42), 41).result == PlanResult::ok);
+	CHECK(plan_post_tonemap(good_colour(), good_guides(42), 42).result == PlanResult::guides_stale);
+	CHECK(plan_post_tonemap(good_colour(), good_guides(41), 42).result == PlanResult::guides_stale);
+	// A frame that ran no TAA dispatch does not advance the counter, so a loading screen is
+	// refused with no separate test for "the TAA pass did not run this frame".
+	CHECK(plan_post_tonemap(good_colour(), good_guides(7), 7).result == PlanResult::guides_stale);
+	// Nothing consumed yet: the very first capture is fresh.
+	CHECK(plan_post_tonemap(good_colour(), good_guides(1), 0).result == PlanResult::ok);
+}
 
 TEST_CASE("the guide-extent latch does NOT reset on the first frame")
 {

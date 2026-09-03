@@ -4,6 +4,7 @@
 #include "gbuffer_resolve.hpp"
 #include "ngx_nr.hpp"
 #include "nr_history.hpp"
+#include "nr_hook.hpp"
 #include "perf.hpp"
 
 #include "intercept/backend.hpp"
@@ -2015,10 +2016,24 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								// leaves the SR/RR image exactly as it is. (src/ngx_nr.hpp)
 								if (ok && nr::enabled())
 								{
-									// DLSS Neural Rendering runs HERE and nowhere else (the post-tonemap
-									// sites were removed 2026-09-02). `ei.reset` is the camera-cut OR
-									// from §2.8 and travels with the evaluate: feature 18 keeps its own
-									// temporal history.
+									// PUBLISH THE GUIDES REGARDLESS OF THE HOOK MODE. The present
+									// stage has no way of its own to find the depth and the motion
+									// vectors — this is the only place in the frame where both are
+									// known-good and known-fresh — and publishing unconditionally
+									// means flipping NgxNRHook takes effect on the next frame
+									// rather than on the next launch. `ei.reset` is the camera-cut
+									// OR from §2.8 and MUST travel with them: feature 18 keeps its
+									// own temporal history.
+									nrhook::note_guides(ei.depth, ei.motion_vectors,
+										ei.render_width, ei.render_height, ei.reset);
+
+									// ...but only RUN here when the hook is at this site. At
+									// NgxNRHook=present the identical nr::apply runs later in the
+									// same frame, from src/nr_hook.cpp, over the back buffer —
+									// which nothing carries into the engine's temporal state and
+									// which is already display-referred, so the whole HDR codec is
+									// bypassed there. (src/core/nr_hook_plan.hpp)
+									if (nrhook::hook_mode() == nrplan::HookMode::taa)
 									{
 										perf::Scope perf_nr(perf::kNgxNr);
 
