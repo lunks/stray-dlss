@@ -696,11 +696,11 @@ bool ensure_output_texture(ID3D12Device *device, ID3D12Resource *image)
 // Records a copy of a centred crop of one resource into its own readback buffer. Mapped a few
 // presents later by on_present(). `res` is expected in `base_state` and is left in it.
 //
-// `base_state` is a parameter rather than a constant because the colour image's state depends on
-// the call site: the TAA site hands us `u0` in UNORDERED_ACCESS (SR/RR just wrote it), the
-// post-tonemap site hands us a staging copy in NON_PIXEL_SHADER_RESOURCE. Assuming the wrong one
-// is a barrier whose StateBefore does not match reality — a validation error on WARP and, under
-// vkd3d-proton where no debug layer exists, silent undefined behaviour.
+// `base_state` is a parameter rather than a constant: the two crops are taken from resources in
+// different states (our own neural output in UNORDERED_ACCESS, the caller's colour image in
+// nrstage::kStagingRestState). Assuming the wrong one is a barrier whose StateBefore does not
+// match reality — a validation error on WARP and, under vkd3d-proton where no debug layer exists,
+// silent undefined behaviour.
 bool copy_crop(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *res,
                DXGI_FORMAT format, const D3D12_BOX &box, D3D12_RESOURCE_STATES base_state,
                CropReadback &out)
@@ -1345,7 +1345,8 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	}
 
 	{
-		// POST-TONEMAP: a whole copy, and the reasons the TAA site cannot do this do not apply.
+		// A WHOLE COPY, which the old TAA site could not have done — none of its three reasons
+		// applies here.
 		//
 		//  * The HDR range is not discarded, because there is none left to discard — the image
 		//    is display-referred already and the network answers in the same encoding.

@@ -111,8 +111,6 @@ void issue_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, std::ui
 
 } // namespace
 
-
-
 void set_back_buffer_state(std::uint32_t states)
 {
 	g_bb_state.store(states, std::memory_order_relaxed);
@@ -123,21 +121,15 @@ std::uint32_t back_buffer_state() { return g_bb_state.load(std::memory_order_rel
 void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
                  std::uint32_t render_width, std::uint32_t render_height, bool reset)
 {
-	// NOTHING AT ALL AT THE DEFAULT SITE. The TAA hook calls this every frame so that no new
-	// wiring is needed if the mode ever becomes live-toggleable, but at `taa` the promise is that
-	// the shipped configuration is byte-identical — and the references taken below, however cheap,
-	// are not nothing. One relaxed atomic load is.
-
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
 
-	// A REFERENCE IS TAKEN HERE, and the reason is the gap this site introduces.
+	// A REFERENCE IS TAKEN HERE, and the reason is the gap between publish and consume.
 	//
-	// At the TAA site the guides are used in the same callback that produced them. Here they are
-	// published from a recording thread and consumed at Present, and UE4 rotates its pooled render
-	// targets constantly — so `depth` could in principle be destroyed in between, and NGX would
-	// then build a descriptor from a dead ID3D12Resource*. That is the CPU-side half of
-	// CLAUDE.md §5's descriptor hazard, and it faults inside the driver rather than returning an
-	// error.
+	// The guides are published from the recording thread inside the TAA dispatch and consumed at
+	// Present, and UE4 rotates its pooled render targets constantly in between — so `depth` could
+	// in principle be destroyed in the gap, and NGX would then build a descriptor from a dead
+	// ID3D12Resource*. That is the CPU-side half of CLAUDE.md §5's descriptor hazard, and it
+	// faults inside the driver rather than returning an error.
 	//
 	// nr::apply's keep-alive ring covers the GPU-side half (it AddRefs everything it evaluates
 	// with and releases behind the lifetime fence), but it can only do so once the resource has
@@ -165,8 +157,6 @@ void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
 
 void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 {
-	// Inert and free at every other mode: no counters, no probe, no allocation.
-
 	// Retire staging textures a resize superseded, whatever this frame then decides. Cheap, and it
 	// must happen even on a frame the gate refuses.
 	nrstage::collect(pc.frame);

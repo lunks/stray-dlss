@@ -28,7 +28,6 @@ namespace stray_dlss::nrhook {
 
 // --- configuration, read once at startup ---
 
-
 // [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which IS
 // D3D12_RESOURCE_STATE_COMMON — the same value, 0).
 //
@@ -49,11 +48,11 @@ std::uint32_t back_buffer_state();
 // Published by the TAA hook once per frame, immediately after a successful SR/RR evaluate, with
 // the depth and the dense motion vectors it just used.
 //
-// CALLED unconditionally by the TAA hook — this is the only place in the frame where both are
-// known-good and known-fresh, and keeping the call site mode-blind means a future live toggle
-// needs no new wiring. It RECORDS nothing at `taa`, though: the promise there is that the shipped
-// configuration is byte-identical, and it takes a reference on each guide (see the .cpp for why
-// this site needs one and the TAA site does not), which is not free even if it is cheap.
+// CALLED unconditionally by the TAA hook — that is the only place in the frame where both are
+// known-good and known-fresh. It RECORDS nothing: this is a publish, not a pass. It does take a
+// reference on each guide (see the .cpp: publish and consume are on different threads and several
+// milliseconds apart, so the resource can be recycled in between), which is not free even if it
+// is cheap.
 //
 // `reset` is the camera-cut OR the TAA path already computes (CLAUDE.md §2.8) and MUST travel
 // with them: feature 18 keeps its OWN temporal history, and a cut that does not reset it is the
