@@ -1915,3 +1915,83 @@ line is a two-line change and would settle it in one session.
 
 **Do not attribute this to anything in this branch.** It reproduces under the plugin and under
 the ReShade add-on, with SR only, and the user reports it predates all of this work.
+
+## 32.15 The blink NAMED: the RHI thread blocks in the NVIDIA kernel driver's RM lock (2026-09-02 21:49-21:53)
+
+§32.14 exonerated our code. This finds the thing itself. Method: a 486 Hz sampler over the
+game's hot threads recording each one's scheduler state and its kernel `wchan`
+(`tools`-external, `/tmp/stallprobe.py`), with every `[stall]` line timestamped as it reached
+the log, pipewire's xrun counter once a second, and `dmesg -T -w`, all in one 150 s SR-only
+gameplay session. 173 stalls captured.
+
+**The finding, and it is a clean discriminator:**
+
+| | inside stall windows | baseline (>=250 ms from any stall) |
+|---|---|---|
+| samples | 4 670 | 13 932 |
+| RHIThread running (R) | 32.2% | 73.5% |
+| **RHIThread in D (uninterruptible kernel sleep)** | **7.9%** | **0.0%** |
+| **blocked in `os_acquire_rwlock_read`** | **365 samples** | **0 samples** |
+
+`os_acquire_rwlock_read` is a symbol in NVIDIA's kernel module: it is the driver taking the
+Resource Manager read/write lock. **It occurs 365 times inside stalls and exactly zero times in
+13 932 baseline samples** — it is not background noise, it is the event.
+
+**The duration matches the symptom exactly.** RHIThread's D episodes measure **median 18.5 ms,
+mean 20.3 ms, p90 30.8 ms, max 39.1 ms** (57 episodes, 791 ms total in 150 s). A 6.1 ms frame
+with ~19 ms of the RHI thread parked in the driver is the 24-28 ms frame the user sees.
+
+### Who holds the lock: not another process, and not another thread of the game
+
+Both halves were measured rather than assumed, from the Proxmox host where every GPU client is
+visible (`/tmp/holder.py`, `/tmp/holder2.py`).
+
+* **Every other GPU client was sampled at 486 Hz and none is elevated during the D episodes.**
+  CPU ticks accrued while RHIThread was blocked, as a ratio to that state's share of wall time:
+  `mangoapp 0.00x`, `gamescope-wl 0.00x`, `Xwayland 0.00x`, `steam 0.00x`, `steamwebhelper
+  0.00x`, `wineserver 0.55x`, `xalia.exe 0.81x`. **Nothing above 1.0x.** MangoHud's NVML polling
+  was the leading external suspect and is refuted outright.
+* **All 268 threads of the game were sampled the same way.** The only thing over-represented
+  while RHIThread is blocked is `RenderThread 1` sitting in `ntsync_schedule` at 1.8x — that is
+  the render thread waiting on the RHI thread, i.e. the CONSEQUENCE, not the cause. No thread of
+  the game is burning CPU or sitting in an nvidia path.
+
+**So the writer holding the RM lock is not CPU-bound at all.** That is the informative part: an
+RM operation that waits on the GPU rather than on the CPU. On this host the driver is the **open
+kernel module 610.43.02 with GSP firmware active** (`EnableGpuFirmware: 18`, GSP 610.43.02) —
+and on the open modules GSP is not optional. An RM request that round-trips to GSP firmware
+holds the lock while consuming no CPU, which is exactly the signature measured. Corroborating,
+this box's own history carries `NVRM ... NV_ERR_NO_MEMORY` from `_memdescAllocInternal` and
+`_kgmmuClientShadowFaultBufferPagesAllocate`, and CLAUDE.md §5 records `_issueRpcAndWait:
+rpcSendMessage failed` GSP RPC failures — the same subsystem.
+
+**SOFT, and stated as such:** that the holder is specifically a GSP round-trip is an inference
+from "holds the RM lock, burns no CPU, on a GSP-mandatory driver", not a direct observation. A
+direct one needs `/proc/driver/nvidia/gpus/*/gsp_logs` or a kernel stack trace from
+`/proc/<tid>/stack`, neither of which was read. **HARD** are: the D state, the
+`os_acquire_rwlock_read` wchan, its 365-vs-0 exclusivity, the 18.5 ms median, and the
+exoneration of every other process and thread.
+
+### Two things this rules out that were being assumed
+
+* **The kernel log is silent.** Zero `dmesg` lines of any kind inside the probe window; every
+  NVRM line in the buffer is from 05:00 or 15:17, hours earlier. So the stall leaves no kernel
+  trace, and grepping `dmesg` for it will always come up empty.
+* **The system is not freezing.** Our own 486 Hz sampler kept its cadence straight through every
+  stall (median inter-sample gap 2.06 ms, only 2 gaps above 15 ms in 72 868 samples). The stall
+  is confined to the game process — specifically to the one thread that talks to the GPU.
+
+### The audio is a SEPARATE event — measured, not assumed
+
+pipewire's xrun counter was sampled once a second across the same 150 s that contained **173
+visual stalls**: it started at 0, ended at 0, **delta 0, with not one second showing a new
+xrun**. The audio dropouts the user hears are not these frames. This confirms the user's own
+correction and closes the question with data rather than an inference.
+
+### Consequence
+
+**This is not ours, and it is not fixable inside this project.** No hook we own is on the path,
+and the blocking is one thread of the game waiting on the NVIDIA kernel driver. Mitigations, if
+the user wants them, live at the host/driver level and are their call, not a code change here.
+The measurement scripts are kept at `/tmp/stallprobe.py`, `/tmp/holder.py` and `/tmp/holder2.py`
+on the box so the result can be reproduced or re-run against a different driver.
