@@ -1716,6 +1716,7 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 
 #include "warp_native_backend.inc"
 #include "warp_fg_present.inc"
+#include "warp_pso_cache.inc"
 
 // A crash in the harness must leave its trail: stdout is unbuffered (ctest captures a pipe, so
 // a segfault would otherwise swallow every line since the last flush) and a vectored handler
@@ -1805,6 +1806,7 @@ int main(int argc, char **argv)
 	test_descriptor_shadow_fast(gpu);
 	test_native_stream_walk();
 	test_native_hooks_ue4_shaped_frame(gpu);
+	test_pso_cached_blob_passthrough(gpu); // after the hooks are installed
 	test_drive_mode_restore_is_complete(gpu);
 	// After drive mode: the frame-generation present path over a real swapchain (needs drive).
 	test_fg_present_twice(gpu);

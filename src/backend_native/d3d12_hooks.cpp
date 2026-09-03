@@ -268,6 +268,8 @@ HRESULT STDMETHODCALLTYPE hk_CreateCommandQueue(ID3D12Device *self, const D3D12_
 
 HRESULT STDMETHODCALLTYPE hk_CreateDescriptorHeap(ID3D12Device *self, const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **out)
 {
+	if (!in_own_code())
+		perf::stall_note_heap_created();
 	const HRESULT hr = g_orig_CreateDescriptorHeap(self, desc, riid, out);
 	// The fast shadow needs every CBV_SRV_UAV/RTV/DSV heap the moment it exists, to allocate its
 	// flat slot array; note_heap_created is a no-op in debug mode. QueryInterface for the heap
@@ -511,29 +513,49 @@ HRESULT STDMETHODCALLTYPE hk_CreateRootSignature(ID3D12Device *self, UINT node_m
 HRESULT STDMETHODCALLTYPE hk_CreateComputePipelineState(ID3D12Device *self, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
 {
 	// The caller's desc, UNMODIFIED, to the original: no CachedPSO stripping, no side effect.
+	// The forwarded call is timed for stall attribution (a first-sight compile lands here).
+	const std::uint64_t t0 = perf::stall_clock_ns();
 	const HRESULT hr = g_orig_CreateComputePipelineState(self, desc, riid, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && desc != nullptr && !in_own_code())
+	{
+		perf::stall_note_pso_create(perf::stall_clock_ns() - t0, /*is_compute=*/true);
 		store_pipeline(*out, desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+	}
 	return hr;
 }
 
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
 HRESULT STDMETHODCALLTYPE hk_CreatePipelineState(ID3D12Device2 *self, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out)
 {
+	// The caller's desc pointer straight to the original: UE 4.27 routes EVERY graphics and
+	// compute PSO through this slot (WinPSO.cpp:819 CreatePipelineStateWrapper with bUseStream),
+	// so the desc - CachedPSO subobject and all - MUST reach vkd3d untouched or the app pipeline
+	// library and the internal disk cache are defeated (facts §32.12). We only OBSERVE, after
+	// the create returns, to hash a compute shader for the census; graphics PSOs are not recorded.
+	const std::uint64_t t0 = perf::stall_clock_ns();
 	const HRESULT hr = g_orig_CreatePipelineState(self, desc, riid, out);
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && desc != nullptr && !in_own_code())
 	{
-		std::size_t len = 0;
-		const char *why = nullptr;
-		const void *cs = find_cs_in_stream(desc->pPipelineStateSubobjectStream, desc->SizeInBytes, len, &why);
-		if (cs == nullptr && why != nullptr)
+		const StreamContents sc = walk_stream(desc->pPipelineStateSubobjectStream, desc->SizeInBytes);
+		perf::stall_note_pso_create(perf::stall_clock_ns() - t0, /*is_compute=*/sc.cs != nullptr);
+		g_forward.stream_creates.fetch_add(1, std::memory_order_relaxed);
+		g_forward.desc.store(desc, std::memory_order_relaxed);
+		g_forward.stream.store(desc->pPipelineStateSubobjectStream, std::memory_order_relaxed);
+		g_forward.stream_size.store(desc->SizeInBytes, std::memory_order_relaxed);
+		g_forward.cs_found.store(sc.cs != nullptr, std::memory_order_relaxed);
+		g_forward.cached_blob.store(sc.cached_blob, std::memory_order_relaxed);
+		g_forward.cached_size.store(sc.cached_size, std::memory_order_relaxed);
+		if (sc.cs != nullptr)
+			store_pipeline(*out, sc.cs, sc.cs_len); // compute: census + TAA hash
+		else
+			g_forward.graphics_creates.fetch_add(1, std::memory_order_relaxed); // graphics: observed, NOT recorded
+		if (sc.cs == nullptr && sc.why != nullptr)
 		{
 			static std::atomic<int> s_said{ 0 };
 			if (s_said.fetch_add(1) < 3)
 				STRAY_LOG_WARN("native hooks: pipeline-state stream not fully walked (%s); a compute PSO "
-					"in it stays unhashed. Logged 3x.", why);
+					"in it stays unhashed (graphics PSOs are unaffected - the desc reached the runtime untouched). Logged 3x.", sc.why);
 		}
-		store_pipeline(*out, cs, len);
 	}
 	return hr;
 }
@@ -780,6 +802,32 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 
 } // namespace
 
+struct StreamContents
+{
+	const void *cs = nullptr;
+	std::size_t cs_len = 0;
+	const void *cached_blob = nullptr;
+	std::size_t cached_size = 0;
+	const char *why = nullptr;
+};
+
+// The last stream-create forward: the desc/stream pointer we handed the original and the
+// CachedPSO blob we OBSERVED there. The WARP test asserts these equal what the caller passed -
+// proof the hook neither copies the desc nor drops the blob, so it is NOT what defeats vkd3d's
+// pipeline cache (facts §32.12).
+struct CreateForwardRecord
+{
+	std::atomic<const void *> desc{ nullptr };
+	std::atomic<const void *> stream{ nullptr };
+	std::atomic<std::size_t> stream_size{ 0 };
+	std::atomic<const void *> cached_blob{ nullptr };
+	std::atomic<std::size_t> cached_size{ 0 };
+	std::atomic<bool> cs_found{ false };
+	std::atomic<std::uint64_t> stream_creates{ 0 };
+	std::atomic<std::uint64_t> graphics_creates{ 0 };
+};
+CreateForwardRecord g_forward;
+
 // ---- the pipeline-state stream walk ----
 //
 // Needs ID3D12Device2's stream types; mingw's older d3d12.h (used for the local syntax
@@ -819,11 +867,12 @@ bool step(const unsigned char *&p, const unsigned char *end, std::size_t &payloa
 
 } // namespace
 
-const void *find_cs_in_stream(const void *stream, std::size_t size, std::size_t &length, const char **stop_reason)
+// One read-only pass over a pipeline-state stream: reports the compute-shader bytecode AND the
+// CachedPSO blob it contains. The hook uses the CS for the census and the CachedPSO ONLY to
+// prove (in the WARP test) that our forward left the blob intact - we never touch the stream.
+StreamContents walk_stream(const void *stream, std::size_t size)
 {
-	length = 0;
-	if (stop_reason != nullptr)
-		*stop_reason = nullptr;
+	StreamContents out;
 	const auto *p = static_cast<const unsigned char *>(stream);
 	const unsigned char *const end = p + size;
 	while (p != nullptr && static_cast<std::size_t>(end - p) >= sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
@@ -848,8 +897,8 @@ const void *find_cs_in_stream(const void *stream, std::size_t size, std::size_t 
 			if (ok)
 			{
 				const auto *cs = reinterpret_cast<const D3D12_SHADER_BYTECODE *>(here + off);
-				length = cs->BytecodeLength;
-				return cs->pShaderBytecode;
+				out.cs = cs->pShaderBytecode;
+				out.cs_len = cs->BytecodeLength;
 			}
 			break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: ok = step<D3D12_STREAM_OUTPUT_DESC>(p, end, off); break;
@@ -864,24 +913,39 @@ const void *find_cs_in_stream(const void *stream, std::size_t size, std::size_t 
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: ok = step<DXGI_FORMAT>(p, end, off); break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: ok = step<DXGI_SAMPLE_DESC>(p, end, off); break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: ok = step<UINT>(p, end, off); break;
-		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: ok = step<D3D12_CACHED_PIPELINE_STATE>(p, end, off); break;
+		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+			ok = step<D3D12_CACHED_PIPELINE_STATE>(p, end, off);
+			if (ok)
+			{
+				const auto *cp = reinterpret_cast<const D3D12_CACHED_PIPELINE_STATE *>(here + off);
+				out.cached_blob = cp->pCachedBlob;
+				out.cached_size = cp->CachedBlobSizeInBytes;
+			}
+			break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: ok = step<D3D12_PIPELINE_STATE_FLAGS>(p, end, off); break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: ok = step<D3D12_DEPTH_STENCIL_DESC1>(p, end, off); break;
 		case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: ok = step<D3D12_VIEW_INSTANCING_DESC>(p, end, off); break;
 		default:
 			// A subobject type this build does not know the size of: stop rather than guess.
-			if (stop_reason != nullptr)
-				*stop_reason = "unknown subobject type";
-			return nullptr;
+			out.why = "unknown subobject type";
+			return out;
 		}
 		if (!ok)
 		{
-			if (stop_reason != nullptr)
-				*stop_reason = "truncated stream";
-			return nullptr;
+			out.why = "truncated stream";
+			return out;
 		}
 	}
-	return nullptr; // walked to the end: no CS (a graphics pipeline)
+	return out; // walked to the end
+}
+
+const void *find_cs_in_stream(const void *stream, std::size_t size, std::size_t &length, const char **stop_reason)
+{
+	const StreamContents sc = walk_stream(stream, size);
+	length = sc.cs_len;
+	if (stop_reason != nullptr)
+		*stop_reason = sc.why;
+	return sc.cs;
 }
 
 #else
@@ -1048,6 +1112,20 @@ std::uint64_t pipeline_count()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 	return g_pipeline_hashes.size();
+}
+
+ForwardProbe last_create_forward()
+{
+	ForwardProbe f;
+	f.desc = g_forward.desc.load(std::memory_order_relaxed);
+	f.stream = g_forward.stream.load(std::memory_order_relaxed);
+	f.stream_size = g_forward.stream_size.load(std::memory_order_relaxed);
+	f.cached_blob = g_forward.cached_blob.load(std::memory_order_relaxed);
+	f.cached_size = g_forward.cached_size.load(std::memory_order_relaxed);
+	f.cs_found = g_forward.cs_found.load(std::memory_order_relaxed);
+	f.stream_creates = g_forward.stream_creates.load(std::memory_order_relaxed);
+	f.graphics_creates = g_forward.graphics_creates.load(std::memory_order_relaxed);
+	return f;
 }
 
 std::uint64_t pipeline_hash(void *pso)

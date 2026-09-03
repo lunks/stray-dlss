@@ -32,4 +32,21 @@ std::uint32_t descriptor_increment(); // CBV_SRV_UAV, from the hooked device
 const void *find_cs_in_stream(const void *stream, std::size_t size, std::size_t &length,
                               const char **stop_reason);
 
+// What the slot-47 (ID3D12Device2::CreatePipelineState) hook last forwarded to the runtime:
+// the exact desc/stream pointer and the CachedPSO subobject it OBSERVED there. The WARP test
+// asserts these equal what the caller passed - proof the hook neither copies the desc nor
+// drops the cached blob, so it cannot be what defeats vkd3d's pipeline cache (facts §32.12).
+struct ForwardProbe
+{
+	const void *desc = nullptr;
+	const void *stream = nullptr;
+	std::size_t stream_size = 0;
+	const void *cached_blob = nullptr;
+	std::size_t cached_size = 0;
+	bool cs_found = false;
+	std::uint64_t stream_creates = 0;
+	std::uint64_t graphics_creates = 0;
+};
+ForwardProbe last_create_forward();
+
 } // namespace stray_dlss::native::hooks

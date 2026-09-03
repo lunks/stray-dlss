@@ -36,6 +36,73 @@ std::uint64_t g_last_dispatches = 0;
 std::uint64_t g_last_large_dispatches = 0;
 bool g_have_baseline = false;
 
+// ---- stall attribution ----
+std::atomic<bool> g_stall_watch{ true };
+// Per-frame accumulators (reset every present). Summed CPU, like the interval buckets.
+std::atomic<std::uint64_t> g_fr_bucket_sum[kBucketCount] = {};
+std::atomic<std::uint64_t> g_fr_bucket_max[kBucketCount] = {};
+std::atomic<std::uint64_t> g_fr_pso_creates{ 0 };
+std::atomic<std::uint64_t> g_fr_pso_compute{ 0 };
+std::atomic<std::uint64_t> g_fr_pso_orig_ns{ 0 };
+std::atomic<std::uint64_t> g_fr_pso_orig_max{ 0 };
+std::atomic<std::uint64_t> g_fr_evaluates{ 0 };
+std::atomic<std::uint64_t> g_fr_res_created{ 0 };
+std::atomic<std::uint64_t> g_fr_res_destroyed{ 0 };
+std::atomic<std::uint64_t> g_fr_heaps_created{ 0 };
+std::atomic<std::uint64_t> g_fr_fence_wait_ns{ 0 };
+std::atomic<std::uint64_t> g_fr_orig_ns[kOrigCount] = {};
+// The running-median window of present intervals (ns).
+constexpr unsigned kMedianWindow = 64;
+std::uint64_t g_interval_ring[kMedianWindow] = {};
+unsigned g_interval_ring_n = 0, g_interval_ring_next = 0;
+std::uint64_t g_stalls_seen = 0;
+
+void record_frame_bucket(Bucket b, std::uint64_t ns)
+{
+	if (!g_stall_watch.load(std::memory_order_relaxed))
+		return;
+	g_fr_bucket_sum[b].fetch_add(ns, std::memory_order_relaxed);
+	std::uint64_t cur = g_fr_bucket_max[b].load(std::memory_order_relaxed);
+	while (ns > cur && !g_fr_bucket_max[b].compare_exchange_weak(cur, ns, std::memory_order_relaxed)) {}
+}
+
+void reset_frame_accumulators()
+{
+	for (int i = 0; i < kBucketCount; ++i)
+	{
+		g_fr_bucket_sum[i].store(0, std::memory_order_relaxed);
+		g_fr_bucket_max[i].store(0, std::memory_order_relaxed);
+	}
+	g_fr_pso_creates.store(0, std::memory_order_relaxed);
+	g_fr_pso_compute.store(0, std::memory_order_relaxed);
+	g_fr_pso_orig_ns.store(0, std::memory_order_relaxed);
+	g_fr_pso_orig_max.store(0, std::memory_order_relaxed);
+	g_fr_evaluates.store(0, std::memory_order_relaxed);
+	g_fr_res_created.store(0, std::memory_order_relaxed);
+	g_fr_res_destroyed.store(0, std::memory_order_relaxed);
+	g_fr_heaps_created.store(0, std::memory_order_relaxed);
+	g_fr_fence_wait_ns.store(0, std::memory_order_relaxed);
+	for (int i = 0; i < kOrigCount; ++i)
+		g_fr_orig_ns[i].store(0, std::memory_order_relaxed);
+}
+
+std::uint64_t interval_median()
+{
+	if (g_interval_ring_n == 0)
+		return 0;
+	std::uint64_t sorted[kMedianWindow];
+	for (unsigned i = 0; i < g_interval_ring_n; ++i)
+		sorted[i] = g_interval_ring[i];
+	for (unsigned i = 1; i < g_interval_ring_n; ++i)
+	{
+		const std::uint64_t v = sorted[i];
+		unsigned j = i;
+		while (j > 0 && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; --j; }
+		sorted[j] = v;
+	}
+	return sorted[g_interval_ring_n / 2];
+}
+
 std::uint64_t now_ns()
 {
 	return static_cast<std::uint64_t>(
@@ -83,7 +150,77 @@ Scope::~Scope() noexcept
 	// wrap the unsigned accumulator into a nonsense total — exactly the "a wrong number is
 	// worse than a coarse one" failure this module exists to avoid.
 	if (end > start_ns_)
+	{
+		record_frame_bucket(bucket_, end - start_ns_);
 		add(bucket_, end - start_ns_);
+	}
+}
+
+std::uint64_t stall_clock_ns() { return now_ns(); }
+void set_stall_watch(bool e) { g_stall_watch.store(e, std::memory_order_relaxed); }
+bool stall_watch() { return g_stall_watch.load(std::memory_order_relaxed); }
+
+void stall_note_pso_create(std::uint64_t orig_ns, bool is_compute)
+{
+	if (!g_stall_watch.load(std::memory_order_relaxed))
+		return;
+	g_fr_pso_creates.fetch_add(1, std::memory_order_relaxed);
+	if (is_compute)
+		g_fr_pso_compute.fetch_add(1, std::memory_order_relaxed);
+	g_fr_pso_orig_ns.fetch_add(orig_ns, std::memory_order_relaxed);
+	std::uint64_t cur = g_fr_pso_orig_max.load(std::memory_order_relaxed);
+	while (orig_ns > cur && !g_fr_pso_orig_max.compare_exchange_weak(cur, orig_ns, std::memory_order_relaxed)) {}
+}
+void stall_note_evaluate() { if (g_stall_watch.load(std::memory_order_relaxed)) g_fr_evaluates.fetch_add(1, std::memory_order_relaxed); }
+void stall_note_resource(bool created) { if (g_stall_watch.load(std::memory_order_relaxed)) (created ? g_fr_res_created : g_fr_res_destroyed).fetch_add(1, std::memory_order_relaxed); }
+void stall_note_heap_created() { if (g_stall_watch.load(std::memory_order_relaxed)) g_fr_heaps_created.fetch_add(1, std::memory_order_relaxed); }
+void stall_add_fence_wait(std::uint64_t ns) { if (g_stall_watch.load(std::memory_order_relaxed)) g_fr_fence_wait_ns.fetch_add(ns, std::memory_order_relaxed); }
+void stall_note_orig(Orig which, std::uint64_t ns) { if (g_stall_watch.load(std::memory_order_relaxed) && which >= 0 && which < kOrigCount) g_fr_orig_ns[which].fetch_add(ns, std::memory_order_relaxed); }
+
+// Emits one line when this present's interval is a stall, then resets the per-frame state.
+// Called from on_present with the interval already computed.
+void stall_check_and_reset(std::uint64_t frame_ns)
+{
+	if (!g_stall_watch.load(std::memory_order_relaxed))
+		return;
+	const std::uint64_t median = interval_median();
+	g_interval_ring[g_interval_ring_next] = frame_ns;
+	g_interval_ring_next = (g_interval_ring_next + 1) % kMedianWindow;
+	if (g_interval_ring_n < kMedianWindow)
+		++g_interval_ring_n;
+	if (median != 0 && frame_ns > 3 * median)
+	{
+		++g_stalls_seen;
+		const double ms = 1e-6;
+		const std::uint64_t bd = g_fr_bucket_sum[kDispatchPath].load();
+		const std::uint64_t restore = g_fr_bucket_sum[kRestore].load();
+		const std::uint64_t resolve = g_fr_bucket_sum[kResolve].load();
+		const std::uint64_t rootbind = g_fr_bucket_sum[kRootBind].load();
+		const std::uint64_t shadowcopy = g_fr_bucket_sum[kShadowCopy].load();
+		double our_sum = 0.0, our_max = 0.0;
+		int worst_bucket = 0;
+		for (int i = 0; i < kBucketCount; ++i)
+		{
+			our_sum += static_cast<double>(g_fr_bucket_sum[i].load());
+			const double bmax = static_cast<double>(g_fr_bucket_max[i].load());
+			if (bmax > our_max) { our_max = bmax; worst_bucket = i; }
+		}
+		static const char *bn[kBucketCount] = { "dispatch", "mv", "gbuf", "ngx_sr", "ngx_rr", "ngx_nr",
+			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve" };
+		STRAY_LOG_WARN("[stall] frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
+			frame_ns * ms, median * ms, static_cast<double>(frame_ns) / static_cast<double>(median),
+			static_cast<unsigned long long>(g_stalls_seen),
+			static_cast<unsigned long long>(g_fr_pso_creates.load()), static_cast<unsigned long long>(g_fr_pso_compute.load()),
+			g_fr_pso_orig_ns.load() * ms, g_fr_pso_orig_max.load() * ms,
+			static_cast<unsigned long long>(g_fr_evaluates.load()),
+			static_cast<unsigned long long>(g_fr_res_created.load()), static_cast<unsigned long long>(g_fr_res_destroyed.load()),
+			static_cast<unsigned long long>(g_fr_heaps_created.load()),
+			g_fr_fence_wait_ns.load() * ms,
+			g_fr_orig_ns[kOrigExecute].load() * ms, g_fr_orig_ns[kOrigPresent].load() * ms,
+			our_sum * ms, our_max * ms, bn[worst_bucket],
+			bd * ms, resolve * ms, rootbind * ms, shadowcopy * ms, restore * ms);
+	}
+	reset_frame_accumulators();
 }
 
 void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_total)
@@ -110,6 +247,9 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 	g_frames_in_interval.fetch_add(1, std::memory_order_relaxed);
 	if (frame_ns > g_worst_frame_ns.load(std::memory_order_relaxed))
 		g_worst_frame_ns.store(frame_ns, std::memory_order_relaxed);
+
+	// Stall attribution: one line when this interval is >3x the running median.
+	stall_check_and_reset(frame_ns);
 	{
 		const std::uint64_t ms = frame_ns / 1000000ull;
 		g_frame_hist[ms < 128 ? static_cast<int>(ms) : 128]++;

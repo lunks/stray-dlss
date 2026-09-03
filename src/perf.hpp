@@ -86,6 +86,29 @@ enum Counter
 };
 void count(Counter c, std::uint64_t n = 1);
 
+// ---- stall attribution ([STRAYDLSS] StallWatch, default ON) ----
+//
+// A present whose interval exceeds 3x the running median (a 64-present window) prints one line
+// naming what ran that frame: our per-bucket time (sum AND the single worst call), whether an
+// NGX evaluate happened, how many pipelines were created and how long the forwarded vkd3d
+// CreatePipelineState took (suspect (1): a first-sight pipeline compile with no write cache,
+// facts §32.12/§32.13), heaps/resources created or destroyed, fence waits, and time inside the
+// other originals we forward to. The per-frame accumulators reset every present.
+void set_stall_watch(bool enabled);
+bool stall_watch();
+
+// A pipeline was created through our hook this frame; `orig_ns` is the time the FORWARDED
+// vkd3d CreatePipelineState/CreateComputePipelineState took (the compile).
+void stall_note_pso_create(std::uint64_t orig_ns, bool is_compute);
+void stall_note_evaluate();      // an NGX SR/RR/NR evaluate ran this frame
+void stall_note_resource(bool created); // a resource was created (true) or destroyed (false)
+void stall_note_heap_created();
+void stall_add_fence_wait(std::uint64_t ns); // present-owner or NGX fence wait
+enum Orig { kOrigExecute = 0, kOrigPresent, kOrigCount };
+void stall_note_orig(Orig which, std::uint64_t ns);
+// A monotonic nanosecond clock, for timing a forwarded original outside a Scope.
+std::uint64_t stall_clock_ns();
+
 // RAII timer. Reads the clock twice only when enabled, so a disabled build pays one atomic
 // load per scope and nothing else.
 class Scope

@@ -815,6 +815,7 @@ bool try_evaluate_rr(ID3D12Device *native_device, ID3D12GraphicsCommandList *nat
 		{
 			perf::Scope perf_rr(perf::kNgxRr);
 			ok = ngx::evaluate_rr(native, er);
+			if (ok) perf::stall_note_evaluate();
 		}
 
 		if (ok)
@@ -2008,6 +2009,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 									{
 										perf::Scope perf_sr(perf::kNgxSr);
 										ok = ngx::evaluate(native, ei);
+										if (ok) perf::stall_note_evaluate();
 									}
 
 								// DLSS Neural Rendering (NGX feature 18), strictly AFTER

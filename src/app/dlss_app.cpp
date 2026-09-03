@@ -349,6 +349,9 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool perf_log = true;
 	perf_log = host::cfg::get_bool("PerfLog", perf_log);
 	perf::set_enabled(perf_log);
+	// [STRAYDLSS] StallWatch (default ON): one [stall] line per present whose interval exceeds
+	// 3x the running median, attributing the frame (facts §32.13). Cheap (a few atomics/present).
+	perf::set_stall_watch(host::cfg::get_bool("StallWatch", true));
 
 	// [STRAYDLSS] ShadowMode: fast (flat lock-free arrays), debug (sharded map with provenance),
 	// or absent = AUTO. Selected once, before the game creates any descriptor heap; logged and

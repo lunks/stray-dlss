@@ -1684,3 +1684,62 @@ unit-tested).
 * `holds=1014 catchups=94`: 91% of pairs went out on the clock, 9% caught up after a late
   game frame. The 9.43 ms median at frame 2400 is the load-screen cadence still inside the
   16-sample window; steady gameplay reads 12.1-12.2.
+
+## 32.12 The vkd3d pipeline cache is NOT defeated by our create-path forwarding (offline, 2026-09-02)
+
+The box shows, with the plugin loaded, every material compiling on first sight every session
+(objects pop in ~200 ms apart) while with no host they appear instantly, and
+`vkd3d-proton.cache` sits at 284 KB with the Proton log reading
+`vkd3d_pipeline_library_disk_cache_merge: No write cache exists`. The hypothesis was that our
+patch on `ID3D12Device2::CreatePipelineState` (slot 47) drops the CachedPSO blob, as ReShade's
+pipeline events do (CLAUDE.md §5).
+
+**Read from UE 4.27.2 source (`WindowsD3D12PipelineState.cpp`, mirror @ `306a7e9`), HARD:**
+`CreatePipelineStateWrapper` (`:819`) uses the STREAM API `ID3D12Device2::CreatePipelineState`
+whenever `pDevice2 && bUseStream` (`:831-832`) — for **both graphics and compute** PSOs. So
+every material PSO passes through our slot-47 hook, and `Stream.CachedPSO = this->CachedPSO`
+(`:73/:111`) puts the app's cached blob in that stream.
+
+**Our hook is transparent, PROVEN in the WARP lane** (`tests/warp/warp_pso_cache.inc`, every
+CI push): `hk_CreatePipelineState` calls `g_orig_CreatePipelineState(self, desc, ...)` with the
+caller's **exact desc pointer**; the stream is only WALKED (read-only) AFTER the create returns,
+to hash a compute shader for the census. The test creates a compute PSO through the patched
+slot with a real CachedPSO blob and asserts, via `native::hooks::last_create_forward()`, that
+the forwarded stream pointer and the `{blob pointer, size}` the runtime received are byte-for-
+byte the caller's, and that the re-create from the PSO's own cached blob SUCCEEDS (a dropped or
+corrupted blob would make D3D12 fail per spec). It does. **So our create hooks do not strip
+CachedPSO and are not what defeats the cache.** HARD.
+
+Two changes landed with the proof: graphics PSOs are no longer recorded at all (only compute,
+for the census + TAA hash — `hk_CreatePipelineState` forwards then observes); and the forwarded
+`CreatePipelineState`/`CreateComputePipelineState` are timed for stall attribution (§32.13).
+
+**What remains to check on the box** (needs a launch, the user is on the box): the process cwd.
+vkd3d writes `vkd3d-proton.cache` and its `.write` sibling RELATIVE to the process cwd
+(`cache.c:3229` `VKD3D_SHADER_CACHE_PATH`, empty → cwd). The running game's cwd is
+`/run/media/deck/GamesLinux/SteamLibrary/steamapps/common/Stray` (measured from `/proc/PID/cwd`),
+yet the 284 KB read cache found is under `Binaries/Win64`. If UE4SS/the plugin changes the cwd
+(vs the no-host run), the `.write` is written to a directory that is never promoted into the
+read cache the game loads next startup — "No write cache exists" + recompile every session,
+with no CachedPSO involvement. The check: compare the game's cwd and where a `.write` appears,
+with the plugin vs without. UNCONFIRMED.
+
+## 32.13 Stall attribution built into the host ([STRAYDLSS] StallWatch, default ON)
+
+The user sees the DLSS indicator blink, the music cut out and a visible jump at the same
+moments, under BOTH the plugin and the ReShade add-on with SR only, "since ever". Measured
+under the add-on (host load 2.5/32, flat 6.1 ms/165 fps, our CPU a steady 1.2 ms) every few
+seconds ONE frame lands at 24-28 ms while the surrounding windows are worst 6.4 ms — a 4x
+single-frame stall a few times a minute: an audio underrun + a frame with no evaluate (so no
+indicator, and NR amplifies it to a whole-screen change) + a visible jump. The -5 nvapi lines
+are a one-time 5-line burst at the first evaluate, not this.
+
+`src/perf.cpp` now prints one `[stall]` line for every present whose interval exceeds **3x the
+running median** (a 64-present window), attributing that frame: our per-bucket CPU (sum AND the
+single worst call), whether an NGX evaluate ran, **how many pipelines were created and how long
+the forwarded vkd3d `CreatePipelineState` took** (suspect (1), §32.12: a first-sight compile
+with no write cache), heaps/resources created, fence waits, and time inside the forwarded
+`Present`. The per-frame accumulators reset each present; the cost is a few relaxed atomics per
+present plus timing around the already-rare create calls. This is instrumentation only — no
+behaviour change — so the culprit names itself in one box session (SR only, 3-minute menu idle,
+where the stall reproduces). Attribution table to follow from that run.

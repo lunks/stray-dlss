@@ -445,7 +445,12 @@ HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain *self, UINT sync, UINT flags
 	HRESULT hr = S_OK;
 	if (fg_present(self, sync, flags, &hr))
 		return hr;
-	return orig != nullptr ? orig(self, sync, flags) : S_OK;
+	if (orig == nullptr)
+		return S_OK;
+	const std::uint64_t t0 = perf::stall_clock_ns();
+	hr = orig(self, sync, flags);
+	perf::stall_note_orig(perf::kOrigPresent, perf::stall_clock_ns() - t0);
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *params)
@@ -456,7 +461,12 @@ HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1 *self, UINT sync, UINT fla
 	HRESULT hr = S_OK;
 	if (fg_present(self, sync, flags, &hr))
 		return hr; // UE 4.27 calls Present, not Present1 (facts §32.4); FG presents through Present either way
-	return orig != nullptr ? orig(self, sync, flags, params) : S_OK;
+	if (orig == nullptr)
+		return S_OK;
+	const std::uint64_t t0 = perf::stall_clock_ns();
+	hr = orig(self, sync, flags, params);
+	perf::stall_note_orig(perf::kOrigPresent, perf::stall_clock_ns() - t0);
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain *self, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags)
