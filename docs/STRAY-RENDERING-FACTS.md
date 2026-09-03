@@ -1760,6 +1760,51 @@ reading is confirmed outright. Then, in ONE session: `readlink /proc/<pid>/cwd`,
 directories mid-session to see whether a `.write` exists at all and where. Only if a `.write`
 does exist mid-session does the kill-versus-clean-exit question arise. UNCONFIRMED.
 
+### 32.12.2 CLOSED, and the premise was wrong: the write cache works (measured 2026-09-02 21:24)
+
+Read-only survey of the box, no launch of mine, immediately after another agent's SR+NR
+plugin session (the plugin loaded, ReShade absent). The Proton log of that very session,
+verbatim:
+
+```
+vkd3d_instance_deduce_config_flags_from_environment: shader_cache is used, global_pipeline_cache is enforced.
+vkd3d_pipeline_library_init_disk_cache: Remapping VKD3D_SHADER_CACHE to: vkd3d-proton.cache.
+vkd3d_pipeline_library_init_disk_cache: Attempting to load disk cache from: vkd3d-proton.cache.
+vkd3d_pipeline_library_disk_cache_merge: Merging disk caches.
+vkd3d_pipeline_library_disk_cache_merge: Done merging shader caches, existing entries: 1157, new entries: 1.
+vkd3d_pipeline_library_disk_cache_merge: Successfully replaced shader cache with merged cache.
+```
+
+**`No write cache exists` does not appear anywhere in that log.** A write cache from the
+previous session existed, was found, and was merged: 1157 existing entries plus 1 new one,
+"successfully replaced". So the disk cache is loading, accumulating and promoting, **with the
+plugin loaded** — the mechanism §32.12 set out to debug is not broken, and every hypothesis
+in §32.12.1 is moot rather than merely unconfirmed.
+
+**The cwd question resolves the other way from §32.12's reading, and the filesystem says so:**
+
+| path | size | mtime |
+|---|---|---|
+| `.../common/Stray/Hk_project/Binaries/Win64/vkd3d-proton.cache` | 283 984 | **2026-09-02 21:24** (that session) |
+| `.../compatdata/1332010/pfx/drive_c/vkd3d-proton.cache` | 432 | 2026-08-31 (an empty stub, dead) |
+
+The `Binaries/Win64` copy is the live one and was rewritten by the session that had just
+ended, so **the game's cwd at device creation is `Binaries/Win64`**, exactly where our own
+sidecars land — consistent, and it retires the "stale orphan" reading I floated in §32.12.1.
+The 432-byte file under `drive_c` is a header-only cache from some earlier configuration whose
+cwd resolved to `C:\`; it is not consulted.
+
+**Also retired: the kill-not-quit candidate.** A write cache from a session that ended in
+`pkill` was still on disk and was merged at the next startup, so vkd3d's cache survives
+SIGTERM and does not depend on a clean exit. The `pkill` in `stray-lib.sh` costs nothing here.
+
+**What the 284 KB and "compiles on first sight" observations were, then, is UNCONFIRMED** —
+they were real when recorded, and the plausible readings are a session that genuinely was the
+first with a given driver/plugin combination (nothing to merge yet), or a cache that had been
+cleared. `new entries: 1` is the number to watch: it stays near zero once warm, and a session
+that recompiles everything would show it in the hundreds. Re-read those three log lines
+before ever reopening this.
+
 ## 32.13 Stall attribution built into the host ([STRAYDLSS] StallWatch, default ON)
 
 The user sees the DLSS indicator blink, the music cut out and a visible jump at the same
