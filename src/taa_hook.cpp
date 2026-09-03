@@ -55,6 +55,13 @@ std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
 // Non-zero is the fix working: each one is a frame the old search would have taken the wrong
 // View for, and refused the real TAA dispatch over.
 std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
+// The SILENT subset (facts §36.20): a View we accepted whose rect is below the engine's own
+// kMinTAAUpsampleResolutionFraction of the dispatch — i.e. an impostor the fits-dispatch filter
+// cannot catch because it is too SMALL rather than too large. Counted, never gated on yet.
+std::atomic<std::uint64_t> g_view_suspect_small{ 0 };
+// More than one plausible View survived the filter on one dispatch, so the pick was a choice.
+std::atomic<std::uint64_t> g_view_ambiguous{ 0 };
+std::atomic<std::uint32_t> g_view_amb_logged{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -695,11 +702,25 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
+	// INVESTIGATION ONLY (facts §36.20). Nothing below changes which CB is picked; it counts
+	// what the current filter cannot see. `view_fits_dispatch` catches an impostor whose rect is
+	// LARGER than the dispatch; one that is SMALLER passes silently and would feed DLSS another
+	// view's jitter, ClipToPrevClip and CameraCut. These two numbers say whether that subset is
+	// empty, occasional or constant — which is the whole question, and it decides the fix.
+	unsigned accepted_candidates = 0;
+	char cand_list[192];
+	int cand_off = 0;
+	cand_list[0] = '\0';
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
+		if (cand_off >= 0 && cand_off < static_cast<int>(sizeof(cand_list)) - 1)
+			cand_off += std::snprintf(cand_list + cand_off, sizeof(cand_list) - cand_off,
+				" b%u=%.0fx%.0f", cb.first,
+				static_cast<double>(candidate.view_size_and_inv_size.x),
+				static_cast<double>(candidate.view_size_and_inv_size.y));
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
 		// establish that a buffer IS a View uniform buffer; a shadow, cubemap-face or
 		// scene-capture view satisfies both. The search runs in slot order, so a wrong-but-
@@ -714,12 +735,38 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
 			continue;
 		}
+		++accepted_candidates;
+		if (view_ok)
+			continue;  // keep scanning ONLY to count; the pick is unchanged (first accepted)
 		view = candidate;
 		view_ok = true;
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
-		break;
+	}
+	if (view_ok)
+	{
+		// Would the engine's own kMinTAAUpsampleResolutionFraction have refused what we took?
+		const bool frac_ok = ue4::view_fraction_plausible(view, x * 8u, y * 8u);
+		if (!frac_ok)
+			g_view_suspect_small.fetch_add(1, std::memory_order_relaxed);
+		if (accepted_candidates > 1)
+			g_view_ambiguous.fetch_add(1, std::memory_order_relaxed);
+		// Log only the INTERESTING dispatches - more than one candidate survived the filter, or
+		// the one we took is below the engine's own minimum fraction. A clean frame logs nothing.
+		if ((!frac_ok || accepted_candidates > 1) &&
+			g_view_amb_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+			STRAY_LOG_WARN("VIEW CB AMBIGUITY: dispatch %ux%u groups (covers %ux%u px) had %u "
+				"plausible View buffers survive the fits-dispatch filter; we TOOK b%u = %.0fx%.0f "
+				"(fraction %.3f of the dispatch, engine minimum 0.5 -> %s). All plausible "
+				"candidates:%s. A candidate SMALLER than the dispatch passes the current filter "
+				"silently and would hand DLSS another view's jitter/ClipToPrevClip/CameraCut. "
+				"Investigation only - nothing is gated on this yet. Logged 8 times.",
+				x, y, x * 8u, y * 8u, accepted_candidates, b.view_cb_register,
+				static_cast<double>(view.view_size_and_inv_size.x),
+				static_cast<double>(view.view_size_and_inv_size.y),
+				x != 0 ? static_cast<double>(view.view_size_and_inv_size.x) / (x * 8.0) : 0.0,
+				frac_ok ? "OK" : "BELOW - SUSPECT", cand_list);
 	}
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
@@ -1963,11 +2010,14 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
 }
 
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view)
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
+                          std::uint64_t &suspect_small, std::uint64_t &ambiguous)
 {
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
+	suspect_small = g_view_suspect_small.load(std::memory_order_relaxed);
+	ambiguous = g_view_ambiguous.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

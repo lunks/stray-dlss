@@ -379,3 +379,52 @@ TEST_CASE("view_fits_dispatch separates THIS view from A view")
 		CHECK(ue4::view_fits_dispatch(p, 0, 0));
 	}
 }
+
+TEST_CASE("view_fraction_plausible is the OTHER half - it catches an impostor that is too SMALL")
+{
+	// view_fits_dispatch catches a rect LARGER than the dispatch (the loud 1.2%, facts §36.18).
+	// A rect that is SMALLER passes it silently and would hand DLSS another view's jitter,
+	// ClipToPrevClip and CameraCut. The floor is the engine's OWN declared minimum,
+	// FSceneViewScreenPercentageConfig::kMinTAAUpsampleResolutionFraction == 0.5 - the same
+	// constant seam::discover already validates the ITemporalUpscaler vtable against.
+	ue4::ViewParams p{};
+
+	SUBCASE("the shipped 50% screen percentage sits exactly ON the floor and passes")
+	{
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("70%, the other configuration this project runs, passes")
+	{
+		p.view_size_and_inv_size = { 2688.0f, 1512.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("DLAA passes")
+	{
+		p.view_size_and_inv_size = { 3840.0f, 2160.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("a shadow-sized view is nowhere near the line")
+	{
+		p.view_size_and_inv_size = { 512.0f, 512.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1024.0f, 1024.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("the quantisation slack is 8px, not a licence to drift")
+	{
+		// group count * 8 rounds the real output rect up by at most 7 per axis, so the floor is
+		// loosened by 8 - enough for DivideAndRoundUp and nothing like enough for a wrong view.
+		p.view_size_and_inv_size = { 1912.0f, 1072.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1700.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("no extent, or nothing to compare against")
+	{
+		p.view_size_and_inv_size = { 0.0f, 0.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 0, 0));
+	}
+}

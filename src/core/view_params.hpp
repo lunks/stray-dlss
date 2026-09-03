@@ -87,6 +87,26 @@ bool view_params_plausible(const ViewParams &p);
 // `covered_w`/`covered_h` are group_count * 8. Inclusive, so DLAA (view == dispatch) passes.
 bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint32_t covered_h);
 
+// THE OTHER HALF OF THE SAME TEST, and it is INVESTIGATION-ONLY for now (nothing gates on it).
+//
+// `view_fits_dispatch` catches an impostor whose rect is LARGER than the dispatch — the subset
+// that failed loudly and became the 1.2% `unclaimed` (facts §36.18). An impostor whose rect is
+// SMALLER passes it silently, and would hand DLSS another view's jitter, ClipToPrevClip and
+// CameraCut. This is the bound that would catch those.
+//
+// It comes from the engine's own declared range, not from a guess:
+// `FSceneViewScreenPercentageConfig::kMinTAAUpsampleResolutionFraction` is **0.5**
+// (SceneView.h:1438-1439) — the same constant `seam::discover` already validates the
+// ITemporalUpscaler vtable against. So for any `Main*` config the input view rect is at least
+// half the output rect, and the dispatch covers the output rect.
+//
+// The slack is quantisation: the dispatch covers `group count * 8`, which rounds the real
+// output rect UP by at most 7 px per axis, so the floor is loosened by 8 rather than being
+// exact. A shadow or capture view is nowhere near this line — 512x512 against 3840x2160 is
+// 0.13, not 0.5 — so the test does not need to be tight to be decisive.
+bool view_fraction_plausible(const ViewParams &p, std::uint32_t covered_w,
+                             std::uint32_t covered_h);
+
 // Is the PreExposure / OneOverPreExposure pair (rows 135.y and 135.z) self-consistent? Separate
 // from view_params_plausible ON PURPOSE — that gate governs the whole DLSS path, and those rows
 // are [derived], so a wrong offset there would disable upscaling entirely. Callers that consume

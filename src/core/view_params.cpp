@@ -120,6 +120,21 @@ bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint3
 	return w <= static_cast<float>(covered_w) && h <= static_cast<float>(covered_h);
 }
 
+bool view_fraction_plausible(const ViewParams &p, std::uint32_t covered_w,
+                             std::uint32_t covered_h)
+{
+	const float w = p.view_size_and_inv_size.x;
+	const float h = p.view_size_and_inv_size.y;
+	if (!(w > 0.0f) || !(h > 0.0f))
+		return false;
+	if (covered_w == 0 || covered_h == 0)
+		return true; // nothing to compare against — invent no verdict
+	// kMinTAAUpsampleResolutionFraction == 0.5, minus 8px of DivideAndRoundUp slack per axis.
+	const float floor_w = 0.5f * static_cast<float>(covered_w) - 8.0f;
+	const float floor_h = 0.5f * static_cast<float>(covered_h) - 8.0f;
+	return w >= floor_w && h >= floor_h;
+}
+
 bool pre_exposure_plausible(const ViewParams &p)
 {
 	// DELIBERATELY NOT part of view_params_plausible, which gates the ENTIRE DLSS path: rows

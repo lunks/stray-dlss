@@ -109,6 +109,12 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // `wrong_view` counts candidates that decoded as A View buffer but described a DIFFERENT view
 // than the dispatch - the search skipping past them instead of stopping. Non-zero is the fix for
 // facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
+// `suspect_small` and `ambiguous` are INVESTIGATION ONLY (facts §36.20) - nothing is gated on
+// them. suspect_small counts a View we accepted whose rect is below the engine's own
+// kMinTAAUpsampleResolutionFraction of the dispatch: an impostor too SMALL for view_fits_dispatch
+// to catch, which would feed DLSS another view's jitter/ClipToPrevClip/CameraCut silently.
+// ambiguous counts dispatches where more than one plausible View survived, so the pick was a choice.
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
+                          std::uint64_t &suspect_small, std::uint64_t &ambiguous);
 
 } // namespace stray_dlss::taa_hook
