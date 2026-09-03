@@ -118,4 +118,12 @@ void named_pass_counters(std::uint32_t out[5]);
 
 void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 
+// Row 135's self-check, tallied over every frame that located a View CB. The buffer is found by
+// SEARCH, and `view_params_plausible` is a shape test the WRONG buffer can satisfy — so this is
+// the number that says whether the search is right. Row 135 must read (denormal, P, 1/P, 0.0);
+// `y*z == 1.0` is true by construction (SceneRendering.cpp:1563-1564) and cannot survive a wrong
+// buffer or a slipped offset. A `bad` rate near 100% means the CB search is what to fix, and
+// that every jitter / ClipToPrevClip / CameraCut we have fed a temporal consumer is suspect.
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad);
+
 } // namespace stray_dlss::taa_hook

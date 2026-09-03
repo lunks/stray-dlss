@@ -516,7 +516,6 @@ const char *l1_gate_name(L1Gate g)
 	{
 	case L1Gate::off:     return "off";
 	case L1Gate::faulted: return "faulted";
-	case L1Gate::stale:   return "stale";
 	case L1Gate::resolve: return "resolve";
 	}
 	return "?";
@@ -525,13 +524,11 @@ const char *l1_gate_name(L1Gate g)
 L1Gate l1_gate(const L1GateInputs &in)
 {
 	// The off-switch first and unconditionally, so EngineSeamInputs=0 can never reach a
-	// dereference by any other route — including a fault latch or a freshness verdict.
+	// dereference by any other route — including the fault latch.
 	if (!in.inputs_enabled || in.mode != Mode::authoritative || !in.hooked || !in.announced)
 		return L1Gate::off;
 	if (in.faulted)
 		return L1Gate::faulted;
-	if (!in.fresh)
-		return L1Gate::stale;
 	return L1Gate::resolve;
 }
 

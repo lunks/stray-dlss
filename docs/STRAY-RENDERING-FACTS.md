@@ -2961,3 +2961,85 @@ the announce/claim pair is now latched with one WARN if it ever moves — report
 **Also measured here:** with L1 inert the blips return exactly as before —
 `unclaimed=53`, `guides-stale=26`, `frame-gap=24` tracking together — which is a third
 independent confirmation that `unclaimed` is the user's "DLSS flip" and that L1 is what closes it.
+
+### 36.11 The RHI thread lags RDG setup by one frame, so claim-time resolution can never work (2026-09-03)
+
+DLL md5 `83628ea2…`→`e421e14`, menu, no input, `EngineSeam=3`, `EngineSeamInputs=1`, FG on, NR on.
+
+**No crash, `faults=0 off=0`, 4200+ frames** — the `VirtualQuery` + SEH guards and the fault latch
+hold across three consecutive builds now.
+
+**And L1 resolved nothing after startup:**
+
+```
+[seam] frame 1800: … | l1: resolved=164 partial=0 fellBack=550 stale=1080 faults=0 off=0
+[seam] frame 2400: … | l1: resolved=164 partial=0 fellBack=550 stale=1676 faults=0 off=0
+[seam] frame 3000: … | l1: resolved=164 partial=0 fellBack=550 stale=2270 faults=0 off=0
+
+ENGINE SEAM L1: AddPasses announced on thread 1408 and the dispatch was recorded on thread 1160.
+ENGINE SEAM L1: declining … A NEWER ANNOUNCEMENT EXISTS … THE FRAME TURNED OVER …
+  (seq 715 vs newest 716, frame 711 vs 712; threads 1408 -> 1160, NOT tested)
+```
+
+`resolved` and `fellBack` are frozen while `stale` grows every frame. **HARD: the claim is exactly
+one announcement and one frame behind the announcement, in steady state.** The 164 early resolves
+are the shallow-pipeline window during load.
+
+**HARD, from UE 4.27.2 source (`AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`), and it is the
+architectural answer:**
+
+* `FRDGBuilder::Execute()` ends with `Clear()`, which contains `Allocator.ReleaseAll();`, freeing
+  every `FRDGTexture`. It calls no `ImmediateFlush`, no `FlushRHIThread`, no `WaitForRHIThread`.
+  `RenderGraphBuilder.h`: *"The builder should be created on the stack and executed prior to
+  destruction"*, with `FRDGAllocator Allocator;` held by value.
+* `RHICommandList.h` opens *"RHI Command List definitions for queueing up & executing later"*, and
+  every entry point is `if (Bypass()) { GetContext().RHI…; return; } ALLOC_COMMAND(…)`.
+
+So a pass lambda's `DispatchComputeShader` enqueues a command, `Execute()` then frees the arena,
+and the D3D12 `Dispatch` our hook sees is made later by another thread. **Resolving an
+`FRDGTexture` at claim time reads freed memory by construction** — that is the crash of §36.9 and
+the inertness of §36.10, one cause.
+
+**The fix is a different site, not a better gate.** `GetSceneTextureParameters` registers both
+guides externally —
+`Parameters.SceneDepthTexture = GraphBuilder.RegisterExternalTexture(SceneContext.SceneDepthZ, …)`
+and `Parameters.GBufferVelocityTexture = TryRegisterExternalTexture(GraphBuilder, SceneContext.SceneVelocity)`
+— and `RegisterExternalTexture` calls `SetRHI` immediately, so **depth and velocity have a
+non-null `ResourceRHI` inside `AddPasses`**, on the render thread, inside the live builder.
+Colour is the post-chain `SceneColor.Texture` and is expected to be graph-allocated (`rhi_null`).
+The resolve moved there; the announcement now carries plain `ID3D12Resource*` and the claim only
+checks them against our registry.
+
+**Also HARD, and it corrects our own framing:** with the RHI thread one frame behind,
+`claim()` returning the OLDEST rect match returns the announcement the dispatch actually belongs
+to. The correlation was always right; only the pointer was dead.
+
+**Not yet measured:** whether colour ever resolves, and whether depth/velocity survive the
+registry's liveness check a frame later. The `l1:` line answers both.
+
+### 36.12 The View constant buffer is located by SEARCH, and nothing has ever checked it (2026-09-03)
+
+From the same session, with the user still reporting flicker:
+
+```
+[INFO ]   View CB: NOT READABLE or implausible (cb valid=0 reg=b0)
+[INFO ]   View CB at b4, offset 4921600
+[INFO ]     PreExposure=1.000000  NearPlane=1.0000  DeltaTime=0.000000  CameraCut=0.0
+[INFO ]     PreExposure=32.100681 NearPlane=1.0000  DeltaTime=0.000000  CameraCut=1.0
+```
+
+`view_params_plausible` is a **shape** test that the wrong buffer can satisfy, and a wrong View
+means wrong jitter, wrong `ClipToPrevClip` and a wrong `CameraCut` — which is what temporal
+flicker looks like on every consumer we feed. `NearPlane` exactly `1.0000` and `DeltaTime` exactly
+`0.000000` while `PreExposure` jumps `1.0 → 32.1` are consistent with a wrong buffer and prove
+nothing either way.
+
+**Row 135 settles it for free and the check already shipped** (`ViewParams::pre_exposure_row`,
+`ue4::pre_exposure_plausible`, §2.6): the row must read `(denormal, P, 1/P, 0.0)`, and
+`y*z == 1.0` is true **by construction** (`SceneRendering.cpp:1563-1564` assigns the pair on
+adjacent lines from the same float) so it cannot survive a wrong buffer or a slipped offset. It is
+now printed beside the "View CB at b…" line — all four components from one read, the three
+predictions, and a verdict — plus a running `ok=/bad=` tally on the periodic `[view]` line.
+
+**A `bad` rate near 100% convicts the CB search; near 0% exonerates it and moves the flicker
+hunt elsewhere.** No new offsets and no new risk were added to obtain that.

@@ -59,11 +59,21 @@ struct Verdict
 	std::uint32_t out_width = 0;
 	std::uint32_t out_height = 0;
 	std::uint64_t sequence = 0;
-	// The engine's own FPassInputs, for L1. Identities at this point; resolve_inputs turns
-	// them into ID3D12Resource* and is the only thing allowed to dereference them.
+	// The engine's own FPassInputs, for L1. The FRDGTexture pointers are IDENTITIES ONLY and
+	// must never be dereferenced here — by claim time `FRDGBuilder::Execute()` has run
+	// `Allocator.ReleaseAll()` and the objects are gone (report §12.9). They are kept only so
+	// the first-resolve line can print what produced each resource.
 	std::uint64_t colour_rdg = 0;
 	std::uint64_t depth_rdg = 0;
 	std::uint64_t velocity_rdg = 0;
+	// The resolved ID3D12Resource*, taken inside AddPasses on the render thread. Plain
+	// pointers no allocator owns; `resolve_inputs` checks each against our resource registry.
+	std::uint64_t colour_res = 0;
+	std::uint64_t depth_res = 0;
+	std::uint64_t velocity_res = 0;
+	seam::RhiChain colour_status = seam::RhiChain::null_rdg;
+	seam::RhiChain depth_status = seam::RhiChain::null_rdg;
+	seam::RhiChain velocity_status = seam::RhiChain::null_rdg;
 	// May those three pointers be dereferenced? Only while the announcing FRDGBuilder lives:
 	// newest announcement, same frame, same thread (seam::announcement_is_fresh). The ledger
 	// claims IDENTITY with slack on purpose; POINTERS get none. False is a normal, counted

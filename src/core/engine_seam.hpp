@@ -305,10 +305,25 @@ struct Announcement
 	std::uint64_t sequence = 0;
 	std::uint32_t out_width = 0;
 	std::uint32_t out_height = 0;
-	// FRDGTexture identities from FPassInputs. Compared, never dereferenced.
+	// FRDGTexture identities from FPassInputs. Compared, never dereferenced OUTSIDE AddPasses.
 	std::uint64_t colour_rdg = 0;
 	std::uint64_t depth_rdg = 0;
 	std::uint64_t velocity_rdg = 0;
+	// The SAME textures, already resolved to ID3D12Resource* ON THE RENDER THREAD INSIDE
+	// AddPasses, where the FRDGBuilder is provably alive because we are inside its setup.
+	// This is the whole architecture (report §12.9): `FRDGBuilder::Execute()` ends with
+	// `Clear()` -> `Allocator.ReleaseAll()`, which frees every FRDGTexture, and it neither
+	// flushes nor waits for the RHI thread - while `FRHICommandList` is "definitions for
+	// queueing up & executing later" and a pass lambda's DispatchComputeShader does
+	// ALLOC_COMMAND rather than calling the RHI. So the D3D12 Dispatch we intercept happens
+	// AFTER the arena is freed, on another thread. Resolving there read freed memory by
+	// construction; resolving here cannot.
+	std::uint64_t colour_res = 0;
+	std::uint64_t depth_res = 0;
+	std::uint64_t velocity_res = 0;
+	RhiChain colour_status = RhiChain::null_rdg;
+	RhiChain depth_status = RhiChain::null_rdg;
+	RhiChain velocity_status = RhiChain::null_rdg;
 	// The OS thread that announced. An FRDGTexture is owned by the FRDGBuilder that made it,
 	// and that builder lives on one thread's stack for the length of one Execute — so a claim
 	// from another thread is a claim against memory that thread may already have recycled.
@@ -327,18 +342,27 @@ struct Announcement
 // so the instant the announcing graph is gone the pointer addresses recycled arena memory —
 // where `+16` is no longer `ResourceRHI` but whatever the next allocation put there.
 //
-// The rule is therefore the narrowest one that is still always true: dereference ONLY the
-// newest announcement, and only before the frame has turned over. A claim that fails this is
-// not an error — L1 declines and the heuristic supplies that frame's inputs, exactly as
-// `EngineSeamInputs=0` would — but it is COUNTED, because a rate that climbs means the ledger
-// has slipped a graph behind and identity is suspect too.
+// >>> THIS IS NO LONGER A GATE. It is a PIPELINE-DEPTH DIAGNOSTIC. <<<
 //
-// THREAD IDENTITY IS NOT PART OF THE RULE, and a version of this that required it shipped and
-// made L1 inert (`stale=4147` of 4147, `resolved=0`; see §12.8 of the report). AddPasses runs
-// during RDG setup and the dispatch during graph execution, on different threads by design.
-// Thread identity governs OWNERSHIP, not VALIDITY: memory held by a live stack frame is
-// readable from any thread. The two ids below are carried so the caller can REPORT the pair
-// and notice if it ever changes; `announcement_is_fresh` does not look at them.
+// It was a gate for exactly one build, and the box retired it: `stale=4147` of 4147 claims with
+// `resolved=0`, because the steady state IS "not the newest, and the frame has turned over" —
+// by one, every frame. UE 4.27 runs RDG setup on the render thread and drains the RHI command
+// list on another, one frame behind, so by the time our hook sees a dispatch the render thread
+// has already built the next graph (report §12.9).
+//
+// The right conclusion was NOT a narrower gate. It was that resolving at claim time is
+// unsafe *whatever* this returns — `FRDGBuilder::Execute()` frees the arena before the
+// commands ever run — so the dereference moved into `AddPasses`, and the announcement now
+// carries plain `ID3D12Resource*` that no allocator owns. Nothing about lifetime is decided
+// here any more; liveness at claim is the check.
+//
+// Kept because the number is worth reading: it measures how far the RHI thread lags, and a
+// sudden change in it means the engine's threading moved under us.
+//
+// THREAD IDENTITY IS NOT PART OF THE RULE EITHER, and a version that required it also shipped
+// and also made L1 inert (§12.8). Thread identity governs OWNERSHIP, not VALIDITY: memory held
+// by a live stack frame is readable from any thread. The two ids below are carried so the
+// caller can REPORT the pair and notice if it ever changes; nothing looks at them.
 struct Freshness
 {
 	std::uint64_t announce_sequence = 0; // Announcement::sequence
@@ -359,8 +383,7 @@ enum class L1Gate : std::uint8_t
 {
 	off = 0,   // EngineSeamInputs=0, not authoritative, seam not live, or nothing announced
 	faulted,   // a guarded read or call already faulted; L1 is off for the session
-	stale,     // claimed from an announcement whose FRDGBuilder is gone — do NOT dereference
-	resolve,   // safe to walk FRDGTexture -> FRHITexture -> ID3D12Resource
+	resolve,   // proceed
 };
 const char *l1_gate_name(L1Gate g);
 
@@ -369,10 +392,12 @@ struct L1GateInputs
 	bool inputs_enabled = false; // [STRAYDLSS] EngineSeamInputs
 	Mode mode = Mode::off;
 	bool hooked = false;
-	bool announced = false;      // this dispatch claimed an announcement
+	bool announced = false;      // announce: always true; claim: this dispatch claimed one
 	bool faulted = false;        // the session has already seen a guarded read fault
-	bool fresh = false;          // announcement_is_fresh for the claimed announcement
 };
+// Used at BOTH ends: inside AddPasses to decide whether to resolve at all, and at claim to
+// decide whether to hand the resolved resources on. There is deliberately no freshness term —
+// see `announcement_is_fresh`, which is now a DIAGNOSTIC rather than a gate.
 L1Gate l1_gate(const L1GateInputs &in);
 
 struct LedgerCounters

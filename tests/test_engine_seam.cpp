@@ -735,7 +735,11 @@ TEST_CASE("every refusal reason has a distinct, stable name for the [seam] line"
 // that a late dispatch still claims the right rect and `unclaimed` stays honest. Identity
 // survives that slack. POINTERS DO NOT.
 
-TEST_CASE("only the newest announcement, same frame, same thread, may be dereferenced")
+// >>> announcement_is_fresh IS NO LONGER A GATE — it is the pipeline-depth diagnostic. <<<
+// It gated the dereference for two builds and made L1 inert in both; the fix was to move the
+// dereference into AddPasses, not to narrow the predicate (report §12.9). These cases stay
+// because the NUMBER is worth reading and because the two failures are worth pinning.
+TEST_CASE("freshness measures how far the RHI thread lags; it decides nothing")
 {
 	Freshness f;
 	f.announce_sequence = 7;
@@ -812,12 +816,13 @@ TEST_CASE("only the newest announcement, same frame, same thread, may be derefer
 	}
 }
 
-TEST_CASE("the freshness gate does NOT change what the ledger claims")
+TEST_CASE("the ledger hands back the OLDER announcement, and that is CORRECT")
 {
-	// The whole point: L1 drove `unclaimed` to 0 and it must stay there. Freshness gates only
-	// the DEREFERENCE, so correlation is byte-identical to 3365f02 — a stale claim is still a
-	// claim, it just supplies no engine inputs, and that frame uses the heuristic exactly as
-	// EngineSeamInputs=0 would.
+	// This case was written to show the crash sequence and it turned out to show something
+	// better. With the RHI thread one frame behind, dispatch(N-1) arrives while {N-1, N} are
+	// pending and claim() returns N-1 — the announcement that dispatch actually belongs to.
+	// The correlation was never wrong; only the pointer was dead. `claim()` stays untouched
+	// on the merits, not out of caution, and `unclaimed` stays comparable across every build.
 	Ledger led;
 	led.begin_frame(1);
 
@@ -884,31 +889,30 @@ TEST_CASE("the ordinary frame is fresh, so L1 keeps working")
 
 TEST_CASE("EngineSeamInputs=0 is a clean off-switch, and nothing can route around it")
 {
-	// The off-switch must leave the plugin behaving exactly as cf31bd9d did — no dereference
-	// of engine memory by any route. It is pure so that this is a TEST rather than a claim.
+	// The off-switch must leave the plugin behaving exactly as cf31bd9d did - no dereference
+	// of engine memory by any route, at either end. This gate is asked TWICE per frame now:
+	// inside AddPasses before the resolve, and at claim before the resources are handed on.
+	// It is pure so that this is a TEST rather than a claim.
 	L1GateInputs in;
 	in.inputs_enabled = false;
 	in.mode = Mode::authoritative;
 	in.hooked = true;
 	in.announced = true;
 	in.faulted = false;
-	in.fresh = true;
 	CHECK(l1_gate(in) == L1Gate::off);
 
 	SUBCASE("and it stays off whatever else is true")
 	{
 		for (bool faulted : { false, true })
-			for (bool fresh : { false, true })
-				for (bool hooked : { false, true })
-					for (bool announced : { false, true })
-					{
-						L1GateInputs o = in;
-						o.faulted = faulted;
-						o.fresh = fresh;
-						o.hooked = hooked;
-						o.announced = announced;
-						CHECK(l1_gate(o) == L1Gate::off);
-					}
+			for (bool hooked : { false, true })
+				for (bool announced : { false, true })
+				{
+					L1GateInputs o = in;
+					o.faulted = faulted;
+					o.hooked = hooked;
+					o.announced = announced;
+					CHECK(l1_gate(o) == L1Gate::off);
+				}
 	}
 }
 
@@ -920,7 +924,6 @@ TEST_CASE("L1 resolves only on the one combination that is safe")
 	in.hooked = true;
 	in.announced = true;
 	in.faulted = false;
-	in.fresh = true;
 	CHECK(l1_gate(in) == L1Gate::resolve);
 
 	SUBCASE("levels below authoritative never dereference")
@@ -941,28 +944,30 @@ TEST_CASE("L1 resolves only on the one combination that is safe")
 		b.announced = false;
 		CHECK(l1_gate(b) == L1Gate::off);
 	}
-	SUBCASE("a fault latches the session off, ahead of freshness")
+	SUBCASE("a fault latches the session off")
 	{
 		L1GateInputs o = in;
 		o.faulted = true;
 		CHECK(l1_gate(o) == L1Gate::faulted);
-		o.fresh = false;
-		CHECK(l1_gate(o) == L1Gate::faulted);
 	}
-	SUBCASE("a stale announcement declines, and says so distinctly from off")
+	SUBCASE("THERE IS NO FRESHNESS TERM, and that is the point")
 	{
+		// Two builds shipped a lifetime condition in this gate and both made L1 inert:
+		// same-thread (stale=4147 of 4147, report SS12.8) and then newest+same-frame (stale
+		// grew every frame while resolved froze, SS12.9). Neither was a narrower gate away
+		// from working, because resolving at claim time is unsafe WHATEVER the gate says -
+		// FRDGBuilder::Execute() runs Allocator.ReleaseAll() before the RHI thread ever makes
+		// the D3D12 call. The dereference moved into AddPasses instead, so this gate has
+		// exactly five inputs and none of them is about when the claim happened.
+		CHECK(sizeof(L1GateInputs) == sizeof(L1GateInputs));  // documentation anchor
 		L1GateInputs o = in;
-		o.fresh = false;
-		CHECK(l1_gate(o) == L1Gate::stale);
-		// Distinct because the [seam] line has to tell "the user turned L1 off" apart from
-		// "the ledger slipped a graph behind", which is the crash's own signature.
-		CHECK(std::strcmp(l1_gate_name(L1Gate::stale), l1_gate_name(L1Gate::off)) != 0);
+		CHECK(l1_gate(o) == L1Gate::resolve);
 	}
 }
 
 TEST_CASE("every L1 gate outcome has a distinct, stable name")
 {
-	const L1Gate all[] = { L1Gate::off, L1Gate::faulted, L1Gate::stale, L1Gate::resolve };
+	const L1Gate all[] = { L1Gate::off, L1Gate::faulted, L1Gate::resolve };
 	std::set<std::string> seen;
 	for (L1Gate g : all)
 	{

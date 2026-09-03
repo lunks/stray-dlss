@@ -1163,6 +1163,22 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		char when[32];
 		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
 		seamhook::log_report(when);
+		// Beside it, the ONE number that says whether the View constant buffer we are reading
+		// every frame is the right one. It is located by SEARCH and `view_params_plausible` is
+		// a shape test the wrong buffer can satisfy; row 135 validates itself from one read
+		// (CLAUDE.md §2.6). A `bad` rate near 100% means every jitter, ClipToPrevClip and
+		// CameraCut we hand a temporal consumer is suspect - which is what flicker looks like.
+		std::uint64_t r135_ok = 0;
+		std::uint64_t r135_bad = 0;
+		taa_hook::view_row135_counters(r135_ok, r135_bad);
+		if (r135_ok != 0 || r135_bad != 0)
+			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu%s", when,
+				static_cast<unsigned long long>(r135_ok),
+				static_cast<unsigned long long>(r135_bad),
+				r135_bad > r135_ok
+					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
+					  "and CameraCut are all suspect"
+					: "");
 	}
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp

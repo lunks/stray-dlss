@@ -46,6 +46,13 @@ bool g_stale_resource_logged = false;
 // A skip is safe but not free: that frame contributes no motion vectors, and a high rate would
 // mean our view->resource lookups are unreliable in general, not just occasionally.
 std::atomic<std::uint32_t> g_resolve_attempts{ 0 };
+// Row 135's self-check, counted over every frame that found a View CB. The buffer is located by
+// SEARCH (`view_params_plausible` is a shape test that the wrong buffer can satisfy), so this is
+// the one cheap thing that says whether the search is right: row 135 must read
+// (denormal, P, 1/P, 0.0) and `y*z == 1.0` is true BY CONSTRUCTION, so it cannot survive a wrong
+// offset or a wrong buffer. CLAUDE.md §2.6.
+std::atomic<std::uint64_t> g_view_row135_ok{ 0 };
+std::atomic<std::uint64_t> g_view_row135_bad{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -970,6 +977,32 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 			view.temporal_aa_params.z, view.temporal_aa_params.w);
 		STRAY_LOG_INFO("    PreExposure=%.6f  NearPlane=%.4f  DeltaTime=%.6f  CameraCut=%.1f",
 			view.pre_exposure, view.near_plane, view.delta_time, view.camera_cut);
+		// THE ONLY LINE HERE THAT CAN CONVICT THE CB SEARCH. Everything above is a value that
+		// "looks plausible", which is what a wrong buffer also produces. Row 135 carries three
+		// different data types at predicted places and validates itself from ONE read:
+		//   y*z == 1.0 exactly   - PreExposure * OneOverPreExposure, assigned on adjacent lines
+		//                          from the same float (SceneRendering.cpp:1563-1564), so it is
+		//                          true BY CONSTRUCTION and cannot survive a wrong offset
+		//   x is a denormal      - int32 NumSceneColorMSAASamples == 1 reinterpreted as float
+		//   w == 0.0 exactly     - padding
+		// Read this before believing any other number in this block. CLAUDE.md §2.6.
+		{
+			const ue4::Float4 &r135 = view.pre_exposure_row;
+			const double yz = static_cast<double>(r135.y) * static_cast<double>(r135.z);
+			const bool denormal = r135.x != 0.0f && std::fabs(r135.x) < 1.0e-30f;
+			STRAY_LOG_INFO("    View row 135 (ONE read): x=%.8e y=%.6f z=%.6f w=%.6f "
+				"| y*z=%.6f (want 1.0) | x denormal=%d (want 1) | w==0=%d (want 1) => %s",
+				static_cast<double>(r135.x), r135.y, r135.z, r135.w, yz,
+				denormal ? 1 : 0, r135.w == 0.0f ? 1 : 0,
+				ue4::pre_exposure_plausible(view)
+					? "SELF-CHECK PASSES - this really is the View buffer"
+					: "SELF-CHECK FAILS - the CB search picked the WRONG BUFFER, so jitter, "
+					  "ClipToPrevClip and CameraCut are all suspect");
+		}
+		STRAY_LOG_INFO("    row135 self-check so far: ok=%llu bad=%llu (a rate near 100%% bad "
+			"means the search, not the offsets, is what to fix)",
+			static_cast<unsigned long long>(g_view_row135_ok.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_view_row135_bad.load(std::memory_order_relaxed)));
 		for (int r = 0; r < 4; ++r)
 			STRAY_LOG_INFO("    ClipToPrevClip[%d]  = %+.6f %+.6f %+.6f %+.6f", r,
 				view.clip_to_prev_clip.m[r * 4 + 0], view.clip_to_prev_clip.m[r * 4 + 1],
@@ -1282,6 +1315,21 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			b.view_cb_register = cb.first;
 			break;
 		}
+	}
+	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
+	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
+	// wrong ClipToPrevClip and a wrong CameraCut, which is exactly what temporal flicker looks
+	// like. Row 135 is the one row that validates ITSELF from a single read: it must be
+	// (denormal, P, 1/P, 0.0), so `y*z == 1.0` by construction (SceneRendering.cpp:1563-1564),
+	// `x` is an int32 MSAA count reinterpreted, and `w` is padding. Count the frames it fails
+	// on: a rate near zero exonerates the search, a rate near 100% convicts it. Costs nothing —
+	// the quad is already parsed and the predicate already ships.
+	if (view_ok)
+	{
+		if (ue4::pre_exposure_plausible(view))
+			g_view_row135_ok.fetch_add(1, std::memory_order_relaxed);
+		else
+			g_view_row135_bad.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// The signature matcher needs the render rect. Prefer the View buffer; fall back to the
@@ -2473,6 +2521,12 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 {
 	attempts = g_resolve_attempts.load(std::memory_order_relaxed);
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
+}
+
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad)
+{
+	ok = g_view_row135_ok.load(std::memory_order_relaxed);
+	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 }
 
 } // namespace stray_dlss::taa_hook

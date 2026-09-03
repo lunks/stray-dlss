@@ -111,25 +111,64 @@ std::int32_t read_i32(const void *base, std::size_t offset)
 // The stand-in
 // ---------------------------------------------------------------------------------------
 
+// Defined below with the rest of the guarded reader; declared here because the ONLY safe place
+// to call it is inside AddPasses, which is above it in this file.
+std::uint64_t resolve_at_announce(std::uint64_t rdg, seam::RhiChain &status);
+// The fault latch, shared by the announce-time resolve and the claim-time consumer.
+bool l1_faulted();
+void l1_note_faults_and_latch();
+
 void add_passes_thunk(const void *self, void *graph_builder, const void *view,
                       const void *pass_inputs, void **out_colour, void *out_rect,
                       void **out_half_colour, void *out_half_rect)
 {
-	// Read FPassInputs BEFORE forwarding. The three FRDGTexture pointers are taken for
-	// IDENTITY only and are never dereferenced: at this point the graph has not executed, so
-	// a transient texture has no RHI resource yet (RenderGraphBuilder.cpp:1222-1233 assigns
-	// them, :1300-1312 runs the passes), and FRDGTexture's own layout is not established.
+	// Read FPassInputs BEFORE forwarding, and RESOLVE IT HERE.
+	//
+	// This is the one place in the frame where the three FRDGTextures are provably alive: we
+	// are inside the FRDGBuilder's own setup, on the render thread, and `Execute()` has not
+	// run. It ends with `Clear()` -> `Allocator.ReleaseAll()`, which frees every FRDGTexture,
+	// and it neither flushes nor waits for the RHI thread — while `FRHICommandList` is
+	// "definitions for queueing up & executing later" and a pass lambda's
+	// DispatchComputeShader does `ALLOC_COMMAND` rather than calling the RHI. So the D3D12
+	// Dispatch we intercept runs on another thread AFTER the arena is freed: resolving there
+	// read freed memory BY CONSTRUCTION, which is what crashed 3365f02 and what left the
+	// freshness gate declining every claim in e421e14 (report §12.9).
+	//
+	// What crosses to the dispatch is therefore an `ID3D12Resource*` that no allocator owns,
+	// checked for liveness against our own registry at claim.
 	Announcement a;
 	a.frame = g_frame.load(std::memory_order_relaxed);
-	// The thread is part of the announcement because it is part of the POINTERS' validity:
-	// FRDGBuilder is a stack object, so only this thread, in this frame, before another
-	// AddPasses, may dereference what FPassInputs names (seam::announcement_is_fresh).
+	// Reported, never tested: AddPasses and the dispatch are on different threads by design
+	// (§12.8), and requiring them to match is what made L1 inert once already.
 	a.thread = static_cast<std::uint64_t>(GetCurrentThreadId());
 	if (pass_inputs != nullptr)
 	{
 		a.colour_rdg = read_ptr(pass_inputs, seam::kPassInputsSceneColor);
 		a.depth_rdg = read_ptr(pass_inputs, seam::kPassInputsSceneDepth);
 		a.velocity_rdg = read_ptr(pass_inputs, seam::kPassInputsSceneVelocity);
+
+		seam::L1GateInputs gi;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			gi.inputs_enabled = g_inputs_enabled;
+			gi.mode = g_mode;
+		}
+		gi.hooked = true;      // we are standing in for AddPasses, so the seam is live
+		gi.announced = true;   // this IS the announcement
+		gi.faulted = l1_faulted();
+		if (seam::l1_gate(gi) == seam::L1Gate::resolve)
+		{
+			// Try all three. Depth and velocity are `RegisterExternalTexture` /
+			// `TryRegisterExternalTexture` in GetSceneTextureParameters, and
+			// RegisterExternalTexture calls SetRHI immediately, so they are expected to
+			// resolve here. Scene colour is the post-chain texture and is expected to be
+			// graph-allocated and therefore `rhi_null` — but ASSERT NOTHING: the `l1:`
+			// counters report which actually did.
+			a.colour_res = resolve_at_announce(a.colour_rdg, a.colour_status);
+			a.depth_res = resolve_at_announce(a.depth_rdg, a.depth_status);
+			a.velocity_res = resolve_at_announce(a.velocity_rdg, a.velocity_status);
+			l1_note_faults_and_latch();
+		}
 	}
 
 	AddPassesFn original = nullptr;
@@ -550,10 +589,35 @@ bool call_native_resource_guarded(std::uint64_t fn, std::uint64_t rhi, void **ou
 #endif
 }
 
-// One FRDGTexture -> ID3D12Resource. `status` always says why on failure.
-std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &registered)
+bool l1_faulted() { return g_l1_disabled.load(std::memory_order_acquire); }
+
+// A fault means an offset is wrong, not that this frame was unlucky. Say so once, at ERROR,
+// with the address the CPU refused - and stop. Called on the render thread right after the
+// three resolves, so the latch is set before the next AddPasses.
+void l1_note_faults_and_latch()
 {
-	registered = false;
+	if (g_l1_faults.load(std::memory_order_relaxed) == 0)
+		return;
+	if (g_l1_disabled.exchange(true, std::memory_order_acq_rel))
+		return;
+	STRAY_LOG_ERROR("ENGINE SEAM L1 DISABLED: a guarded read or call into engine memory "
+		"FAULTED at %#llx, inside AddPasses on the render thread. The guards caught it (the "
+		"game is alive and this line exists because of it), but a fault means one of the "
+		"[derived] offsets is wrong on THIS executable - FRDGResource::ResourceRHI @%zu or "
+		"FRHITexture::GetNativeResource slot %u. L1 is off for the rest of the session and "
+		"the heuristic supplies DLSS SR's inputs; set EngineSeamInputs=0 to make that the "
+		"deliberate configuration. Paste this line: the offset is one constant, not another "
+		"round trip.",
+		static_cast<unsigned long long>(g_l1_fault_va.load(std::memory_order_relaxed)),
+		seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot);
+}
+
+// One FRDGTexture -> ID3D12Resource, called ONLY from inside AddPasses. `status` always says
+// why on failure. The registry liveness check is deliberately NOT here: it belongs at claim,
+// on the thread that is about to use the pointer, and it is the only check that still means
+// anything once the FRDGTexture is gone.
+std::uint64_t resolve_at_announce(std::uint64_t rdg, seam::RhiChain &status)
+{
 	seam::RdgReader reader;
 	reader.read_u64 = &l1_read_u64;
 	reader.is_code = &l1_is_code;
@@ -576,14 +640,19 @@ std::uint64_t resolve_one(std::uint64_t rdg, seam::RhiChain &status, bool &regis
 		status = seam::RhiChain::rhi_unreadable;
 		return 0;
 	}
-	const std::uint64_t id = reinterpret_cast<std::uint64_t>(native);
+	return reinterpret_cast<std::uint64_t>(native);
+}
+
+// THE VALIDATION, at claim, on the thread about to use the pointer. Our own registry sees every
+// ID3D12Resource the process creates; a pointer it has never seen is not a resource, whatever
+// the chain thought — and by this point the FRDGTexture it came from no longer exists, so this
+// is the only check left that means anything.
+bool resource_is_live(std::uint64_t id)
+{
 	if (id == 0)
-		return 0;
-	// THE VALIDATION. Our own registry sees every ID3D12Resource the process creates; a
-	// pointer it has never seen is not a resource, whatever the chain thought.
+		return false;
 	icept::Backend *b = icept::backend();
-	registered = b != nullptr && b->is_resource_live(static_cast<icept::ResourceId>(id));
-	return id;
+	return b != nullptr && b->is_resource_live(static_cast<icept::ResourceId>(id));
 }
 
 } // namespace
@@ -690,6 +759,13 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 		v.colour_rdg = a->colour_rdg;
 		v.depth_rdg = a->depth_rdg;
 		v.velocity_rdg = a->velocity_rdg;
+		// Already resolved, inside AddPasses, while the FRDGBuilder was alive.
+		v.colour_res = a->colour_res;
+		v.depth_res = a->depth_res;
+		v.velocity_res = a->velocity_res;
+		v.colour_status = a->colour_status;
+		v.depth_status = a->depth_status;
+		v.velocity_status = a->velocity_status;
 		v.out_width = a->out_width;
 		v.out_height = a->out_height;
 		v.sequence = a->sequence;
@@ -812,21 +888,17 @@ EngineInputs resolve_inputs(const Verdict &v)
 	gi.announced = v.announced;
 	// A fault already told us an offset is wrong on this executable. Rolling the dice again
 	// every frame is how a diagnosis becomes a crash report; L1 stays off for the session.
-	gi.faulted = g_l1_disabled.load(std::memory_order_acquire);
-	// THE GUARD THE CRASH WAS MISSING. The ledger holds an announcement across up to
-	// kRetireAfterAnnouncements newer ones, so a dispatch that missed its own frame claims a
-	// PREVIOUS frame's announcement — correct for identity, fatal for pointers, because that
-	// frame's FRDGAllocator has been reset and `+16` is now somebody else's FIntPoint.
-	gi.fresh = v.fresh;
+	gi.faulted = l1_faulted();
 
 	// The thread pair, said once. It is not a gate and must never become one again; it is
 	// here so that "AddPasses and the dispatch run on different threads" is a MEASUREMENT in
 	// the log rather than an assumption in a predicate.
 	if (v.threads_first_seen)
 		STRAY_LOG_INFO("ENGINE SEAM L1: AddPasses announced on thread %llu and the dispatch "
-			"was recorded on thread %llu%s. UE 4.27 runs RDG setup and graph execution "
-			"separately, so these differing is NORMAL and is not tested - only the "
-			"announcement being the newest and the frame not having turned over are. Latched: "
+			"was recorded on thread %llu%s. UE 4.27 runs RDG setup on one and drains the RHI "
+			"command list on the other, so these differing is NORMAL and nothing is gated on "
+			"it. It is also WHY the resolve happens inside AddPasses: by the time this thread "
+			"records the dispatch, Execute() has already run Allocator.ReleaseAll(). Latched: "
 			"if this pair changes mid-session it gets one WARN.",
 			static_cast<unsigned long long>(v.announce_thread),
 			static_cast<unsigned long long>(v.current_thread),
@@ -839,10 +911,12 @@ EngineInputs resolve_inputs(const Verdict &v)
 			static_cast<unsigned long long>(v.announce_thread),
 			static_cast<unsigned long long>(v.current_thread));
 
-	const seam::L1Gate gate_verdict = seam::l1_gate(gi);
-	if (gate_verdict == seam::L1Gate::off || gate_verdict == seam::L1Gate::faulted)
-		return out;
-	if (gate_verdict == seam::L1Gate::stale)
+	// STALENESS IS NO LONGER A REFUSAL. It is counted, and that is all it is: the announcement
+	// carries plain ID3D12Resource* that no allocator owns, so "a newer graph exists" says
+	// nothing about whether they are safe. It says how far the RHI thread lags — measured on
+	// the box as exactly one announcement and one frame, every frame, which is why gating on
+	// it declined 4147 of 4147 claims (report §12.8, §12.9).
+	if (!v.fresh)
 	{
 		bool first = false;
 		{
@@ -855,50 +929,39 @@ EngineInputs resolve_inputs(const Verdict &v)
 			}
 		}
 		if (first)
-			// Name the CONDITION that failed, not just the numbers. The first version of this
-			// line printed six values and left the reader to spot which pair differed - and
-			// the pair that differed was the threads, which should never have been a gate.
-			STRAY_LOG_WARN("ENGINE SEAM L1: declining to dereference a STALE announcement - "
-				"%s%s(seq %llu vs newest %llu, frame %llu vs %llu; threads %llu -> %llu, NOT "
-				"tested). The claim itself stands (the rect identifies the pass); only "
-				"FPassInputs is refused, so this frame uses the heuristic's inputs exactly as "
-				"EngineSeamInputs=0 would. An FRDGTexture belongs to the FRDGBuilder that made "
-				"it, so once a newer graph exists the pointer addresses recycled arena memory "
-				"- dereferencing one is what crashed 3365f02. Once per session; the rate is in "
+			STRAY_LOG_INFO("ENGINE SEAM L1: the claim is one graph behind the announcement, "
+				"which is NORMAL and is no longer a refusal - %s%s(seq %llu vs newest %llu, "
+				"frame %llu vs %llu; threads %llu -> %llu). UE 4.27 drains the RHI command "
+				"list a frame behind RDG setup, so this is the pipeline depth, not an error. "
+				"It is safe because the resources were resolved inside AddPasses while the "
+				"FRDGBuilder was alive; nothing dereferences an FRDGTexture here. The rate is "
 				"the [seam] line's l1: stale=.",
-				v.sequence != v.ledger_sequence ? "A NEWER ANNOUNCEMENT EXISTS, so a newer "
-					"graph does too. " : "",
-				v.announce_frame != v.current_frame ? "THE FRAME TURNED OVER between announce "
-					"and claim, so the announcing graph has completed. " : "",
+				v.sequence != v.ledger_sequence ? "a newer announcement exists; " : "",
+				v.announce_frame != v.current_frame ? "the frame turned over; " : "",
 				static_cast<unsigned long long>(v.sequence),
 				static_cast<unsigned long long>(v.ledger_sequence),
 				static_cast<unsigned long long>(v.announce_frame),
 				static_cast<unsigned long long>(v.current_frame),
 				static_cast<unsigned long long>(v.announce_thread),
 				static_cast<unsigned long long>(v.current_thread));
-		return out;
 	}
+
+	const seam::L1Gate gate_verdict = seam::l1_gate(gi);
+	if (gate_verdict != seam::L1Gate::resolve)
+		return out;
 	out.enabled = true;
 
-	out.colour = resolve_one(v.colour_rdg, out.colour_status, out.colour_registered);
-	out.depth = resolve_one(v.depth_rdg, out.depth_status, out.depth_registered);
-	out.velocity = resolve_one(v.velocity_rdg, out.velocity_status, out.velocity_registered);
-
-	// A fault means an offset is wrong, not that this frame was unlucky. Say so once, at ERROR,
-	// with the address the CPU refused - and stop. The heuristic runs the rest of the session.
-	if (g_l1_faults.load(std::memory_order_relaxed) != 0 &&
-		!g_l1_disabled.exchange(true, std::memory_order_acq_rel))
-	{
-		STRAY_LOG_ERROR("ENGINE SEAM L1 DISABLED: a guarded read or call into engine memory "
-			"FAULTED at %#llx. The guards caught it (the game is alive and this line exists "
-			"because of it), but a fault means one of the [derived] offsets is wrong on THIS "
-			"executable - FRDGResource::ResourceRHI @%zu or FRHITexture::GetNativeResource "
-			"slot %u. L1 is off for the rest of the session and the heuristic supplies DLSS "
-			"SR's inputs; set EngineSeamInputs=0 to make that the deliberate configuration. "
-			"Paste this line: the offset is one constant, not another round trip.",
-			static_cast<unsigned long long>(g_l1_fault_va.load(std::memory_order_relaxed)),
-			seam::kRdgResourceRhiOffset, seam::kRhiGetNativeResourceSlot);
-	}
+	// No dereference here. The chain walk happened on the render thread inside AddPasses; all
+	// that is left is to ask our own registry whether each pointer is still a live resource.
+	out.colour = v.colour_res;
+	out.depth = v.depth_res;
+	out.velocity = v.velocity_res;
+	out.colour_status = v.colour_status;
+	out.depth_status = v.depth_status;
+	out.velocity_status = v.velocity_status;
+	out.colour_registered = resource_is_live(out.colour);
+	out.depth_registered = resource_is_live(out.depth);
+	out.velocity_registered = resource_is_live(out.velocity);
 
 	bool log_first = false;
 	{
@@ -916,14 +979,16 @@ EngineInputs resolve_inputs(const Verdict &v)
 		}
 	}
 	if (log_first)
-		STRAY_LOG_INFO("ENGINE SEAM L1: first resolve of the engine's own FPassInputs - "
-			"colour=%p (%s, registered=%d) depth=%p (%s, registered=%d) velocity=%p (%s, "
-			"registered=%d). These REPLACE the heuristic's register-role guesses and its "
-			"liveness verdict for every frame they resolve; the heuristic stays as an "
-			"assertion. Offsets are [derived] (FRDGResource::ResourceRHI @%zu, "
-			"FRHITexture::GetNativeResource slot %u) and this line is what confirms them. "
-			"FRDGTexture in: colour=%p depth=%p velocity=%p (seq %llu, frame %llu, thread %llu) "
-			"- paste these with any L1 fault line, they are the inputs to the offset.",
+		STRAY_LOG_INFO("ENGINE SEAM L1: first use of the engine's own FPassInputs, RESOLVED "
+			"INSIDE AddPasses - colour=%p (%s, registered=%d) depth=%p (%s, registered=%d) "
+			"velocity=%p (%s, registered=%d). DEPTH AND VELOCITY ARE THE ONES THAT MATTER "
+			"(GetSceneTextureParameters registers both externally, so RegisterExternalTexture "
+			"has already called SetRHI); colour is the post-chain texture and `rhi_null` here "
+			"is EXPECTED, not a failure. These REPLACE the heuristic's register-role guesses "
+			"and its liveness verdict for every frame they resolve. Offsets "
+			"(FRDGResource::ResourceRHI @%zu, FRHITexture::GetNativeResource slot %u) are what "
+			"this line confirms. FRDGTexture in: colour=%p depth=%p velocity=%p (seq %llu, "
+			"frame %llu, announced on thread %llu) - paste these with any L1 fault line.",
 			reinterpret_cast<void *>(out.colour), seam::rhi_chain_name(out.colour_status),
 			out.colour_registered ? 1 : 0,
 			reinterpret_cast<void *>(out.depth), seam::rhi_chain_name(out.depth_status),

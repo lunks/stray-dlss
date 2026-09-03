@@ -609,6 +609,32 @@ Config and saves live in the **Proton prefix**:
 > COUNTED and NAMED turned it into a one-line diagnosis instead of another bisect. The thread
 > pair is now latched and reported — one INFO, and one WARN if it ever moves — and gated on
 > nothing.
+>
+> **THEN THE NARROWER GATE MADE L1 INERT TOO, AND THAT FINALLY NAMED THE REAL BUG: THE SITE
+> (2026-09-03, facts §36.11, report §12.9).** `resolved` froze at 164 while `stale` grew every
+> frame — the claim is **one announcement and one frame behind, in steady state**. Two source
+> facts explain it and end the argument: **`FRDGBuilder::Execute()` ends with `Clear()` →
+> `Allocator.ReleaseAll()`**, freeing every `FRDGTexture`, and it neither flushes nor waits for
+> the RHI thread; while **`FRHICommandList` is "definitions for queueing up & executing later"**
+> and a pass lambda's `DispatchComputeShader` does `ALLOC_COMMAND` rather than calling the RHI.
+> **So the D3D12 dispatch we intercept happens on another thread AFTER the arena is freed, and
+> resolving there reads freed memory by construction.** No gate on the claim side could ever have
+> worked; the two inert builds were empirically proving that.
+>
+> **The fix is the SITE.** The chain walk moved into `AddPasses`, on the render thread, inside the
+> builder's own setup, where the textures are provably alive — and `GetSceneTextureParameters`
+> registers depth and velocity with `RegisterExternalTexture`, which calls `SetRHI` immediately,
+> so exactly the two guides that matter resolve there. The announcement now carries plain
+> `ID3D12Resource*` that no allocator owns; the claim only checks them against our registry.
+> `announcement_is_fresh` is demoted to a pipeline-depth diagnostic.
+>
+> **The rule to carry: when a guard keeps having to be narrowed, the guard is not the problem —
+> the placement is.** This file already learned that once, from NR growing 4,900 lines of
+> machinery to survive `u0`. L1 rediscovered it in three builds. **And the corollary that saved
+> `claim()`: with the RHI thread a frame behind, returning the OLDEST rect match returns the
+> announcement the dispatch actually belongs to — the correlation was right the whole time, and
+> only the pointer was dead.** Ask which of identity and lifetime you are relying on, and then ask
+> where each is still true.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -878,6 +904,30 @@ Measured in the same session, PreExposure moved **1.000 -> 4.881 -> 0.051 -> 0.4
 menu, camera cut and gameplay. That is a ~95x swing, and it is independent support for keeping
 `NgxNRTrackExposure` on with a long time constant: no fixed codec scale can be right across
 that range.
+
+#### THE VIEW CB IS FOUND BY SEARCH, AND UNTIL 2026-09-03 NOTHING CHECKED WHICH BUFFER IT WAS
+
+`taa_hook` tries every bound constant buffer and keeps the first that `view_params_plausible`
+accepts — and that is a **shape** test the WRONG buffer can satisfy. A wrong View means wrong
+jitter, wrong `ClipToPrevClip` and a wrong `CameraCut`, fed to every temporal consumer we have:
+DLSS SR, feature 18, and the engine's own accumulation. **That is what flicker looks like**, and
+this file's own rule already applies — *bad motion vectors do not produce one bad frame, they
+compound through the accumulation* (§5).
+
+Measured in the menu (facts §36.12): `View CB: NOT READABLE or implausible (cb valid=0 reg=b0)`,
+then `View CB at b4, offset 4921600`, with `NearPlane` exactly `1.0000`, `DeltaTime` exactly
+`0.000000` and `PreExposure` jumping `1.0 -> 32.1`. Consistent with a wrong buffer; proof of
+nothing either way.
+
+**Row 135 settles it for free, and the check already shipped** — it just was not being printed.
+The row must read `(denormal, P, 1/P, 0.0)` and `y*z == 1.0` is true BY CONSTRUCTION, so it
+cannot survive a wrong buffer or a slipped offset. All four components from one read, the three
+predictions and a verdict now print beside the `View CB at b…` line, with a running `ok=/bad=`
+tally on the periodic `[view]` line. **A `bad` rate near 100% convicts the search; near 0%
+exonerates it and moves the flicker hunt elsewhere.** No new offsets were added to get that
+answer — which is the point: reach for the check the data already contains before building an
+identity path (`FSceneView::ViewUniformBuffer` matched against the bound CBV) that would cost a
+new [derived] offset into `FViewInfo`.
 
 
 Traps:

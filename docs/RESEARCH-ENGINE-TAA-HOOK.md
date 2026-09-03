@@ -1049,3 +1049,115 @@ answer. The residual hole is a second graph inside one present interval whose di
 announcement the first graph's dispatch never consumed. It needs an unclaimed announcement AND a
 rect-matching look-alike in the same frame, and if it happens the `VirtualQuery` + SEH guards make
 it a counted fault rather than a crash — which is exactly why those stay whatever else changes.
+
+### 12.9 THE SAFE POINT IS `AddPasses`, NOT THE CLAIM — and this is why (2026-09-03)
+
+`e421e14` on the box: **no crash, `faults=0 off=0`, 4200+ frames** — the guards hold, and this
+session is a measurement rather than a dump. And L1 was inert after startup:
+
+```
+[seam] frame 1800: … | l1: resolved=164 partial=0 fellBack=550 stale=1080 faults=0 off=0
+[seam] frame 2400: … | l1: resolved=164 partial=0 fellBack=550 stale=1676 faults=0 off=0
+[seam] frame 3000: … | l1: resolved=164 partial=0 fellBack=550 stale=2270 faults=0 off=0
+```
+
+`resolved` and `fellBack` **frozen**; `stale` growing ~596 per 600 frames, i.e. every frame. The
+WARN said exactly why, and both lifetime conditions failed together, by one, every time:
+
+```
+seq 715 vs newest 716, frame 711 vs 712; threads 1408 -> 1160
+```
+
+The 164 early resolves are the shallow-pipeline window during load.
+
+#### The root cause, and it retires §12.3's
+
+Two facts from UE 4.27.2 (`AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`) settle it:
+
+1. **`FRDGBuilder::Execute()` frees every `FRDGTexture` before it returns.** Its tail runs the
+   extraction loops and then `Clear()`, which contains `Allocator.ReleaseAll();`. `Execute()`
+   calls no `ImmediateFlush`, no `FlushRHIThread`, no `WaitForRHIThread`. `RenderGraphBuilder.h`
+   states outright: *"The builder should be created on the stack and executed prior to
+   destruction"*, and holds `FRDGAllocator Allocator;` by value.
+2. **The dispatch we intercept has not happened yet at that point.** `RHICommandList.h` opens
+   *"RHI Command List definitions for queueing up & executing later"*, and every entry point is
+   `if (Bypass()) { GetContext().RHI…; return; } ALLOC_COMMAND(…)`. With the RHI thread on, a
+   pass lambda's `DispatchComputeShader` **allocates a command**; the D3D12 call happens when the
+   RHI thread drains it.
+
+So the order is: **pass lambda enqueues → `Allocator.ReleaseAll()` frees the `FRDGTexture` →
+later, another thread makes the D3D12 call our hook sees.** Resolving at claim time reads freed
+memory **by construction**, and the measured thread pair (1408 render, 1160 RHI) with a one-frame
+lag is that mechanism's signature.
+
+**§12.3 named the danger correctly and put the safe point in the wrong place.** Ledger slack was
+real but secondary; the race is structural, and no gate on the claim side could have fixed it —
+which is what the two inert builds were empirically demonstrating.
+
+#### One thing the ledger was doing RIGHT all along
+
+With the RHI thread exactly one frame behind, dispatch(N−1) arrives while `{N−1, N}` are pending
+and `claim()` returns the OLDEST rect match — **N−1, the announcement that dispatch actually
+belongs to**. The correlation was never wrong; only the pointer was dead. `claim()` stays
+untouched on the merits, not out of caution.
+
+#### The three candidate fixes, assessed against the source
+
+**Resolve at announce — YES, and it is the fix.** `GetSceneTextureParameters` builds both guides
+externally:
+
+```cpp
+Parameters.SceneDepthTexture      = GraphBuilder.RegisterExternalTexture(SceneContext.SceneDepthZ, ERenderTargetTexture::ShaderResource);
+Parameters.GBufferVelocityTexture = TryRegisterExternalTexture(GraphBuilder, SceneContext.SceneVelocity);
+```
+
+and `RegisterExternalTexture` calls `Texture->SetRHI(...)` immediately. `PostProcessing.cpp` passes
+them straight through (`UpscalerPassInputs.SceneDepthTexture = SceneDepth.Texture;`,
+`.SceneVelocityTexture = Velocity.Texture;`) before
+`UpscalerToUse->AddPasses(GraphBuilder, View, UpscalerPassInputs, …)`. **So depth and velocity have
+a non-null `ResourceRHI` inside `AddPasses`, on the render thread, inside the builder's own
+setup — provably alive**, and `TD3D12Texture2D::GetNativeResource` is `return Resource->GetResource();`,
+a pure getter with no locks or side effects. Colour is the post-chain `SceneColor.Texture` and is
+expected to be graph-allocated, hence `rhi_null` — **expected, not a failure**, and enough, because
+depth and velocity are what `deadInputs` and the render-extent logic hang on while colour is
+already resolved by register. **Assert none of it: try all three and let the `l1:` counters say.**
+
+**A later render-thread point inside `Execute()` — possible, strictly worse.** An RDG pass lambda
+runs after `SetRHI` and before `ReleaseAll`, so all three would be non-null there. But it needs
+the RDG parameter-struct machinery (§4.3's L2) and still ends by handing a plain
+`ID3D12Resource*` across to the RHI thread — the same hand-off the announce-time resolve gets for
+a few lines. Only worth building if colour specifically turns out to matter.
+
+**A generation/serial — impossible, and worth recording why.** The memory is *freed*, so any
+serial stored in the object lives in freed memory and reading it to validate is the very read we
+are trying to make safe. `FRDGResource` has no generation counter. A serial in our own ledger only
+tells us the announcement is stale, which we already do, and the steady state is "always stale".
+
+#### What shipped
+
+* **The chain walk moved into `add_passes_thunk`.** The `Announcement` now carries three resolved
+  `ID3D12Resource*` and their `RhiChain` statuses; the `FRDGTexture*` are kept for the
+  first-resolve line and are **never dereferenced anywhere else**.
+* **`resolve_inputs` no longer dereferences anything.** It checks each resolved pointer against
+  our own resource registry — liveness at claim is the only check that still means anything once
+  the `FRDGTexture` is gone — and hands them on.
+* **`announcement_is_fresh` is demoted to a pipeline-depth diagnostic.** `L1Gate` loses `stale`
+  and `L1GateInputs` loses `fresh`; `stale=` keeps counting, and its once-per-session line is now
+  INFO explaining that the lag is normal, not a WARN explaining a refusal.
+* **The guards moved with the read** — `VirtualQuery` + SEH around the `memcpy` and the
+  `GetNativeResource` call, now on the render thread — and the fault latch fires there, before the
+  next `AddPasses`.
+* **`l1_gate` is asked at BOTH ends**, so `EngineSeamInputs=0` still means zero dereferences of
+  engine memory anywhere, and the exhaustive off-switch test covers the new shape.
+* **`claim()` is byte-identical**, so `announced` / `claimed` / `unclaimed` / `orphans` /
+  `lookalikesRefused` stay comparable across all five builds.
+
+#### What to read
+
+`l1: resolved=` should now track `claimed` instead of freezing, with `partial=` counting frames
+where depth+velocity resolved and colour did not (**the expected steady state**), `fellBack=`
+small, `faults=0 off=0`. `stale=` will still grow every frame and that is now *information*, not
+a fault — it is the RHI thread's lag. `unclaimed` must stay 0.
+
+**Still UNCONFIRMED:** whether colour ever resolves, and whether the resolved depth/velocity
+survive the registry's liveness check a frame later. Both are answered by the same `l1:` line.
