@@ -1,5 +1,38 @@
 # Streamline internals, read for what our own present-owner/pacer/tagging code should learn
 
+> ## RE-REVIEWED 2026-09-03 — read this box first
+>
+> The first pass (commit `dd38dd5`) read only the **public** `NVIDIA-RTX/Streamline` SDK. Access
+> to **`NvRTX/UnrealEngine`**, NVIDIA's private UE fork, has since been obtained, and with it
+> NVIDIA's own *caller* of that SDK on both UE 4.27 (our engine) and UE 5.8. Sources with branch
+> and SHA are in §0.
+>
+> **Where the first pass was right, and it was right about the things it built its argument on.**
+> Its two adoptable recommendations both stand: `NvAPI_D3D12_NotifyOutOfBandCommandQueue` is
+> genuinely the one Reflex-surface call Streamline makes that we do not (§4), and the
+> orthonormality check on `camera_basis()` remains a cheap guard on a silent failure (§6). Its
+> §2 cross-validation of our tagging discipline stands, and is now corroborated by the plugin
+> itself, which uses `eOnlyValidNow` — the stricter mode — exactly as we do. Its §5.1/§5.2
+> negative result (Streamline's proxies are transparent to `IID_ID3D12DeviceExt`) stands.
+>
+> **What changed materially:**
+>
+> 1. **§5's premise is stated too absolutely, and its own §5.3 already knows it.** The document
+>    opens by calling the OptiScaler death *"a measured answer, and it is no, on this driver
+>    stack"* — then argues 300 lines later that the mechanism was probably **ReShade's** vtable
+>    patch, which is not in the process any more. Those two cannot both be load-bearing. Worse,
+>    the conclusion has since been **overtaken by measurement**: our own present-twice path has
+>    cleared the exact wall OptiScaler died at. Corrected in §5.0 and §5.3.
+> 2. **§5.4 contains a feasibility claim that has flipped.** "Forcing the engine to render
+>    off-screen" is listed as *not reachable from outside the engine*. **We do it today**, by
+>    returning replacement textures from a hooked `GetBuffer`. Corrected in §5.4.
+> 3. **§3's hudless contract is right but incomplete in a way that matters** — the UI half
+>    depends on an engine patch, and NVIDIA tells HDR titles (which we are) not to use it at all.
+> 4. **§1's pacing section gains a first-party fact**: NVIDIA's plugin never presents. The extra
+>    frames come from inside the interposed swapchain. Our present-twice design is our own.
+>
+> Superseded reasoning is preserved inline rather than deleted, per `CLAUDE.md`'s house style.
+
 We deliberately do not use Streamline. `src/ngx_fg.cpp` drives NGX feature 11
 (`NVSDK_NGX_Feature_FrameGeneration`) directly through the NGX core; `src/backend_native/present_owner.*`
 and `fg_present.cpp` are our own swapchain hook, present-twice path, phase-locked pacer and
@@ -12,6 +45,31 @@ point, never past it. So the question this document answers is not "should we ad
 that has a measured answer, and it is no, on this driver stack. The question is: **Streamline is
 the reference implementation of the thing we built ourselves. Read its source. Where is ours
 wrong or weaker, and where does its own design explain the crash we already measured?**
+
+> **CORRECTED 2026-09-03 — this paragraph overstates its own evidence, and §5.3 below already
+> knows why.** Calling the OptiScaler result *"a measured answer, and it is no"* treats a
+> confounded measurement as settled. Three things are now on the record against it:
+>
+> 1. **The measurement included ReShade by construction** (OptiScaler as `dxgi.dll`, ReShade
+>    loaded behind it as `ReShade64.dll`) — a configuration this project no longer runs. §5.3
+>    argues at length that ReShade's process-wide ext-vtable patch is the most plausible
+>    mechanism, and explicitly predicts that **removing ReShade should remove the crash**. If
+>    that argument is right, the opening sentence is wrong. The document cannot have both.
+> 2. **It has been overtaken by our own measurement.** `docs/STRAY-RENDERING-FACTS.md`
+>    §32.9-§32.11 record DLSS-G evaluating at **1.91x through three checkpoint reloads**, and
+>    `CLAUDE.md` records that *"the fullscreen transition — where OptiScaler's FG died — is
+>    survived"*. The wall that stopped OptiScaler is one our own present-twice path has since
+>    walked through. Whatever killed OptiScaler, "frame generation cannot work on this driver
+>    stack" is not it.
+> 3. **The project's own diagnosis is internally unreconciled**: `CLAUDE.md` attributes the death
+>    to a bit-packed handle (the ReShade descriptor-conversion family) in one place and to the
+>    fullscreen transition in another, and never reconciles them.
+>
+> **Restated honestly: Streamline's interposer is off the table by USER CONSTRAINT** (recorded in
+> `docs/STRAY-RENDERING-FACTS.md` §32.5) **and was measured to fail once in a confounded
+> configuration.** That is a good enough reason not to adopt it — we have a working alternative
+> — but it is **not** the settled technical finding this sentence claims, and no design decision
+> should rest on it as though it were. **SOFT**, and the falsifiable test is in §5.3.
 
 Companion documents, not repeated: `docs/RESEARCH-DLSS-UE5-PLUGIN.md` (the UE5 plugin wrapper
 around Streamline — this document goes one layer deeper, into the SDK the plugin calls),
@@ -48,6 +106,22 @@ forward to the current, ReShade-free, UE4SS-native setup.
 §32 already used to extract `nvngx_dlssg.dll`'s parameter names — so everything below is directly
 cross-checkable against that work, and several places below do exactly that. **HARD** throughout
 unless marked.
+
+> **ADDED 2026-09-03 — first-party callers of this SDK, now obtainable.** The first pass read
+> the SDK alone. These are NVIDIA's own integrations of it, and several claims below are now
+> cross-checked against them rather than against the SDK's prose:
+>
+> | Source | Branch | Tip SHA | Relevance |
+> |---|---|---|---|
+> | `NvRTX/UnrealEngine` | `dlss3/sl2-4.27-dlss-plugin` | `32c3e4d5e0ee9ea7b792d1d09bcc2549917ad252` | DLSS-FG/Streamline **1.3.0-SL2.4.0 on UE 4.27** — our exact engine version |
+> | `NvRTX/UnrealEngine` | `nvrtx-5.8_prerelease` | `5b89940f9436ab7475d547e322443efe6d875ac2` | Current: plugin **8.7.2**, Streamline SDK **2.11.1**, NGX **310.6.0** (July 2026) |
+> | `NvRTX/UnrealEngine` | `dlss-streamline-4.27-engine-changes` | `e1ee6efc0d4efda533fb71060b2387a698073dba` | The **engine-side** requirements for hosting Streamline on 4.27 |
+> | `EpicGames/UnrealEngine` | tags `4.27`, `5.4`, `5.6`, `5.8` | (by ref) | Stock engine, to establish what Stray already has |
+>
+> Note the SDK version read by the first pass (**public v2.12.0**) is *newer* than the one the
+> current plugin vendors (**2.11.1**). Where the two could differ, the SDK reading is retained
+> and flagged. `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §7 covers the engine-changes branch in full and
+> is not duplicated here.
 
 **What is genuinely open source in this repo**, confirmed by browsing `source/`:
 
@@ -114,6 +188,32 @@ finding of this project's own, not something to second-guess against an unread r
 before/after the real present to schedule it, how it reacts to a hitch, whether it uses vsync
 timing feedback) lives entirely inside the closed `sl.dlss_g.dll`. What is adoptable is only the
 *principle* already matched (§ above) — **no action**.
+
+> **CONFIRMED 2026-09-03, and the reason no algorithm is visible is now structural rather than
+> incidental.** The first pass inferred that SL's pacing lives in the closed DLL. First-party
+> reading of NVIDIA's own UE plugin shows *why nothing else could*: **the plugin never presents,
+> and never even evaluates DLSS-G.** There is no `evaluateFeature` call for `kFeatureDLSS_G`
+> anywhere in it; DLSS-G is driven entirely by `slDLSSGSetOptions` + resource tags + constants,
+> and the extra frames are issued from **inside the interposed swapchain**. The custom present
+> the plugin installs is a deliberate no-op that exists only to release back-buffer references
+> before a viewport resize:
+>
+> ```cpp
+> virtual bool NeedsNativePresent()    override final { return true; }   // engine presents normally
+> virtual bool NeedsAdvanceBackbuffer() override final { return true; }  // engine advances normally
+> virtual bool Present(FRHIViewport*, IRHICommandContext&, int32&) override final { return true; };
+> ```
+>
+> **HARD.** So the pacer is not merely closed — it is on the far side of an architectural
+> boundary NVIDIA's own engine integration never crosses. **The first pass's "no action" verdict
+> stands and is now better founded**: there is no reference implementation to compare our
+> `core::fg::Schedule` against, at any level of access short of the DLL itself.
+>
+> One consequence for our own pacer's *correctness argument*, worth recording: our phase-locked
+> scheduler and the Wine `wait_for` spin-window workaround (`fg_present.cpp:721-751`) are
+> **unreviewable against a reference**, so their only evidence is our own measurement. That is a
+> reason to keep the FG validation gate (the per-frame crop readback that revokes a generated
+> frame and counts the refusal by reason) rather than to trust the schedule.
 
 ---
 
@@ -212,6 +312,38 @@ and found that our DXGI-level hook structurally cannot reach the first of those 
 see the *final*, already-composited backbuffer). Nothing in Streamline's own source changes that
 conclusion; it only sharpens the target contract for whenever engine-level access exists.
 
+> **CORRECTED AND NARROWED 2026-09-03.** The contract above is accurate and worth keeping. Two
+> things change the conclusion, and they pull in opposite directions.
+>
+> **The UI half is not merely unreachable — it is the WRONG TECHNIQUE for this title, twice
+> over. HARD, first-party.**
+>
+> 1. **NVIDIA's alpha mask is manufactured by an engine patch, not discovered.** The view
+>    extension clears scene-colour alpha to zero at the end of the post-process chain
+>    (`r.Streamline.ClearSceneColorAlpha`, default **true**) so that whatever Slate draws
+>    afterwards is the only thing with non-zero alpha. It calls `DrawClearQuadAlpha`, which
+>    **does not exist in stock UE 4.27** (verified absent from `EpicGames/UnrealEngine` @ `4.27`,
+>    `RenderCore/Public/ClearQuad.h`) and which the plugin hard-`#error`s without. Without that
+>    step the back-buffer alpha is simply whatever the game left there.
+> 2. **NVIDIA tells HDR titles not to use it.** The 8.7.2 plugin's own `README.md` records that
+>    in HDR the back-buffer alpha is not meaningful and recommends `r.Streamline.TagUIColorAlpha 0`.
+>    Stray presents `R10G10B10A2_UNORM` under gamescope's HDR path. **So the technique is
+>    switched off for titles like ours even when it is fully available.**
+>
+> **The hudless half is more reachable than this section says**, and that is the more useful
+> correction. `SubscribeToPostProcessingPass(EPostProcessingPass::VisualizeDepthOfField, ...)`
+> is a method on **stock UE 4.27's** `ISceneViewExtension`, with the enum value present — not a
+> UE5 addition. It is not reachable from our *DXGI-level* hook, which is what this section
+> correctly says; it is reachable in principle by registering a view extension, which is a
+> different and better-specified problem. `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §1.1 and §5.2 carry
+> the full grading and the obstacles (`GEngine->ViewExtensions` is not a `UPROPERTY`;
+> `FSceneViewExtensions::NewExtension` is a template and cannot be hooked). **UNCONFIRMED** that
+> it is achievable; **HARD** that the interface exists on our engine.
+>
+> **Net for this section: the target contract narrows to Hudless alone.** User Interface
+> Recomposition (§6.6) needs *both* buffers and is therefore doubly out of reach — worth knowing
+> before anyone budgets for it.
+
 ---
 
 ## 4. Reflex
@@ -253,6 +385,24 @@ correctly excluding our extra present from its own timing model) and no plausibl
 
 **Streamline needs the identical NVAPI surface we already use; there is no lighter-weight
 Reflex path available that we are missing.** No further action beyond the one call above.
+
+> **CONFIRMED AND EXTENDED 2026-09-03, first-party.** Reflex is not merely recommended for
+> DLSS-G, it is a **hard SDK-level requirement**: `sl_dlss_g.h` defines
+> `DLSSGStatus::eFailReflexNotDetectedAtRuntime` — *"Reflex is not active while DLSS-G is
+> running, Reflex must be turned on when DLSS-G is on"* — and the 8.7.2 plugin `checkf`s on a
+> non-`eOk` status **every frame** (`r.Streamline.DLSSG.CheckStatusPerFrame`, default true). The
+> plugin force-enables Reflex whenever DLSS-G is active, via a function whose entire body is
+> `return IsDLSSGActive();`. **HARD.** This corroborates, from the vendor side, why this project
+> needed `fakenvapi` + `force_reflex=2` before FG behaved.
+>
+> **A refinement to the recommendation below.** NVIDIA's markers go through `kFeaturePCL`
+> (`slPCLSetMarker`) with a 1:1 mapping onto `sl::PCLMarker` — `eSimulationStart/End`,
+> `eRenderSubmitStart/End`, `ePresentStart/End`, `eTriggerFlash` — and
+> `SetInputSampleLatencyMarker` is a **deliberate no-op** ("no longer supported"). Our
+> `fg_reflex.cpp` set is equivalent. **`NvAPI_D3D12_NotifyOutOfBandCommandQueue` remains the one
+> call we do not make**, and the first pass's reasoning for it is unchanged and still
+> **UNCONFIRMED** as *necessary*: no source or doc read on either pass states a consequence of
+> omitting it. Keep it ranked as a small, well-targeted addition, not a fix for a known symptom.
 
 ---
 
@@ -403,6 +553,38 @@ consequences of Streamline owning the whole presentation pipeline, which is prec
 posture measured to break under this target's vkd3d-proton, and precisely what our own design
 exists to avoid.**
 
+> ### CORRECTED 2026-09-03 — one of those three is something WE ALREADY DO, from outside
+>
+> **The middle claim is wrong, and it is exactly the class of ReShade-era feasibility judgement
+> this re-review exists to catch.** "Forcing the whole engine to render off-screen" is filed
+> above as *not reachable from outside the engine*, by analogy to `ITemporalUpscaler`. **We do it
+> today.**
+>
+> `src/backend_native/fg_present.cpp` hooks `IDXGISwapChain::GetBuffer` and returns **our own
+> replacement textures** (`replacement[kMaxReplacements]`, created with the same desc as the real
+> back buffer), copying into the real back buffer at each of our presents. The game renders every
+> frame into a texture of ours and **never touches a real swap-chain buffer** — which is
+> precisely the guide's *"host has no access to the swap-chain buffers directly"*. We achieved it
+> not by changing the engine but by lying in one COM method. **HARD**, read from our own source,
+> and measured working (`docs/STRAY-RENDERING-FACTS.md` §32.7-§32.11).
+>
+> The analogy to `ITemporalUpscaler` is what misled the paragraph: that is engine-internal C++
+> with no D3D12 marshalling, whereas off-screen rendering is expressed **entirely through the
+> DXGI interface we already own**. Same sentence, two completely different kinds of wall.
+>
+> **The other two claims stand, and are now first-party confirmed.** We use no dedicated second
+> command queue, and we do not tear down the swapchain on toggle. Both remain deliberate.
+>
+> **What this changes in practice: less than it sounds, and that is the honest part.** We are not
+> "avoiding Streamline's model" as thoroughly as this section claims — we have independently
+> reimplemented one of its three defining properties. The genuine architectural difference is
+> narrower and is stated in `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §7.6: **NVIDIA presents once and
+> lets a proxy swapchain inject frames; we present twice from a private ring.** The plugin's own
+> custom present is a no-op with `NeedsNativePresent() { return true; }` — the engine presents
+> normally and `sl.dlss_g` adds frames invisibly inside the interposed swapchain. **Present-twice
+> is our invention**, forced by not owning the swapchain end to end, not a reproduction of
+> NVIDIA's design.
+
 ---
 
 ## 6. Anything Streamline does that we simply do not
@@ -439,77 +621,94 @@ exists to avoid.**
   callback, so there is no equivalent gap to fill.
 * **Multi-viewport support** (§5.3) — not applicable, Stray is a single-viewport title.
 * **`eRetainResourcesWhenOff`** — already flagged as low-priority/UNCONFIRMED in
-  `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §6; not re-derived here.
+  `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §6; not re-derived here. **CONFIRMED 2026-09-03**:
+  `r.Streamline.DLSSG.RetainResourcesWhenOff` defaults to **false** in the 8.7.2 plugin, so
+  NVIDIA does not take it by default either. **HARD.** Closes the first pass's open question in
+  the "do nothing" direction.
 
 ---
 
-## What could not be obtained, stated plainly
+## Recommendations, ranked — RE-RANKED 2026-09-03
 
-* **`sl.dlss_g.dll` / `sl.dlss_d`'s actual source.** Not present in the open repository at any
-  tag, including `v2.12.0`. Every claim above about the *interpolation algorithm*, the *exact*
-  ASCD math, and the *precise* pacer scheduling formula rests on `docs/ProgrammingGuideDLSS_G.md`'s
-  prose (SOFT) or on `docs/STRAY-RENDERING-FACTS.md` §32's binary-string extraction (HARD for
-  parameter names, UNCONFIRMED for the logic behind them) — never on code read for this document.
-* **Confirmation of the §5.3 crash hypothesis.** This is a reasoned diagnostic argument built
-  from source facts that were genuinely verified (the proxy-transparency and command-list-unwrap
-  behaviour) plus facts already established elsewhere in this project (`CLAUDE.md` §1's
-  process-wide static vtable, the OptiScaler death's exact frame numbers and crash signature). It
-  was not, and could not be, tested against the box in this report-only task. The next concrete
-  step is named in §5.3.
-* **Whether `NvAPI_D3D12_NotifyOutOfBandCommandQueue` is required or merely correct-in-principle.**
-  No source or doc read here states a consequence of omitting it; the recommendation rests on it
-  being the one Reflex-surface call Streamline makes that we do not, not on a measured symptom.
-
----
-
-## Recommendations, ranked
+> The first pass's ranking is largely retained: its two adoptable items both survive first-party
+> checking. What changed is the confidence attached to the diagnostic section, and the removal of
+> one feasibility claim that had flipped.
 
 ### Adopt into our own code (independent of Streamline's swapchain — safe under vkd3d-proton)
 
 1. **Call `NvAPI_D3D12_NotifyOutOfBandCommandQueue` on the present owner's queue for the
-   generated-frame submissions.** Small, concrete, matches Streamline's own Reflex plumbing
-   exactly; we already have the conceptual equivalent at the marker level
-   (`out_of_band_present_start/end`) and are missing the queue-level counterpart. §4.
-2. **Add a CI/runtime check that `core::fg::camera_basis()` produces an orthonormal matrix from a
-   real captured `TranslatedWorldToView`, not just from synthetic test matrices.** Cheap, and
-   protects against a repeat of exactly the kind of stationary-camera-hides-everything convention
-   bug this project has already shipped once (`ClipToPrevClip`'s missing `row_major`). Protects a
-   safety net (NVIDIA's own ASCD) whose loss would be silent. §6.
-3. **No code change, but worth stating with confidence**: our async worker-thread present
-   (`Pacing::thread`), our per-guide GPU-side copy discipline (`GuideSet[2]`), and our
-   guide-nulling-by-omission on invalid frames are all independently confirmed to already match
-   the principles Streamline's own documentation and source state as correct. §1, §2.
+   generated-frame submissions.** Small, concrete, matches Streamline's own Reflex plumbing; we
+   already have the marker-level equivalent (`out_of_band_present_start/end`) and are missing the
+   queue-level counterpart. **HARD** that Streamline makes the call and we do not.
+   **UNCONFIRMED** that omitting it has any consequence — no source read on either pass states
+   one. Adopt as tidiness with a plausible latency-accounting benefit, not as a fix. §4.
+2. **Add a CI/runtime orthonormality check on `core::fg::camera_basis()` against a real captured
+   `TranslatedWorldToView`**, not just synthetic matrices. Cheap; protects NVIDIA's own ASCD
+   safety net, whose loss would be **silent**. Unchanged from the first pass and still right —
+   note it is the same failure class as the newly-found half-pixel motion-vector question in
+   `docs/RESEARCH-DLSS-UE5-PLUGIN.md` §2.4, and the two would be sensibly done together. §6.
+3. **No code change, stated with more confidence than before.** Our async worker-thread present,
+   our per-guide GPU-side copy discipline (`GuideSet[2]`), and our guide-nulling-by-omission on
+   invalid frames all match the principles Streamline's source and docs state as correct — and
+   the tagging discipline is now **corroborated by NVIDIA's own plugin**, which uses
+   `eOnlyValidNow` (the stricter mode) with a TODO noting `eValidUntilPresent` would be more
+   efficient. We chose the same trade-off independently, for a reason the guide states. §1, §2.
 
-### Explains a bug we have measured
+### Explains a bug we have measured — DOWNGRADED, and partly overtaken
 
-1. **The OptiScaler FG death — measured under the ReShade-based configuration this project no
-   longer runs by default — is most plausibly the already-diagnosed ReShade ext-vtable-patch bug
-   (`CLAUDE.md` §1), reached by DLSS-G's own internal NVAPI calls at present time, a path our
-   `ext_unhook` did not protect because it only repairs the vtable immediately before *our own*
-   NGX calls.** Streamline's own device/command-queue/command-list proxies were checked
-   specifically for the naive version of this hazard (a leaked proxy pointer reaching a subsystem
-   that expects the native vkd3d object) and found clean — so the fault was not Streamline's own
-   object-wrapping design. Two falsifiable next steps, in order of cost: (a) cheapest — re-run the
-   same OptiScaler/Streamline coexistence test under the *current*, ReShade-free, UE4SS-native
-   configuration; if the hypothesis is right, the deterministic death should simply not occur,
-   since nothing installs the ext-vtable patch in the first place. (b) if ReShade is ever
-   reintroduced into any configuration (e.g. a user layering it for visual effects) — run
-   `ext_unhook`'s repair continuously, or specifically before every `Present`, rather than only
-   before our own NGX calls, and see whether that changes the outcome. §5.3.
+4. **The OptiScaler FG death is most plausibly ReShade's ext-vtable patch reached by DLSS-G's own
+   NVAPI calls — but this now explains a historical measurement of diminishing relevance.**
+   §5.1/§5.2's negative result stands (Streamline's own proxies are transparent to
+   `IID_ID3D12DeviceExt` and unwrap command lists before submission, so its object-wrapping design
+   was not the fault). The §5.3 hypothesis remains **SOFT** and untested.
+   **What changed: the question matters less.** Our own present-twice path has since carried
+   DLSS-G past the exact wall OptiScaler died at — 1.91x through three checkpoint reloads,
+   surviving the fullscreen transition (`docs/STRAY-RENDERING-FACTS.md` §32.9-§32.11). The
+   cheapest test named by the first pass — re-run the coexistence experiment with no ReShade in
+   the process — is still valid and still falsifiable, but it now buys a tidy explanation of a
+   dead configuration rather than unblocking anything. **Rank accordingly: interesting, not
+   urgent.** §5.0, §5.3.
+5. **The one live item that falls out of §5.3.** `ext_unhook` repairs the vtable only immediately
+   before *our own* NGX calls. With the present owner we now own the frame's end-of-submission
+   chokepoint, so running the repair there as well is nearly free. Only worth doing if ReShade is
+   ever reintroduced alongside the plugin (a supported configuration — `mods/StrayDLSS/README.md`
+   documents Config B); **inert otherwise**, as measured. §5.3.
 
 ### Not applicable under vkd3d-proton / UE 4.27
 
-1. **Streamline's full off-screen-render + dedicated-queue + swapchain-teardown-on-toggle
-   architecture (§18.0).** Requires forcing UE 4.27's entire renderer to draw off-screen — not
-   reachable from a swapchain or D3D12-event hook, and a heavier commitment than this project's
-   present-in-place design needs for what it does today. §5.4.
-2. **Streamline's swapchain proxy itself, deployed as `sl.interposer.dll`.** Measured to break
-   frame generation on this exact target, deterministically, independent of how clean its
-   component-level code reads — an interaction with this specific driver stack, not a defect
-   fixable by reading more source. §5, `CLAUDE.md` OptiScaler section.
-3. **VSync-with-Frame-Generation, multi-viewport support, dynamic-resolution+FG interplay.** None
-   apply to Stray's fixed single-viewport, fixed-screen-percentage, gamescope-composited
-   configuration. §6.
-4. **User Interface Recomposition (§6.6).** Depends on Hudless+UI tagging this project cannot
-   produce without engine-level access — recorded precisely in §3 for if that ever changes, not
-   actionable today.
+6. **Streamline's dedicated-queue and swapchain-teardown-on-toggle architecture.** Both remain
+   deliberate divergences. **NOTE the third item in the original list was WITHDRAWN**: "forcing
+   the engine to render off-screen" is *not* out of reach — our `GetBuffer` replacement ring does
+   exactly that, from outside, today. The real difference is present-once-with-injection versus
+   present-twice-from-a-private-ring. §5.4.
+7. **Streamline's interposer deployed as `sl.interposer.dll`.** Off the table by **user
+   constraint** (`docs/STRAY-RENDERING-FACTS.md` §32.5), and separately measured to fail once in
+   a configuration that included ReShade. **Restated as SOFT** rather than as the settled
+   technical finding the document's opening claimed. §5.0.
+8. **Hudless + UI tagging, and User Interface Recomposition.** Narrowed: the **UI half is dead
+   for this title regardless of reachability** — NVIDIA's alpha mask depends on the
+   `DrawClearQuadAlpha` engine patch (absent from stock 4.27), and NVIDIA's own README tells HDR
+   titles, which we are, to disable UI tagging. Recomposition needs both buffers and is therefore
+   doubly out. The **hudless half alone** is the remaining prize, and it is a view-extension
+   problem rather than a DXGI-hook one. §3.
+9. **VSync-with-FG, multi-viewport, dynamic-resolution+FG.** Unchanged: none apply to Stray's
+   fixed single-viewport, fixed-screen-percentage, gamescope-composited configuration. §6.
+
+---
+
+## What could not be obtained, stated plainly — REVISED 2026-09-03
+
+* **`sl.dlss_g.dll` / `sl.dlss_d`'s source.** Still closed, at every tag. Everything about the
+  interpolation algorithm, the exact ASCD math and the pacer's scheduling formula rests on
+  `ProgrammingGuideDLSS_G.md` prose (**SOFT**) or on `docs/STRAY-RENDERING-FACTS.md` §32's binary
+  string extraction (**HARD** for names, **UNCONFIRMED** for the logic). First-party access to
+  NVIDIA's *engine* fork did not change this — the plugin never calls into DLSS-G's evaluate at
+  all, so there was never a caller-side view of it to obtain.
+* **Confirmation of the §5.3 crash hypothesis.** Unchanged: a reasoned argument, never tested.
+  This was a report-only task and the box is owned by another agent this session.
+* **Whether `NvAPI_D3D12_NotifyOutOfBandCommandQueue` is required or merely correct.** Unchanged
+  and still **UNCONFIRMED** after reading both NVIDIA integrations.
+* **Streamline SDK 2.12.0's source versus the 2.11.1 the current plugin vendors.** The public SDK
+  read by the first pass is *newer* than the vendored one; no diff between them was performed, so
+  a 2.12.0-only behaviour could be attributed here to Streamline generally. **SOFT** wherever the
+  distinction could matter.
