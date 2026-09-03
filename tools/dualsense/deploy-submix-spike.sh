@@ -88,6 +88,15 @@ if pgrep -x Stray-Win64-Shi >/dev/null 2>&1; then
   done
   pgrep -x Stray-Win64-Shi >/dev/null 2>&1 && fail "the game is still running; refusing to write under it"
   say "  game stopped"
+  # MEASURED 2026-09-03: launching while Steam's reaper for the killed chain is still alive
+  # makes Steam ignore the launch (CLAUDE.md 2.10) and tools/launch-stray-safe.sh refuses with
+  # "stale launch chain". Wait for it here so the next command can be the launcher.
+  for _ in $(seq 1 40); do
+    pgrep -f "13320[1]0" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  pgrep -f "13320[1]0" >/dev/null 2>&1 && say "  WARNING: Steam's reaper is still up; a launch now will be ignored" \
+                                        || say "  launch chain reaped"
 else
   say "game is not running"
 fi
