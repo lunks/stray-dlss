@@ -631,11 +631,39 @@ replacement is `Kim2091/dxvk-remix` branch `gta4-atmos-dlss5`, four commits (`a1
 
 ### 9.0 Method, and one thing this does NOT establish
 
-**The changelog claim is SOFT and must not be read as a measurement of Kim's branch.** It describes
-a *squashed cherry-pick into a third repository*, so any improvement could have come from edits
-made during that squash, or from other changes in the same release, and it could even include
-fixes to the user's own code rather than a wholesale replacement of it. The useful evidence is
-therefore not the claim — it is the **source diff**, which is public on both sides and was read
+**First, what the shipping mod actually ships — because half of the "it was a squash" caveat turns
+out to be answerable.** v1.5.2's README at the tag names its runtime as
+`xoxor4d/dxvk-remix` branch `game/gta4_atmos10_nr2` (**HARD** — README line 54 at the tag; the
+wiki's "Remix Runtime Changes" page still says `game/gta4_rebase6` and is **stale**, do not use
+it). Comparing that branch against `Kim2091/dxvk-remix@gta4-atmos-dlss5` by GitHub blob SHA —
+content-addressed, so equal SHA is byte equality:
+
+| File | xoxor4d | Kim2091 | |
+|---|---|---|---|
+| `rtx_neural_uplift.cpp` | `f52e639a…` | `f52e639a…` | **identical** |
+| `rtx_neural_uplift.h` | `0226a22d…` | `0226a22d…` | **identical** |
+| `nvsdk_ngx_defs_dlssnr.h` | `df42c808…` | `df42c808…` | **identical** |
+
+The NR-touching lines of `rtx_ngx_wrapper.*` and `rtx_context.cpp` are identical too; those files'
+only deltas are DLSS-**SR** preset plumbing and RR/NRD denoiser work. **So the squash changed
+nothing in the NR implementation** — the shipped code IS Kim's branch, and the only genuine NR
+difference is which ImGui tab the panel sits in. **HARD.** (The runtime binary itself ships as a
+committed 72 MB blob, `assets/.trex/d3d9_runtime.zip`, updated five minutes before the release was
+published; that is documentation and timing, not binary provenance, so "this exact commit" is a
+tight inference rather than proof.)
+
+Note also, and it matters for §9.2: **the shipped runtime contains no NR shader files at all.**
+`rtx_neural_uplift.cpp` includes no shader header, and the display-referred conversion rides
+entirely on the runtime's existing `performSRGBConversion` path. The codec deletion is not an
+artefact of reading a development branch — it is what shipped.
+
+**What remains SOFT is the attribution, not the code.** The changelog line credits the NR swap with
+the improvement, but the same release also refactored the Remix variable plumbing, changed
+particle alpha and quadrupled the RTXDI sample count to 64 ("less noisy headlights"). None of
+those is nothing, and no A/B isolating the NR change is published. So *"Kim's NR implementation is
+what shipped"* is HARD; *"Kim's NR implementation is why it flickers less"* is SOFT.
+
+The useful evidence is therefore the **source diff**, which is public on both sides and was read
 directly rather than inferred from commit messages:
 
 * **Theirs**: `Kim2091/dxvk-remix@gta4-atmos-dlss5`, `src/dxvk/rtx_render/rtx_neural_uplift.{h,cpp}`.
@@ -719,3 +747,127 @@ in the periodic report:
   that used to pass silently, each one a mis-reprojected frame.
 * **All near zero while the flicker persists** clears our reset machinery entirely and points back
   at placement — i.e. at the thing we cannot change without a working post-tonemap site.
+
+---
+
+## 10. Can we run NR as a STAGE rather than a HOOK? — verdict: YES, at present, and it outranks §9
+
+**This is the recommendation, stated first.** A present-time NR stage is feasible, and if it works
+it deletes more of our NR machinery than every difference in §9 combined fixes. It should be
+built as an **additional site behind a key, not a migration** — the `taa` site stays until the new
+one is confirmed on the box. **Not implemented in this pass; it is the user's call.**
+
+### 10.1 Why this is genuinely a stage and not another hook
+
+The fork's pass is an `RtxPass`/`CommonDeviceObject`: one fixed chosen point, its own resources on
+the framework's lifecycle, its own command list. Our `taa` site is the opposite of all three — it
+runs inside a compute dispatch Unreal scheduled for something else, on the game's list, with the
+game's state bound.
+
+**`src/backend_native/present_owner.*` already has all three properties**, and this is the fact
+that changes the answer (**HARD**, read from the source):
+
+| Property the fork's pass has | Present owner | Where |
+|---|---|---|
+| Its own command list and allocator | **Yes** — a ring of 3 slots, each with its own `ID3D12CommandAllocator` and `ID3D12GraphicsCommandList` (DIRECT) | `present_owner.cpp:51-56`, `:93-117` |
+| Its own fence and completion tracking | **Yes** — one `ID3D12Fence` + event; waits only when reusing an in-flight slot | `present_owner.cpp:110-115`, `:343-348`, `:382-383` |
+| A fixed, chosen point in the frame | **Yes** — inside the patched `Present`, *before* the original, therefore after the game's every submission to that queue | `present_owner.cpp:387-392`, `present_owner.hpp:19-22` |
+
+**And the decisive one: there is no game state on that list to clobber.** The list is `Reset` with a
+null PSO every frame (`present_owner.cpp:351`) and nothing of the game's is ever bound on it. The
+documented cause of the `preui` disaster was *"it clobbered state the next pass was about to
+use"* (CLAUDE.md), a hazard that exists only because `preui` recorded onto **the game's** list —
+its own code says so: *"UE4 filters its own redundant binds, so a clobber that is never undone
+survives into the next draw"* (`da37085^:src/nr_hook.cpp:421-423`). **On the present list that
+failure mode does not exist, because there is no next draw and nothing of the game's is bound.**
+`restore_game_compute_state` is not merely unnecessary there — it would be wrong, exactly as
+CLAUDE.md already argues for ReShade's immediate list.
+
+So the two prior failures do **not** generalise to this site. `preui` failed on state; `present`
+failed because it depended on `reshade_begin_effects`, which never fires with an empty preset. The
+native present owner has neither dependency, and it did not exist when either was tried.
+
+### 10.2 What it deletes
+
+Not "tunes" — *deletes*, because the reason each thing exists is the pre-tonemap anchor:
+
+* **The whole HDR codec.** The back buffer at present is post-tonemap, and Stray never calls
+  `SetColorSpace1`, so `R10G10B10A2_UNORM` is DXGI's default `RGB_FULL_G22_NONE_P709` — **an SDR,
+  display-encoded, [0,1] image, which is precisely feature 18's training domain** (CLAUDE.md
+  §2.1 for the format; the fork reaches the identical conclusion from the other direction in
+  `10fa0368`, and the shipped runtime carries **no NR shaders at all**, §9.0). That retires the
+  proxy encode/decode pair, `NgxNRPaperWhiteScale`, `NgxNRColorStrength`, `NgxNRTransferStrength`.
+* **The entire exposure feedback loop** — `NgxNRTrackExposure`, `NgxNRExposureSmoothing`, the
+  smoothed `OneOverPreExposure` read, and **the codec-scale reset latch that §9's table ranks as
+  our most likely remaining flicker source (item 2)**. There is no pre-exposure left to undo, so
+  there is no loop to close and no metronome to tune.
+* **The `u0` feedback node, and `NgxNRRestoreHistory` with it.** The back buffer at present is
+  terminal: nothing in UE4 carries it into the next frame, so the SSR / `TemporalAAHistory.RT[0]`
+  conduit and the eye-adaptation histogram are both unreachable **by construction**, not by having
+  been closed. NR would never touch `u0` at all.
+* **Pass identification for NR.** The site is a swapchain event, not a shader match.
+
+### 10.3 What it risks, honestly
+
+1. **The HUD is in the image.** The fork runs *before* the screen overlay specifically so the UI is
+   not fed through the model. At present it is composited. Our mitigation is `DLSSNR.UICorrection`,
+   which we already set to 1 — but **what it actually does is UNCONFIRMED** (it is not in the five
+   controls CLAUDE.md read out of the binary). This is a *look* risk, not a crash risk, and one
+   screenshot judges it: softened or denoised HUD text is the tell.
+2. **Typed UAV store on `R10G10B10A2_UNORM`.** NGX writes `DLSSNR.Output` through a typed UAV, and
+   that format's typed-UAV support is optional in D3D12. **The probe already exists and is
+   generic** (`src/nr_codec_pass.cpp:464-471`, `D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW`
+   + `FORMAT_SUPPORT2_UAV_TYPED_STORE`), so this is a gate, not an unknown. **SOFT:** NVIDIA
+   supports `A2B10G10R10` storage images, so it is expected to pass — but it must be probed and
+   refused loudly, never assumed.
+3. **Guide freshness.** Depth and motion vectors are captured at the TAA dispatch and consumed
+   later in the same frame. The publish-a-counter / consume-it-once machinery for exactly this
+   existed and was deleted with `nr_hook.cpp`; it has to be rebuilt, together with re-running
+   `is_resource_live` at present. Modest, and previously working code.
+4. **A compute dispatch has never been recorded on the present list.** Its only users to date are
+   barriers and one `CopyTextureRegion` (`native_backend.cpp:385-399`, `nr_history.cpp:573`). The
+   list is a plain open DIRECT list, so `SetDescriptorHeaps` + root signature + `Dispatch` is
+   legal — but it is new, and it is what the experiment below exists to prove.
+5. **Cost.** `ExecuteCommandLists` on the present list becomes unconditional, plus one staging copy
+   of the back buffer (~33 MB at 4K in `R10G10B10A2`) — *cheaper* than the 66 MB FP16 copies the
+   `taa` site already pays.
+
+### 10.4 Coordinate, do not duplicate: the FG boundary
+
+The frame-generation work wants **the same pre-UI signal** — the frame's first back-buffer
+render-target bind — for its HUD-less input, and has it as an unimplemented, user-gated stage. Our
+old `preui` detector was exactly that signal (identity-test `rtvs[0]` against the swapchain's
+back-buffer list, fire at ordinal N) and was deleted on 2026-09-02; nothing of it survives in
+`src/`.
+
+**The recommendation deliberately does not need it.** A present-time stage requires no boundary
+detection at all, which is its main practical advantage over the `preui` shape and keeps it out of
+FG's way. **If and only if risk 1 above proves unacceptable** does NR need that boundary — and at
+that point it should be built once and shared with FG, not rebuilt privately. Say so before
+starting.
+
+### 10.5 The smallest experiment that proves or kills it
+
+**One launch, no NR machinery, and it answers four questions at once.** Behind a key
+(`NgxNRPresentProbe=1`, default off), record on the present owner's list a **single compute
+dispatch** that writes magenta into a 128×128 centre patch of the back buffer through a typed UAV
+in `R10G10B10A2_UNORM`, then `note_present_list_used()`. Screenshot.
+
+* **Magenta on screen, game healthy** ⇒ compute on the present list works, typed UAV store on the
+  back buffer's format works under vkd3d-proton, the write survives to the display, and the site is
+  viable. Everything after that is plumbing we have already written once.
+* **No magenta** ⇒ either the probe said no (logged) or the write does not reach the display, and
+  the idea dies for the cost of one launch.
+* **Game unhealthy** ⇒ recording compute on that list is not safe here, which is the one thing no
+  amount of source reading can settle.
+
+This is deliberately the same trick as `NgxPaint=1`, which is the debugging step that actually
+cracked "DLSS runs but nothing changes" (CLAUDE.md gotchas ledger): **prove the write path before
+building anything that depends on it.** Note that `NgxPaint` worked precisely because it separated
+"can we write here" from "is the network right", and that separation is what makes this cheap.
+
+**Ranking, plainly: if the probe passes, this outranks every individual difference in §9.** Item 2
+of that table — our exposure-tracked reset latch — is not fixed by a stage, it is *deleted* by one,
+along with the codec that motivates it and the feedback node that motivates `NgxNRRestoreHistory`.
+§9's implemented fixes (the frame-gap latch, the new-feature reset) remain correct and apply at
+either site, so nothing there is wasted.
