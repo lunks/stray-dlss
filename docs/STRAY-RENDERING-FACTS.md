@@ -1722,6 +1722,44 @@ read cache the game loads next startup — "No write cache exists" + recompile e
 with no CachedPSO involvement. The check: compare the game's cwd and where a `.write` appears,
 with the plugin vs without. UNCONFIRMED.
 
+### 32.12.1 The cwd theory, narrowed offline (2026-09-03)
+
+Two of the three ways our host could be responsible are now closed without a launch:
+
+* **Nothing of ours changes the working directory.** `grep -rn "SetCurrentDirectory\|chdir"`
+  over `src/`, `mods/` and `tools/` returns NOTHING. The plugin, the host and the launch
+  tooling all leave the cwd exactly as Proton set it. So "the plugin chdir's and vkd3d's
+  `.write` lands somewhere else" is dead as stated. HARD (absence in our own tree).
+* **Our create-path forwarding is already exonerated** by the WARP proof above.
+
+**What the section's own two measurements cannot both be true of one directory, and that is
+the lead.** §32.12 records the game's cwd as `/run/media/.../common/Stray` (from
+`/proc/PID/cwd`) while the 284 KB read cache sits under `.../common/Stray/Hk_project/Binaries/Win64`.
+With `VKD3D_SHADER_CACHE_PATH` empty, vkd3d resolves BOTH the read cache and the `.write`
+sibling against the cwd — so if the cwd really is the game root, the file in `Binaries/Win64`
+is a **stale orphan from an older configuration that is never loaded**, and vkd3d has been
+reading and writing in `common/Stray` all along. That alone produces "No write cache exists"
+plus a full recompile every session, **with or without our plugin loaded** — i.e. it would not
+be our bug at all. (Note our own sidecars — the status file, the verdict, the hash lists — are
+opened by relative path and DO land in `Binaries/Win64`, which is evidence the cwd is
+`Binaries/Win64` at least while the plugin writes them. One of the two readings is wrong, and
+which one is the whole question.)
+
+**A third candidate the earlier framing missed: every test session is killed, never quit.**
+`tools/stray-lib.sh:81` and `tools/launch-stray-safe.sh:124` both end a session with
+`pkill -x Stray-Win64-Shi` after a 10 s grace. A SIGTERM'd Wine process runs no
+`DLL_PROCESS_DETACH` and no D3D12 device destruction, so whatever flush or promote vkd3d does
+at teardown never runs. SOFT — it depends on whether vkd3d's disk cache is written
+incrementally during the session or only at teardown, which has not been read from
+vkd3d-proton 3.1.0's source.
+
+**The sharpened check, and most of it needs no launch:** survey the filesystem for every
+`vkd3d-proton.cache*` under the Steam library and note each one's size and mtime — if the
+`Binaries/Win64` copy's mtime is old while something in `common/Stray` is fresh, the orphan
+reading is confirmed outright. Then, in ONE session: `readlink /proc/<pid>/cwd`, and `ls` both
+directories mid-session to see whether a `.write` exists at all and where. Only if a `.write`
+does exist mid-session does the kill-versus-clean-exit question arise. UNCONFIRMED.
+
 ## 32.13 Stall attribution built into the host ([STRAYDLSS] StallWatch, default ON)
 
 The user sees the DLSS indicator blink, the music cut out and a visible jump at the same
