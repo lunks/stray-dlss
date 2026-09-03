@@ -49,6 +49,15 @@
 > desynchronising on a fullscreen toggle without a resize, and two outright bugs. The verdict
 > survives, but only on the narrower claim that ours is correct *for the user's configuration*
 > and that its defects are in code we can reach.
+>
+> **§7.2c settles the platform question at HARD.** Streamline's pacer drives itself from
+> `NvAPI_SetFlipConfig` (private), `GetFrameStatistics`, `WaitForVBlank` and Independent Flip —
+> DXGI presentation timing and a DWM-bypass mode, none of which gamescope provides. And DLSS-FG
+> has **two fail-closed gates with no override**: Hardware-accelerated GPU Scheduling, read
+> through **WDDM kernel thunks** that do not exist on Linux, and **Authenticode dual-signature
+> verification** of every plugin. So the honest expectation is that Streamline reports
+> *unavailable* here — a better reason than the one this project was citing, and reached by
+> reading its source rather than by mis-attributing a crash.
 
 We deliberately do not use Streamline. `src/ngx_fg.cpp` drives NGX feature 11
 (`NVSDK_NGX_Feature_FrameGeneration`) directly through the NGX core; `src/backend_native/present_owner.*`
@@ -718,7 +727,7 @@ Sources: `NVIDIA-RTX/Streamline` @ **v2.12.0** (`e8aaa6eaac`, public) for the SD
 | **Output validation** | Auto Scene Change Detection inside the closed snippet (input-side) | **Crop readback gate**: 3 consecutive good looks to validate, and it **revokes** on a bad one, with per-reason refusal counters (`fg_present.cpp:642-662`) | **We have something Streamline does not** at the integration level — but it is a 64×64 centre crop, and a generated frame byte-identical to the real one (a pure copy, not an interpolation) is weighted *good* and validates the feature. It proves "something plausible reached the screen", not "a frame was interpolated". **See §7.2b** |
 | **Back-buffer index** | **Requires** `GetCurrentBackBufferIndex`; `eFailGetCurrentBackBufferIndexNotCalled` is a documented failure bit | `GameIndexMirror` models the engine's `++ % N` counter | Ours is correct **only against an engine that manually increments** — true for stock 4.27, false for UE 5.6+. A stated precondition, not a bug |
 | **Resolution / fullscreen** | Teardown + recreate | Drain the worker, idle the GPU, bump an **epoch**, drop and re-arm replacements | Ours is measured through `SetFullscreenState(TRUE)` + `ResizeBuffers` and three checkpoint reloads (facts §32.7, §32.10) — **deliberately, because that is where OptiScaler died** |
-| **Multi-viewport / multi-swapchain** | Supported, view-id keyed | **Assumes one** (`fg_present.cpp:301`; a second logs an error and is passed through untouched) | A real simplification. Correct for Stray; would not survive a second swapchain |
+| **Multi-viewport / multi-swapchain** | Multi-**viewport** is view-id keyed. Multi-**swapchain** is **also one only** — `dxgiSwapchain.cpp:152`: *"Streamline supports only one DXGISwapChain"* | **Assumes one** (`fg_present.cpp:301`; a second logs an error and is passed through untouched) | **Corrected in §7.2c.** The one-swapchain limit is **shared with the reference**, not a place we fall short. Only multi-viewport is genuinely theirs |
 | **VSync** | Handled; `bIsVsyncSupportAvailable` is part of the API | **Unhandled.** Both presents reuse the game's sync interval verbatim; nothing forces `sync=0` on the generated one | **A genuine weakness that would bite on a config change.** Validated only at VSync off on a VRR panel. §7.2b |
 | **Device removal / TDR** | Handled | **Zero handling** — no `DXGI_ERROR_DEVICE_REMOVED` anywhere in the native backend, and an internal failure returns `E_FAIL`, which UE4's `PresentChecked` does not treat as fatal | §7.2b |
 | **MFG (>2×)** | Supported | `MultiFrameCount=1` | Not applicable — Ada's ceiling is 2×. Same outcome |
@@ -764,6 +773,7 @@ measurement of Wine's timer behaviour, not on reading Streamline's pacer, which 
 But the asymmetry is real and it does not require the hypothesis to be exactly right: *any*
 pacing defect in a closed component is unfixable, and we have already demonstrated that this
 platform produces pacing defects that a Windows-developed component would not have anticipated.
+
 
 
 ### 7.2b Where ours is genuinely weaker — the honest defect list
@@ -830,6 +840,108 @@ It works, and is measured, *in one configuration* — windowed-fullscreen, VSync
 swapchain, three back buffers, no device resets. That is exactly the configuration the user
 runs, which is why it has never bitten. It is not a general implementation and should not be
 described as one.
+
+### 7.2c RESOLVED 2026-09-03 — the platform gates, located in Streamline's own source
+
+§7.2 offered two possibilities for the pacer and §7.6 left HWS as **UNCONFIRMED**. Both are now
+answered from `NVIDIA-RTX/Streamline` @ **v2.12.0** (`e8aaa6eaac`), plus string/import analysis of
+the shipped `sl.dlss_g.dll` (**the FG plugin is closed — `source/plugins/sl.dlss_g` does not exist
+in the repository**; findings from the binary are marked **HARD (binary)**).
+
+**§7.2's possibility (2) is CONFIRMED: the pacer really is a display-stack mechanism, and it is
+the part least likely to survive translation.** DLSS-FG's pacer ("RSync") drives itself from:
+
+* **`NvAPI_SetFlipConfig`** — a *private* NVAPI flip-metering entry point, V1 and V2, with
+  fallback logging (`Driver reports SetFlipConfig V2 support`, `Failed to set flip config V2,
+  falling back to V1`). **HARD (binary).**
+* **`IDXGISwapChain::GetFrameStatistics`** in a warm-up loop (`RSYNC: getFrameStats not working
+  during warmup (initial call), will keep retrying.`, `RSYNC: getFrameStats failed, invalidating
+  warmup.`), **`IDXGIOutput::WaitForVBlank`** on a dedicated `thread.rsync-vblank`, and
+  **`GetFrameLatencyWaitableObject`** flip-queue throttling. **HARD (binary).**
+* **Independent Flip (IFLIP)**, a DWM-bypass presentation mode, for the VSync+FG path
+  (`ProgrammingGuideDLSS_G.md` §22).
+
+DXGI presentation timing is historically the weakest area of any translation layer, and gamescope
+is a Wayland compositor with no DWM and no IFLIP. **So the pacer would not merely inherit Wine's
+timer skew — its inputs largely do not exist here.** This closes §7.2's argument at HARD rather
+than SOFT: we would be handing pacing to a closed component whose timing sources are absent.
+
+**The HWS gate: located, and it fails CLOSED with no bypass.** `sl.common`'s
+`commonInterface.cpp:150-256` queries it entirely through **WDDM kernel-mode thunks in
+`gdi32.dll`** — `D3DKMTEnumAdapters2` + `D3DKMTQueryAdapterInfo` with
+`KMTQAITYPE_WDDM_2_7_CAPS`, reading `D3DKMT_WDDM_2_7_CAPS::HwSchEnabled`, matched against the
+DXGI adapter LUID. Then `sl.cpp:792-801`:
+
+```cpp
+bool required = cfg["hws"]["required"];
+bool detected = cfg["hws"]["detected"];
+if (required && !detected) {
+    SL_LOG_ERROR("Feature '%s' requires GPU hardware scheduling to be enabled in the OS", ...);
+    return Result::eErrorOSDisabledHWS;
+}
+```
+
+Three properties make this the likeliest single blocker, and all three are **HARD**:
+
+1. **It is a WDDM concept, not a D3D12 one.** There is no WDDM on Linux.
+2. **Enumeration failure is indistinguishable from HWS being off.** If `D3DKMTEnumAdapters2`
+   fails, SL logs a warning, zeroes the struct, skips the loop, and leaves `hwsSupported =
+   false`. There is no fallback and no NVAPI alternative.
+3. **`eBypassOSVersionCheck` does not help.** It gates the *OS version* comparison only. **No
+   flag bypasses HWS.** And `hws.required` is set by the closed `sl.dlss_g` itself (the string
+   table at `0x74d28` carries `hws`, `detected`, `required`, `supported`), so it cannot be
+   configured away either.
+
+**A second fail-closed gate the first draft did not know about: Authenticode.**
+`security::loadLibrary` (`secureLoadLibrary.cpp:31-41`) gates every `LoadLibraryW` of an SL plugin
+behind `verifyEmbeddedSignature`, which needs `wintrust.dll!WinVerifyTrust` with
+`WSS_GET_SECONDARY_SIG_COUNT | WSS_VERIFY_SPECIFIC`, requires **exactly one secondary signature**,
+and walks the nested-signature OID `1.3.6.1.4.1.311.2.4.1` through nine `crypt32.dll` entry points
+to confirm NVIDIA is the second signer. Failure message: *"Streamline will not load unsecured
+modules."* **HARD.** This depends on the OS trust store and Wine's `wintrust`/`crypt32`
+completeness — another gate that reports unavailable rather than degrading.
+
+**Corrections to §7.1 this forces:**
+
+* **"Multi-swapchain: Streamline supported, ours assumes one" was WRONG.** Streamline supports
+  exactly one too — `dxgiSwapchain.cpp:152`: *"Streamline supports only one DXGISwapChain
+  (currently it is 0x%p). Skipping some Present() hooks…"*. **HARD.** Our one-swapchain
+  assumption (§7.2b item 7) is a limitation we *share with the reference*, not a place we fall
+  short. Multi-**viewport** is view-id keyed and genuinely theirs; multi-**swapchain** is neither's.
+* **Our replacement-back-buffer trick is what DLSS-FG does too.** It creates its own internal
+  swapchain and hands the application **cloned fake back buffers** — binary strings
+  `cloneFakeBuffers: ENTRY - width=%u…`, `tex2d.fake-swapchain-buffer`, and `GetBuffer` /
+  `GetCurrentBackBufferIndex` are declared `"exclusive_hooks"` in its plugin JSON. **HARD
+  (binary).** §5.4's correction was right and is now doubly so: we independently reinvented the
+  reference's own mechanism.
+* **Reflex's mandatory status is structural, not stylistic.** `sl.dlss_g`'s plugin JSON lists
+  `"required_plugins": ["sl.common", "sl.reflex"]`, and the guide states that *"any existing
+  regular Reflex SDK integration (not using Streamline) cannot be used by DLSS-G"* — so our
+  working DXVK-NVAPI Reflex would not satisfy it; SL's own would have to work. Note also that SL
+  calls `NvAPI_D3D_GetLatency` with a **newer-than-public struct layout**
+  (`NV_LATENCY_RESULT_PARAMS_V1_BFM_36495674`, `chi/generic.cpp:1252-1276`), which DXVK-NVAPI has
+  no reason to match.
+
+**One finding that cuts the other way, and it deserves recording.** The *only* mention of
+vkd3d/Proton/Wine/Linux in Streamline's entire source tree is a deliberate accommodation for our
+stack (`chi/d3d12.cpp:425-428`):
+
+```cpp
+// Shared fences are needed for DX11 interop (DX11-on-DX12 scenario).
+// For pure DX12 titles, non-shared fences avoid inefficient shared semaphore
+// GPU waits in vkd3d-proton (Linux DX12-to-Vulkan translation layer).
+```
+
+**HARD.** NVIDIA knows vkd3d-proton exists and has tuned at least one thing for it. That is weak
+evidence of viability — one comment is not a support commitment — but it is honest to note that
+the SDK is not oblivious to the platform.
+
+**Two operational notes for anyone running §7.6.** OTA is **on by default**
+(`Preferences::flags` defaults to `eAllowOTA | eLoadDownloadedPlugins`) and uses `wininet` plus
+`CreateProcessW` on `nvngx_update.exe` — clear those flags before testing anything. And SL raises
+the **global** timer resolution to 0.5 ms via `NtSetTimerResolution`
+(`slPreferredTimerRes = 5000UL`), which is a system-wide side effect worth knowing about under
+Wine.
 
 ### 7.3 What replacing it would actually cost
 
@@ -904,7 +1016,7 @@ schedule and present it differently.
 5. **Independence from Reflex's real behaviour on this stack** (7.1).
 6. **The user's stated constraint** would have to be revisited — which is their call, not ours.
 
-### 7.6 The decisive experiment, and it is nearly free
+### 7.6 The decisive experiment — still worth running, but expect a different answer
 
 **One launch settles the question that 7.0 opened**, and the reason it is cheap is that the
 configuration already existed once:
@@ -943,14 +1055,40 @@ from `sl_core_types.h:508-542` (**HARD**):
   INCLUDING BUT NOT LIMITED TO `IsWindowsXXX`, `GetVersionX`, `rtlGetVersion` ARE KNOWN FOR
   RETURNING INCORRECT RESULTS."* Directly relevant under Wine.
 
-**One caveat that must not be skipped.** DLSS-FG's first-party system requirements
-(`Streamline/README.md:66-69` on `dlss3/sl2-4.27-dlss-plugin`, **HARD**) list *"Display
-Hardware-accelerated GPU Scheduling (HWS) must be enabled"* — a **WDDM** feature that does not
-exist on Linux. **Our own direct-NGX path reaches 2.00× without it**, which proves the gate is
-not inside the snippet. Where it *is* enforced — Streamline, the Windows driver, or nowhere —
-is **UNCONFIRMED**, and it is a specific way the experiment could fail for a reason that has
-nothing to do with ReShade or with fullscreen. If it does fail, check for an HWS-related
-refusal in `sl.log` before concluding anything.
+**The caveat, now RESOLVED and promoted to a prediction.** §7.2c locates the HWS gate exactly:
+`sl.common` queries it through the **WDDM kernel thunks** `D3DKMTEnumAdapters2` +
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS)` and reads `HwSchEnabled`; `sl.cpp:792-801`
+then returns `Result::eErrorOSDisabledHWS` when a feature requires it, and **no preference flag
+bypasses it** (`eBypassOSVersionCheck` covers the OS version only). Enumeration failure is
+indistinguishable from HWS being off. **HARD.** Our own direct-NGX path reaches 2.00× without
+HWS, which proves the gate is *not* in the snippet — it is in Streamline.
+
+**So the most likely outcome of the experiment is now a specific, named refusal that has nothing
+to do with ReShade or fullscreen**, and the run should be read accordingly:
+
+* Look first for `eErrorOSDisabledHWS`, `requires GPU hardware scheduling to be enabled in the
+  OS`, or `Adapter enumeration has failed` in `sl.log`. If any appears, **Streamline is
+  unavailable on this platform for a structural reason** and the ReShade question becomes moot
+  — the experiment still succeeded, it just answered a different question.
+* Look also for `Streamline will not load unsecured modules` — SL verifies an **Authenticode
+  dual signature** on every plugin before `LoadLibraryW` (§7.2c), another fail-closed gate that
+  depends on Wine's `wintrust`/`crypt32`.
+* Only if it gets past both is the ReShade-versus-fullscreen question actually under test.
+
+**Clear these before running**, both **HARD** from `sl_core_types.h:569`: OTA is **on by
+default** (`eAllowOTA | eLoadDownloadedPlugins`) and will try `wininet` plus `CreateProcessW` on
+`nvngx_update.exe`.
+
+**And one option the first draft did not know existed: manual hooking.** `eUseManualHooking`
+plus `slGetNativeInterface`/`slUpgradeInterface` is a fully documented integration mode
+(`docs/ProgrammingGuideManualHooking.md`) in which the host loads `sl.interposer.dll`
+**explicitly** and keeps its own hooks, routing a mandatory list through SL's proxies —
+`CreateSwapChain*`, `Present`, `Present1`, `GetBuffer`, `ResizeBuffers`, `ResizeBuffers1`,
+`GetCurrentBackBufferIndex`, `SetFullscreenState`, `CreateCommandQueue`. **HARD.** So Streamline
+does **not** have to be installed as `dxgi.dll` at all, and the experiment does not have to go
+through OptiScaler. That does not change the verdict — the mandatory list still hands SL the
+swapchain, and the pacer still comes with it — but it means "the interposer must own the DLL
+chain" was never true, and a future attempt has a cleaner integration shape available.
 
 **This experiment is not a prerequisite for the verdict below** — it is worth running for the
 knowledge, and because a wrong belief in this project's own documentation is worth correcting
@@ -958,17 +1096,36 @@ even when the conclusion survives.
 
 ### 7.7 Verdict: KEEP OURS, and adopt the pieces — but for the right reasons
 
-**Not replace. Not a hybrid in the architectural sense** (there is no way to take Streamline's
-pacer without taking its swapchain — the pacer is inside `sl.dlss_g.dll` and is driven by the
-interposed present). **Hybrid only in the sense our existing recommendations already mean:
-adopt the specific, small things Streamline does that we do not.**
+**Not replace. Not a hybrid in the architectural sense** — the pacer is inside `sl.dlss_g.dll`,
+driven by the interposed present, and cannot be taken without the swapchain. **Hybrid only in
+the sense our existing recommendations already mean: adopt the specific, small things Streamline
+does that we do not.**
+
+> **One correction to this paragraph, 2026-09-03.** The first draft said Streamline must own the
+> DLL chain. **It need not** — `eUseManualHooking` is a documented mode in which the host loads
+> `sl.interposer.dll` explicitly and keeps its own hooks (§7.6). But the mandatory hook list
+> still includes `CreateSwapChain*`, `Present`, `GetBuffer`, `GetCurrentBackBufferIndex` and
+> `SetFullscreenState`, so SL still ends up owning the swapchain and the pacer still arrives
+> with it. **The conclusion is unchanged; the reason "there is no way" was overstated.**
 
 **The argument, in order of weight:**
 
-1. **The pacer is closed and this platform breaks pacers** (7.2). We have already found one
-   Wine-specific timing defect and fixed it in code we own. Handing pacing to a closed,
-   Windows-developed component on a Wine/vkd3d/gamescope stack is the single worst trade
-   available, because the failure mode is *visible to the user* and *unfixable by us*.
+1. **The pacer is closed, and its timing sources largely do not exist here** (7.2, **now
+   confirmed at HARD in 7.2c**). This was a hypothesis in the first draft; Streamline's own
+   source and binary settle it. RSync paces from `NvAPI_SetFlipConfig` (a *private* NVAPI
+   entry), `IDXGISwapChain::GetFrameStatistics`, `IDXGIOutput::WaitForVBlank`, waitable-object
+   flip-queue throttling and Independent Flip — DXGI presentation timing and a DWM-bypass mode,
+   under a Wayland compositor that has neither. We already found and fixed one Wine timer defect
+   in code we own; here we would be handing pacing to a closed component whose *inputs* are
+   missing, with a failure mode that is visible to the user and unfixable by us.
+
+   **1b. And Streamline may simply refuse to run.** Two fail-closed gates with no override
+   (7.2c): **HWS**, read through WDDM kernel thunks that do not exist on Linux, with no bypass
+   flag and enumeration-failure indistinguishable from "disabled"; and **Authenticode
+   dual-signature verification** of every plugin before load. Either returns *unavailable*
+   rather than degrading. **This is now the most likely outcome of the 7.6 experiment** — and
+   note it is a *stronger* reason than the one this project was wrongly citing, arrived at by
+   reading rather than by mis-attributing a crash.
 2. **We would be replacing a measured system with an unmeasured one**, and the measured one
    already hits the theoretical maximum (2.00× steady state; the 1.91× headline is startup and
    reload frames that are legitimately not generatable).
@@ -1067,6 +1224,15 @@ looked at your own code is not an argument.
    Either outcome is worth having: it convicts or acquits a suspect this project has been
    quoting a verdict on without a trial. **It does not change the §7.7 verdict either way** —
    it changes what we are allowed to say. §7.6.
+   **Revised expectation (§7.2c):** the likeliest outcome is now that Streamline reports
+   *unavailable* before frame generation is ever reached, on the **HWS** gate (WDDM kernel
+   thunks, no bypass flag) or on **Authenticode plugin-signature verification** — both
+   fail-closed. Read `sl.log` for `eErrorOSDisabledHWS`, `requires GPU hardware scheduling`,
+   `Adapter enumeration has failed`, or `Streamline will not load unsecured modules` **before**
+   concluding anything about ReShade or the fullscreen transition. Clear the default OTA flags
+   (`eAllowOTA | eLoadDownloadedPlugins`) first. Note also that `sl.interposer.dll` need not be
+   installed as `dxgi.dll` at all — `eUseManualHooking` is a documented mode — so OptiScaler is
+   a convenience here, not a requirement.
 
 ### Fix these regardless of the Streamline question — found while writing §7.2b
 
