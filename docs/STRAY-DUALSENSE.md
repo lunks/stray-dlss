@@ -702,3 +702,65 @@ Names are not a reliable signal for anything:
 real name from the pak path recorded in its `.json`, and `wavegen.sh` regenerates from a clean
 work dir (a stale one once carried the three speaker files into `haptic/`) and refuses to run
 without its `ue4_soundwave_extract.py` sibling rather than dying on an import mid-copy.
+
+---
+
+## 14. The submix spike: take the haptics from the engine's own mix — UNCONFIRMED, never run
+
+§12's coil path plays the game's VIBE **assets from disk**, and §9's "one global scale" reading
+assumes we are the mixer. Both of those exist because we reproduce what the engine already
+does. **The engine may be willing to hand us the finished mix instead.**
+
+### What is MEASURED (2026-09-02, from the box's own `ue4ss/UE4SS_ObjectDump.txt`)
+
+The haptic audio has its own submix chain, loaded and live in the PC build:
+
+```
+SoundSubmix /Game/Sound/tools/settings/Submix_vibration.Submix_vibration
+SoundSubmix /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+SoundSubmix /Game/Sound/tools/settings/Submix_controller.Submix_controller
+SoundSubmix /Game/Sound/tools/settings/Submix_controllerPre.Submix_controllerPre
+SoundSubmix /Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster
+```
+
+24 submixes exist in total, and the two sound classes `SCLASS_controllerVibration` and
+`SCLASS_controller` match the asset selection `tools/dualsense/extract_assets.sh` already
+makes pak-wide. This agrees with §9's chain
+`Submix_vibration -> Submix_vibrationMaster -> VibrationEndpointSubmix`.
+
+### Why it is worth a spike
+
+The asset path has **one playback slot**: a new waveform supersedes the current one, so the
+ambient rain dies the moment the cat is touched — `Rain_Loop_VIBE ended (stop=0 superseded=1)`,
+observed by the user. §12 already lists "concurrent haptics do not mix" as a known gap. UE's
+own mixer solves it, along with the fades, the loops, the levels and the asset extraction.
+
+### What is verified about the mechanism (UE 4.27.2 source, HARD)
+
+* `ISubmixBufferListener` (`AudioDevice.h:394-407`) has **exactly one** virtual and **no**
+  virtual destructor. `IsRenderingAudio()` is UE5 and is not present.
+* `NumSamples` is **interleaved samples**, `frames * channels` — not frames.
+* Buffer listeners are invoked LAST in `FMixerSubmix::ProcessAudio`
+  (`AudioMixerSubmix.cpp:1367-1385`), after the effect chain, after the output volume, and
+  after the mix into the parent — so the buffer we see is the parent's accumulation, not this
+  submix alone.
+* They are only invoked when the owning object `Cast`s to `USoundSubmix`
+  (`AudioMixerSubmix.cpp:1370`): an endpoint or soundfield submix registers cleanly and then
+  never calls.
+* `FMixerDevice::RegisterSubmixBufferListener` (`AudioMixerDevice.cpp:2343-2377`) is safe to
+  call from any thread (it `AsyncTask`s to the audio thread) and a **null submix means the
+  MASTER submix**. UNregistration is asynchronous, so a listener must outlive the caller.
+
+### What is NOT verified, and is the whole question
+
+* **Whether Stray's PC build renders anything into `Submix_vibration` at all.** The PS5 paths
+  are platform-gated (§12: `scePadSetTriggerEffect` is called 0 times), and the submix objects
+  being *loaded* proves only that something references them.
+* Whether `FAudioDevice::RegisterSubmixBufferListener` really sits at vtable index **16** in
+  this licensee build. The index is derived, not measured.
+* Whether the `FAudioDevice*` structural scan finds the right pointer.
+
+`mods/StrayDualSense`'s `HapticSource = measure` answers the first without letting anything new
+reach the pad, and its master-submix probe distinguishes "the game is silent here" from "our
+tap is broken". Deploy with `tools/dualsense/deploy-submix-spike.sh`; the full design,
+including why the listener's vtable lives in a leaked page, is in that mod's README.

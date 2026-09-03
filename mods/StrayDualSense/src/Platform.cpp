@@ -32,6 +32,25 @@ uint64_t NowMs()
     return static_cast<uint64_t>(::GetTickCount64());
 }
 
+bool MainModuleRange(const void*& base, size_t& size)
+{
+    base = nullptr;
+    size = 0;
+    HMODULE exe = ::GetModuleHandleW(nullptr);
+    if (exe == nullptr)
+        return false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const unsigned char*>(exe) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+    base = exe;
+    size = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
+    return size != 0;
+}
+
 bool DirectoryExists(const std::wstring& path)
 {
     const DWORD a = ::GetFileAttributesW(path.c_str());

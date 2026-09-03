@@ -18,6 +18,10 @@
 #include "HidMode.hpp"
 #include "LoopList.hpp"
 #include "ScePad.hpp"
+#include "SubmixDiscovery.hpp"
+#include "SubmixDsp.hpp"
+#include "SubmixSink.hpp"
+#include "SubmixTap.hpp"
 #include "TriggerEffect.hpp"
 #include "Triggers.hpp"
 
@@ -78,9 +82,26 @@ public:
     void NoteHookRegistered(const char* name);
     void NoteHookMissing(const char* name);
 
+    // ---- the submix spike ------------------------------------------------------------
+    // True while HapticSource is measure|submix and the listener has not been registered.
+    // The UE4SS glue polls this from inside a game-thread hook and stops as soon as it is
+    // false, so a session that never binds is one WARN per attempt and not a silent nothing.
+    bool SubmixWantsBinding() const;
+
+    // Called ON THE GAME THREAD by the UE4SS glue, which resolves the three UObjects and the
+    // executable's image range reflectively and hands them over as raw pointers — the runtime
+    // itself stays free of every UE4SS type. `submixObject` may be null, which registers on
+    // the engine's MASTER submix (AudioMixerDevice.cpp:2350). Returns true when the listener
+    // has been handed to the engine; false means "not yet, or refused", and the reason has
+    // already been logged.
+    bool BindSubmixTap(const void* worldObject, const void* engineObject, void* submixObject,
+                       bool submixObjectResolved, const void* imageBase, std::size_t imageSize);
+
 private:
     void PadThreadMain();
     void LogStatus();
+    void StartSubmix();
+    void SubmixStatus();     // the numbers proof: one log line and one status file line
     bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
     void LoadLoopLists();
 
@@ -92,6 +113,22 @@ private:
     AudioPlayer   m_speaker;
     LoopList      m_hapticLoops;
     LoopList      m_spkLoops;
+
+    // The submix spike. The taps are LEAKED on purpose (SubmixTap.hpp): the engine may still
+    // call a listener after UnregisterSubmixBufferListener returns, so they are raw pointers
+    // that are detached, never deleted.
+    submix::SubmixRing m_submixRing;
+    submix::SubmixSink m_submixSink;
+    submix::Tap*       m_tapVibration = nullptr;
+    submix::Tap*       m_tapMaster    = nullptr;
+    std::atomic<bool>  m_submixBound{false};
+    std::atomic<int>   m_submixBindAttempts{0};
+    const void*        m_submixDevice = nullptr;
+    std::string        m_submixStatusPath;   // narrow, for the log; the wide one is below
+    std::wstring       m_submixStatusFile;
+    uint64_t           m_lastSubmixStatusMs = 0;
+    uint64_t           m_submixStatusWindowMs = 0;
+    uint64_t           m_lastSubmixCallbacks = 0;   // for a per-second RATE, not a total
 
     std::wstring m_gameDir;
     std::wstring m_modDir;

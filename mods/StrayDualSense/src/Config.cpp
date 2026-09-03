@@ -35,6 +35,17 @@ bool ParseBool(const std::string& v, bool fallback)
     return fallback;
 }
 
+Config::HapticSource ParseHapticSource(const std::string& v, Config::HapticSource fallback)
+{
+    const std::string l = Lower(Trim(v));
+    if (l == "assets"  || l == "asset")   return Config::HapticSource::Assets;
+    if (l == "measure" || l == "measure-only" || l == "probe") return Config::HapticSource::Measure;
+    if (l == "submix")                    return Config::HapticSource::Submix;
+    SDS_LOG_WARN("config: HapticSource='%s' is not one of assets|measure|submix; keeping the "
+                 "previous value.", v.c_str());
+    return fallback;
+}
+
 LogLevel ParseLevel(const std::string& v, LogLevel fallback)
 {
     const std::string l = Lower(Trim(v));
@@ -101,6 +112,16 @@ bool Config::Load(const std::wstring& path)
         else if (key == "haptics")                haptics                = ParseBool(val, haptics);
         else if (key == "hapticvalidflag0")       hapticValidFlag0       = ParseByte(val, hapticValidFlag0);
         else if (key == "hapticreassertseconds")  hapticReassertSeconds  = ParseFloat(val, hapticReassertSeconds);
+        else if (key == "hapticsource")           hapticSource           = ParseHapticSource(val, hapticSource);
+        else if (key == "submixpath")             submixPath             = val;
+        else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
+        else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
+        else if (key == "submixdevicesource")     submixDeviceSource     = Lower(val);
+        else if (key == "submixgain")             submixGain             = std::clamp(ParseFloat(val, submixGain), 0.0f, 8.0f);
+        else if (key == "submixqueueaheadms")     submixQueueAheadMs     = std::clamp(std::atoi(val.c_str()), 5, 500);
+        else if (key == "submixringms")           submixRingMs           = std::clamp(std::atoi(val.c_str()), 20, 2000);
+        else if (key == "submixstatusseconds")    submixStatusSeconds    = ParseFloat(val, submixStatusSeconds);
+        else if (key == "submixstatusfile")       submixStatusFile       = val;
         else if (key == "speaker")                speaker                = ParseBool(val, speaker);
         else if (key == "endpointmatch")          endpointMatch          = val;
         else if (key == "hapticdir")              hapticDir              = val;
@@ -139,6 +160,20 @@ bool Config::ReloadIfChanged(const std::wstring& path)
         SDS_LOG_WARN("config: PadUserId / EndpointMatch / HapticDir / SpkDir / *LoopsFile "
                      "changed but are NOT hot-reloadable. Relaunch the game for those.");
     }
+    // The submix tap binds ONCE, on the game thread, into a listener the engine then holds
+    // for the session. Re-reading its shape at runtime would mean a second registration
+    // against a live audio render thread, which is exactly the kind of half-applied change
+    // this function exists to refuse.
+    if (fresh.hapticSource != hapticSource || fresh.submixPath != submixPath ||
+        fresh.submixRegisterSlot != submixRegisterSlot ||
+        fresh.submixDeviceSource != submixDeviceSource ||
+        fresh.submixProbeMaster != submixProbeMaster)
+    {
+        SDS_LOG_WARN("config: HapticSource / SubmixPath / SubmixRegisterSlot / "
+                     "SubmixDeviceSource / SubmixProbeMaster changed but are NOT "
+                     "hot-reloadable - the listener is registered once and the engine keeps "
+                     "it. Relaunch the game.");
+    }
 
     // Scalars only: the strings above are read by running threads without a lock.
     enabled               = fresh.enabled;
@@ -150,6 +185,8 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     hapticValidFlag0      = fresh.hapticValidFlag0;
     hapticReassertSeconds = fresh.hapticReassertSeconds;
     speaker               = fresh.speaker;
+    submixGain            = fresh.submixGain;      // live: it is one atomic on the sink
+    submixStatusSeconds   = fresh.submixStatusSeconds;
     statusSeconds         = fresh.statusSeconds;
     configReloadSeconds   = fresh.configReloadSeconds;
     m_lastWriteTime       = fresh.m_lastWriteTime;
@@ -169,6 +206,22 @@ void Config::LogSummary(const char* what) const
                  static_cast<double>(hapticReassertSeconds), speaker ? 1 : 0,
                  endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
                  hapticLoopsFile.c_str(), spkLoopsFile.c_str());
+    SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
+                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms",
+                 what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
+                 submixRegisterSlot, submixDeviceSource.c_str(),
+                 static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs);
+}
+
+const char* Config::HapticSourceName() const
+{
+    switch (hapticSource)
+    {
+    case HapticSource::Measure: return "measure";
+    case HapticSource::Submix:  return "submix";
+    case HapticSource::Assets:
+    default:                    return "assets";
+    }
 }
 
 } // namespace sds

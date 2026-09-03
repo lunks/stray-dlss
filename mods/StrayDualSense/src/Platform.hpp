@@ -27,6 +27,14 @@ std::wstring GameBinariesDir();
 // The directory this mod's DLL lives in. Trailing separator included.
 std::wstring ModuleDir(const void* addressInsideThisModule);
 
+// The game executable's loaded image: base address and SizeOfImage, read from its own PE
+// headers. Used to decide whether a pointer is a function in the game (a vtable entry) or a
+// heap object, which is what makes the FAudioDevice search safe (SubmixDiscovery.hpp).
+//
+// Deliberately Win32 rather than UE4SS's SigScannerStaticData::m_modules_info: the answer is
+// the same, and this compiles on the mingw lane where the SDK does not exist.
+bool MainModuleRange(const void*& base, size_t& size);
+
 // A UFunction argument can name anything, and a name that reaches the filesystem must not be
 // able to escape the asset directory. Refuse rather than sanitise, so a surprise is visible.
 bool AssetNameIsSafe(const std::string& name);

@@ -32,7 +32,7 @@ name: StrayDualSense plugin
 
 on:
   push:
-    branches: [ main, dualsense ]
+    branches: [ main, dualsense, dualsense-submix ]
     paths:
       - 'mods/StrayDualSense/**'
       - '.github/workflows/dualsense.yml'
@@ -94,7 +94,8 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/obj
           for f in AssetName AudioPlayer Config HidMode Log LoopList Platform Runtime ScePad \
-                   TriggerEffect Triggers Wasapi; do
+                   SubmixDiscovery SubmixDsp SubmixSink SubmixTap TriggerEffect Triggers \
+                   Wasapi; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
               -Isrc -c "src/$f.cpp" -o "/tmp/obj/$f.o"
@@ -123,6 +124,11 @@ jobs:
               sds::Rt().OnSetControllerSoundLevel(0.5f);
               sds::Rt().OnStopControllerSound(0.0f);
               sds::Rt().OnPadVibrationEnabled(true);
+              // The submix spike's entry points. Nulls everywhere: BindSubmixTap must refuse
+              // an unresolved submix rather than register with a null one, which the engine
+              // reads as the MASTER submix.
+              if (sds::Rt().SubmixWantsBinding())
+                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, false, nullptr, 0);
               sds::Rt().Shutdown();
           }
           BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }

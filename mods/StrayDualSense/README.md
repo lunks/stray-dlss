@@ -27,6 +27,135 @@ What is **not** here, on purpose: `scePadSetVibration` (reads two bytes; structu
 carry a waveform — §12), amplitude envelopes, normalisation, master gain, the lightbar (no
 shipped content drives it), glyph/platform overrides, and every probe the shim grew.
 
+## The submix spike — `HapticSource = measure | submix`
+
+**A SPIKE. Nothing in it has run in the game, and the step that reaches the engine is a
+virtual call on a pointer found by a memory scan.** It defaults OFF (`HapticSource = assets`),
+and with that default not one line of it executes.
+
+### The idea
+
+Stray's haptics are not special data. They are ordinary sounds played through
+`AudioComponent`s, sorted into `SCLASS_controllerVibration`, and routed to their own submixes
+— **measured** in the box's own `ue4ss/UE4SS_ObjectDump.txt`:
+
+```
+SoundSubmix /Game/Sound/tools/settings/Submix_vibration.Submix_vibration
+SoundSubmix /Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster
+```
+
+UE 4.27 lets a C++ caller register an `ISubmixBufferListener` on a submix and receive its
+rendered buffer. If that works here, the engine hands us every concurrent haptic **already
+mixed, faded, looped and levelled** — and that deletes, in one move: the asset extraction to
+disk, `haptic_loops.txt`, the asset-name mapping, the fade ramps, the per-component stop
+bookkeeping, and the concurrency mixer we were otherwise about to write. It also removes the
+redistribution question, since no game audio is ever copied to disk.
+
+**The problem it exists to solve is measured and current:** the asset path has ONE playback
+slot, so the ambient rain dies the moment the cat is touched
+(`Rain_Loop_VIBE ended (stop=0 superseded=1)`). On PS5 they sum on the coils.
+
+### The interface, verified
+
+Read in UE 4.27.2's `Engine/Source/Runtime/Engine/Public/AudioDevice.h:394-407` (public mirror
+`AlexMercer-MA/UnrealEngine-4.27`). **HARD:**
+
+```cpp
+class ENGINE_API ISubmixBufferListener
+{
+public:
+    virtual void OnNewSubmixBuffer(const USoundSubmix* OwningSubmix, float* AudioData,
+                                   int32 NumSamples, int32 NumChannels,
+                                   const int32 SampleRate, double AudioClock) = 0;
+};
+```
+
+**Exactly one virtual, and NO virtual destructor.** `IsRenderingAudio()` is a UE5 addition and
+does not exist here — assuming it would have put a second entry in the vtable and sent the
+engine into the wrong function. `NumSamples` is **interleaved samples** (`frames * channels`),
+not frames (`AudioDevice.h:400`, `AudioMixerSubmix.cpp:1082`).
+
+### How the pointer and the call are reached
+
+`FAudioDevice` is not a UObject, `RegisterSubmixBufferListener` is not reflected, and no
+Blueprint-callable function in UE 4.27 reaches it — so UE4SS's reflection is no help and the
+two pieces have to be found by hand. Both are validated before anything is called, and every
+step is logged.
+
+* **The vtable index is 16.** Counted from `AudioDevice.h`'s virtuals in declaration order, and
+  the count is unusually trustworthy: **not one `FAudioDevice` virtual sits inside a
+  preprocessor conditional**, so the vtable is identical in Shipping, Development and Editor.
+  `FAudioDevice : public FExec` is single inheritance with no virtual bases, and `FExec` has
+  exactly two unconditional virtuals. HARD for the source, INFERRED for the index. Stray is a
+  **licensee build**, so it is a knob (`SubmixRegisterSlot`) and the log dumps the whole vtable
+  as RVAs, with `/OPT:ICF`-folded stubs marked, so a wrong value is fixable in one run.
+* **The `FAudioDevice*` is found by a STRUCTURAL SCAN, not an offset.** `FAudioDeviceHandle`
+  (`AudioDeviceManager.h:81-125`) is `{TWeakObjectPtr<UWorld> World; FAudioDevice* Device;
+  Audio::FDeviceId DeviceId;}`; one lives in `UWorld::AudioDeviceHandle` and another in
+  `UEngine::MainAudioDeviceHandle`, both at offsets that shift with `#if` blocks. So we scan
+  both objects for the shape, require the device's vtable pointer to lie inside the game
+  executable's image, require its first 32 slots to all be in-image function pointers, require
+  a small `DeviceId` — and then the decisive one: **the same pointer must be found
+  independently in both objects.**
+* **It binds from the GAME THREAD**, from inside the first UFunction hook that fires, and from
+  nowhere else. `on_update` is UE4SS's own jthread; a UObject read there is an unsynchronised
+  cross-thread read, which this plugin does not do anywhere.
+* **Registration is safe cross-thread and asynchronous.**
+  `FMixerDevice::RegisterSubmixBufferListener` dispatches with
+  `AsyncTask(ENamedThreads::AudioThread, ...)` (`AudioMixerDevice.cpp:2405`), and
+  `FMixerSubmix` holds `BufferListenerCriticalSection` across the whole listener loop
+  (`AudioMixerSubmix.cpp:1376`) — so we are never re-entered for one submix, and blocking in
+  the callback would stall the game's own audio.
+
+### The listener object outlives the DLL, on purpose
+
+Because unregistration is asynchronous, the engine can still hold and call our pointer after
+the call returns — and after UE4SS unloads the mod. So the listener is **hand-laid-out**: a
+one-qword object, a one-slot vtable, and a 15-byte trampoline, all in a `VirtualAlloc` page
+that is **deliberately never freed** (`src/SubmixTap.cpp`). The trampoline loads a target
+pointer from that same page and tail-jumps to it, or returns immediately when it is null;
+`Detach()` nulls it with one aligned store. After shutdown the engine can call us forever and
+reach nothing but a `ret`. The precedent is `src/backend_native/resource_registry.cpp`'s
+sentinel — an object whose lifetime the other side controls.
+
+### The numbers proof, and where to read it
+
+Once a second, to the log and to **`<gamedir>/stray-dualsense-submix.txt`** (one line,
+rewritten in place, so it can be read with `cat` over ssh with no overlay):
+
+```
+SUBMIX measure bound=1 cb=1407 (46.9/s) ch=2 rate=48000 frames/cb=1024 peak=0.03112 rms=0.00714
+  bad=0 | master-probe cb=1407 peak=0.41 | ring fill=0/16384 drop=0 under=0
+  | sink open=0 '' 0ch 0Hz frames=0 fail=0
+```
+
+The proof is three readings, in order: **silence with nothing playing**, **a live signal during
+the rain**, and **a HIGHER peak when the rain and a purr overlap** — that last one is the whole
+argument, because it is precisely what our one-slot asset player cannot do.
+
+**A null result is a diagnosis, not a shrug**, which is what the master probe is for:
+
+| vibration submix | master probe | reading |
+|---|---|---|
+| fires, signal | fires | **the tap works and the engine is mixing haptics for us** |
+| fires, silent | fires | the tap works; the game is not rendering haptics into that submix on PC |
+| never fires | fires | the submix object is wrong (an endpoint/soundfield submix never calls listeners) |
+| never fires | never fires | the tap itself is broken — the device pointer or the slot |
+
+The `NO CALLBACKS` line says so explicitly rather than looking like silence, and the ring's
+`drop` / `under` counters exist so that a dropped buffer can never be mistaken for a tap that
+did not fire.
+
+### What it is NOT
+
+The trigger path is untouched. The asset path is untouched and remains the default. There is
+no concurrency mixer, no refactor, and nothing is deleted — if the spike answers "yes", a
+follow-up does the deletions.
+
+**Deploy:** `tools/dualsense/deploy-submix-spike.sh [GAMEDIR]`, `--revert` to undo. It restores
+`libScePad_orig.dll` and sets `StrayTriggers : 0` first, because the shim and the plugin both
+drive the coils and the HID mode byte and would fight.
+
 ## Source layout
 
 Only `src/Mod.cpp` includes a UE4SS header. Everything else is plain Win32 and is compiled
@@ -37,11 +166,15 @@ and link-tested without the SDK.
 | `TriggerEffect` | game↔Sony enum translation, `ScePadTriggerEffectParam` layout (§3/§13) | unit test |
 | `LoopList` | `haptic_loops.txt` / `spk_loops.txt` | unit test |
 | `Fade` | `FadeInTime` / `FadeOutTime` gain ramps | unit test |
+| `SubmixDsp` | the spike's signal path: channel fold, soft clip, resampler, level meter, SPSC ring | unit test |
 | `AssetName` | `"SoundWave /Game/.../X.X"` → `X` | unit test |
 | `HidMode` | the `valid_flag0` write and its re-assert thread | mingw compile+link |
 | `Wasapi` | finds the endpoint, opens a shared-mode 32-bit float stream | mingw |
 | `AudioPlayer` | one worker per route (coils / speaker): supersede, level, fades, loop | mingw |
 | `ScePad` | binds the game's already-mapped `libScePad.dll`; pad selection by the `connected` byte | mingw |
+| `SubmixTap` | the `ISubmixBufferListener` itself: leaked page, hand-built vtable, trampoline | mingw |
+| `SubmixDiscovery` | finding `FAudioDevice*` and calling vtable slot 16, with every check | mingw |
+| `SubmixSink` | the ring -> RL/RR WASAPI stream for the submix path | mingw |
 | `Triggers` | per-side accumulation, transmit on change, optional readback | mingw |
 | `Runtime` | game intent → the engines; component ownership; `PadVibrationEnabled` | mingw |
 | `Config` / `Log` / `Platform` | INI + hot reload; mutex-guarded file log; paths | mingw |
@@ -104,6 +237,15 @@ per-component rule working) and `effect=... (game)` versus `(FALLBACK)`.
 
 Ranked by how likely each is to be the first thing that misbehaves. "UNCONFIRMED" is used in
 the CLAUDE.md sense: plausible from source, not yet compiled by CI or seen on the box.
+
+0. **THE SUBMIX SPIKE, all of it, and it is the riskiest thing in this repo.** It defaults OFF.
+   Turned on, it calls a virtual on a pointer found by scanning two UObjects for a struct
+   shape, at an index counted out of engine source, in a licensee build. Every step is
+   validated and logged before the call, and the log line immediately before it names itself as
+   the suspect — but a wrong device pointer or a wrong slot is a crash, not a bad number. Also
+   unverified: whether Stray's PC build renders any audio into `Submix_vibration` at all (the
+   PS5 paths are platform-gated), and whether the buffer we would receive is the vibration mix
+   or its parent's accumulation. See [The submix spike](#the-submix-spike--hapticsource--measure--submix).
 
 1. **Hardware behaviour — all of it.** `src/Mod.cpp` now **compiles under MSVC** against
    RE-UE4SS `68caddcf` (CI run 33582881130, `4e8fb0c`) — see

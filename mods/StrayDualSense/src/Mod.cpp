@@ -58,6 +58,7 @@
 #include <vector>
 
 #include "Log.hpp"
+#include "Platform.hpp"
 #include "Runtime.hpp"
 #include "TriggerEffect.hpp"
 #include "Version.hpp"
@@ -508,6 +509,85 @@ void ReadAuthoredTriggerEffectOnGameThread()
 }
 
 // ---------------------------------------------------------------------------------------
+// The submix tap's ONE piece of UE4SS glue: resolve three objects and hand them over as raw
+// pointers. Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know
+// nothing about UE4SS and are compiled and link-tested without it.
+//
+// ON THE GAME THREAD, ALWAYS. This is called from the top of every UFunction hook and from
+// nowhere else, for the same reason as the two reads above: on_update runs on UE4SS's own
+// event-loop jthread, and a UObject read there is an unsynchronised cross-thread read of
+// state the engine mutates and the GC can move. The cost is that binding waits for the first
+// hook to fire — which is exactly when haptics start mattering — and a session where no hook
+// ever fires says so in the status line rather than looking like a silent submix.
+// ---------------------------------------------------------------------------------------
+std::chrono::steady_clock::time_point g_lastSubmixAttempt{};
+
+void MaybeBindSubmixOnGameThread()
+{
+    if (!sds::Rt().SubmixWantsBinding())
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_lastSubmixAttempt.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastSubmixAttempt).count() < 1000)
+        return;
+    g_lastSubmixAttempt = now;
+
+    const void* imageBase = nullptr;
+    size_t      imageSize = 0;
+    if (!sds::MainModuleRange(imageBase, imageSize))
+    {
+        SDS_LOG_ERROR("submix: the game executable's image range could not be read; the tap "
+                      "cannot validate a vtable and will not run.");
+        return;
+    }
+
+    UObject* world  = RC::Unreal::UObjectGlobals::FindFirstOf(STR("World"));
+    UObject* engine = RC::Unreal::UObjectGlobals::FindFirstOf(STR("Engine"));
+
+    // The submix, by the exact path measured in the box's own UE4SS object dump. The literal
+    // "master" means "do not look one up" — a null submix is the engine's own shorthand for
+    // the master submix (AudioMixerDevice.cpp:2350).
+    UObject* submix = nullptr;
+    bool     submixResolved = false;
+    const std::string& path = sds::Rt().Cfg().submixPath;
+    if (path == "master")
+    {
+        submixResolved = true;
+    }
+    else
+    {
+        submix = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr,
+                                                                       Widen(path));
+        if (submix != nullptr)
+        {
+            const std::string full = Narrow(submix->GetFullName());
+            // FMixerSubmix::ProcessAudio only invokes buffer listeners when the owning object
+            // Casts to USoundSubmix (AudioMixerSubmix.cpp:1370) — an endpoint or soundfield
+            // submix would register cleanly and then never call us, which is the exact
+            // silent-null-result this spike must not produce.
+            const bool isPlainSubmix = full.rfind("SoundSubmix ", 0) == 0;
+            SDS_LOG_INFO("submix: resolved '%s' -> %s%s", path.c_str(), full.c_str(),
+                         isPlainSubmix ? ""
+                                       : "   <- NOT a plain SoundSubmix. UE 4.27 only calls "
+                                         "buffer listeners for USoundSubmix, so this will "
+                                         "register and then never fire.");
+            submixResolved = true;
+        }
+    }
+
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        SDS_LOG_INFO("submix: binding from the game thread. exe=%p+0x%zX world=%p engine=%p "
+                     "target='%s'", imageBase, imageSize, static_cast<void*>(world),
+                     static_cast<void*>(engine), path.c_str());
+    }
+
+    sds::Rt().BindSubmixTap(world, engine, submix, submixResolved, imageBase, imageSize);
+}
+
+// ---------------------------------------------------------------------------------------
 // The mod object.
 // ---------------------------------------------------------------------------------------
 class StrayDualSenseMod : public RC::CppUserModBase
@@ -641,7 +721,10 @@ void RegisterAll()
 // ---------------------------------------------------------------------------------------
 // Callbacks. Each does the minimum on the game thread: read the params, hand the intent over.
 // ---------------------------------------------------------------------------------------
+// Every hook runs on the game thread, so every hook is a chance to bind the submix tap. The
+// call is a single atomic read once bound, and rate-limited to 1 Hz before that.
 #define SDS_HOOK_PROLOGUE(varName)                                                              \
+    MaybeBindSubmixOnGameThread();                                                               \
     auto* varName = static_cast<HookInfo*>(customData);                                          \
     if (varName == nullptr) return;                                                              \
     uint8_t* base = context.TheStack.Locals()
@@ -670,11 +753,13 @@ void CbTriggerActivated(UnrealScriptFunctionCallableContext& context, void* cust
 
 void CbUseStarted(UnrealScriptFunctionCallableContext&, void*)
 {
+    MaybeBindSubmixOnGameThread();
     sds::Rt().OnUseStarted();
 }
 
 void CbAfterUseDone(UnrealScriptFunctionCallableContext&, void*)
 {
+    MaybeBindSubmixOnGameThread();
     sds::Rt().OnAfterUseDone();
 }
 

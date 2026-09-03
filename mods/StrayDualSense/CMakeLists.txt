@@ -36,6 +36,9 @@ endif()
 #   TriggerEffect  the game<->Sony enum translation and the ScePadTriggerEffectParam layout
 #   LoopList       the game's own bLooping flags, parsed from haptic_loops.txt / spk_loops.txt
 #   Fade           the FadeInTime / FadeOutTime gain ramps
+#   SubmixDsp      the submix spike's signal path: channel fold, soft clip, resampler, the
+#                  level meter that IS the proof, and the lock-free ring the audio render
+#                  thread writes into
 # ---------------------------------------------------------------------------------------
 add_library(straydualsense_core STATIC
     src/AssetName.cpp
@@ -43,6 +46,8 @@ add_library(straydualsense_core STATIC
     src/Fade.hpp
     src/LoopList.cpp
     src/LoopList.hpp
+    src/SubmixDsp.cpp
+    src/SubmixDsp.hpp
     src/TriggerEffect.cpp
     src/TriggerEffect.hpp)
 target_include_directories(straydualsense_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -50,7 +55,7 @@ target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
 enable_testing()
-foreach(t asset_name trigger_effect loop_list fade)
+foreach(t asset_name trigger_effect loop_list fade submix_dsp)
     add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
     target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
     target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
@@ -95,6 +100,14 @@ add_library(StrayDualSense SHARED
     src/Runtime.hpp
     src/ScePad.cpp
     src/ScePad.hpp
+    src/SubmixDiscovery.cpp
+    src/SubmixDiscovery.hpp
+    src/SubmixDsp.cpp
+    src/SubmixDsp.hpp
+    src/SubmixSink.cpp
+    src/SubmixSink.hpp
+    src/SubmixTap.cpp
+    src/SubmixTap.hpp
     src/TriggerEffect.cpp
     src/TriggerEffect.hpp
     src/Triggers.cpp

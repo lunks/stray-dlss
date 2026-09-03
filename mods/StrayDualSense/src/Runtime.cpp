@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <vector>
 
 namespace sds {
@@ -144,12 +145,175 @@ void Runtime::Startup(const void* addressInsideThisModule)
                     [this] { m_hidMode.AssertNow("before waveform"); });
     m_speaker.Start(kSpeakerRoute, m_config.endpointMatch, m_spkDir, nullptr);
 
+    StartSubmix();
+
     m_padThreadRunning.store(true, std::memory_order_release);
     m_padThread = std::thread(&Runtime::PadThreadMain, this);
 
     m_lastStatusMs = NowMs();
     m_lastReloadMs = m_lastStatusMs;
+    m_lastSubmixStatusMs = m_lastStatusMs;
     m_started.store(true, std::memory_order_release);
+}
+
+// ---- the submix spike -------------------------------------------------------------------
+//
+// SPIKE, and nothing about it has run in the game. It answers ONE question: does UE's own
+// audio engine hand us the vibration submix already mixed? If it does, the concurrency limit
+// (one playback slot, so touching the cat kills the rain), the asset extraction, the loop
+// list and the fades all become the engine's problem instead of ours.
+
+void Runtime::StartSubmix()
+{
+    if (!m_config.SubmixTapWanted())
+    {
+        SDS_LOG_INFO("submix: HapticSource=assets, so no submix tap is created. The shipped "
+                     "behaviour is unchanged.");
+        return;
+    }
+
+    const std::wstring dir = m_gameDir.empty() ? m_modDir : m_gameDir;
+    m_submixStatusFile = dir + Widen(m_config.submixStatusFile);
+    m_submixStatusPath = Narrow(m_submixStatusFile);
+
+    // Sized at the default rate; the ring holds frames, and the engine's real rate only
+    // changes how many milliseconds that is. Off by a few ms is irrelevant here.
+    const std::size_t ringFrames =
+        static_cast<std::size_t>(submix::kSubmixDefaultRate) *
+        static_cast<std::size_t>(m_config.submixRingMs) / 1000u;
+    m_submixRing.Init(ringFrames);
+
+    m_tapVibration = submix::Tap::Create("vibration");
+    if (m_tapVibration == nullptr)
+    {
+        SDS_LOG_ERROR("submix: the listener page could not be allocated; the tap is DEAD for "
+                      "this session and the coils will stay on the asset path.");
+        return;
+    }
+    if (m_config.SubmixDrivesCoils())
+        m_tapVibration->SetRing(&m_submixRing);
+
+    if (m_config.submixProbeMaster)
+    {
+        // Meter only: never attached to the ring, so the game's whole soundtrack can never
+        // reach the coils through it.
+        m_tapMaster = submix::Tap::Create("master-probe");
+    }
+
+    SDS_LOG_INFO("submix: HapticSource=%s, ring %zu frames (%d ms), probeMaster=%d. The "
+                 "listener is registered lazily from the GAME THREAD, inside the first "
+                 "UFunction hook that fires - reading a UObject from UE4SS's update thread "
+                 "is an unsynchronised cross-thread read and this project does not do it.",
+                 m_config.HapticSourceName(), m_submixRing.CapacityFrames(),
+                 m_config.submixRingMs, m_config.submixProbeMaster ? 1 : 0);
+
+    if (m_config.SubmixDrivesCoils())
+    {
+        m_submixSink.Start(&m_submixRing, m_config.endpointMatch, m_config,
+                           [this] { m_hidMode.AssertNow("submix: silence -> signal"); });
+        SDS_LOG_WARN("submix: HapticSource=submix, so the ASSET haptic path is disabled - "
+                     "StartPS5Vibration will no longer play <gamedir>/haptic/<name>.f32. Set "
+                     "HapticSource=measure to keep the assets driving the coils while the tap "
+                     "only reports numbers.");
+    }
+    else
+    {
+        SDS_LOG_INFO("submix: HapticSource=measure, so NOTHING from the submix reaches the "
+                     "pad. The asset path still drives the coils; this run only answers "
+                     "whether the engine is mixing haptics for us.");
+    }
+}
+
+bool Runtime::SubmixWantsBinding() const
+{
+    return m_config.SubmixTapWanted() && m_tapVibration != nullptr &&
+           !m_submixBound.load(std::memory_order_acquire);
+}
+
+bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
+                            void* submixObject, bool submixObjectResolved,
+                            const void* imageBase, std::size_t imageSize)
+{
+    if (!SubmixWantsBinding())
+        return m_submixBound.load(std::memory_order_acquire);
+
+    const int attempt = m_submixBindAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Refuse rather than register on the wrong thing: a null submix means MASTER to the
+    // engine, so an unresolved USoundSubmix would silently put the game's entire soundtrack
+    // on the voice coils. Only the literal "master" may pass null.
+    const bool wantMaster = m_config.submixPath == "master";
+    if (!wantMaster && !submixObjectResolved)
+    {
+        if (attempt == 1 || attempt % 20 == 0)
+            SDS_LOG_WARN("submix: '%s' has not loaded yet (attempt %d). NOT registering with a "
+                         "null submix - the engine reads that as the MASTER submix and the "
+                         "whole soundtrack would go to the coils.",
+                         m_config.submixPath.c_str(), attempt);
+        return false;
+    }
+
+    submix::DiscoveryInput in;
+    in.worldObject  = worldObject;
+    in.engineObject = engineObject;
+    in.imageBase    = imageBase;
+    in.imageSize    = imageSize;
+    in.requireBoth  = m_config.submixDeviceSource == "both";
+
+    const submix::DiscoveryResult d = submix::FindAudioDevice(in);
+    if (!d.ok)
+    {
+        if (attempt == 1 || attempt % 20 == 0)
+            SDS_LOG_WARN("submix: FAudioDevice not found (attempt %d): %s. World=%p Engine=%p "
+                         "image=%p+0x%zX", attempt,
+                         d.refusal != nullptr ? d.refusal : "no reason recorded",
+                         worldObject, engineObject, imageBase, imageSize);
+        return false;
+    }
+
+    SDS_LOG_INFO("submix: FAudioDevice %p (vtable %p, deviceId %u) found in UWorld+0x%zX AND "
+                 "UEngine+0x%zX - two independent structures agreeing on one pointer.",
+                 d.device, d.vtable, d.deviceId, d.worldOffset, d.engineOffset);
+    submix::LogVtable(d.device, imageBase, imageSize);
+
+    const char* whyNot = nullptr;
+    SDS_LOG_WARN("submix: about to call vtable slot %d as "
+                 "FAudioDevice::RegisterSubmixBufferListener(listener=%p, submix=%p). The slot "
+                 "is derived from stock UE 4.27.2 (see src/SubmixDiscovery.hpp); Stray is a "
+                 "LICENSEE build, so if the game dies HERE, that derivation is the suspect - "
+                 "read the vtable dump above and set SubmixRegisterSlot.",
+                 m_config.submixRegisterSlot, m_tapVibration->ListenerPointer(),
+                 wantMaster ? nullptr : submixObject);
+
+    if (!submix::CallRegisterSubmixBufferListener(
+            d.device, m_config.submixRegisterSlot, m_tapVibration->ListenerPointer(),
+            wantMaster ? nullptr : submixObject, imageBase, imageSize, &whyNot))
+    {
+        SDS_LOG_ERROR("submix: REFUSED to call the register slot: %s. The tap is dead for this "
+                      "session.", whyNot != nullptr ? whyNot : "no reason recorded");
+        m_submixBound.store(true, std::memory_order_release);   // stop retrying; it is a refusal
+        return false;
+    }
+
+    if (m_tapMaster != nullptr)
+    {
+        const char* masterWhy = nullptr;
+        if (!submix::CallRegisterSubmixBufferListener(
+                d.device, m_config.submixRegisterSlot, m_tapMaster->ListenerPointer(),
+                nullptr, imageBase, imageSize, &masterWhy))
+        {
+            SDS_LOG_WARN("submix: the master probe could not be registered: %s",
+                         masterWhy != nullptr ? masterWhy : "no reason recorded");
+        }
+    }
+
+    m_submixDevice = d.device;
+    m_submixBound.store(true, std::memory_order_release);
+    SDS_LOG_INFO("submix: registration submitted for '%s'. It is ASYNCHRONOUS - the engine "
+                 "runs it on the audio thread (AudioMixerDevice.cpp:2405) - so callbacks are "
+                 "expected within a frame or two, not immediately. Watch the SUBMIX line.",
+                 wantMaster ? "the MASTER submix" : m_config.submixPath.c_str());
+    return true;
 }
 
 void Runtime::Shutdown()
@@ -161,6 +325,13 @@ void Runtime::Shutdown()
     m_padThreadRunning.store(false, std::memory_order_release);
     if (m_padThread.joinable())
         m_padThread.join();
+
+    // Detach BEFORE anything else: the taps are the only things the engine can still call
+    // into. They are never deleted (SubmixTap.hpp) — after this the leaked trampoline is a
+    // `ret` and the engine can hold the pointer for the rest of the process.
+    if (m_tapVibration != nullptr) m_tapVibration->Detach();
+    if (m_tapMaster    != nullptr) m_tapMaster->Detach();
+    m_submixSink.Shutdown();
 
     m_haptics.Shutdown();
     m_speaker.Shutdown();
@@ -232,6 +403,111 @@ void Runtime::Tick()
     {
         m_lastStatusMs = now;
         LogStatus();
+    }
+
+    if (m_tapVibration != nullptr && m_config.submixStatusSeconds > 0.0f &&
+        now - m_lastSubmixStatusMs >=
+            static_cast<uint64_t>(m_config.submixStatusSeconds * 1000.0f))
+    {
+        m_submixStatusWindowMs = now - m_lastSubmixStatusMs;
+        m_lastSubmixStatusMs   = now;
+        SubmixStatus();
+    }
+}
+
+// The NUMBERS PROOF. Silence when nothing plays, a live signal during rain, and a HIGHER
+// signal when rain and a purr overlap, is the whole argument that the engine is mixing
+// concurrent haptics for us — which is the thing our own one-slot player cannot do.
+//
+// It is written to a file as well as the log so it can be read with `cat` over ssh, with no
+// overlay and no log grepping. And when the tap never fires it SAYS SO: a listener that was
+// never called and a submix that is genuinely silent produce identical audio, so they must
+// not produce identical text.
+void Runtime::SubmixStatus()
+{
+    const submix::TapStats     vib   = m_tapVibration->Stats();
+    const submix::LevelReading level = m_tapVibration->TakeLevels();
+    const double seconds = m_submixStatusWindowMs > 0
+                               ? static_cast<double>(m_submixStatusWindowMs) / 1000.0
+                               : 1.0;
+    const uint64_t deltaCallbacks =
+        vib.callbacks >= m_lastSubmixCallbacks ? vib.callbacks - m_lastSubmixCallbacks : 0;
+    m_lastSubmixCallbacks = vib.callbacks;
+    const double cbPerSec = static_cast<double>(deltaCallbacks) / seconds;
+
+    char line[900];
+    if (level.frames == 0)
+    {
+        const uint64_t now  = NowMs();
+        const uint64_t last = vib.lastCallbackMs;
+        char since[80];
+        if (last == 0)
+            std::snprintf(since, sizeof(since), "NEVER - the listener has never been called");
+        else
+            std::snprintf(since, sizeof(since), "%.1fs ago",
+                          static_cast<double>(now - last) / 1000.0);
+        std::snprintf(line, sizeof(line),
+                      "SUBMIX %s bound=%d NO CALLBACKS in the last %.1fs (total=%llu, last %s) "
+                      "| %s",
+                      m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0, seconds,
+                      static_cast<unsigned long long>(vib.callbacks), since,
+                      m_submixBound.load()
+                          ? "the tap IS registered, so the engine is rendering nothing into "
+                            "this submix"
+                          : "the tap is NOT registered yet (see the WARN lines above)");
+    }
+    else
+    {
+        std::snprintf(line, sizeof(line),
+                      "SUBMIX %s bound=%d cb=%llu (%.1f/s) ch=%d rate=%d frames/cb=%d "
+                      "peak=%.5f rms=%.5f bad=%llu",
+                      m_config.HapticSourceName(), m_submixBound.load() ? 1 : 0,
+                      static_cast<unsigned long long>(vib.callbacks), cbPerSec,
+                      vib.lastNumChannels, vib.lastSampleRate,
+                      vib.lastNumChannels > 0 ? vib.lastNumSamples / vib.lastNumChannels : 0,
+                      static_cast<double>(level.peak), static_cast<double>(level.rms),
+                      static_cast<unsigned long long>(vib.badCallbacks));
+        // Learned from the engine, never assumed: a project ini can change the rate.
+        if (vib.lastSampleRate > 0)
+            m_submixSink.SetSourceRate(static_cast<uint32_t>(vib.lastSampleRate));
+    }
+
+    char master[220] = "";
+    if (m_tapMaster != nullptr)
+    {
+        const submix::TapStats     ms = m_tapMaster->Stats();
+        const submix::LevelReading ml = m_tapMaster->TakeLevels();
+        std::snprintf(master, sizeof(master), " | master-probe cb=%llu peak=%.5f%s",
+                      static_cast<unsigned long long>(ms.callbacks),
+                      static_cast<double>(ml.peak),
+                      ms.callbacks == 0
+                          ? "  <- the MASTER submix is silent too, so the TAP is broken, not "
+                            "the game"
+                          : "");
+    }
+
+    char rest[400];
+    std::snprintf(rest, sizeof(rest),
+                  "%s | ring fill=%zu/%zu drop=%llu under=%llu | sink open=%d '%s' %uch %uHz "
+                  "frames=%llu fail=%llu",
+                  master, m_submixRing.Available(), m_submixRing.CapacityFrames(),
+                  static_cast<unsigned long long>(m_submixRing.Dropped()),
+                  static_cast<unsigned long long>(m_submixRing.Underruns()),
+                  m_submixSink.StreamOpen() ? 1 : 0, m_submixSink.EndpointName().c_str(),
+                  m_submixSink.EndpointChannels(), m_submixSink.EndpointRate(),
+                  static_cast<unsigned long long>(m_submixSink.FramesWritten()),
+                  static_cast<unsigned long long>(m_submixSink.Failures()));
+
+    SDS_LOG_INFO("%s%s", line, rest);
+
+    if (!m_submixStatusFile.empty())
+    {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, m_submixStatusFile.c_str(), L"w") == 0 && f != nullptr)
+        {
+            std::fprintf(f, "%s%s\n", line, rest);
+            std::fclose(f);
+        }
     }
 }
 
@@ -340,6 +616,12 @@ void Runtime::OnStartVibration(const VibrationStart& s)
 
     if (!m_config.enabled || !m_config.haptics)
         return;
+    // HapticSource=submix: the coils are fed continuously from the engine's own mix, so the
+    // asset player must not also drive them. The call is still LOGGED above, because the log
+    // is how a null submix result gets diagnosed — "the game asked for CatPurr2_VIBE and the
+    // submix stayed silent" is a completely different finding from "the game never asked".
+    if (m_config.SubmixDrivesCoils())
+        return;
     if (name.empty())
     {
         SDS_LOG_ERROR("StartPS5Vibration: could not derive an asset name from '%s'",
@@ -362,6 +644,8 @@ void Runtime::OnStopVibration(float fadeOut)
         std::lock_guard<std::mutex> lock(m_componentMutex);
         m_playingComponent.clear();
     }
+    if (m_config.SubmixDrivesCoils())
+        return;      // the engine's own fade-out is already in the submix we are listening to
     m_haptics.Stop(fadeOut);
 }
 
@@ -386,12 +670,16 @@ void Runtime::OnStopVibrationOnComponent(const std::string& componentFullName, f
     m_componentStopsHonoured.fetch_add(1, std::memory_order_relaxed);
     SDS_LOG_INFO("StopPS5VibrationOnAudioComponent fadeOut=%.2f (owner) %s",
                  static_cast<double>(fadeOut), componentFullName.c_str());
+    if (m_config.SubmixDrivesCoils())
+        return;
     m_haptics.Stop(fadeOut);
 }
 
 void Runtime::OnSetVibrationLevel(float level)
 {
     // ~60 Hz. Never log it per call.
+    if (m_config.SubmixDrivesCoils())
+        return;   // the level is already applied by the engine, upstream of the submix
     m_haptics.SetLevel(level);
 }
 
@@ -435,6 +723,11 @@ void Runtime::OnPadVibrationEnabled(bool enabled)
     SDS_LOG_INFO("haptics: PadVibrationEnabled -> %d", enabled ? 1 : 0);
     if (!enabled)
         m_haptics.Stop(0.0f);
+    // The game's only vibration control (§9) must gate the submix path too, and it is a gain
+    // rather than a teardown: the tap keeps reporting numbers, which is what makes "the user
+    // turned it off in the menu" distinguishable from "the tap died".
+    if (m_config.SubmixDrivesCoils())
+        m_submixSink.SetGain(enabled ? m_config.submixGain : 0.0f);
 }
 
 void Runtime::NoteHookRegistered(const char* name)
