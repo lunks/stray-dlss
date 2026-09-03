@@ -635,6 +635,25 @@ Config and saves live in the **Proton prefix**:
 > announcement the dispatch actually belongs to — the correlation was right the whole time, and
 > only the pointer was dead.** Ask which of identity and lifetime you are relying on, and then ask
 > where each is still true.
+>
+> **CONFIRMED ON THE BOX, frame 16800, 53.3 fps, no crash (facts §36.13).** `partial == claimed`
+> exactly — every claimed dispatch takes depth and velocity from the engine — with
+> **`deadInputs=0`**, `fellBack=0`, `faults=0`, `off=0`. Colour comes back `rhi_null` exactly as
+> predicted (it is the graph-allocated post-chain texture), so `resolved` stays 0 by design and
+> **`partial` is the success state, not a degraded one**. `ResourceRHI @16` and
+> `GetNativeResource` slot 7 are **HARD**.
+>
+> **And L1 caught a real defect on its first frame, which is the reason it was worth building:**
+> `ENGINE SEAM L1 ASSERTION: the engine's velocity is …5323DD00 and the heuristic's register walk
+> says …52FB62F0.` The register walk was feeding DLSS SR a velocity resource **the engine did not
+> bind**. A wrong velocity is a motion-vector error, and §5's rule is that those compound through
+> the accumulation and read as drift and instability rather than as a motion-vector bug — so this
+> is now the **leading candidate for the flicker**, and L1 replaces it with the engine's answer.
+> UNCONFIRMED that it *is* the flicker: the image has not been judged since.
+>
+> **The one gap left is `unclaimed` (~1.2%, all `noDispatch`)** — the engine announced and no
+> dispatch we accepted ever claimed, so those frames ran the engine's own TAA. That is UPSTREAM
+> of L1, in the matcher that decides which dispatch may call `claim()`, and it is the next thing.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -923,11 +942,21 @@ nothing either way.
 The row must read `(denormal, P, 1/P, 0.0)` and `y*z == 1.0` is true BY CONSTRUCTION, so it
 cannot survive a wrong buffer or a slipped offset. All four components from one read, the three
 predictions and a verdict now print beside the `View CB at b…` line, with a running `ok=/bad=`
-tally on the periodic `[view]` line. **A `bad` rate near 100% convicts the search; near 0%
-exonerates it and moves the flicker hunt elsewhere.** No new offsets were added to get that
-answer — which is the point: reach for the check the data already contains before building an
-identity path (`FSceneView::ViewUniformBuffer` matched against the bound CBV) that would cost a
-new [derived] offset into `FViewInfo`.
+tally on the periodic `[view]` line.
+
+> **MEASURED THE SAME DAY: `ok=64044 bad=0`. THE SEARCH IS RIGHT (facts §36.14).** So
+> `NearPlane` exactly `1.0000` and `DeltaTime` exactly `0.000000` in the menu are the engine's
+> real values, not a wrong buffer, and the `1.0 -> 32.1` PreExposure swing is the menu's genuine
+> exposure range. **The flicker is not a wrong View CB** — look at the velocity disagreement in
+> §2.3's L1 note instead. And the View-CB-by-identity idea
+> (`FSceneView::ViewUniformBuffer` matched against the bound CBV) is demoted from a correctness
+> fix to a **performance** change: it is what would let the descriptor shadow leave the hot path.
+> No urgency, and no reason to take risk for it.
+
+**The method is the transferable part, and it cost nothing.** The predicate already existed; only
+the log line was missing. One line settled a question that would otherwise have justified a new
+[derived] offset into `FViewInfo`. **Reach for the check the data already contains before
+building the identity path.**
 
 
 Traps:

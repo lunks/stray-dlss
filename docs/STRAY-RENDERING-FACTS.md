@@ -3019,6 +3019,11 @@ registry's liveness check a frame later. The `l1:` line answers both.
 
 ### 36.12 The View constant buffer is located by SEARCH, and nothing has ever checked it (2026-09-03)
 
+> **ANSWERED THE SAME DAY, AND THE ANSWER IS "THE SEARCH IS RIGHT" — see §36.14.** The check
+> shipped and read `ok=64044 bad=0`. Everything below is the reasoning that motivated it; the
+> suspicion it records is refuted. Kept because building the check rather than the fix was the
+> correct move and is the transferable part.
+
 From the same session, with the user still reporting flicker:
 
 ```
@@ -3043,3 +3048,94 @@ predictions, and a verdict — plus a running `ok=/bad=` tally on the periodic `
 
 **A `bad` rate near 100% convicts the CB search; near 0% exonerates it and moves the flicker
 hunt elsewhere.** No new offsets and no new risk were added to obtain that.
+
+### 36.13 L1 WORKS: the announce-time resolve, confirmed on the box (2026-09-03)
+
+DLL md5 `2101ad15…` (`77d656e`), menu, **no injected input**, `EngineSeam=3`,
+`EngineSeamInputs=1`, FG on, NR on. Ran past **frame 16800** at 53.3 fps, no crash.
+
+**The offsets are HARD now, confirmed by our own registry on the render thread:**
+
+```
+ENGINE SEAM L1: first use of the engine's own FPassInputs, RESOLVED INSIDE AddPasses -
+  colour=0000000000000000 (rhi-null, registered=0)
+  depth=0000000052FAAC80 (ok, registered=1)
+  velocity=0000000052FB5A50 (ok, registered=1)
+  ... FRDGTexture in: colour=000000003157A328 depth=0000000046AA63A8 velocity=0000000031572978
+      (seq 1, frame 0, announced on thread 1400)
+```
+
+**Exactly the prediction of §36.11, including which one fails.** Depth and velocity resolve
+(`RegisterExternalTexture` has already called `SetRHI`); colour is `rhi_null` because the
+post-chain `SceneColor.Texture` is graph-allocated. `FRDGResource::ResourceRHI @16` and
+`FRHITexture::GetNativeResource` slot **7** are confirmed.
+
+**Steady state, frame 16800:**
+
+```
+[seam] announced=16803 claimed=16596 unclaimed=204 orphans=0 lookalikesRefused=10947 overflow=0
+  | claimedButNoSR: viewUnreadable=0 deadInputs=0 roleUnresolved=0 mvFailed=0 createFailed=0 evalFailed=0
+  | evaluated=16475 | l1: resolved=0 partial=16596 fellBack=0 stale=14933 faults=0 off=0
+```
+
+* **`partial == claimed`, exactly.** Every claimed dispatch takes its depth and velocity from the
+  engine. (`resolved` counts all THREE including colour, so it stays 0 by design — `partial` is
+  the success state here, not a degraded one.)
+* **`deadInputs=0`.** The gate L1 was built to close is closed. It was the one refusal printed
+  once-per-pass by design, whose rate was invisible, and which drove the "DLSS flip".
+* **`fellBack=0 faults=0 off=0`.** The chain never failed and the guards never fired.
+* **`stale=14933`** — the RHI thread's lag, now correctly a diagnostic. It is ~90% of claims and
+  is *not* an error; gating on it is what made two earlier builds inert (§36.10, §36.11).
+
+Healthy alongside: FG 1.98x with `evaluate-failures=0`, NR `guides-stale=23` of 3601 at frame
+3600, `[perf] our CPU/frame ... total 0.90ms (5% of 18.8ms)`.
+
+**REMAINING GAP, and it is now the only one: `unclaimed=204` (~1.2%), all `noDispatch`.** The
+engine announced its primary upscale and no dispatch we accepted ever claimed it, so those frames
+ran the engine's own TAA. L1 does not address this and never could — it is *upstream*, in the
+matcher that decides which dispatch is allowed to call `claim()`.
+
+#### 36.13.1 THE HEURISTIC AND THE ENGINE DISAGREE ABOUT VELOCITY
+
+```
+ENGINE SEAM L1 ASSERTION: the engine's velocity is 000000005323DD00 and the heuristic's register
+walk says 0000000052FB62F0. The ENGINE's is used.
+```
+
+**This is the most consequential line of the session.** Before L1 the register walk's answer was
+what reached DLSS SR — and the engine says it was not the resource it bound as
+`SceneVelocityTexture`. A wrong velocity texture is a **motion-vector** error, and this project's
+own rule (§5) is that *bad motion vectors do not produce one bad frame, they compound through the
+accumulation* and surface as drift, smearing and instability rather than as anything shaped like a
+motion-vector bug. It is therefore the **leading candidate for the flicker the user still reports**,
+and L1 replaces it with the engine's own answer on every claimed frame.
+
+**Not yet confirmed** that this is the flicker: it is one assertion, once per session, and the
+image has not been judged since. That judgement is the next thing worth a launch.
+
+### 36.14 The View CB search is EXONERATED — row 135 never fails (2026-09-03)
+
+Same session, same build:
+
+```
+[view] frame 16800: row135 self-check ok=64044 bad=0
+```
+
+**64 044 frames, zero failures.** Row 135 must read `(denormal, P, 1/P, 0.0)` with `y*z == 1.0`
+true by construction (`SceneRendering.cpp:1563-1564`), so this cannot pass on the wrong buffer or
+a slipped offset.
+
+**This RETRACTS the suspicion in §36.12.** `NearPlane` exactly `1.0000` and `DeltaTime` exactly
+`0.000000` in the menu are the engine's real values, not the signature of a wrong buffer, and
+`PreExposure` jumping `1.0 -> 32.1` is the menu's genuine exposure swing (§2.6 already records a
+~95x range). The CB search picks the right buffer.
+
+**Consequence: the flicker is NOT a wrong View constant buffer**, and the
+View-CB-by-identity work (`FSceneView::ViewUniformBuffer` matched against the bound CBV) is
+demoted from a correctness fix to a **performance** change — it is what would let the descriptor
+shadow leave the hot path. No urgency, and no reason to accept risk for it.
+
+**The method is the point, and it cost nothing.** The check already existed
+(`ue4::pre_exposure_plausible`, `ViewParams::pre_exposure_row`); it was simply never printed. One
+log line settled a question that would otherwise have justified a new [derived] offset into
+`FViewInfo`. **Reach for the check the data already contains before building the identity path.**
