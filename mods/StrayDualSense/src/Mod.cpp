@@ -610,6 +610,12 @@ void CbGlyphPost(UnrealScriptFunctionCallableContext& context, void* customData)
     }
     if (want < 0 || ret == nullptr || ret->size != 1)
         return;
+    // Only a GAMEPAD answer is rewritten (1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro). KeyboardMouse (5)
+    // and Unknown (0) are left alone: the point is "this Xbox-looking pad is a DualSense", not
+    // "always draw PlayStation prompts" - a keyboard user must keep keyboard prompts.
+    const int observed = result != nullptr ? beforeRes : beforeLocal;
+    if (observed < 1 || observed > 4)
+        return;
 
     if (result != nullptr)
         *result = static_cast<uint8_t>(want);
