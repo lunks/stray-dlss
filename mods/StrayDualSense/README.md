@@ -27,7 +27,15 @@ What is **not** here, on purpose: `scePadSetVibration` (reads two bytes; structu
 carry a waveform — §12), amplitude envelopes, normalisation, master gain, the lightbar (no
 shipped content drives it), glyph/platform overrides, and every probe the shim grew.
 
-## The submix spike — `HapticSource = measure | submix`
+## The submix spike — `HapticSource = measure | submix-fallback | submix`
+
+**READ FIRST (2026-09-03): every `SUBMIX` and `STATUS` line begins with `COILS: ...` — who is
+driving the pad right now. Never infer it from `bound=` or `total=`.** `measure` reports and
+leaves the coils to the asset path; `submix-fallback` keeps the asset path until the tap carries a
+real signal and WARNS every `SubmixWarnSeconds` meanwhile; `submix` is strict — the asset path
+never plays, so anything felt came from the submix. The measured reason the tap sees nothing on
+PC, and the `SubmixReroute` / `ForcePS5HapticPath` switches built for it, are in
+`docs/STRAY-DUALSENSE.md` §14, "Third live run".
 
 **A SPIKE. Nothing in it has run in the game, and the step that reaches the engine is a
 virtual call on a pointer found by a memory scan.** It defaults OFF (`HapticSource = assets`),

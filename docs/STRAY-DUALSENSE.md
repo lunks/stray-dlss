@@ -850,3 +850,113 @@ other. A candidate found that way records the container's slot, which names the 
   delivered a real signal, so a tap that never binds costs nothing.
 * **The sink streamed 1,097,761 frames of pure underrun** to the pad endpoint while unbound. It
   no longer opens the endpoint until the listener has registered.
+
+### Third live run, 2026-09-03: the tap BOUND, the submix is EMPTY, and here is exactly why
+
+`submix bound=1` for the first time — discovery through `UEngine` works — and then
+**`total=0` callbacks for a whole session, "last NEVER"**, while the master probe on the same
+machinery fired 15,739 times with real signal. So the tap is sound and `Submix_vibrationMaster`
+is genuinely never rendered on PC.
+
+**The vibration the user felt that night came from the ASSET path** (`hap[starts=2 played=2]`,
+`CatPurr2_VIBE` and `Scratch_VIBE`), which the previous build kept in charge until the tap
+carried signal, and nothing in the log said so in words. That is fixed in 0.3.0: every `SUBMIX`
+and `STATUS` line now starts with `COILS: driven by the ASSET path (FALLBACK) - what you feel is
+NOT the submix` / `COILS: driven by the SUBMIX` / `COILS: NOBODY ...`, the verdict is a pure
+function (`src/CoilOwner.cpp`, `tests/test_coil_owner.cpp`), `HapticSource=submix` is now
+STRICT (the asset path never plays, so a felt vibration proves the submix) and
+`submix-fallback` is the old behaviour with a WARN every 10 s while the fallback is in charge.
+
+#### Why it is empty — HARD, from the UE 4.27.2 source plus one probe read
+
+`mods/StrayAudioProbe` (UE4SS Lua, drivable through `stray-audio-probe.cmd`) read the live
+graph:
+
+```
+EndpointSubmix  VibrationEndpointSubmix    EndpointType = "Vibration Output"
+  SoundSubmix   Submix_vibrationMaster     OutputVolume 1.0, no effects
+    SoundSubmix Submix_vibration           OutputVolume 1.0, no effects
+EndpointSubmix  ControllerEndpointSubmix   EndpointType = "Pad Speaker Output"
+  SoundSubmix   Submix_controllerMaster -> Submix_controller -> Submix_controllerPre (SBFX_Boost)
+SoundClass      SCLASS_controllerVibration Properties.DefaultSubmix = Submix_vibration
+                                           bIsUISound = true, parent SCLASS_master_soundmix_01
+SoundAttenuation PS5VibrationAttenuation   SubmixSendSettings[0].Submix = VibrationEndpointSubmix
+HKPlayerController.m_PS5VibrationSubmix  = Submix_vibrationMaster
+HKPlayerController.ControllerVibration   = an AudioComponent, Sound null, no attenuation override
+```
+
+The root of the vibration tree is a `UEndpointSubmix`, and UE 4.27.2 does this with it:
+
+1. `UEndpointSubmix::GetAudioEndpointForSubmix()` → `IAudioEndpointFactory::Get("Vibration
+   Output")` (`SoundSubmix.cpp:888-890`). No factory of that name is registered on Windows, so
+   `Get` logs *"No endpoint implementation for %s found for this platform. Endpoint Submixes set
+   to this type will not do anything."* and **returns the DUMMY factory** (`IAudioEndpoint.cpp:
+   172-174`, `GetDummyFactory`).
+2. `FMixerSubmix::SetupEndpoint` therefore creates a dummy `IAudioEndpoint`, so
+   `EndpointData.NonSoundfieldEndpoint` is valid and `IsExternalEndpointSubmix()` is true
+   (`AudioMixerSubmix.cpp:898`) — the submix lands in `ExternalEndpointSubmixes`
+   (`AudioMixerDevice.cpp:1603`).
+3. Every render callback runs `Submix->ProcessAudioAndSendToEndpoint()` on it
+   (`AudioMixerDevice.cpp:750-757`), whose first statement is
+   `if (IsDummyEndpointSubmix()) { zero the buffer; return; }` — **before `ProcessAudio`, so
+   before the child loop.** `Submix_vibrationMaster` and `Submix_vibration` are never processed,
+   their buffer listeners are never invoked, and sources routed to them are never pulled.
+
+That is the whole explanation for `total=0`: not a broken tap, not a silent submix, a subtree the
+mixer skips by design on a platform without the endpoint. The same applies to the speaker tree
+(`"Pad Speaker Output"`).
+
+#### The Blueprint gate — HARD, measured with the probe's command file
+
+`BP_HKPlayerController_C` carries a `DebugPS5Haptic` bool (object dump, offset `0x778`) next to
+the platform check in every `StartPS5Vibration` Blueprint. Calling the Blueprint from Lua:
+
+| `DebugPS5Haptic` | `StartPS5Vibration(Scratch_VIBE)` | `ControllerVibration.IsPlaying()` | `AudioComponent:SetSound/Play` hooks |
+|---|---|---|---|
+| false | entered (our hooks fire) | false | 0 |
+| **true** | entered | **true, Sound = Scratch_VIBE** | **SetSound=2, Play=2** |
+
+So the gate is `(GetPlatform() == PS5) || DebugPS5Haptic`, and with the bool set the shipped
+Blueprint plays the `_VIBE` asset on the `ControllerVibration` AudioComponent, whose base submix
+is `Submix_vibration` through the sound class. `GetPlatform` is called ~700 times a minute by the
+UI and returns 0 (Windows); it was NOT overridden.
+
+**And the engine renders that source the moment it has a rendered submix to reach.** With the
+component playing, `ControllerVibration:SetSubmixSend(Submix_menuSliders_sfx, 1.0)` drove the
+MASTER probe's peak from ~0.03 to **1.00** (the master limiter) — the haptic waveform reached the
+speakers — while the tap on `Submix_vibrationMaster` still read zero. The source, the mixer and
+the tap all work; only the endpoint root is dead.
+
+#### The way round it, built and UNCONFIRMED (never run): `SubmixReroute=1` + `ForcePS5HapticPath=1`
+
+Re-parent `Submix_vibrationMaster` under a submix the mixer DOES process every callback
+(`Submix_unused`: ParentSubmix null → the master tree, OutputVolume 1.0, no children, no
+effects — measured), after writing that parent's `OutputVolume = 0` so nothing leaks into the
+speakers; then call `FAudioDevice::RegisterSoundSubmix(parent, true)` and `(master, true)` —
+the virtual at **slot 14**, two below the listener slot that is validated live, counted from the
+same `AudioDevice.h` table (`:854`). `RegisterSoundSubmix` → `RebuildSubmixLinks` reads the
+UObject's `ParentSubmix` and re-links the live instances (`AudioMixerDevice.cpp:1034-1060`);
+`Init(bAllowReInit)` re-reads `OutputVolume` (`InitInternal`). Listeners run after a submix's own
+output volume and before its parent's, so the tap on `Submix_vibrationMaster` (volume 1.0) sees
+the full mix and `Submix_unused` (volume 0) kills it before the speakers. The attenuation's own
+send to the dead root is simply lost; the class-default routing to `Submix_vibration` is what
+carries the sound. `ForcePS5HapticPath` writes `DebugPS5Haptic=true` from the plugin's own Start
+pre-hooks, before the Blueprint's gate runs.
+
+**What a run must show, in order:** `submix: REROUTE submitted` → the `SUBMIX` line turning from
+`NO CALLBACKS` into a steady `cb=... (46.9/s)` with `peak=0` (the subtree renders) → `peak > 0`
+during a purr/scratch (the engine mixes haptics) → `HANDOVER: the SUBMIX now drives the coils`
+in `submix-fallback`/`submix` → the user feeling it. Nothing past the first arrow has been seen.
+
+**Risks stated:** slot 14 is derived, not measured (the call refuses if the slot shares its
+address with a neighbour, the ICF signature of an empty base stub); `Submix_unused` is assumed
+unused on the strength of its name; `DebugPS5Haptic` may open more than the haptic path (the
+speaker Blueprints share the shape — harmless, their endpoint is dead too).
+
+#### Glyphs — HARD shape, UNCONFIRMED effect
+
+`/Script/Hk_project.InputSubsystem:GetGameControllerType(_forceGamepad: bool @0) ->
+EGameControllerType @1` (1 byte; `0 Unknown, 1 XBOX, 2 PS4, 3 PS5, 4 SwitchPro,
+5 KeyboardMouse`), called by `UMG_KeyIcon_C:Set Key`. The plugin's POST hook writes 3 into
+`RESULT_DECL` and the frame copy (`Glyphs=ps5`, default) and logs the observed call shape once.
+Whether the prompts actually change on screen has not been seen on this build.
