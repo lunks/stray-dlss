@@ -83,8 +83,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same pattern as dlss-plugin.yml's mingw job (same apt fetch, same occasional mirror
+      # slowness): cache the resolved .deb so a warm run skips `apt-get update` and the
+      # network fetch entirely. Only one package here (g++-mingw-w64-x86-64 pulls in
+      # gcc-mingw-w64-x86-64 as a dependency; there is no .c source in this lane), so the key
+      # names only that one.
+      - name: Determine Ubuntu release
+        id: os
+        run: echo "codename=$(. /etc/os-release && echo "$VERSION_CODENAME")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache mingw-w64 .deb packages
+        id: mingw-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/apt-cache/archives/*.deb
+          key: mingw-w64-debs-${{ steps.os.outputs.codename }}-g++-mingw-w64-x86-64-v1
+
       - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+        run: |
+          set -euo pipefail
+          APT_CACHE_DIR="${{ runner.temp }}/apt-cache/archives"
+          mkdir -p "$APT_CACHE_DIR"
+          if [ "${{ steps.mingw-cache.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get -o Dir::Cache::Archives="$APT_CACHE_DIR" install -y \
+              --download-only g++-mingw-w64-x86-64
+          fi
+          sudo dpkg -i "$APT_CACHE_DIR"/*.deb || sudo apt-get install -f -y
 
       # Every source EXCEPT src/Mod.cpp, which is the only file that includes a UE4SS header.
       # That split is why this lane is possible at all, and it is worth preserving.
@@ -139,10 +164,29 @@ jobs:
             grep -q "$sym" /tmp/obj/imports.txt || { echo "missing import: $sym"; exit 1; }
           done
 
+  # ---------------------------------------------------------------------------------------
+  # CACHING: identical shape to dlss-plugin.yml's plugin job, which builds the same RE-UE4SS
+  # checkout at the same pinned SHA. See that file's block comment for the full reasoning;
+  # summarised here:
+  #
+  #   1. sccache over every cl.exe invocation (GHA cache backend). Needs /Z7, not /Zi
+  #      (RE-UE4SS's Shipping config hardcodes /Zi and is patched below; StrayDualSense's own
+  #      target is patched at mods/StrayDualSense/CMakeLists.txt).
+  #   2. The cargo registry plus corrosion's target dir (build/cargo), keyed on rustc and the
+  #      two Cargo.lock files.
+  #   3. FetchContent's cloned sources (build/_deps/*-src, *-subbuild), keyed on the file that
+  #      pins them.
+  #
+  # NOT cached, same reason as dlss-plugin.yml: the RE-UE4SS checkout itself (its
+  # deps/first/Unreal submodule is the PRIVATE, secret-fetched Epic headers tree) and
+  # nvsdk_ngx_*.lib-class small downloads (StrayDualSense links none).
+  # ---------------------------------------------------------------------------------------
   plugin:
     name: Plugin DLL (Windows, MSVC)
     runs-on: windows-latest
     needs: tests
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -154,15 +198,25 @@ jobs:
         with:
           arch: x64
 
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       # Rust is needed: deps/first/patternsleuth is a Rust crate that RE-UE4SS's CMake drives
       # through corrosion. windows-latest ships a toolchain; assert it rather than discover it
-      # halfway through a 20-minute build.
+      # halfway through a 20-minute build. The rustc version keys the cargo cache: a target
+      # dir built by another rustc is worthless to this one.
       - name: Check the toolchain
+        id: toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           cargo --version
           cmake --version
           ninja --version
+          sccache --version
+          $rustc = (rustc --version)
+          Write-Host $rustc
+          "rustc=$($rustc.Split(' ')[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Clone RE-UE4SS at the pinned SHA
         shell: pwsh
@@ -220,6 +274,49 @@ jobs:
           }
           Write-Host "UE4SS sources are complete."
 
+      # Cache 2: the cargo registry and corrosion's target dir. Only PUBLIC crates live here
+      # (patternsleuth, trumank/patternsleuth). The key needs the Cargo.lock files, which
+      # exist only after the clone above, so this step sits after it.
+      - name: Cache cargo (patternsleuth)
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            build/cargo
+          key: cargo-${{ runner.os }}-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('RE-UE4SS/deps/first/patternsleuth/Cargo.lock', 'RE-UE4SS/deps/first/patternsleuth_bind/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.toolchain.outputs.rustc }}-
+
+      # Cache 3: FetchContent's clones (glaze, glfw, imgui, fmt, polyhook2, zydis, raw_pdb,
+      # corrosion, ...), all public. Keyed on the file that pins them; no prefix fallback, so
+      # a changed pin set starts clean rather than reusing a tree at the wrong tag.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/*-src
+            build/_deps/*-subbuild
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('RE-UE4SS/deps/third/CMakeLists.txt') }}
+
+      # Cache 1's precondition, identical to dlss-plugin.yml: RE-UE4SS's Shipping config
+      # compiles with /Zi, which is a per-target shared PDB under CMake+Ninja and sccache
+      # cannot cache that ("shared pdb"). /Z7 embeds the same records in each .obj; the link
+      # (/DEBUG:FULL) still produces every PDB.
+      - name: Embed debug info (/Z7) so sccache can cache the compiles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $f = 'RE-UE4SS/cmake/modules/CompilerOptions/msvc-compatible.cmake'
+          $before = Get-Content $f -Raw
+          $after = $before -replace 'set\(Shipping_FLAGS "/Zi" PARENT_SCOPE\)', 'set(Shipping_FLAGS "/Z7" PARENT_SCOPE)'
+          if ($after -eq $before) {
+            throw "$f no longer contains 'set(Shipping_FLAGS ""/Zi"" PARENT_SCOPE)': RE-UE4SS changed its flag plumbing. Re-derive the /Z7 substitution before trusting sccache."
+          }
+          Set-Content $f $after -NoNewline
+          Select-String -Path $f -Pattern 'Shipping_FLAGS' | ForEach-Object { Write-Host $_.Line }
+
       # The layout RE-UE4SS documents for C++ mods: a parent project that adds RE-UE4SS and
       # then the mod. mods/StrayDualSense/CMakeLists.txt detects the UE4SS target and builds
       # the DLL only in that case.
@@ -241,12 +338,34 @@ jobs:
         # argument, so CMake received the literal text "$env:BUILD_CONFIG" as the build type
         # and every $<CONFIG:...> generator expression then failed to parse (run 33710048662:
         # "-- Build type: $env:BUILD_CONFIG", then "Expression syntax not recognized").
-        run: cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)"
+        run: |
+          cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$($env:BUILD_CONFIG)" `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
+            -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
       # Only our target. Ninja pulls in whatever of UE4SS the link needs and nothing else,
       # which is a great deal less than building all of UE4SS, UVTD and the bundled cppmods.
       - name: Build the plugin
-        run: cmake --build build --target StrayDualSense --parallel
+        shell: pwsh
+        run: |
+          sccache --zero-stats | Out-Null
+          cmake --build build --target StrayDualSense --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      # Read this to know whether the cache did anything: "Cache hits" against "Cache misses".
+      # Zero compile requests means the launcher never engaged, which is a fault in the
+      # caching, so it fails the job rather than silently building uncached every run.
+      - name: sccache stats
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stats = & sccache --show-stats | Out-String
+          Write-Host $stats
+          $m = [regex]::Match($stats, 'Compile requests\s+(\d+)')
+          if (-not $m.Success) { throw "sccache --show-stats printed no 'Compile requests' line" }
+          if ([int]$m.Groups[1].Value -eq 0) { throw "sccache saw zero compile requests: the compiler launcher never engaged" }
 
       - name: Run the portable tests
         run: ctest --test-dir build --output-on-failure

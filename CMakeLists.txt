@@ -365,8 +365,12 @@ if(STRAY_DLSS_BUILD_ADDON)
         reshade_utils_headers
         imgui_headers)
 
+    # /Z7, not /Zi — same reasoning as stray_dlss_native above: sccache (now wired into
+    # ci.yml's build-windows job) refuses to cache a /Zi compile whose /Fd is shared, and
+    # CMake+Ninja gives every object of this target the same /Fd. /DEBUG below still emits
+    # the full PDB from the embedded per-object records, so nothing downstream changes.
     target_compile_options(stray-dlss PRIVATE
-        /W4 /permissive- /Zi
+        /W4 /permissive- /Z7
         $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
 
     # Keep symbols for field crash triage, but do not pay for them in the binary.
