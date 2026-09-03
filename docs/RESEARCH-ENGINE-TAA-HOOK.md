@@ -1236,3 +1236,94 @@ Both were reported in `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` and both check out:
 This one matters more than it looks: **L1 resolves colour as `rhi_null`** (it is the
 graph-allocated post-chain texture, §12.9), so the register map *is* the colour source on the
 live path.
+
+---
+
+## 14. Can we read SceneColorTexture the way NVIDIA does? Assessed: NO, and the current shape is the answer (2026-09-03)
+
+### 14.1 First, a correction that improves how our offsets should be described
+
+`RenderGraphResources.h` (UE 4.27):
+
+```cpp
+FRHIResource* GetRHI() const  { ValidateRHIAccess(); return ResourceRHI; }
+FRHIResource* GetRHIUnchecked() const { return ResourceRHI; }
+```
+
+`GetRHI()` is **an inline accessor over exactly the field we read**, and in Shipping
+(`RDG_ENABLE_DEBUG == 0`) `ValidateRHIAccess()` is a no-op, so it compiles to a single load of
+`ResourceRHI`. There is no out-of-line symbol: the only `RENDERCORE_API` function in the whole
+resource class family is `FRDGTexture::GetPassthrough`.
+
+**So `kRdgResourceRhiOffset` should stop being described as a layout guess.** For depth and
+velocity we are doing *precisely* what NVIDIA's lambda does — same field, same value, same moment
+in the frame — and the offset is only how we spell an accessor the compiler has already inlined
+away. `kRhiGetNativeResourceSlot` is the same shape one level down: a virtual we cannot name, so
+we index its vtable. Both are confirmed on this exe and both are validated at runtime by our own
+registry recognising the returned pointer (facts §36.13).
+
+Also settled, and it removes a tempting anchor: **`MarkResourceAsUsed()` is
+`inline void MarkResourceAsUsed() {}` in Shipping** — NVIDIA's call to it compiles to nothing, so
+it is not a hookable point.
+
+### 14.2 The question, and why the answer is no
+
+NVIDIA reads all four inputs — colour included — inside a lambda **they authored** as an RDG pass:
+
+```cpp
+GraphBuilder.AddPass(..., [PassParameters, ...](FRHICommandListImmediate& RHICmdList) {
+    DLSSArguments.InputColor = PassParameters->SceneColorInput->GetRHI();
+});
+```
+
+That lambda runs during graph *execution*, after RDG has assigned the transient texture's memory
+and before `Execute()` reaches `Allocator.ReleaseAll()` — the window §12.9 identifies. **Authoring
+such a pass is exactly the thing an injected DLL cannot do**: `AddPass` is a template over a
+parameter struct with shader-parameter metadata, instantiated at engine compile time, with no ABI
+to call from outside.
+
+So the question reduces to: is there some *other* hookable point in that window? Every candidate
+fails, and they fail for different reasons, which is what makes this a "no" rather than a "not
+yet":
+
+| Candidate | Why not |
+|---|---|
+| `TRDGLambdaPass<>::Execute` (the virtual that runs each pass) | a **template instantiation per lambda type** — one vtable per pass, not one anchor. There is nothing to scan for that identifies the TAA pass's instantiation specifically |
+| `FRDGResource::GetRHI` / `MarkResourceAsUsed` | **inline**, no symbol, nothing to hook |
+| `FRDGBuilder::ExecutePass` | private, non-template, plausibly signature-scannable — but **no self-validating constant**. The seam is safe because a candidate must reproduce a name literal *and* 0.5 *and* 2.0 before anything is installed (§3). Nothing here offers that, so a wrong answer could not be refused, and §9's rule forbids installing on a guess |
+| `FRDGBuilder::Execute` entry / exit | outside the window at both ends: at entry transient textures have no RHI, at exit the allocator is gone |
+| `RHICmdList.SetGlobalUniformBuffers({})`, after the pass loop | inline, called from many places — **and by then the TAA pass has already run**, so its transient colour may already be back in the pool |
+
+### 14.3 The one thing that WOULD work, and why we must not do it
+
+`r.RHICmdBypass=1` makes `FRHICommandList` execute inline instead of queueing, so the pass
+lambda's `Dispatch` would reach D3D12 **on the render thread, inside `Execute()`, with the
+allocator alive** — and our existing claim-time L1 code would have worked unmodified.
+
+This also retroactively explains the **164 early resolves** of §36.11: during load the pipeline is
+shallow, so claim and announce briefly coincide.
+
+**It is still the wrong trade.** Bypass disables the RHI thread process-wide — the engine's main
+rendering-throughput mechanism — to buy one texture we already have by another route. Recording it
+here so the idea is not rediscovered as clever.
+
+### 14.4 Why colour-by-register is a good end state, not a compromise
+
+* **Colour was never the ambiguous input.** L1's own cross-check has flagged a disagreement
+  exactly once, and it was **velocity** (§36.13.1) — the heuristic naming a resource the engine
+  never bound. Nothing has ever suggested colour was misidentified.
+* **Its warrant improved anyway.** `trust_registers` used to require a cooked-hash match before
+  believing §2.3's register map; it now also accepts the engine's announcement (§13.4), which is
+  a *stronger* warrant — being called through `ITemporalUpscaler::AddPasses` proves the dispatch
+  is the primary temporal upscale, which the hash table only ever approximated and which it
+  misses outright after a game update.
+* **The register map is the engine's own binding**, read from the descriptor the game actually
+  set, not an inference about what a colour buffer looks like.
+
+### 14.5 The useful half of the reference
+
+NVIDIA implements **velocity combine and the G-buffer resolve as RDG passes of their own** — the
+same two pieces of work we built by hand as D3D12 compute. That is independent validation of the
+architecture, and it says where the deleted finder's replacement belongs: **not a descriptor-shape
+search, but the engine's own named G-buffer textures**, taken from the `const FViewInfo&` that
+`AddPasses` already hands us (§13.2). If RR is ever rewired, that is the shape to copy.

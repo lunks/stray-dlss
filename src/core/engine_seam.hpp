@@ -105,6 +105,12 @@ constexpr std::uint32_t kTaaTileSize = 8;
 // ResourceRHI is null at AddPasses time for a graph-allocated texture (assigned in
 // FRDGBuilder::Execute's CollectPassResources loop); it is non-null at DISPATCH time, which is
 // when the seam claims. So the resolve happens at claim time, never at the AddPasses thunk.
+// NOT A LAYOUT GUESS - it is `GetRHI()`, spelled as an offset. UE 4.27's accessor is
+// `FRHIResource* GetRHI() const { ValidateRHIAccess(); return ResourceRHI; }`, inline in
+// RenderGraphResources.h, and in Shipping (RDG_ENABLE_DEBUG == 0) ValidateRHIAccess() is a
+// no-op — so it compiles to this single load and there is no out-of-line symbol to call
+// instead. NVIDIA's own DLSS plugin reads the same field the same way from inside an RDG pass
+// lambda; we read it from inside AddPasses because we cannot author a pass (report §14).
 constexpr std::size_t kRdgResourceRhiOffset = 16;
 
 // FRHITexture's vtable slot for GetNativeResource in a Shipping build (ENABLE_RHI_VALIDATION=0,
