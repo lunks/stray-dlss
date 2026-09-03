@@ -1995,3 +1995,161 @@ and the blocking is one thread of the game waiting on the NVIDIA kernel driver. 
 the user wants them, live at the host/driver level and are their call, not a code change here.
 The measurement scripts are kept at `/tmp/stallprobe.py`, `/tmp/holder.py` and `/tmp/holder2.py`
 on the box so the result can be reproduced or re-run against a different driver.
+
+## 32.16 The blink is WALL-CLOCK, and the kernel stack names the call: a VRAM-info ioctl (2026-09-02 22:09-22:22)
+
+§32.15 named the block (`os_acquire_rwlock_read`, the NVIDIA RM lock) but left two questions:
+frames or seconds, and what the RHI thread was actually doing. Both are now answered, and the
+second one by reading the kernel call chain rather than inferring it — `/proc/<tid>/stack` is
+readable on this host **with symbols** (`kptr_restrict=0`).
+
+### It is seconds, not frames — the A/B inside one session
+
+`[stall]` now carries `f=<present index> t=<unix epoch>` (`src/perf.cpp`), so the period can be
+read directly instead of reconstructed from 600-frame windows. One gameplay session, frame cap
+flipped mid-session through `mods/StrayConsole` (`t.MaxFPS`), everything else identical:
+
+| | uncapped | capped |
+|---|---|---|
+| frame rate | 100.8 fps | 57.0 fps |
+| **Δ frames between stalls** | **~101** | **~57** |
+| **Δ seconds between stalls** | **1.007 0.995 1.012 0.992 1.009 1.003 0.998** | **1.017 0.997 0.992 1.000 1.012 1.003 0.997** |
+
+**The frame gap tracks the frame rate; the time gap does not move off 1.00 s.** The trigger is
+wall-clock 1 Hz and nothing in the render path or in our stack is driving it. HARD.
+
+### The kernel stack, verbatim — and it is a framebuffer-info query
+
+Captured the instant RHIThread was seen in D (25 dumps, all identical):
+
+```
+[<0>] os_acquire_rwlock_read+0x31/0x50 [nvidia]
+[<0>] portSyncRwLockAcquireRead+0x10/0x40 [nvidia]
+[<0>] rmapiLockAcquire+0x2c4/0x360 [nvidia]
+[<0>] serverTopLock_Prologue+0x5c/0xe0 [nvidia]
+[<0>] serverControl+0xc5/0x590 [nvidia]
+[<0>] _rmapiRmControl+0x4f2/0x820 [nvidia]
+[<0>] rmapiControlWithSecInfo+0x79/0x140 [nvidia]
+[<0>] _rmControlForDeprecatedApi+0x1f/0x30 [nvidia]
+[<0>] _ctrl_convert_v2_NV2080_CTRL_CMD_FB_GET_INFO+0x195/0x2c0 [nvidia]
+[<0>] _nv04ControlWithSecInfo+0x47/0xa0 [nvidia]
+[<0>] RmIoctl+0x934/0xda0 [nvidia]
+[<0>] rm_ioctl+0x66/0x4e0 [nvidia]
+[<0>] nvidia_unlocked_ioctl+0x69a/0xa50 [nvidia]
+[<0>] __x64_sys_ioctl+0xa2/0x100
+```
+
+**`NV2080_CTRL_CMD_FB_GET_INFO` is an RM control that queries framebuffer (VRAM) information**,
+reached through `_rmControlForDeprecatedApi` — the legacy v1 control path the driver converts.
+So once per second the game's RHI thread issues a VRAM-info ioctl, and blocks taking the RM
+**top lock** in read mode. That the caller above the ioctl is UE4's own memory-stats update via
+`IDXGIAdapter3::QueryVideoMemoryInfo` (translated by vkd3d-proton) is the obvious reading but
+is **SOFT** — it was not traced into user space, and vkd3d-proton's own budget refresh is an
+equally shaped candidate. **We are not the caller: `QueryVideoMemoryInfo`, `IDXGIAdapter3` and
+`SetVideoMemoryReservation` appear nowhere in `src/` or `mods/`.** HARD.
+
+### Nothing else on the box is blocked — swept twice, at two widths
+
+* Every process holding the nvidia device, plus `pvestatd`, `rrdcached` and
+  `nvidia-persistenced`, sampled by STATE and wchan rather than by CPU (the earlier CPU test
+  could not have detected a poller, since a poller blocked in the driver burns no CPU either):
+  **not one thread of any of them was in D or in an nvidia wchan while RHIThread was blocked.**
+  111 D samples against 18 876 non-D. `pvestatd`'s 10 s cadence is therefore not it.
+* Widened to **every task on the entire host, kernel threads included**, 12 full `/proc` sweeps
+  taken at the instant RHIThread was in D: **NONE**. Not one other task anywhere was in D.
+
+So the RM write-lock holder is not visible as a blocked task. **Its identity is UNCONFIRMED**,
+and there is a known gap in the method: a holder spinning on a GSP RPC would sit in **R**, and
+both sweeps looked only for **D**. That is the next measurement, not a conclusion.
+
+### Ruled out by measurement
+
+* **VRAM pressure**: 7 824 of 24 564 MiB used, **16 285 MiB free**; BAR1 72/256 MiB. The
+  `NV_ERR_NO_MEMORY` lines in this box's history are from 05:00 and 15:17 and are unrelated.
+* **Throttling**: `clocks_event_reasons.active 0x0`, 73 C.
+* **Kernel log**: silent for the whole window.
+* **Audio**: pipewire xrun delta 0 across 150 s containing 173 stalls (§32.15).
+
+### Two things §32.14 left unconfirmed, now answered
+
+* **The three stalls in a menu burst are NOT consecutive frames.** `f=6506 / 6509 / 6511` inside
+  61 ms — one disturbance smeared over ~10 frames, three of which crossed the threshold.
+* **The menu's period is 11.4 s, gameplay's is 1.0 s** (`t=482.98 -> 494.42 -> 505.85`, and
+  `f=6506 -> 8385 -> 10264`, i.e. 1879 frames at a pinned 164.8 fps). The likely reconciliation
+  is that the 1 Hz event is always there and only its COST varies — the menu's disturbances
+  measure 19-38 ms against gameplay's 49-83 ms, and the detector only fires above 3x the median
+  (18.2 ms in the menu, 30 ms in gameplay), so in the menu only the occasional expensive one is
+  logged. **That reconciliation is inference, not measurement** — no stack was captured in the
+  menu.
+
+## 32.17 Mitigating the blink — options for the user, none of them applied
+
+**Nothing here has been done to the box.** Each option says what to change, how to revert, and
+what number decides whether it worked. Take them in order: the first two are free and reversible
+inside the game directory, the third is a host-level driver change.
+
+**The measurement is the same for all of them, and it is cheap.** Run a session, then:
+
+```
+grep -o 'f=[0-9]* t=[0-9.]* frame [0-9.]* ms' stray-dlss-plugin.log | tail -20
+```
+
+Success is the `t=` gaps ceasing to be ~1.00 s apart, or the `frame` figures dropping from
+49-83 ms toward the 10 ms median. **Judge on the medians of at least 15 stalls, never on one**
+(CLAUDE.md §5). A run where `[stall]` stops appearing at all is the win condition.
+
+### Option 1 — stop the once-per-second VRAM query (free, in-game, MOST LIKELY TO HELP)
+
+The stack shows a framebuffer-info RM control once per second on the RHI thread. If that is
+UE4's memory-stats update — **SOFT, §32.16** — then UE 4.27 may expose a way to stop it, and
+`Engine.ini [SystemSettings]` is how this game takes cvars (§2.2, command-line arguments do not
+work). **Do NOT paste a cvar name from memory into that file**: the first step is to read UE
+4.27.2's `D3D12Adapter.cpp` / `D3D12Viewport.cpp` for the call site of `QueryVideoMemoryInfo`
+and find what actually gates it. An invented cvar name is silently ignored and would produce a
+convincing-looking null result.
+
+Revert: delete the line from `Engine.ini`.
+
+### Option 2 — confirm the caller first, which costs one run
+
+Before changing anything, settle whether the 1 Hz caller is UE4 or vkd3d-proton, because they
+have different fixes. `ltrace`/`strace` is too heavy for a running game, but the RHI thread's
+USER-space stack at the moment of the block is enough, and the box already has everything
+needed. That single answer decides between option 1 and an upstream vkd3d-proton report.
+
+Worth reporting upstream either way: the call goes through `_rmControlForDeprecatedApi`, i.e.
+the **legacy v1 control API** that the driver has to convert, and it costs 49-83 ms on a
+completely idle GPU with 16 GiB of VRAM free. That is pathological for what is a status query,
+and it is the kind of thing vkd3d-proton or the driver team would want to know.
+
+### Option 3 — the driver: proprietary modules, GSP off (HOST-LEVEL, the user's call)
+
+The blocked call is an RM control taking the RM top lock. On this host the driver is the **open
+kernel module 610.43.02**, where **GSP firmware is mandatory** (`EnableGpuFirmware: 18`, GSP
+610.43.02), so RM controls round-trip to firmware. The testable alternative is the
+**proprietary** kernel modules, which allow GSP to be turned off:
+
+```
+# /etc/modprobe.d/nvidia-gsp.conf
+options nvidia NVreg_EnableGpuFirmware=0
+```
+
+then `update-initramfs -u` and reboot. **This requires the proprietary driver flavour; setting
+it on the open modules does nothing**, because they have no non-GSP path.
+
+Revert: delete the file, `update-initramfs -u`, reboot. Confirm with
+`cat /proc/driver/nvidia/params | grep EnableGpuFirmware` and `nvidia-smi -q | grep GSP`.
+
+**Caveats, stated plainly.** This is the biggest-blast-radius option and the least certain: the
+GSP explanation for the lock hold is **SOFT** (§32.15/§32.16 — nothing was observed holding the
+lock at all), the host runs other tenants that share this GPU, and a driver flavour change
+affects all of them. It is worth doing only after options 1 and 2 have failed, and only when the
+user is willing to reboot the host.
+
+### What NOT to spend time on
+
+Measured and dead: mangoapp/MangoHud's NVML polling, `pvestatd`, `rrdcached`,
+`nvidia-persistenced`, gamescope, Xwayland, steam and steamwebhelper (none blocked at the
+instant, §32.16); VRAM pressure and thermal/clock throttling; anything in our own render path
+(§32.14, 89% of the stall is outside every hook we own); and StrayProbe or our status-file write
+(both excluded by period, §32.14, and by the frame/second A/B, §32.16).
