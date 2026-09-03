@@ -4,6 +4,7 @@
 #include "log.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_nr.hpp"
+#include "nr_mask.hpp"
 #include "nr_stage.hpp"
 #include "perf.hpp"
 
@@ -76,6 +77,14 @@ std::atomic<std::uint32_t> g_bb_fmt{ 0 };
 std::atomic<float> g_scale_x{ 0.0f };
 std::atomic<float> g_scale_y{ 0.0f };
 
+// The mask configuration, and the last verdict. The config is written from the ini at startup and
+// from the overlay at any time; the mutex is the same one the guides use because both are read
+// once per present and there is no contention worth splitting them over.
+std::mutex g_mask_mutex;
+nrmaskplan::Config g_mask_cfg;
+std::atomic<int> g_mask_result{ static_cast<int>(nrmaskplan::MaskResult::disabled) };
+std::atomic<bool> g_mask_bound{ false };
+
 // One counted, once-per-reason-logged refusal, in the shape the TAA path's log_gate_refusal uses.
 // A stage that never fires must never be indistinguishable from a stage that fired and did
 // nothing.
@@ -117,6 +126,18 @@ void set_back_buffer_state(std::uint32_t states)
 }
 
 std::uint32_t back_buffer_state() { return g_bb_state.load(std::memory_order_relaxed); }
+
+void set_mask(const nrmaskplan::Config &cfg)
+{
+	std::lock_guard<std::mutex> lock(g_mask_mutex);
+	g_mask_cfg = cfg;
+}
+
+nrmaskplan::Config mask_config()
+{
+	std::lock_guard<std::mutex> lock(g_mask_mutex);
+	return g_mask_cfg;
+}
 
 void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
                  std::uint32_t render_width, std::uint32_t render_height, bool reset)
@@ -160,6 +181,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// Retire staging textures a resize superseded, whatever this frame then decides. Cheap, and it
 	// must happen even on a frame the gate refuses.
 	nrstage::collect(pc.frame);
+	nrmask::collect(pc.frame);
 
 	if (!nr::enabled())
 		return;
@@ -253,6 +275,52 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// --- read the frame out of the back buffer ---
 	nrstage::record_capture(cmd, colour, bb_state, issue_barrier, &bctx);
 
+	// --- DLSSNR.ControlMask, if it is turned on ---
+	//
+	// The mask's own typed-UAV probe is on the MASK's format, not the back buffer's: we write it
+	// with our own compute shader, and a format this device cannot store to through a typed UAV
+	// would leave the texture uninitialised while the runtime sampled it anyway (it validates
+	// nothing). Refuse rather than bind — that is the whole gate.
+	ID3D12Resource *mask_texture = nullptr;
+	nrmaskplan::Plan mask_plan;
+	{
+		const nrmaskplan::Config cfg = mask_config();
+		const nrmaskplan::FormatSupport fs = nrmask::probe(device);
+		mask_plan = nrmaskplan::plan_mask(cfg, plan.width, plan.height, fs);
+
+		if (mask_plan.result == nrmaskplan::MaskResult::ok)
+		{
+			if (!nrmask::ensure(device, mask_plan.width, mask_plan.height, pc.frame)
+				|| !nrmask::record_fill(cmd, mask_plan))
+			{
+				mask_plan.result = nrmaskplan::MaskResult::alloc_failed;
+			}
+			else
+			{
+				mask_texture = nrmask::texture();
+				if (mask_texture == nullptr)
+					mask_plan.result = nrmaskplan::MaskResult::alloc_failed;
+			}
+		}
+		// A mask refusal NEVER refuses the frame: NR without a mask is what shipped before this
+		// existed and is strictly better than no NR. It is counted and named, once per reason.
+		static std::uint32_t s_mask_logged[nrmaskplan::kMaskResultCount] = {};
+		const int idx = static_cast<int>(mask_plan.result);
+		if (mask_plan.result != nrmaskplan::MaskResult::ok
+			&& mask_plan.result != nrmaskplan::MaskResult::disabled
+			&& idx >= 0 && idx < nrmaskplan::kMaskResultCount && s_mask_logged[idx]++ == 0)
+		{
+			STRAY_LOG_WARN("NR mask: refused (%s) — colour rect %ux%u, mask format %d, probe "
+				"queried=%d view=%d store=%d, last error \"%s\". The frame is still evaluated, "
+				"just without a ControlMask. First occurrence of this reason only.",
+				nrmaskplan::mask_result_name(mask_plan.result), plan.width, plan.height,
+				nrmask::format(), fs.queried ? 1 : 0, fs.view ? 1 : 0, fs.store ? 1 : 0,
+				nrmask::last_error());
+		}
+		g_mask_result.store(idx, std::memory_order_relaxed);
+		g_mask_bound.store(mask_texture != nullptr, std::memory_order_relaxed);
+	}
+
 	nr::ApplyInputs ni;
 	ni.image = staging;
 	ni.depth = guides.depth;
@@ -278,6 +346,10 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// so the two can be compared on the box before either is changed. See nrplan::Plan.
 	ni.mvec_scale_x = 0.0f;
 	ni.mvec_scale_y = 0.0f;
+	// Null when the mask is off or refused, which is what UNBINDS a mask a previous frame set.
+	ni.control_mask = mask_texture;
+	ni.control_mask_width = mask_plan.width;
+	ni.control_mask_height = mask_plan.height;
 
 	// Our dense RG16_FLOAT motion vectors rest in UNORDERED_ACCESS; NGX wants its inputs in
 	// NON_PIXEL_SHADER_RESOURCE. Balanced on every path out, like the TAA hook's pair. Recording
@@ -331,6 +403,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 void shutdown()
 {
 	nrstage::shutdown();
+	nrmask::shutdown();
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
 	// The publish-side references (note_guides) go here. Device destruction is the one call site
 	// where the caller, not us, has established that the GPU is idle.
@@ -355,6 +428,15 @@ Counters counters()
 	c.last_mvec_scale_x = g_scale_x.load(std::memory_order_relaxed);
 	c.last_mvec_scale_y = g_scale_y.load(std::memory_order_relaxed);
 	c.staging_bytes = nrstage::stats().bytes;
+	const nrmask::Stats ms = nrmask::stats();
+	c.last_mask_result = static_cast<nrmaskplan::MaskResult>(
+		g_mask_result.load(std::memory_order_relaxed));
+	c.mask_bound = g_mask_bound.load(std::memory_order_relaxed);
+	c.mask_r = ms.value_r;
+	c.mask_g = ms.value_g;
+	c.mask_b = ms.value_b;
+	c.mask_fills = ms.fills;
+	c.mask_bytes = ms.bytes;
 	return c;
 }
 

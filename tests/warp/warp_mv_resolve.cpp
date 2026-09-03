@@ -1715,6 +1715,7 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 }
 
 #include "warp_nr_stage.inc"
+#include "warp_nr_mask.inc"
 
 #include "warp_native_backend.inc"
 #include "warp_fg_present.inc"
@@ -1800,6 +1801,8 @@ int main(int argc, char **argv)
 	test_private_data_release_on_destroy(gpu);
 	test_nr_present_stage_round_trip(gpu);
 	test_nr_present_stage_deferred_free(gpu);
+	test_nr_control_mask_fill(gpu);
+	test_nr_control_mask_resize_retires(gpu);
 	// The native backend last: its hooks are installed on this device and never restored.
 	test_vtable_patch_roundtrip(gpu);
 	test_registry_liveness(gpu);

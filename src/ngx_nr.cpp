@@ -7,6 +7,7 @@
 
 #include "core/nr_hook_plan.hpp"
 #include "core/nr_lifetime.hpp"
+#include "core/nr_mask_plan.hpp"
 #include "core/nr_params.hpp"
 
 #include <d3d12.h>
@@ -117,6 +118,12 @@ constexpr const char *kUICorrection = "DLSSNR.UICorrection";
 // parameter name — docs/RESEARCH-DLSSNR-STYLES.md). NOT the same axis as kPreset: preset selects
 // a different embedded weight set, Style is a small integer with no weight switch behind it.
 constexpr const char *kStyle        = "DLSSNR.Style";
+// The per-pixel control texture. Read by the evaluate parameter reader into +0x60 of its input
+// struct through the SAME vtable slot as kColor/kDepth/kMVec/kOutput, then registered and given a
+// guide-rect record alongside them — so it is genuinely consumed, and it is written here exactly
+// the way those four are. src/core/nr_mask_plan.hpp carries the addresses and the two things
+// binding one costs.
+constexpr const char *kControlMask  = "DLSSNR.ControlMask";
 
 // Refusal indices, parallel to kNrRefusalNames.
 enum
@@ -309,7 +316,8 @@ bool g_teardown_requested = false;        // NgxNR 1->0: give the whole working 
 constexpr std::size_t kKeepAliveSlots = 16;
 struct KeepAlive
 {
-	ID3D12Resource *resources[4] = {};
+	// colour, depth, motion vectors, output, control mask.
+	ID3D12Resource *resources[5] = {};
 	nrlife::Tag tag;
 };
 KeepAlive g_keep_alive[kKeepAliveSlots];
@@ -1230,6 +1238,19 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kMVec, in.motion_vectors);
 	g_params->Set(kOutput, g_nr_output);
 
+	// THE CONTROL MASK, and the null is as load-bearing as the pointer. The parameter block
+	// persists across evaluates and nothing clears it, so a frame that stops wanting a mask has to
+	// write a null rather than skip the key; the runtime's reader treats a fetched null exactly as
+	// an absent parameter (0x18001a3f4), which makes this the supported way to unbind.
+	g_params->Set(kControlMask, in.control_mask);
+	if (in.control_mask != nullptr)
+	{
+		nrparam::Entry mask_rect[nrparam::kMaxMaskRectEntries];
+		const int n = nrparam::build_mask_rect(in.control_mask_width, in.control_mask_height,
+			mask_rect, nrparam::kMaxMaskRectEntries);
+		apply_entries(g_params, mask_rect, n);
+	}
+
 	// The four rects, through the builder that carries their TYPES. Every one of these used to be
 	// written through the `unsigned int` overload while the snippet reads them as `int` — a
 	// different vtable slot and a different stored type, with no error either way.
@@ -1263,6 +1284,38 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	// One line per SITE, not one per session: `taa` and a post-tonemap mode describe genuinely
 	// different pixels, so a session that switched between them must not report only the first.
+	// ONE LINE PER MASK STATE, because binding a mask silently rewrites two other parameters we
+	// also set, and a log that echoed only what we asked for would be wrong in exactly the way
+	// that costs a round trip. `resolve_structure` is the runtime's own arithmetic, transcribed.
+	{
+		const bool bound = in.control_mask != nullptr;
+		static int s_logged_mask_state = -1;
+		const int state = bound ? 1 : 0;
+		if (s_logged_mask_state != state)
+		{
+			s_logged_mask_state = state;
+			const nrmaskplan::ResolvedStructure rs = nrmaskplan::resolve_structure(bound,
+				g_auto_mask, g_skin_structure, g_local_structure);
+			if (bound)
+				STRAY_LOG_INFO("NR: DLSSNR.ControlMask BOUND (%p, %ux%u). R is the per-pixel final "
+					"blend weight, G scales local tone, B scales local structure; there is no skin "
+					"channel. Binding it FORCES UseAutoMask to 0 whatever we asked for (we asked "
+					"%u -> effective %u) and drives BOTH resolved structure strengths to %.1f, so "
+					"the SkinStructure=%.2f and LocalStructure=%.2f we set no longer reach the "
+					"resolved pair. That is the trade, and it is the runtime's, not ours.",
+					static_cast<void *>(in.control_mask), in.control_mask_width,
+					in.control_mask_height, g_auto_mask, rs.effective_auto_mask,
+					static_cast<double>(rs.skin), static_cast<double>(g_skin_structure),
+					static_cast<double>(g_local_structure));
+			else
+				STRAY_LOG_INFO("NR: DLSSNR.ControlMask UNBOUND (a null pointer is written, not the "
+					"key omitted — the parameter block persists). UseAutoMask=%u -> effective %u, "
+					"resolved skin=%.2f local=%.2f.",
+					g_auto_mask, rs.effective_auto_mask, static_cast<double>(rs.skin),
+					static_cast<double>(rs.local));
+		}
+	}
+
 	static bool s_params_logged = false;
 	if (!s_params_logged)
 	{
@@ -1325,6 +1378,10 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		ka.resources[1] = in.depth;
 		ka.resources[2] = in.motion_vectors;
 		ka.resources[3] = g_nr_output;
+		// The mask is nrmask's and has its own retirement delay, but NGX holds no references to
+		// anything we hand it, so it goes in the ring with the rest rather than depending on
+		// another module's schedule staying conservative.
+		ka.resources[4] = in.control_mask;
 		for (ID3D12Resource *r : ka.resources)
 			if (r != nullptr)
 				r->AddRef();

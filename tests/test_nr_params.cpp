@@ -178,3 +178,45 @@ TEST_CASE("a builder that would overflow its buffer writes nothing")
 	CHECK(build_rects(r, buf, 4) == 0);
 	CHECK(build_create(8, 8, 1.0f, buf, 1) == 0);
 }
+
+TEST_CASE("the ControlMask subrect is written in the same TYPES as the other four")
+{
+	// The runtime reads DLSSNR.ControlMaskSubrect* through the SAME parameter-block vtable slot
+	// (+0x58) as the Color/Depth/MVec/Output subrects, so writing it through a different overload
+	// would store it under a different type tag and the runtime would read a rect it never wrote —
+	// with no error, exactly as DLSSNR.Scale did.
+	Entry buf[kMaxMaskRectEntries];
+	const int n = build_mask_rect(2560, 1440, buf, kMaxMaskRectEntries);
+	REQUIRE(n == kMaxMaskRectEntries);
+
+	const std::vector<Entry> e(buf, buf + n);
+	for (const Entry &x : e)
+		CHECK(x.type == Type::i32);
+
+	REQUIRE(find(e, "DLSSNR.ControlMaskSubrectBaseX") != nullptr);
+	CHECK(find(e, "DLSSNR.ControlMaskSubrectBaseX")->i == 0);
+	CHECK(find(e, "DLSSNR.ControlMaskSubrectBaseY")->i == 0);
+	CHECK(find(e, "DLSSNR.ControlMaskSubrectWidth")->i == 2560);
+	CHECK(find(e, "DLSSNR.ControlMaskSubrectHeight")->i == 1440);
+}
+
+TEST_CASE("build_mask_rect never writes a partial rect")
+{
+	// Half a subrect is worse than none: the parameter block persists across evaluates, so the
+	// missing half would silently keep a previous frame's value.
+	Entry buf[kMaxMaskRectEntries];
+	CHECK(build_mask_rect(2560, 1440, buf, kMaxMaskRectEntries - 1) == 0);
+	CHECK(build_mask_rect(2560, 1440, nullptr, kMaxMaskRectEntries) == 0);
+}
+
+TEST_CASE("build_rects does NOT emit a ControlMask rect")
+{
+	// The four rects are mandatory; the mask's is optional and must not appear unless a mask is
+	// actually bound.
+	Rects r;
+	r.color_width = 2560; r.color_height = 1440;
+	r.guide_width = 1280; r.guide_height = 720;
+	r.output_width = 2560; r.output_height = 1440;
+	const std::vector<Entry> e = rects(r);
+	CHECK(find(e, "DLSSNR.ControlMaskSubrectWidth") == nullptr);
+}

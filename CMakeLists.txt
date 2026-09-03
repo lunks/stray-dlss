@@ -231,6 +231,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/nr_hook.hpp
         src/nr_stage.cpp
         src/nr_stage.hpp
+        src/nr_mask.cpp
+        src/nr_mask.hpp
         src/ext_unhook.cpp
         src/ext_unhook.hpp
         src/input_dump.cpp
@@ -306,6 +308,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
                    main cs_5_0 g_gbuffer_resolve_dxbc)
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
+                   main cs_5_0 g_nr_mask_dxbc)
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -386,6 +390,10 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         # The NR present stage's D3D12 half: the staging texture and the two copies. NGX-free on
         # purpose (src/nr_stage.hpp), which is the only reason the harness can judge it at all.
         src/nr_stage.cpp
+        # The ControlMask fill: one committed texture and one compute dispatch, NGX-free for the
+        # same reason (src/nr_mask.hpp), so the debug layer can judge whether it stores as well
+        # as records.
+        src/nr_mask.cpp
         # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
         # 2026-09-02), so the harness that links present_owner must also link perf.
         src/perf.cpp
@@ -407,6 +415,8 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
+    compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
+                   main cs_5_0 g_nr_mask_dxbc)
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/warp_probe.hlsl"
                    main cs_5_0 g_warp_probe_dxbc)
 
