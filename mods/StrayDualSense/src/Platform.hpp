@@ -27,6 +27,15 @@ std::wstring GameBinariesDir();
 // The directory this mod's DLL lives in. Trailing separator included.
 std::wstring ModuleDir(const void* addressInsideThisModule);
 
+// The module an address belongs to: its load address (an HMODULE IS the base address) and its
+// full path. A UE4 crash dump line is `<module> 0x<base> + <offset>` and nothing more, so both
+// halves are what makes a dump readable: the path's filename is the name the dump prints, and
+// the base is what a dump's base must match for the crash to be ours. Logging the pair once at
+// startup also catches the one silent failure of the naming scheme - a stale dlls/main.dll,
+// which UE4SS loads in preference to dlls/<ModName>.dll. False (and both outputs left empty) if
+// the address belongs to no loaded module.
+bool ModuleIdentity(const void* addressInsideThisModule, const void*& base, std::wstring& path);
+
 // The game executable's loaded image: base address and SizeOfImage, read from its own PE
 // headers. Used to decide whether a pointer is a function in the game (a vtable entry) or a
 // heap object, which is what makes the FAudioDevice search safe (SubmixDiscovery.hpp).

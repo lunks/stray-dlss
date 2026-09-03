@@ -62,6 +62,43 @@ void Runtime::Startup(const void* addressInsideThisModule)
     SDS_LOG_INFO("  game binaries dir: %ls", m_gameDir.c_str());
     SDS_LOG_INFO("  mod dir          : %ls", m_modDir.c_str());
 
+    // WHAT A CRASH DUMP WILL CALL US. A UE4 dump line is `<module> 0x<base> + <offset>` and
+    // nothing else, so the DLL's filename and its load address ARE the identity. Until
+    // 2026-09-03 both C++ plugins shipped as dlls/main.dll and every dump said `main`; working
+    // out which mod that was cost real time. We now ship dlls/StrayDualSense.dll (UE4SS falls
+    // back to dlls/<ModName>.dll - CMakeLists.txt has the chain), so the name should read
+    // `StrayDualSense`.
+    //
+    // This line is also the detector for the one silent failure of that scheme: UE4SS prefers
+    // dlls/main.dll whenever it exists, so a stale one left behind by an older install is loaded
+    // INSTEAD of this build, and nothing else would say so.
+    const void*  selfBase = nullptr;
+    std::wstring selfPath;
+    if (ModuleIdentity(addressInsideThisModule, selfBase, selfPath))
+    {
+        std::wstring file = selfPath;
+        const size_t slash = file.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            file = file.substr(slash + 1);
+        const size_t dot = file.find_last_of(L'.');
+        const std::wstring moduleName = dot == std::wstring::npos ? file : file.substr(0, dot);
+        SDS_LOG_INFO("  module identity  : StrayDualSense is loaded at base 0x%016llx from %ls -- a UE4 "
+                     "crash dump will name this module `%ls`, so a `%ls 0x<base> + <offset>` line with "
+                     "that base is OURS and the offset is the RVA; symbolize it against "
+                     "StrayDualSense.pdb.%s",
+                     reinterpret_cast<unsigned long long>(selfBase), selfPath.c_str(),
+                     moduleName.c_str(), moduleName.c_str(),
+                     moduleName == L"StrayDualSense"
+                         ? ""
+                         : " WARNING: that is not `StrayDualSense`. A stale dlls/main.dll is being "
+                           "loaded in preference to dlls/StrayDualSense.dll - delete it, or dumps "
+                           "stay ambiguous.");
+    }
+    else
+        SDS_LOG_WARN("  module identity  : GetModuleHandleEx could not name our own module; a crash "
+                     "dump's `<module> + <offset>` line cannot be attributed to StrayDualSense from "
+                     "this log");
+
     // MEASURED 2026-09-02: a deploy once wrote the ini to the mod's ROOT while only the DLL's
     // own directory and the game directory were searched, and the run silently used the
     // defaults. The mod root is the conventional place for a UE4SS mod's config, so it is

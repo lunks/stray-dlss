@@ -23,8 +23,13 @@ are compiled under mingw by CI as the fast proxy for the MSVC build.
 ## Install
 
 1. Build (CI: `.github/workflows/dlss-plugin.yml`, artifact `stray-dlss-plugin`).
-2. Copy `StrayDLSS/` into `<game>/ue4ss/Mods/` (`dlls/main.dll`, `StrayDLSS.ini`); add
-   `StrayDLSS : 1` to `ue4ss/Mods/mods.txt` **above** the `Keybinds` line.
+2. Copy `StrayDLSS/` into `<game>/ue4ss/Mods/` (`dlls/StrayDLSS.dll`, `dlls/StrayDLSS.pdb`,
+   `StrayDLSS.ini`); add `StrayDLSS : 1` to `ue4ss/Mods/mods.txt` **above** the `Keybinds` line.
+   **Delete any `dlls/main.dll` and `dlls/main.pdb` from an older install**, before or instead of
+   copying — UE4SS loads `dlls/main.dll` in preference to `dlls/StrayDLSS.dll` (CppMod.cpp:24-35),
+   so a leftover one silently keeps running the old build and every crash dump goes back to
+   saying `main`. The startup line `module identity:` in `stray-dlss-plugin.log` names the module
+   the game actually loaded, and warns if it is not `StrayDLSS`.
 3. `nvngx_dlss.dll` (and `nvngx_dlssnr.dll` for NR) beside the game executable, as for the add-on.
 4. Launch with UE4SS loading (`dwmapi=n,b`) and `-dx12`. **DXGI must be DXVK's, never
    wine-builtin** — the game's D3D12 is vkd3d-proton, and wine-builtin DXGI (`dxgi=b`) cannot

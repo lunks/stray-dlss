@@ -12,7 +12,12 @@
 #     twice (docs/STRAY-DUALSENSE.md §12), and two writers of the pad's WASAPI endpoint means
 #     whichever opened last wins.
 #  3. Sets `StrayDualSense : 1` in mods.txt and installs the plugin at
-#     ue4ss/Mods/StrayDualSense/dlls/main.dll.
+#     ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.dll — NOT main.dll. A UE4 crash dump names
+#     a module by its filename, and both C++ plugins used to be main.dll, so no dump could say
+#     which had crashed. UE4SS falls back to dlls/<ModName>.dll (CppMod.cpp:24-35) and the dump
+#     then says `StrayDualSense`. It DELETES any dlls/main.dll and dlls/main.pdb first, because
+#     main.dll takes precedence whenever both exist and would silently keep running the old
+#     build under the old ambiguous name.
 #  4. Writes ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.ini with the keys 0.4.0 reads.
 #     There are no modes any more: the engine's own submixes are the only source, the reroute
 #     and the DebugPS5Haptic gate are always on, and Sony's API is the only speaker route.
@@ -177,6 +182,12 @@ fi
 # ---------------------------------------------------------------------------------------
 if [ -z "$DLL" ]; then
   for c in \
+      "./StrayDualSense.dll" \
+      "./StrayDualSense/dlls/StrayDualSense.dll" \
+      "./stray-dualsense-plugin/StrayDualSense/dlls/StrayDualSense.dll" \
+      "$HOME/Downloads/StrayDualSense/dlls/StrayDualSense.dll" \
+      "$HOME/Downloads/stray-dualsense-plugin/StrayDualSense/dlls/StrayDualSense.dll" \
+      "/tmp/stray-dualsense-plugin/StrayDualSense/dlls/StrayDualSense.dll" \
       "./main.dll" \
       "./StrayDualSense/dlls/main.dll" \
       "./stray-dualsense-plugin/StrayDualSense/dlls/main.dll" \
@@ -188,7 +199,7 @@ if [ -z "$DLL" ]; then
 fi
 [ -n "$DLL" ] && [ -f "$DLL" ] || fail "no plugin DLL found. Download the 'stray-dualsense-plugin'
   artifact from the StrayDualSense CI run and pass it:
-      $0 --dll /path/to/StrayDualSense/dlls/main.dll"
+      $0 --dll /path/to/StrayDualSense/dlls/StrayDualSense.dll"
 
 say "deploying StrayDualSense"
 say "  game dir : $GAME"
@@ -203,14 +214,49 @@ set_mod StrayTriggers 0
 set_mod StrayDualSense 1
 
 mkdir -p "$MODS/StrayDualSense/dlls"
-if cmp -s "$DLL" "$MODS/StrayDualSense/dlls/main.dll"; then
-  say "  main.dll is already this build"
+
+# THE STALE main.dll GOES FIRST, and the order is deliberate. UE4SS tries dlls/main.dll before
+# dlls/StrayDualSense.dll (CppMod.cpp:24-35), so while both exist the OLD build is what loads —
+# silently, under the old ambiguous module name `main`. Removing it before the copy means the
+# only window is one where NO dll is present, in which UE4SS says so loudly ("dlls folder must
+# contain either main.dll or StrayDualSense.dll") instead of running something unexpected. The
+# game is already dead at this point in the script, so nothing observes the window anyway.
+for stale in "$MODS/StrayDualSense/dlls/main.dll" "$MODS/StrayDualSense/dlls/main.pdb"; do
+  if [ -e "$stale" ]; then
+    rm -f "$stale" && note "removed stale $stale (UE4SS would have loaded it in preference)"
+  fi
+done
+
+if cmp -s "$DLL" "$MODS/StrayDualSense/dlls/StrayDualSense.dll"; then
+  say "  StrayDualSense.dll is already this build"
 else
-  cp -f "$DLL" "$MODS/StrayDualSense/dlls/main.dll" || fail "could not install main.dll"
-  note "installed $MODS/StrayDualSense/dlls/main.dll"
+  cp -f "$DLL" "$MODS/StrayDualSense/dlls/StrayDualSense.dll" || fail "could not install StrayDualSense.dll"
+  note "installed $MODS/StrayDualSense/dlls/StrayDualSense.dll"
 fi
-PDB="${DLL%.dll}.pdb"
-[ -f "$PDB" ] && cp -f "$PDB" "$MODS/StrayDualSense/dlls/main.pdb"
+
+# The PDB keeps its own name too — the artifact ships StrayDualSense.pdb, which is exactly the
+# basename the DLL's debug directory records (/PDBALTPATH), and a symbolizer looks for that name
+# next to the DLL. Installing it as main.pdb is what made the 2026-09-03 crash unsymbolizable
+# until it was renamed by hand. `${DLL%.dll}.pdb` covers a hand-built DLL under another name.
+PDB=""
+for c in "$(dirname "$DLL")/StrayDualSense.pdb" "${DLL%.dll}.pdb"; do
+  [ -f "$c" ] && { PDB="$c"; break; }
+done
+if [ -n "$PDB" ]; then
+  cp -f "$PDB" "$MODS/StrayDualSense/dlls/StrayDualSense.pdb"
+  note "installed $MODS/StrayDualSense/dlls/StrayDualSense.pdb (the name the DLL records)"
+else
+  say "  no PDB beside the DLL; a crash dump will give RVAs but no symbols"
+fi
+
+# Belt and braces: whatever happened above, the layout the game sees must have exactly one DLL
+# and it must be the named one. This is the check that a future edit cannot quietly undo.
+if [ -e "$MODS/StrayDualSense/dlls/main.dll" ]; then
+  fail "$MODS/StrayDualSense/dlls/main.dll still exists; UE4SS would load it instead of
+  StrayDualSense.dll and every crash dump would go back to saying \`main\`"
+fi
+[ -f "$MODS/StrayDualSense/dlls/StrayDualSense.dll" ] ||
+  fail "$MODS/StrayDualSense/dlls/StrayDualSense.dll is missing after install"
 
 # ---------------------------------------------------------------------------------------
 # 4. The ini, NEXT TO THE DLL.

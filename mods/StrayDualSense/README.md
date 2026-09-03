@@ -76,9 +76,14 @@ I/O there: they fold, meter and write a lock-free ring, and nothing else.
 ## Install
 
 1. Build the DLL (CI: `.github/workflows/dualsense.yml`, artifact `stray-dualsense-plugin`).
-2. `<gamedir>/ue4ss/Mods/StrayDualSense/dlls/main.dll`, and `StrayDualSense : 1` in
-   `ue4ss/Mods/mods.txt`. `tools/dualsense/deploy-submix-spike.sh` does this and retires the
-   shim arrangement (below) in the same run.
+2. `<gamedir>/ue4ss/Mods/StrayDualSense/dlls/StrayDualSense.dll` (with `StrayDualSense.pdb`
+   beside it), and `StrayDualSense : 1` in `ue4ss/Mods/mods.txt`.
+   `tools/dualsense/deploy-submix-spike.sh` does this and retires the shim arrangement (below)
+   in the same run. **Delete any `dlls/main.dll` and `dlls/main.pdb` from an older install** —
+   UE4SS loads `dlls/main.dll` in preference to `dlls/StrayDualSense.dll` (CppMod.cpp:24-35), so
+   a leftover one silently keeps running the old build and every crash dump goes back to saying
+   `main`. The `module identity  :` line in `stray-dualsense.log` names the module the game
+   actually loaded, and warns if it is not `StrayDualSense`.
 3. **Remove the shim arrangement**: restore the original `libScePad.dll` (rename
    `libScePad_orig.dll` back) and disable the `StrayTriggers` Lua mod. Both would fight this
    plugin for the pad and for the HID report.

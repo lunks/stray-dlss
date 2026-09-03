@@ -155,8 +155,17 @@ target_compile_definitions(StrayDualSense PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 set_property(TARGET StrayDualSense PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
-# UE4SS loads <Mods>/<ModName>/dlls/main.dll, falling back to <ModName>.dll
-# (UE4SS/src/Mod/CppMod.cpp). CI stages it under the former name.
+# THE FILENAME IS THE MODULE'S IDENTITY IN A CRASH DUMP, so it is StrayDualSense.dll and CI stages it
+# under exactly this name. UE4SS tries <Mods>/<ModName>/dlls/main.dll first and falls back to
+# dlls/<ModName>.dll (CppMod.cpp:24-35 at the pinned SHA 68caddcf, "dlls folder must contain
+# either main.dll or {}"), where <ModName> is the mod DIRECTORY name verbatim
+# (UE4SSProgram.cpp:1422, path().stem()) and is still intact at that point because Mod::Mod
+# COPIES it (Mod.cpp:45, `m_mod_name(mod_name)`) rather than moving it. Under Mods/StrayDualSense/ the
+# fallback therefore resolves, and a UE4 dump says `StrayDualSense 0x<base> + <rva>` rather than the
+# `main` that no dump could attribute while both C++ plugins were deployed.
+#
+# main.dll WINS whenever both files exist, and silently. Every install path must DELETE a stale
+# dlls/main.dll and dlls/main.pdb rather than write this beside them.
 set_target_properties(StrayDualSense PROPERTIES OUTPUT_NAME "StrayDualSense")
 
 if(MSVC)
@@ -165,5 +174,22 @@ if(MSVC)
     # shared between objects, and CMake+Ninja gives every object of this target the same /Fd.
     # /DEBUG below still emits the full PDB from the embedded per-object records.
     target_compile_options(StrayDualSense PRIVATE /Z7)
-    target_link_options(StrayDualSense PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    #
+    # /PDBALTPATH IS THE HALF THAT MAKES A CRASH DUMP READABLE, and it is not the same lever as
+    # the PDB's filename. The linker writes the file wherever /PDB says (here: StrayDualSense.pdb, next
+    # to the DLL) and stamps a SEPARATE string into the PE's debug directory - by default the
+    # absolute build-machine path, e.g.
+    # `D:\a\stray-dlss\stray-dlss\build\StrayDualSense\StrayDualSense.pdb`. That string is what a symbolizer
+    # looks for, so it has to be a name the shipped tree actually has.
+    #
+    # It matters here because a dump gives a module name, a base and an offset and nothing else;
+    # the DLL's own filename now carries the name (above), and this record is what turns the
+    # offset into a symbol. On 2026-09-03 symbolizing only worked after the shipped main.pdb was
+    # renamed by hand to the basename recorded here.
+    #
+    # So: record a BARE basename (resolved next to the DLL, on any machine) and have CI ship the
+    # PDB under exactly that name rather than as main.pdb. `tools/pe_debug_dir.py --expect
+    # StrayDualSense.pdb` asserts the record in the BUILT artifact, because a rename that left the debug
+    # directory saying something else would look fixed and not be.
+    target_link_options(StrayDualSense PRIVATE /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:StrayDualSense.pdb)
 endif()

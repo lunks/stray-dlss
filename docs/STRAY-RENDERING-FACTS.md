@@ -706,6 +706,45 @@ the UE4 minidump (`Saved/Crashes/UE4CC-…EA9444C2…`, the 02:41 run) against t
 `main.pdb` and the box's own wine DLLs, with `llvm-symbolizer`. No launch was needed to root-cause
 it. HARD unless marked.
 
+> **NEITHER PLUGIN IS CALLED `main` ANY MORE (2026-09-03).** Both C++ plugins used to deploy as
+> `<Mods>/<Name>/dlls/main.dll`, so both loaded as a module literally named `main` and a UE4 dump
+> (`main 0x00006ffff4720000 + 771f6`) could not say which had crashed. Working that out cost real
+> time, and symbolizing then only worked after the shipped `main.pdb` was renamed by hand to the
+> basename the DLL's debug directory recorded (`…\build\StrayDLSS\StrayDLSS.pdb`, an absolute
+> path from the CI machine). Three changes, in order of how much they matter:
+>
+> 1. **The DLL ships under its own name: `dlls/StrayDLSS.dll`, `dlls/StrayDualSense.dll`.** A dump
+>    names a module by its FILENAME, so this is the identity itself rather than a way to recover
+>    it. `main.dll` was never required — **HARD**, three files at the pinned UE4SS SHA 68caddcf:
+>    `CppMod.cpp:24-35` tries `dlls/main.dll` first and falls back to `dlls/<ModName>.dll`
+>    (*"dlls folder must contain either main.dll or {}"*); `<ModName>` is the mod DIRECTORY name
+>    verbatim (`UE4SSProgram.cpp:1422`, `path().stem()`); and it is still intact at that point
+>    because `Mod::Mod` **copies** it (`Mod.cpp:45`, `m_mod_name(mod_name)`) rather than moving it,
+>    which is the one thing that could have made the fallback resolve to `.dll`. Only the mod
+>    DIRECTORY scan is rigid (non-directories are skipped in both discovery loops).
+>
+>    **`main.dll` wins whenever both files exist, and silently** — the old build would keep
+>    loading under the old name. So every install path *deletes* `dlls/main.dll` and
+>    `dlls/main.pdb` rather than writing beside them: both CI staging steps refuse to ship a
+>    `main.*` at all, `tools/dualsense/deploy-submix-spike.sh` removes them BEFORE it copies (the
+>    only window is one with no DLL, where UE4SS complains loudly, rather than one where the wrong
+>    DLL wins), and both READMEs say so.
+> 2. **The PDB is `StrayDLSS.pdb` / `StrayDualSense.pdb`, in the file AND in the artifact.**
+>    `/PDBALTPATH:<Name>.pdb` is the only lever that changes the string in the debug directory —
+>    the linker's default is its own absolute build path — and a symbolizer looks for exactly that
+>    basename next to the binary. `tools/pe_debug_dir.py --expect/--expect-dll` asserts both the
+>    recorded PDB name and the shipped DLL's filename, on the built DLL and again on the staged
+>    artifact, because a rename that left either half stale would look fixed and not be.
+> 3. **Each plugin logs `module identity:` once at startup** with the module name the dump will
+>    print, its load base and its path — and WARNs when that name is not its own, which is the
+>    only detector for a stale `main.dll` being loaded in preference to this build.
+>
+> **A second, independent signal already existed and still does:** the PE's **export directory**
+> records the link-time name (`StrayDLSS.dll` / `StrayDualSense.dll`), and it survives any rename
+> of the file — so a `main.dll` from an older install, found on the box or attached to a bug
+> report, can still be identified with `dumpbin /EXPORTS` or a few lines of Python. Two ways to
+> name a module beats one.
+
 **The faulting instruction.** Exception thread context: `Rip = libvkd3d-1.dll+0x3e7b0`,
 `Rcx = 0`, code `c0000005` reading `0x0`. That RVA is `vkd3d_instance_get_vk_instance`, whose
 entire body is `mov rax,[rcx]; ret` — it dereferences its argument. Its caller is **wine-builtin**

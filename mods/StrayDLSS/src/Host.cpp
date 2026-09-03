@@ -383,7 +383,41 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 	STRAY_LOG_INFO("StrayDLSS %s attaching (UE4SS C++ mod, the HOST): mod dir %s, game dir %s",
 		STRAY_DLSS_PLUGIN_VERSION_STRING, sds::Narrow(mod_dir).c_str(), sds::Narrow(game_dir).c_str());
 
-	// The DLL lives at <Mod>/dlls/main.dll but StrayDLSS.ini sits at the mod ROOT (<Mod>/), the
+	// WHAT A CRASH DUMP WILL CALL US. A UE4 dump line is `<module> 0x<base> + <offset>` and
+	// nothing else, so the DLL's filename and its load address ARE the identity. Until
+	// 2026-09-03 both C++ plugins shipped as dlls/main.dll and every dump said `main`; working
+	// out which mod that was cost real time. We now ship dlls/StrayDLSS.dll (UE4SS falls back to
+	// dlls/<ModName>.dll - CMakeLists.txt has the chain), so the name should read `StrayDLSS`.
+	//
+	// This line is also the detector for the one silent failure of that scheme: UE4SS prefers
+	// dlls/main.dll whenever it exists, so a stale one left behind by an older install is loaded
+	// INSTEAD of this build, and nothing else would say so.
+	{
+		const void *self_base = nullptr;
+		std::wstring self_path;
+		if (sds::ModuleIdentity(reinterpret_cast<const void *>(&Start), self_base, self_path))
+		{
+			const std::string path = sds::Narrow(self_path);
+			const size_t slash = path.find_last_of("\\/");
+			std::string file = slash == std::string::npos ? path : path.substr(slash + 1);
+			const size_t dot = file.find_last_of('.');
+			const std::string module_name = dot == std::string::npos ? file : file.substr(0, dot);
+			STRAY_LOG_INFO("module identity: StrayDLSS is loaded at base 0x%016llx from %s -- a UE4 crash "
+				"dump will name this module `%s`, so a `%s 0x<base> + <offset>` line with that base is "
+				"OURS and the offset is the RVA; symbolize it against StrayDLSS.pdb.%s",
+				reinterpret_cast<unsigned long long>(self_base), path.c_str(),
+				module_name.c_str(), module_name.c_str(),
+				module_name == "StrayDLSS"
+					? ""
+					: " WARNING: that is not `StrayDLSS`. A stale dlls/main.dll is being loaded in "
+					  "preference to dlls/StrayDLSS.dll - delete it, or dumps stay ambiguous.");
+		}
+		else
+			STRAY_LOG_WARN("module identity: GetModuleHandleEx could not name our own module; a crash "
+				"dump's `<module> + <offset>` line cannot be attributed to StrayDLSS from this log");
+	}
+
+	// The DLL lives at <Mod>/dlls/StrayDLSS.dll but StrayDLSS.ini sits at the mod ROOT (<Mod>/), the
 	// UE4SS convention. mod_dir is the dll's directory, so try the parent first, then the dll
 	// dir as a fallback. (Measured 2026-09-02: the first host run looked only in dlls/, found
 	// nothing, and every key silently took its default - which left EnableNGX and NgxEvaluate

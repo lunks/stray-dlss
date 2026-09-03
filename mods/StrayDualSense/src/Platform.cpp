@@ -98,6 +98,26 @@ std::wstring GameBinariesDir()
     return DirOfModule(nullptr);
 }
 
+bool ModuleIdentity(const void* addressInsideThisModule, const void*& base, std::wstring& path)
+{
+    base = nullptr;
+    path.clear();
+    HMODULE self = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCWSTR>(addressInsideThisModule), &self))
+        return false;
+    wchar_t buf[MAX_PATH]{};
+    const DWORD n = ::GetModuleFileNameW(self, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return false;
+    // An HMODULE is the module's load address: that is what the loader hands out, and it is
+    // the same number a UE4 crash dump prints beside the module name.
+    base = static_cast<const void*>(self);
+    path.assign(buf, n);
+    return true;
+}
+
 std::wstring ModuleDir(const void* addressInsideThisModule)
 {
     HMODULE self = nullptr;
