@@ -3317,3 +3317,59 @@ the whole time.
 
 **The transferable rule: a self-validating check tells you what KIND of thing you have, never
 WHICH one.** Identity needs something that distinguishes the candidates from each other.
+
+### 36.19 `unclaimed = 0`. The fix is confirmed, and two downstream counters agree (2026-09-03)
+
+DLL `9de21f88…` (`49c1c9d`), menu, no injected input, same config. Frame 10800, 53.0 fps,
+`>33ms = 0`, **zero ERROR lines** beyond the pre-existing `nvapi -5` noise.
+
+```
+[seam] frame 9000: announced=9003 claimed=9003 unclaimed=0 orphans=0 lookalikesRefused=6542
+  overflow=0 unreadableRect=0 | notClaimed: noDispatch=0 nearMiss=0
+  | claimedButNoSR: viewUnreadable=0 deadInputs=0 roleUnresolved=0 mvFailed=0 createFailed=0 evalFailed=0
+  | evaluated=8882 | l1: resolved=0 partial=9003 fellBack=0 stale=0 faults=0 off=0
+[view] frame 10800: row135 ok=20364 bad=0 | wrongView=19870
+```
+
+| | before (`264c04c`) | after (`49c1c9d`) |
+|---|---|---|
+| `unclaimed` | 134 / 13 803 (~1.2%) | **0 / 9 003** |
+| `nearMiss` | 137 | **0** |
+| `l1: stale` | 12 309 | **0** |
+| NR `frame-gap` resets @3600 | 23 (total 25) | **1 (total 3)** |
+| `claimed` vs `announced` | 13 666 / 13 803 | **9 003 / 9 003** |
+
+**`announced == claimed` exactly, with every refusal reason at zero.** The View CB is read at b4
+on every frame, and `wrongView=19870` is the search stepping past the impostor rather than
+stopping on it.
+
+#### Two independent corroborations
+
+* **NR's `frame-gap` resets fell 23 → 1.** Each one discards feature 18's whole accumulation, and
+  they were driven by frames that published no guides — i.e. the unclaimed frames. This is the
+  downstream consumer agreeing, from a counter that knows nothing about the seam.
+* **`l1: stale` fell from ~90% of claims to 0**, which **refines §12.9's account of why it was
+  high**. The one-announcement/one-frame lag was mostly the *refusal backlog*: a frame whose
+  dispatch was refused left its announcement pending, the next frame's dispatch claimed that older
+  slot (oldest-first), and the ledger rolled one behind indefinitely — the mechanism §12.3 first
+  guessed at. With no refusals there is no backlog and the claim is the newest announcement in its
+  own frame.
+  **This does NOT weaken the announce-time architecture.** That rests on `Execute()` running
+  `Allocator.ReleaseAll()` before the queued commands are drained, and on announce (1400) and
+  dispatch-record (1152) being different threads — both still true, and neither expressed in
+  presents. A frame counter cannot tell you whether `Execute()` has returned.
+
+#### Not yet answered
+
+**Whether the flicker is gone is for the user's eyes, not this counter.** `unclaimed = 0` is the
+success criterion they set, and it is met; the image has not been judged since.
+
+#### A second, quieter error this fix also removes
+
+`wrongView` is ~1.8 per frame across all candidate dispatches, so the impostor View was being
+offered constantly and the old "first plausible hit" would take it whenever it sat on a lower
+register than the real one. **Only the subset whose rect was LARGER than the dispatch failed
+loudly** — that is the 1.2%. A wrong view whose rect was *smaller* passed the gate and fed DLSS
+another view's jitter, `ClipToPrevClip` and `CameraCut` **silently**. How often that happened on
+the real TAA dispatch specifically is not measured here, but it is the same class of error as the
+wrong velocity (§36.13.1) and it is now impossible by construction.

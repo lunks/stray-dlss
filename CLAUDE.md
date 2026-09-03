@@ -679,6 +679,15 @@ Config and saves live in the **Proton prefix**:
 > larger than the dispatch covers cannot be this one (`ue4::view_fits_dispatch`, inclusive so
 > DLAA passes, and 200% downsampling still rejected). Read **`wrongView=`** on the `[view]` line.
 >
+> **CONFIRMED ON THE BOX (facts §36.19): `announced=9003 claimed=9003 unclaimed=0 orphans=0
+> nearMiss=0`**, every refusal reason zero, 53.0 fps, no errors. Two downstream counters agree
+> independently: NR's `frame-gap` resets fell **23 -> 1**, and `l1: stale` fell from ~90% of
+> claims to **0** — which refines §12.9's account of the lag (it was mostly the refusal backlog
+> rolling the ledger one behind, not pure RHI-thread pipelining) without touching the
+> announce-time argument, which rests on `Execute()` freeing the allocator and on the two
+> threads, neither of which is expressed in presents. **Whether the flicker is gone is for the
+> user's eyes; `unclaimed = 0` is met.**
+>
 > **And it narrows row 135.** §36.14's `ok=64044 bad=0` was read as exonerating the CB search;
 > it does not. Row 135 proves the buffer IS a View uniform buffer — a shadow view satisfies all
 > three predictions, because it is one. **A self-validating check tells you what KIND of thing
