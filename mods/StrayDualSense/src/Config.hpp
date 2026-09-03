@@ -17,6 +17,7 @@
 
 #include "CoilOwner.hpp"
 #include "Log.hpp"
+#include "PadAudio.hpp"
 
 namespace sds {
 
@@ -167,6 +168,39 @@ struct Config
 
     // ---- controller speaker ----------------------------------------------------------
     bool speaker = true;
+
+    // WHICH MECHANISM SELECTS THE PAD'S AUDIO ROUTING. Read PadAudio.hpp first: the pad's
+    // default routing MUTES the internal speaker, so writing correct samples into its audio
+    // endpoint — which we do, with zero failures and megabytes streamed — reaches nothing
+    // until something selects a route.
+    //
+    //   sony   scePadSetAudioOutPath / scePadSetVolumeGain. What the retired libScePad shim
+    //          did, on this hardware, when the speaker last worked.
+    //   hid    the raw output-report claim. The fallback for a libScePad that refuses.
+    //   both   sony, then hid unconditionally.
+    //   auto   sony, escalating to hid ONLY if Sony's call failed. THE DEFAULT: the HID
+    //          claim's coil safety is argued (a disjoint bit set) rather than measured, so it
+    //          runs only in the world where the measured path is already broken.
+    //   off    write nothing. The behaviour that left the speaker silent.
+    PadSpeakerRoute padSpeakerRoute = PadSpeakerRoute::Auto;
+
+    // ScePadAudioOutPath. 3 = SPEAKER is the shim's measured-working value; do not change it
+    // on a reading of the kernel's OUTPUT_PATH_SEL table, which is a DIFFERENT enum.
+    int padSpeakerPath = kSceAudioOutPathSpeaker;
+    // ScePadVolumeGain speakerVolume and jackVolume. The shim passed 80 for both.
+    int padSpeakerGain = kSceVolumeGainDefault;
+
+    // Re-apply the routing on this cadence as well as on change. 0 = only on change, which is
+    // what the shim did (one call, and the speaker worked). Raise it only if the routing is
+    // observed being lost mid-session — libScePad writes its own reports for triggers and
+    // rumble, and whether any of them resets the audio path is UNCONFIRMED.
+    float padSpeakerReassertSeconds = 0.0f;
+
+    // The HID fallback's own values (PadSpeakerRoute = hid/both, or auto after a refusal).
+    // These are the KERNEL's numbering and have nothing to do with padSpeakerPath above.
+    int padSpeakerHidPath   = kPadSpeakerPathDefault;     // 2: speaker on, headphones alive
+    int padSpeakerHidVolume = kPadSpeakerVolumeDefault;   // 0x64
+    int padSpeakerHidPreamp = kPadSpeakerPreampDefault;   // +6 dB
 
     // ---- the pad's WASAPI endpoint ---------------------------------------------------
     // Substring of the friendly name. MEASURED: "Speakers (DualSense Wireless Controller)",

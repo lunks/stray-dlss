@@ -314,6 +314,18 @@ SubmixStatusFile = stray-dualsense-submix.txt
 Triggers = 1
 Haptics = 1
 Speaker = 1
+
+; THE PAD SPEAKER'S ROUTING. Retiring the shim (which this script does, and correctly) removed
+; the only caller of scePadSetAudioOutPath, and the pad's DEFAULT routing MUTES its internal
+; speaker - which is why the purr is felt and not heard. The plugin now makes Sony's own calls
+; itself, with the handle scePadGetHandle already gives it: no proxy, no rename.
+;   auto  scePadSetAudioOutPath/SetVolumeGain, escalating to the raw HID output-report claim
+;         ONLY if Sony's call fails. sony = never touch a HID byte. off = the silent shape.
+; Read docs/STRAY-DUALSENSE.md §16 before changing PadSpeakerPath: 3 is Sony's SPEAKER and is
+; the shim's measured-working value, and Sony's enum is NOT the kernel's.
+PadSpeakerRoute = auto
+PadSpeakerPath = 3
+PadSpeakerGain = 80
 INI_EOF
 if cmp -s "$INI_NEW" "$INI"; then
   rm -f "$INI_NEW"

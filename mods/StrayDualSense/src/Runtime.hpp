@@ -128,6 +128,17 @@ private:
     bool LoadLoopList(LoopList& list, const std::string& fileName, const char* what);
     void LoadLoopLists();
 
+    // ---- the controller speaker's ROUTING -----------------------------------------------
+    // Selects where the pad sends the audio we stream into its endpoint. Deliberately NOT
+    // hung off AudioPlayer: the routing is orthogonal to where the samples come from, and the
+    // asset-replay path is on its way out in favour of a rerouted speaker submix. Runs on the
+    // pad thread — the only thread that owns a libScePad handle. Re-applies when the pad
+    // changes, when the settings change (hot reload), or on the optional cadence.
+    void ApplySpeakerRoute(const char* why);
+    // Everything that decides what is written, folded into one value so "has anything
+    // changed" is a comparison rather than six.
+    uint64_t SpeakerRouteSignature() const;
+
     Config        m_config;
     ScePad        m_pad;
     HidMode       m_hidMode;
@@ -168,6 +179,16 @@ private:
     // UE4SS's update thread — hence the mutex.
     std::mutex         m_watchMutex;
     SubmixWatch        m_submixWatch;
+
+    // The pad-speaker routing, all touched only by the pad thread except the atomics the
+    // STATUS line reads.
+    uint64_t                   m_speakerRouteApplied = 0;   // signature last written; 0 = never
+    int32_t                    m_speakerRouteHandle  = 0;   // the handle it was written to
+    uint64_t                   m_lastSpeakerRouteMs  = 0;
+    std::atomic<bool>          m_speakerRouteSonyOk{false};
+    std::atomic<bool>          m_speakerRouteHidOn{false};
+    std::atomic<int32_t>       m_speakerRouteLastPathResult{0};
+    std::atomic<unsigned long> m_speakerRouteApplies{0};
 
     std::wstring m_gameDir;
     std::wstring m_modDir;

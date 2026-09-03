@@ -459,6 +459,123 @@ void Runtime::Shutdown()
     Log::Close();
 }
 
+// ---- the controller speaker's ROUTING ----------------------------------------------------
+//
+// THE REGRESSION THIS FIXES (docs §15, PadAudio.hpp). The retired libScePad shim called
+// scePadSetAudioOutPath(3 = SPEAKER) and scePadSetVolumeGain(80), and the pad speaker worked.
+// deploy-submix-spike.sh retired the shim and nothing has called them since, so the pad has
+// been sitting on its default routing, where the internal speaker is muted — which is exactly
+// the shape of tonight's report: our own counters say the asset loaded, the endpoint opened,
+// zero failures, megabytes streamed, and the user hears nothing.
+//
+// NO PROXY DLL IS NEEDED. The shim intercepted scePadOpen for its handle; we already hold the
+// same handle from scePadGetHandle (§11, "verified to return the same handles"), and the
+// plugin runs in the game's own process. So Sony's dll stays the SINGLE writer of pad output
+// reports and the §12 two-writers hazard never arises: we are asking it to change a setting,
+// not writing bytes beside it.
+//
+// This is deliberately NOT hung off AudioPlayer. The routing says where the pad sends what it
+// receives; it is orthogonal to whether those samples came from an extracted asset or (the
+// target shape) from a rerouted speaker submix. Wiring it to the asset player would have to
+// be unpicked the moment the asset path goes.
+
+uint64_t Runtime::SpeakerRouteSignature() const
+{
+    // Everything that decides what is written, in one comparable value — including the
+    // enable bit, so `Speaker=0` re-applies as a change rather than being silently ignored.
+    uint64_t sig = 1;   // never 0: 0 means "nothing has been applied yet"
+    sig = sig * 131 + static_cast<uint64_t>(m_config.speaker ? 1 : 0);
+    sig = sig * 131 + static_cast<uint64_t>(static_cast<int>(m_config.padSpeakerRoute));
+    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerPath);
+    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerGain);
+    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidPath);
+    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidVolume);
+    sig = sig * 131 + static_cast<uint64_t>(m_config.padSpeakerHidPreamp);
+    return sig;
+}
+
+void Runtime::ApplySpeakerRoute(const char* why)
+{
+    const PadSpeakerRoute route =
+        m_config.speaker ? m_config.padSpeakerRoute : PadSpeakerRoute::Off;
+
+    if (route == PadSpeakerRoute::Off)
+    {
+        m_hidMode.SetAudioClaim(PadAudioClaim{});
+        m_speakerRouteSonyOk.store(false, std::memory_order_relaxed);
+        m_speakerRouteHidOn.store(false, std::memory_order_relaxed);
+        SDS_LOG_INFO("pad audio: PadSpeakerRoute=%s (%s) - nothing is written, so the pad "
+                     "keeps whatever routing it has. Its DEFAULT routing mutes the internal "
+                     "speaker, so this is the configuration in which the speaker is silent.",
+                     PadSpeakerRouteName(route), why);
+        return;
+    }
+
+    bool sonyAttempted = false;
+    bool sonyOk        = false;
+    if (RouteUsesSony(route))
+    {
+        const SceVolumeGain gain =
+            BuildSceVolumeGain(m_config.padSpeakerGain, m_config.padSpeakerGain, 0);
+        ScePad::AudioRouteResult r;
+        sonyAttempted = true;
+        sonyOk        = m_pad.ApplyAudioRoute(m_config.padSpeakerPath, gain.bytes, r);
+        m_speakerRouteLastPathResult.store(r.path, std::memory_order_relaxed);
+
+        // Every result code in hex, in one line, exactly as the shim logged them. A Sony
+        // status is not a bitmask to be read leniently: 0 is success and 0x809200xx is not,
+        // and 0x80920007 in particular means "this pad has no audio" (§7) — the device-tree
+        // refusal that the GE-Proton ds5 patches exist to fix.
+        SDS_LOG_INFO("pad audio: scePadIsSupportedAudioFunction=%s0x%08X "
+                     "scePadSetAudioOutPath(%d=%s)=%s0x%08X scePadSetVolumeGain(spk=%d)=%s0x%08X "
+                     "[handle=0x%X, %s]",
+                     r.supportedRan ? "" : "(absent) ", static_cast<unsigned>(r.supported),
+                     m_config.padSpeakerPath, SceAudioOutPathName(m_config.padSpeakerPath),
+                     r.pathRan ? "" : "(absent) ", static_cast<unsigned>(r.path),
+                     m_config.padSpeakerGain,
+                     r.gainRan ? "" : "(absent) ", static_cast<unsigned>(r.gain),
+                     static_cast<unsigned>(m_pad.Handle()), why);
+
+        if (sonyOk)
+            SDS_LOG_INFO("pad audio: SONY ACCEPTED the route. The pad's internal speaker is "
+                         "selected; anything written into FL/FR of its endpoint should now be "
+                         "audible.");
+        else if (!r.pathRan)
+            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath is not exported by this "
+                          "libScePad.dll, so Sony's API cannot select the speaker.");
+        else if (static_cast<uint32_t>(r.path) == 0x80920007u)
+            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x80920007 - libScePad "
+                          "believes this pad HAS NO AUDIO. That is the device-tree refusal "
+                          "docs §7 measured: it walks for USB audio sibling interfaces with "
+                          "SetupDiGetDeviceRegistryPropertyW and finds none. It is a Proton "
+                          "problem, not ours; GE-Proton's proton-ds5-haptic series is the fix.");
+        else
+            SDS_LOG_ERROR("pad audio: scePadSetAudioOutPath returned 0x%08X (not success). "
+                          "The pad speaker will stay silent on this route.",
+                          static_cast<unsigned>(r.path));
+    }
+
+    const bool wantHid = RouteShouldWriteHid(route, sonyAttempted, sonyOk);
+    if (wantHid && route == PadSpeakerRoute::Auto)
+        SDS_LOG_WARN("pad audio: PadSpeakerRoute=auto and Sony's API did not accept the "
+                     "route, so ESCALATING to the raw HID output-report claim. It selects the "
+                     "path in valid_flag0/audio_control directly. Its coil safety is argued "
+                     "(a disjoint bit set, masked in ComposeValidFlag0) rather than measured - "
+                     "if the coils stop working, set PadSpeakerRoute=sony or off.");
+
+    m_hidMode.SetAudioClaim(BuildPadAudioClaim(wantHid, m_config.padSpeakerHidPath,
+                                               m_config.padSpeakerHidVolume,
+                                               m_config.padSpeakerHidPreamp));
+    m_speakerRouteSonyOk.store(sonyOk, std::memory_order_relaxed);
+    m_speakerRouteHidOn.store(wantHid, std::memory_order_relaxed);
+    m_speakerRouteApplies.fetch_add(1, std::memory_order_relaxed);
+
+    if (!sonyOk && !wantHid)
+        SDS_LOG_ERROR("pad audio: NOTHING selected the pad's audio route (PadSpeakerRoute=%s). "
+                      "The speaker will be silent however good the samples are. Try "
+                      "PadSpeakerRoute=hid.", PadSpeakerRouteName(route));
+}
+
 void Runtime::PadThreadMain()
 {
     // libScePad is DELAY-loaded (import #9), so at mod init it is usually not mapped yet.
@@ -492,6 +609,33 @@ void Runtime::PadThreadMain()
         else if (m_config.padPollSeconds > 0.0f)
         {
             m_pad.RefreshIfLost();
+        }
+
+        // The routing is applied HERE, on the only thread that owns a libScePad handle, and
+        // re-applied whenever the handle changes (a pad re-adopted after a disconnect loses
+        // its routing) or the settings change (hot reload, so the sony-versus-hid question
+        // is one ini edit and one keypress rather than one relaunch per arm).
+        if (m_pad.HasPad())
+        {
+            const uint64_t sig = SpeakerRouteSignature();
+            const char*    why = nullptr;
+            if (m_speakerRouteApplied == 0)              why = "pad adopted";
+            else if (m_pad.Handle() != m_speakerRouteHandle) why = "pad handle changed";
+            else if (sig != m_speakerRouteApplied)       why = "settings changed";
+            if (why != nullptr)
+            {
+                m_speakerRouteApplied = sig;
+                m_speakerRouteHandle  = m_pad.Handle();
+                m_lastSpeakerRouteMs  = NowMs();
+                ApplySpeakerRoute(why);
+            }
+            else if (m_config.padSpeakerReassertSeconds > 0.0f &&
+                     NowMs() - m_lastSpeakerRouteMs >=
+                         static_cast<uint64_t>(m_config.padSpeakerReassertSeconds * 1000.0f))
+            {
+                m_lastSpeakerRouteMs = NowMs();
+                ApplySpeakerRoute("periodic re-assert");
+            }
         }
 
         // WHILE THERE IS NO PAD, POLL FAST. MEASURED 2026-09-02: two launches of the same
@@ -770,7 +914,9 @@ void Runtime::LogStatus()
                  "hap[starts=%lu played=%lu done=%lu missing=%lu fail=%lu endpoint=%d now='%s' "
                  "compStops ok=%lu ignored=%lu padVibe=%d] "
                  "gate[open=%d writes=%lu misses=%lu] "
-                 "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s']",
+                 "spk[starts=%lu played=%lu missing=%lu fail=%lu endpoint=%d now='%s'] "
+                 "padaudio[route=%s api=%d sonyOk=%d pathResult=0x%08X hidClaim=%d applies=%lu "
+                 "fail=%lu]",
                  CoilOwnerName(coils.owner), coils.detail,
                  m_pad.HasPad() ? "yes" : "NO", m_pad.UserId(), static_cast<unsigned>(m_pad.Handle()),
                  m_pad.Probes(), m_pad.ProbeMisses(),
@@ -787,7 +933,17 @@ void Runtime::LogStatus()
                  m_hapticGateMisses.load(),
                  m_speakerStarts.load(), m_speaker.Started(), m_speaker.Missing(),
                  m_speaker.Failures(), m_speaker.EndpointFound() ? 1 : 0,
-                 m_speaker.CurrentName().c_str());
+                 m_speaker.CurrentName().c_str(),
+                 // ONE pasted STATUS line must answer "why is the pad speaker silent". The
+                 // three fields that do it: `api` says libScePad exports the routing call at
+                 // all, `sonyOk` says it accepted, and `pathResult` is its verbatim status.
+                 PadSpeakerRouteName(m_config.speaker ? m_config.padSpeakerRoute
+                                                      : PadSpeakerRoute::Off),
+                 m_pad.HasAudioApi() ? 1 : 0,
+                 m_speakerRouteSonyOk.load(std::memory_order_relaxed) ? 1 : 0,
+                 static_cast<unsigned>(m_speakerRouteLastPathResult.load(std::memory_order_relaxed)),
+                 m_speakerRouteHidOn.load(std::memory_order_relaxed) ? 1 : 0,
+                 m_pad.AudioApplies(), m_pad.AudioFailures());
 }
 
 // ---- game intent ----------------------------------------------------------------------

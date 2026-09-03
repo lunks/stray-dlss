@@ -22,6 +22,7 @@ been observed on the box. See [What is unverified](#what-is-unverified) before a
 | **Per-component stops** | `StopPS5VibrationOnAudioComponent` (~700/session) is honoured only when it names the component that is playing. `StopPS5Vibration` stops everything. | §12 |
 | **Adaptive triggers** | Reads `HKPlayerController::m_scratchablePS5TriggerEffect` (`{Mode, Value1, Value2, Value3}`, game enum space), translates the game's `EPS5TriggerEffectMode` to Sony's (they are in **different orders**), and drives `scePadSetTriggerEffect` on both sides, accumulated per side from `SetPS5TriggerActivated(State, Side)`. Both triggers stay in the mask; the per-side mode varies. | §13 |
 | **Controller speaker** | `<gamedir>/spk/<name>.f32` (mono @ 48 kHz) → FL/FR on the same endpoint through its **own** `IAudioClient`, so it mixes with the haptics rather than displacing them. The game's `SBFX_Boost` (+5 dB = ×1.7783) is a named constant. | §10 |
+| **Pad speaker ROUTING** | `scePadSetAudioOutPath(3 = SPEAKER)` + `scePadSetVolumeGain(80)`, resolved out of the libScePad the game already mapped and called with the handle `scePadGetHandle` already gives us. **The pad's default routing MUTES its internal speaker**, so without this the samples above reach the pad and go nowhere — which is exactly what was measured on 2026-09-03. `PadSpeakerRoute`. | §16 |
 
 What is **not** here, on purpose: `scePadSetVibration` (reads two bytes; structurally cannot
 carry a waveform — §12), amplitude envelopes, normalisation, master gain, the lightbar (no
@@ -249,7 +250,8 @@ and link-tested without the SDK.
 | `AssetName` | `"SoundWave /Game/.../X.X"` → `X` | unit test |
 | `HidMode` | the `valid_flag0` write and its re-assert thread | mingw compile+link |
 | `Wasapi` | finds the endpoint, opens a shared-mode 32-bit float stream | mingw |
-| `AudioPlayer` | one worker per route (coils / speaker): supersede, level, fades, loop | mingw |
+| `AudioPlayer` | one worker per route (coils / speaker): supersede, level, fades, loop. **CONDEMNED** — it replays extracted assets, which the target shape removes in favour of a rerouted speaker submix (§16) | mingw |
+| `PadAudio` | the pad-speaker routing: Sony's `ScePadAudioOutPath`/`ScePadVolumeGain`, the raw HID output-report claim, and the invariant that the claim can never touch `valid_flag0` bits 0..3 | **unit** |
 | `ScePad` | binds the game's already-mapped `libScePad.dll`; pad selection by the `connected` byte | mingw |
 | `SubmixTap` | the `ISubmixBufferListener` itself: leaked page, hand-built vtable, trampoline | mingw |
 | `SubmixDiscovery` | finding `FAudioDevice*` and calling vtable slot 16, with every check | mingw |

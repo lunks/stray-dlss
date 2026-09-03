@@ -19,12 +19,21 @@ using PFN_scePadGetHandle                = int32_t(__cdecl*)(int32_t userId, int
 using PFN_scePadSetTriggerEffect         = int32_t(__cdecl*)(int32_t handle, const void* param);
 using PFN_scePadGetControllerInformation = int32_t(__cdecl*)(int32_t handle, void* info);
 using PFN_scePadGetTriggerEffectState    = int32_t(__cdecl*)(int32_t handle, void* state);
+// The three audio entry points the retired shim called (PadAudio.hpp). The shim invoked them
+// through a generic 4x uint64 thunk; these are the narrow signatures its own comments imply:
+// the path is taken BY VALUE (libScePad_shim.c:489) and the gain BY POINTER (:495-497).
+using PFN_scePadIsSupportedAudioFunction = int32_t(__cdecl*)(int32_t handle);
+using PFN_scePadSetAudioOutPath          = int32_t(__cdecl*)(int32_t handle, int32_t path);
+using PFN_scePadSetVolumeGain            = int32_t(__cdecl*)(int32_t handle, const void* gain);
 
 HMODULE                            g_lib              = nullptr;
 PFN_scePadGetHandle                g_getHandle        = nullptr;
 PFN_scePadSetTriggerEffect         g_setTriggerEffect = nullptr;
 PFN_scePadGetControllerInformation g_getInfo          = nullptr;
 PFN_scePadGetTriggerEffectState    g_getTriggerState  = nullptr;
+PFN_scePadIsSupportedAudioFunction g_audioSupported   = nullptr;
+PFN_scePadSetAudioOutPath          g_setAudioOutPath  = nullptr;
+PFN_scePadSetVolumeGain            g_setVolumeGain    = nullptr;
 
 template <typename Fn>
 Fn Resolve(const char* name)
@@ -63,6 +72,9 @@ bool ScePad::Bind()
     g_setTriggerEffect = Resolve<PFN_scePadSetTriggerEffect>("scePadSetTriggerEffect");
     g_getInfo          = Resolve<PFN_scePadGetControllerInformation>("scePadGetControllerInformation");
     g_getTriggerState  = Resolve<PFN_scePadGetTriggerEffectState>("scePadGetTriggerEffectState");
+    g_audioSupported   = Resolve<PFN_scePadIsSupportedAudioFunction>("scePadIsSupportedAudioFunction");
+    g_setAudioOutPath  = Resolve<PFN_scePadSetAudioOutPath>("scePadSetAudioOutPath");
+    g_setVolumeGain    = Resolve<PFN_scePadSetVolumeGain>("scePadSetVolumeGain");
 
     wchar_t path[MAX_PATH]{};
     ::GetModuleFileNameW(g_lib, path, MAX_PATH);
@@ -71,6 +83,19 @@ bool ScePad::Bind()
                  "getTriggerEffectState=%p",
                  reinterpret_cast<void*>(g_getHandle), reinterpret_cast<void*>(g_setTriggerEffect),
                  reinterpret_cast<void*>(g_getInfo), reinterpret_cast<void*>(g_getTriggerState));
+    // The audio trio is what routes sound to the pad's internal speaker. §1 measured that the
+    // GAME resolves none of them, so their presence here is purely our doing — and a build
+    // where they are absent must say so once, loudly, rather than leave a silent speaker
+    // looking like a playback bug.
+    SDS_LOG_INFO("  scePadIsSupportedAudioFunction=%p setAudioOutPath=%p setVolumeGain=%p",
+                 reinterpret_cast<void*>(g_audioSupported),
+                 reinterpret_cast<void*>(g_setAudioOutPath),
+                 reinterpret_cast<void*>(g_setVolumeGain));
+    m_audioApi.store(g_setAudioOutPath != nullptr, std::memory_order_release);
+    if (g_setAudioOutPath == nullptr)
+        SDS_LOG_WARN("libScePad.dll exports no scePadSetAudioOutPath. The pad's internal "
+                     "speaker cannot be selected through Sony's API in this build; set "
+                     "PadSpeakerRoute=hid to use the raw output-report claim instead.");
 
     // GetHandle and GetControllerInformation are required: without both we cannot tell an
     // occupied slot from an empty one, and picking blindly is exactly the bug being avoided.
@@ -83,6 +108,59 @@ bool ScePad::Bind()
 
     m_bound.store(true, std::memory_order_release);
     return true;
+}
+
+// Restores exactly what tools/dualsense/libScePad_shim.c's `audio_probe` did, in its order,
+// with its values. Nothing here writes a HID byte: Sony's implementation owns the report
+// layout for this pad and this firmware.
+//
+// THE COILS CANNOT BE AFFECTED BY THIS FUNCTION. It touches only the audio routing and the
+// audio levels; the coils are driven as PCM on the endpoint's RL/RR (AudioPlayer) and their
+// mode comes from HidMode's own output report, which this never writes. The one path from
+// here to the coils would be libScePad writing a report of its own as a side effect — which
+// it does for every trigger call already, and which HidMode's periodic re-assert exists to
+// undo (§12).
+bool ScePad::ApplyAudioRoute(int outPath, const uint8_t gainBlock[8], AudioRouteResult& out)
+{
+    out = AudioRouteResult{};
+    const int32_t handle = Handle();
+    if (!IsBound() || handle <= 0)
+        return false;
+
+    out.apiPresent = (g_setAudioOutPath != nullptr);
+
+    // The capability probe runs FIRST and gates NOTHING. §7 measured it returning 0x80920007
+    // ("this pad has no audio") on a prefix with no USB audio siblings, and the point of
+    // logging it is to separate "this build cannot do pad audio" from "we asked wrong" — not
+    // to decide for us. If it says no and the path call then succeeds, the path call wins.
+    if (g_audioSupported != nullptr)
+    {
+        out.supportedRan = true;
+        out.supported    = g_audioSupported(handle);
+    }
+
+    if (g_setAudioOutPath == nullptr)
+    {
+        m_audioFailures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    out.pathRan = true;
+    out.path    = g_setAudioOutPath(handle, static_cast<int32_t>(outPath));
+
+    if (g_setVolumeGain != nullptr && gainBlock != nullptr)
+    {
+        out.gainRan = true;
+        out.gain    = g_setVolumeGain(handle, gainBlock);
+    }
+
+    // Sony returns 0 for success and 0x809200xx for everything else (§3, §5, §7). Treat only
+    // an exact zero as success: a bitmask read would call 0x80920007 a partial win.
+    const bool ok = (out.path == 0);
+    if (ok)
+        m_audioApplies.fetch_add(1, std::memory_order_relaxed);
+    else
+        m_audioFailures.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 bool ScePad::GetControllerInformation(int32_t handle, PadInfo& out) const

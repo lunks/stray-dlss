@@ -149,6 +149,13 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixlivethreshold")    submixLiveThreshold    = std::clamp(ParseFloat(val, submixLiveThreshold), 0.0f, 1.0f);
         else if (key == "submixstatusfile")       submixStatusFile       = val;
         else if (key == "speaker")                speaker                = ParseBool(val, speaker);
+        else if (key == "padspeakerroute")        padSpeakerRoute        = ParsePadSpeakerRoute(val.c_str(), padSpeakerRoute);
+        else if (key == "padspeakerpath")         padSpeakerPath         = std::clamp(std::atoi(val.c_str()), 0, 4);
+        else if (key == "padspeakergain")         padSpeakerGain         = std::clamp(std::atoi(val.c_str()), 0, 255);
+        else if (key == "padspeakerreassertseconds") padSpeakerReassertSeconds = std::clamp(ParseFloat(val, padSpeakerReassertSeconds), 0.0f, 600.0f);
+        else if (key == "padspeakerhidpath")      padSpeakerHidPath      = std::clamp(std::atoi(val.c_str()), 0, 3);
+        else if (key == "padspeakerhidvolume")    padSpeakerHidVolume    = std::clamp(ParseByte(val, padSpeakerHidVolume), kPadSpeakerVolumeMin, kPadSpeakerVolumeMax);
+        else if (key == "padspeakerhidpreamp")    padSpeakerHidPreamp    = std::clamp(std::atoi(val.c_str()), 0, kPadSpeakerPreampMax);
         else if (key == "endpointmatch")          endpointMatch          = val;
         else if (key == "hapticdir")              hapticDir              = val;
         else if (key == "spkdir")                 spkDir                 = val;
@@ -214,6 +221,16 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     hapticValidFlag0      = fresh.hapticValidFlag0;
     hapticReassertSeconds = fresh.hapticReassertSeconds;
     speaker               = fresh.speaker;
+    // LIVE, deliberately: Runtime re-applies the routing whenever these change, so the whole
+    // sony-versus-hid question can be A/B'd inside one session with one keypress per arm
+    // rather than one relaunch per arm.
+    padSpeakerRoute       = fresh.padSpeakerRoute;
+    padSpeakerPath        = fresh.padSpeakerPath;
+    padSpeakerGain        = fresh.padSpeakerGain;
+    padSpeakerReassertSeconds = fresh.padSpeakerReassertSeconds;
+    padSpeakerHidPath     = fresh.padSpeakerHidPath;
+    padSpeakerHidVolume   = fresh.padSpeakerHidVolume;
+    padSpeakerHidPreamp   = fresh.padSpeakerHidPreamp;
     submixGain            = fresh.submixGain;      // live: it is one atomic on the sink
     submixStatusSeconds   = fresh.submixStatusSeconds;
     submixWatchSeconds    = fresh.submixWatchSeconds;
@@ -240,6 +257,12 @@ void Config::LogSummary(const char* what) const
                  static_cast<double>(hapticReassertSeconds), speaker ? 1 : 0,
                  endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
                  hapticLoopsFile.c_str(), spkLoopsFile.c_str());
+    SDS_LOG_INFO("config %s: PadSpeakerRoute=%s sonyPath=%d(%s) sonyGain=%d | hid fallback "
+                 "path=%d(%s) volume=0x%02X preamp=%d",
+                 what, PadSpeakerRouteName(padSpeakerRoute), padSpeakerPath,
+                 SceAudioOutPathName(padSpeakerPath), padSpeakerGain, padSpeakerHidPath,
+                 PadAudioPathName(padSpeakerHidPath), static_cast<unsigned>(padSpeakerHidVolume),
+                 padSpeakerHidPreamp);
     SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
                  "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d "
                  "warnEvery=%.1fs watch=%.1fs liveThreshold=%.5f",

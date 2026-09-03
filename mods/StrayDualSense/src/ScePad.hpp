@@ -4,10 +4,15 @@
 // §1). A UE4SS plugin is in the same process, so it resolves the exports out of the module the
 // game has already mapped — no rename, no forwarding, no proxy DLL.
 //
-// Only the TRIGGER path goes through libScePad. Haptics do not: scePadSetVibration reads
-// exactly two amplitude bytes and structurally cannot carry a waveform (§12, RVA 0xDC50), so
-// the coils are driven as audio through WASAPI instead (AudioPlayer) once HidMode has taken
-// them out of motor emulation. There is no SetVibration here on purpose.
+// The TRIGGER path and the SPEAKER ROUTING go through libScePad. Haptics do not:
+// scePadSetVibration reads exactly two amplitude bytes and structurally cannot carry a
+// waveform (§12, RVA 0xDC50), so the coils are driven as audio through WASAPI instead
+// (AudioPlayer) once HidMode has taken them out of motor emulation. There is no SetVibration
+// here on purpose.
+//
+// The speaker routing is `ApplyAudioRoute`, restoring what the retired libScePad shim did.
+// It needs no proxy DLL: the shim intercepted `scePadOpen` for its handle, and this class
+// gets the same handle from `scePadGetHandle` (§11). See PadAudio.hpp for the evidence.
 //
 // Nothing here touches UE4SS types; this compiles against Win32 alone.
 #pragma once
@@ -83,6 +88,33 @@ public:
 
     bool GetControllerInformation(int32_t handle, PadInfo& out) const;
 
+    // ---- the controller speaker's ROUTING (PadAudio.hpp) --------------------------------
+    // True once libScePad is bound AND scePadSetAudioOutPath resolved. The three audio
+    // exports are OPTIONAL: §1 measured that the game resolves ten entry points and none of
+    // them is an audio one, so a build that lacks them must degrade to the HID fallback
+    // rather than refuse to start.
+    bool HasAudioApi() const { return m_audioApi.load(std::memory_order_acquire); }
+
+    // Calls, in the shim's order: scePadIsSupportedAudioFunction (a capability probe, logged
+    // and never gating), scePadSetAudioOutPath(path), scePadSetVolumeGain(&gain). Every
+    // result code is written into `out` so the caller logs them verbatim — a Sony result is
+    // a bitmask-ish status, and `0x80920007` specifically means "this pad has no audio" (§7).
+    // Returns true only if the PATH call itself succeeded; the gain is a level, not a route.
+    struct AudioRouteResult
+    {
+        bool    apiPresent   = false;
+        bool    supportedRan = false;
+        int32_t supported    = 0;
+        bool    pathRan      = false;
+        int32_t path         = 0;
+        bool    gainRan      = false;
+        int32_t gain         = 0;
+    };
+    bool ApplyAudioRoute(int outPath, const uint8_t gainBlock[8], AudioRouteResult& out);
+
+    unsigned long AudioApplies() const  { return m_audioApplies.load(); }
+    unsigned long AudioFailures() const { return m_audioFailures.load(); }
+
     unsigned long TriggerOk() const   { return m_trigOk.load(); }
     unsigned long TriggerFail() const { return m_trigFail.load(); }
     // How many times the slots have been probed, and how many of those found nothing. A pad
@@ -92,8 +124,12 @@ public:
 
 private:
     std::atomic<bool>    m_bound{false};
+    std::atomic<bool>    m_audioApi{false};
     std::atomic<int32_t> m_handle{0};
     std::atomic<int>     m_userId{0};
+
+    std::atomic<unsigned long> m_audioApplies{0};
+    std::atomic<unsigned long> m_audioFailures{0};
 
     std::atomic<unsigned long> m_trigOk{0};
     std::atomic<unsigned long> m_trigFail{0};

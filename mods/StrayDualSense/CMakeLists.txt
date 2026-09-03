@@ -40,6 +40,9 @@ endif()
 #                  wrong in the game on 2026-09-02, and is pure, so CI can prove the fix
 #   CoilOwner      WHO DRIVES THE COILS, from the facts - the sentence whose absence let a
 #                  silent submix pass for a working one on 2026-09-03
+#   PadAudio       the DualSense output report's AUDIO claim: which validity bits to set,
+#                  which output path routes the internal speaker, and the invariant that the
+#                  claim can never touch the coil or trigger bits (§12)
 #   SubmixWatch    correlates the engine's submix level with the game's own vibration starts -
 #                  the instrument whose absence let one silent second be read as a dead submix
 #   SubmixDsp      the submix spike's signal path: channel fold, soft clip, resampler, the
@@ -54,6 +57,8 @@ add_library(straydualsense_core STATIC
     src/Fade.hpp
     src/LoopList.cpp
     src/LoopList.hpp
+    src/PadAudio.cpp
+    src/PadAudio.hpp
     src/SubmixChoice.cpp
     src/SubmixChoice.hpp
     src/SubmixDsp.cpp
@@ -67,7 +72,7 @@ target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
 enable_testing()
-foreach(t asset_name trigger_effect loop_list fade submix_dsp submix_choice coil_owner submix_watch)
+foreach(t asset_name trigger_effect loop_list fade submix_dsp submix_choice coil_owner submix_watch pad_audio)
     add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
     target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
     target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
@@ -108,6 +113,8 @@ add_library(StrayDualSense SHARED
     src/LoopList.cpp
     src/LoopList.hpp
     src/Mod.cpp
+    src/PadAudio.cpp
+    src/PadAudio.hpp
     src/Platform.cpp
     src/Platform.hpp
     src/Runtime.cpp

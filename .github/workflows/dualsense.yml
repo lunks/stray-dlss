@@ -93,7 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/obj
-          for f in AssetName AudioPlayer CoilOwner Config HidMode Log LoopList Platform Runtime ScePad \
+          for f in AssetName AudioPlayer CoilOwner Config HidMode Log LoopList PadAudio Platform Runtime ScePad \
                    SubmixChoice SubmixDiscovery SubmixDsp SubmixSink SubmixTap SubmixWatch \
                    TriggerEffect Triggers Wasapi; do
             echo "--- $f"

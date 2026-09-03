@@ -11,8 +11,10 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   see §8.
 * **Haptics: WORKING, as real waveforms on the voice coils** — the native DualSense
   mechanism, not motor emulation. See §12, which supersedes the envelope approach in §9.
-* **Controller speaker: WORKING**, playing the game's own `_CONTROL` assets on the pad's
-  Windows audio endpoint, with the game's own +5 dB trim. See §10.
+* **Controller speaker: REGRESSED, and the cause is identified.** It worked from the
+  `libScePad` shim, which called `scePadSetAudioOutPath(3 = SPEAKER)`; retiring the shim
+  removed the only caller, and the pad's default routing MUTES its internal speaker. The
+  plugin now makes those calls itself, with no proxy DLL. **Not yet run — see §16.**
 * **Lightbar: implemented in the binary, never driven by any shipped content.** Driving it
   would be inventing a feature, not restoring one — no evidence Stray designed a behaviour.
 
@@ -521,8 +523,24 @@ The coils were in **rumble-emulation mode the whole time**. DualSense USB output
 | 0 | `COMPATIBLE_VIBRATION` |
 | 1 | `HAPTICS_SELECT` |
 | 2 / 3 | right / left trigger FFB data is valid |
-| 4 / 5 | audio volume / audio path is valid |
-| 6 / 7 | mic LED / mute |
+| 5 | `SPEAKER_VOLUME_ENABLE` |
+| 6 | `MIC_VOLUME_ENABLE` |
+| 7 | `AUDIO_CONTROL_ENABLE` |
+
+> **CORRECTED 2026-09-03 against the Linux kernel's own DualSense driver**
+> (`drivers/hid/hid-playstation.c:154-164`, `DS_OUTPUT_VALID_FLAG0_*`). Rows 4/5 and 6/7 used
+> to read "audio volume / audio path is valid" and "mic LED / mute", and **both were wrong**.
+>
+> The one that mattered: **there is no "audio path" validity bit.** The output path lives in
+> the `audio_control` BYTE at report offset 8, bits 5:4, gated by **bit 7**. Anyone acting on
+> the old table would have claimed headphone and speaker volume while supplying zeros — the
+> two-writers trap below, in its purest form — and never selected a path, leaving the speaker
+> silent while the log said the claim went out. (The mic LED and mute controls are real, but
+> they live in `valid_flag1` bits 0 and 1, not here.)
+>
+> The full corrected layout, the report offsets, the output-path routing table and the
+> `never touch bits 0..3` invariant are in `mods/StrayDualSense/src/PadAudio.hpp`, with a unit
+> test that pins them (`tests/test_pad_audio.cpp`). **This correction is why §16 exists.**
 
 With bit 0 set, the firmware **synthesises rumble on the coils** from the two motor
 amplitude bytes — so the actuators are busy emulating motors and audio sent to them goes
@@ -1025,6 +1043,29 @@ latency between the engine's mix and the coils. **This is the build left on the 
 
 ## 15. Fourth live run, 2026-09-03: `peak=0.00000` does NOT mean the submix is empty
 
+> **SETTLED 2026-09-03 by a later capture, and both open questions closed the same way.** The
+> instrument fixes below shipped, and with them the purr reproduces from a **single `Q`
+> press**:
+>
+> ```
+> 04:00:01.378  StartPS5Vibration 'CatPurr2_VIBE' level=1.000 fadeIn=1.00 loop=1(asset)
+> 04:00:01.426  StartPS5ControllerSound 'cat_purr_loop_01_CONTROL' level=1.000 fadeIn=1.00
+> 04:00:02.098  submix: FIRST REAL SIGNAL (peak 0.25548) - HANDOVER: the SUBMIX drives the coils
+> 04:01:04.222  COILS: driven by the SUBMIX | cb=17024 (46.9/s) peak=0.70795 rms=0.15550 bad=0
+> ```
+>
+> * **The handover was EARNED, not tripped on a noise floor.** `peak 0.25548` at the handover
+>   against the `1e-4` threshold, then sustained `0.70795` — the same figure §14 run A measured
+>   for a real VIBE asset. The "a handover at 0.0001 and a handover at 0.7 are completely
+>   different worlds" worry resolves to the second world. `SubmixLiveThreshold` does not need
+>   raising.
+> * **The `FindFirstOf` defect was real and its fix holds** — `hap[... padVibe=1]` with the
+>   gate open and the vibration felt. It remains an inference that it was the *cause* of the
+>   loading-screen symptom; what is now HARD is that the corrected build works.
+> * **The user FEELS the purr and HEARS nothing from the pad speaker.** That asymmetry is the
+>   subject of §16, and its cause is not in this section: the tap, the sink and the asset
+>   player were all doing their jobs.
+
 The user's report on the `da014c5` build: *"The scratch vibration is wrong. The vibration for
 the purr is right but it doesn't have sound. There is a loading screen that has a purr that
 should be purring in the controller, but it isn't."* The pasted evidence, strict `submix` +
@@ -1205,3 +1246,210 @@ Everything, on the target: the plugin has not been built by CI at the time of wr
 never been run. The `FindFirstOf` finding is HARD (read in the source CI pins) and the
 `peak`-is-one-window finding is HARD (read in this repo's own code), but **"this is why the
 user's pad felt wrong" is an inference from both, not a measurement.**
+
+---
+
+## 16. The pad speaker is a ROUTING choice, and we stopped making it — 2026-09-03
+
+### The symptom, and why it was so confusing
+
+One `Q` press fires both halves of the purr. The user **feels** it and **hears nothing** from
+the pad. Every counter we own says the speaker path worked:
+
+```
+spk[starts=1 played=1 missing=0 fail=0 endpoint=1 now='cat_purr_loop_01_CONTROL']
+sink open=1 'Speakers (DualSense Wireless Controller)' 4ch 48000Hz frames=2982240 fail=0
+```
+
+The asset was found (`spk/cat_purr_loop_01_CONTROL.f32`, 3,721,460 bytes), the pad's WASAPI
+endpoint opened, samples went in, zero failures. **We were writing correct audio into the pad
+and the pad was routing it nowhere.**
+
+### The asymmetry has a structural cause
+
+**THE COILS ARE A WAVEFORM PATH THAT NEEDS NOTHING CLAIMED; THE SPEAKER IS A ROUTING CHOICE
+THAT MUST BE CLAIMED EXPLICITLY.** §12's whole finding is that the coils take audio as soon as
+*nothing re-asserts* `COMPATIBLE_VIBRATION` — an absence is sufficient. The speaker is the
+opposite: the pad's default output path sends audio to the headphone sinks and **mutes the
+internal speaker**, and no absence ever changes that. Something has to select it.
+
+### THE REGRESSION — HARD, from the repo's own history
+
+`tools/dualsense/libScePad_shim.c:476-502` (`audio_probe`, committed in `bf87d91`) called
+Sony's own audio API, and the pad speaker worked:
+
+```c
+supp = resolve("scePadIsSupportedAudioFunction");   supp(h, 0, 0, 0)
+/* scePadSetAudioOutPath(handle, path) takes the path BY VALUE; 3 = SPEAKER
+   0 STEREO_HEADSET 1 MONO_HEADSET 2 MONO_HEADSET_SPEAKER 3 SPEAKER 4 OFF */
+path = resolve("scePadSetAudioOutPath");            path(h, 3, 0, 0)
+/* s_ScePadVolumeGain { uint8 SpeakerVol, JackVol, Reserved, MicGain } */
+unsigned char g[8] = { 80, 80, 0, 0, 0, 0, 0, 0 };
+gain = resolve("scePadSetVolumeGain");              gain(h, &g, 0, 0)
+```
+
+`tools/dualsense/deploy-submix-spike.sh` retires the shim (`libScePad.dll` ←
+`libScePad_orig.dll`) — **correctly**, because two writers of `valid_flag0` is the §12 trap —
+and **nothing has called those functions since**. The pad fell back to its default routing.
+That is the whole of "it worked as-is and it is not working right now".
+
+Note the shim also **crashed the game** calling `scePadGetContainerIdInformation` on a guessed
+struct, and its own comment says we do not need it. Do not call it.
+
+### The fix needs NO proxy DLL — `scePadGetHandle` is the reason
+
+The shim obtained its handle by intercepting `scePadOpen`, which is why it had to be a proxy.
+A UE4SS plugin cannot intercept `scePadOpen` — but it does not need to. **`ScePad::SelectPad`
+already holds a live handle from `scePadGetHandle` (§11, "verified to return the same
+handles"), confirmed live tonight as `handle=0x101`.** So the whole mechanism is four
+resolutions against a module the game has already mapped:
+
+```
+GetModuleHandleW(L"libScePad.dll")     // already in the process; never LoadLibrary a copy
+GetProcAddress: scePadGetHandle  scePadIsSupportedAudioFunction
+                scePadSetAudioOutPath  scePadSetVolumeGain
+```
+
+Full `scePad*` export list of the shipped `libScePad.dll` (md5
+`7a492fe29202487f3c94fe094f135c48`), read 2026-09-03 — all four are present:
+
+```
+scePadClose  scePadGetContainerIdInformation  scePadGetControllerInformation
+scePadGetControllerType  scePadGetHandle  scePadGetJackState  scePadGetParticularMode
+scePadGetTriggerEffectState  scePadInit  scePadIsSupportedAudioFunction  scePadOpen
+scePadRead  scePadReadState  scePadResetLightBar  scePadResetOrientation
+scePadSetAngularVelocityDeadbandState  scePadSetAudioOutPath  scePadSetLightBar
+scePadSetMotionSensorState  scePadSetParticularMode  scePadSetTiltCorrectionState
+scePadSetTriggerEffect  scePadSetVibration  scePadSetVibrationMode  scePadSetVolumeGain
+```
+
+**Why plugin-level beats a proxy, and it is not merely simpler:**
+
+* **Sony's dll stays the SINGLE writer of pad output reports.** The §12 two-writers hazard
+  never arises, because we are asking it to change a setting rather than writing bytes beside
+  it.
+* **No export forwarding.** A proxy that drops or mistypes one of 25 exports breaks the pad
+  entirely; that whole failure class disappears.
+* **No deploy surgery.** No `_orig`, no `_shim`, nothing renamed — which is the drop-in goal.
+
+### Implemented, and NOT YET RUN
+
+`[StrayDualSense] PadSpeakerRoute` = `sony` | `hid` | `both` | `auto` | `off`, default
+**`auto`**. `PadSpeakerPath = 3` (Sony's enum) and `PadSpeakerGain = 80` are the shim's
+measured values, configurable rather than baked. `ScePad::ApplyAudioRoute` runs on the pad
+thread — the only thread holding a libScePad handle — when a pad is adopted, when the handle
+changes, and when the settings change (they are hot-reloadable on purpose, so `sony` versus
+`hid` is one ini edit and one keypress rather than one relaunch per arm).
+
+Every result code is logged in hex exactly as the shim logged them, and `0x80920007` is named
+in the log as the §7 device-tree refusal rather than left as a number.
+
+### The HID fallback, and the bit table that was wrong
+
+`PadSpeakerRoute = hid` writes the routing into the USB output report ourselves. It exists
+because §7 measured `scePadSetAudioOutPath` returning `0x80920007` ("this pad has no audio")
+before the GE-Proton11-6 upgrade — libScePad decides from the device tree, and Wine exposed no
+USB audio sibling interfaces. If that ever comes back, the fallback needs no rebuild.
+
+Building it required correcting §12's bit table against `drivers/hid/hid-playstation.c`; see
+the correction note there. The routing table (kernel's own comment, `:1366-1377`):
+
+| path | headphone L | headphone R | internal speaker |
+|---|---|---|---|
+| 0 | L | R | **MUTED** — the pad's default, and our bug |
+| 1 | L | L | MUTED |
+| 2 | L | L | **R** |
+| 3 | muted | muted | **R** |
+
+**The internal speaker is fed from the RIGHT channel in every path.** `kSpeakerRoute` writes
+the mono `_CONTROL` asset into both FL and FR, so the signal is already on R — but
+"optimising" that route to FL alone would silence the pad speaker completely.
+
+**Sony's enum and the kernel's are DIFFERENT and must not be mixed.** Sony's 3 = SPEAKER; the
+kernel's 3 = "headphones muted, speaker gets R". `PadSpeakerPath` is Sony's;
+`PadSpeakerHidPath` is the kernel's.
+
+### Why the coils cannot be affected
+
+* **`sony` never writes a HID byte.** It calls two Sony functions that set audio routing and
+  audio levels. `HidMode`'s report — the one thing that decides the coils' mode — is untouched.
+* **The HID claim contributes bits 5 and 7 only**, and `ComposeValidFlag0` masks bits 0..3 out
+  of it unconditionally, so the coil-mode base (`HapticValidFlag0`, the §12 measurement) is the
+  only source of those bits. It is folded into the report `HidMode` already writes, so there is
+  no second writer. `tests/test_pad_audio.cpp` pins this over every path/volume/preamp and
+  every coil base, and over a deliberately hostile `flag0 = 0xFF`.
+* **`auto` never writes the claim speculatively** — only after Sony's API has been tried and
+  refused. In the world where the speaker works, the coils never see it at all.
+
+### The target shape, and how much of this stays bespoke
+
+The end state the user has set: **a drop-in DLL, no extracted assets, ever.** The `spk/*.f32`
+and `haptic/*.f32` files, `AudioPlayer`'s replay path,
+`tools/dualsense/ue4_soundwave_extract.py` and the `SpkDir`/`HapticDir` settings are all
+**condemned** — they were a workaround for a submix that would not render, and §14's reroute is
+the actual fix. Extracted game audio in a mod directory is also redistribution of Stray's
+assets, which `CLAUDE.md` already forbids.
+
+**The speaker submix is dead for the IDENTICAL reason as the vibration one** (§14):
+`ControllerEndpointSubmix` has `EndpointType = "Pad Speaker Output"`, hits the same
+`IAudioEndpointFactory::Get` dummy factory, and `ProcessAudioAndSendToEndpoint` returns before
+touching a child. So the same reroute should work on it. Order, and do not collapse it:
+
+1. **Prove the speaker ROUTES.** Orthogonal to where the samples come from — this section.
+2. **Reroute the speaker submix** and switch the source from replayed files to the live tap.
+3. **Delete** the asset player, the extracted files, the extraction tooling and their settings.
+
+**One consequence to face rather than discover:** the asset path is currently also the fallback
+when the submix tap fails to bind. Under the target shape there is no fallback — a failed tap
+is a silent pad. That is the right trade (a silent pad that says why beats a pad that
+pretends), but it makes the tap's refusal reporting **load-bearing**: `COILS:` and `spk[]` must
+name the failure, not merely report zeros.
+
+**How generic is this really?** Honestly: mostly, but not entirely.
+
+* **Passive bridging**, and it is the bulk of it: tapping a submix the engine mixes and pushing
+  it at the channel pair the hardware expects; asking Sony's dll to select a route.
+* **Not passive**, and it cannot be: the **reroute mutates the engine's audio graph**
+  (re-parenting a submix and calling `RegisterSoundSubmix`), the `DebugPS5Haptic` gate **writes
+  a Blueprint property**, and the trigger path **translates a genuine enum permutation**
+  between the game's `EPS5TriggerEffectMode` and Sony's (§13).
+
+Those three exist because parts of the PS5 path are structurally *absent* on PC rather than
+merely switched off — **you cannot bridge a stream that was never produced.** The dead endpoint
+submixes have no factory, the Blueprint gate is false, and nothing ever sets the
+`PS5TriggerEffect` device property. Making the engine produce the stream is the minimum
+intervention, not an embellishment.
+
+### UNVERIFIED — everything in this section
+
+Per §0.3: **none of it has run.** The plugin has not been built by CI at the time of writing
+and the routing has never been applied in the game. What is HARD is the shim's source (read in
+this repo), the export list (read from the shipped DLL), the kernel's bit layout (read in
+mainline) and the pure logic (tested in CI). **"This is why the pad speaker was silent" is an
+inference from all four, not a measurement.**
+
+### The one-run test
+
+Deploy the build, press `Q` once at a checkpoint, then against
+`<gamedir>/stray-dualsense.log`:
+
+```sh
+L=stray-dualsense.log
+grep -n "pad audio:"        "$L"     # the decider
+grep -o "padaudio\[[^]]*\]" "$L" | tail -3
+grep -o "spk\[[^]]*\]"      "$L" | tail -3
+grep -n "AUDIO CLAIM"       "$L" | head -3   # only if it escalated to hid
+```
+
+| what the log says | reading |
+|---|---|
+| `scePadSetAudioOutPath(3=SPEAKER)=0x00000000` + `SONY ACCEPTED` | claimed and, if the purr is audible, **done** |
+| `SONY ACCEPTED` but still silent | routing is right and the fault is downstream — levels, the endpoint's FL/FR, or the two WASAPI clients on one endpoint |
+| `=0x80920007` | libScePad refuses: "this pad has no audio" (§7, device tree). `auto` escalates to the HID claim on its own; read the `AUDIO CLAIM` line next |
+| `=0x8092xxxx` (other) | asked wrong. `scePadIsSupportedAudioFunction`'s hex on the same line says whether the capability is there at all |
+| `(absent)` on `scePadSetAudioOutPath` | this libScePad has no such export; set `PadSpeakerRoute=hid` |
+| no `pad audio:` line at all | no pad was adopted — read `pad=NO` in STATUS, not this section |
+
+**And in every case check that `COILS: driven by the SUBMIX` and the peaks are unchanged.** If
+the coils regressed, set `PadSpeakerRoute=sony` (which never writes a HID byte) or `off`, and
+report it — that would be the first evidence against the claim's safety argument.
