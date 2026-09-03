@@ -292,7 +292,12 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	nrmaskplan::Plan mask_plan;
 	{
 		const nrmaskplan::Config cfg = mask_config();
-		const nrmaskplan::FormatSupport fs = nrmask::probe(device);
+		// The probe is only run when the mask is actually wanted. It logs once, and a session with
+		// NgxNRMask=0 should produce no mask lines at all — an off feature that still writes to
+		// the log is how a log stops being readable.
+		nrmaskplan::FormatSupport fs;
+		if (cfg.enabled)
+			fs = nrmask::probe(device);
 		mask_plan = nrmaskplan::plan_mask(cfg, plan.width, plan.height, fs);
 
 		if (mask_plan.result == nrmaskplan::MaskResult::ok)
