@@ -360,3 +360,18 @@ any NaN inherits `LocalStructureStrength`, while local itself passes through.
 So binding a mask does **not** slave skin to local structure; it retires the resolved pair and
 leaves the texture as the only spatial control. Both branches are transcribed in
 `src/core/nr_mask_plan.cpp` and pinned in `tests/test_nr_mask_plan.cpp`. **HARD.**
+
+### 8.7 Toggling the mask resets the temporal history; changing its values does not
+
+`CG2R_ResetTemporalHistoryOnControlChange` (0x1800179d0) compares exactly seven fields of the
+input struct against the previous frame's snapshot, with epsilon 1e-5 (0x1800afc20), and forces
+`DLSSNR.Reset = 1` on any difference: **+0xe4 LocalToneStrength, +0xe8 LocalStructureStrength,
++0xec Style, +0xf0 UseAutoMask, +0xf4 raw SkinStructureStrength, +0xf8 resolved skin, +0xfc
+resolved local**. `Intensity` (+0xe0) is not among them — which confirms CLAUDE.md's existing note
+that Intensity is the one strength knob that does not cost a reset — and neither is the
+ControlMask pointer itself.
+
+**But binding a mask moves three of the seven** (UseAutoMask 1 -> 0, and both resolved strengths
+to -1.0), so `NgxNRMask` 0 -> 1 and 1 -> 0 each wipe feature 18's accumulation for a frame.
+Changing what the mask CONTAINS moves none of them. So a mask-value A/B is clean and immediate,
+while an on/off A/B has to be judged a second or two after the toggle. **HARD.**

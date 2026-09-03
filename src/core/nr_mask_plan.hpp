@@ -48,6 +48,23 @@
 // documented in CLAUDE.md as feeding its flag channel from the raw value when the resolved pair is
 // negative, so the global knob is not lost — only the resolved pair is.)
 //
+// TOGGLING THE MASK COSTS A TEMPORAL HISTORY RESET; CHANGING ITS VALUES DOES NOT. [HARD]
+// `CG2R_ResetTemporalHistoryOnControlChange` (0x1800179d0) compares the previous frame's controls
+// against this frame's with epsilon 1e-5 and forces `DLSSNR.Reset = 1` on any difference. Read off
+// its own compare sites, the list is exactly seven fields of the input struct: +0xe4 LocalTone,
+// +0xe8 LocalStructure, +0xec Style, +0xf0 UseAutoMask, +0xf4 raw Skin, +0xf8 resolved skin,
+// +0xfc resolved local. Intensity (+0xe0) is not in it, and neither is the ControlMask POINTER.
+//
+// But binding a mask moves THREE of those seven — UseAutoMask 1 -> 0 and both resolved strengths
+// to -1.0 — so turning the mask on, and turning it off again, each wipe feature 18's accumulation
+// for a frame. Changing what the mask CONTAINS moves none of them.
+//
+// The operational consequence, and it decides how the A/B has to be run: a mask VALUE comparison
+// is clean and immediate, while an on/off comparison carries a reset and must be judged a second
+// or two after the toggle, never on the frame it changes. This is the same trap CLAUDE.md records
+// for the structure sliders ("set the value, release, wait 1-2 s, THEN judge"), reached by a
+// different route.
+//
 // WHAT WE DELIBERATELY DO NOT BIND, and it is worth recording as a closed door rather than an
 // unexplored one: `DLSSNR.BidirectionalDistortionField` is read into the same struct at +0xc0 and
 // is then TOUCHED EXACTLY ONCE more in the entire module — `cmp qword ptr [rbp+0xe0], 0` at
