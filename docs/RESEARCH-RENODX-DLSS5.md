@@ -616,3 +616,258 @@ confirmed correct on target per staging (CLAUDE.md §3).
   RHI/DLSS5-Feeder/dlss5-dx11-bridge/dlssnr-signature-repair GitHub repos, techspot). The
   addon's self-reported `v4.1.5` / `DLSSNR v310.8.0` overlay text is independently attested by
   users quoting it on nexusmods.com/site/mods/2224.
+
+---
+
+## 9. The Kim2091 / "Sparkles" DLSS-NR implementation, diffed against ours — a temporal-stability audit
+
+**Why this section exists.** On 2026-08-31 the shipping mod `xoxor4d/gta4-rtx` v1.5.2 replaced the
+user's own DLSS 5 integration — the one our NR path is a port of — with a different one, saying:
+*"Dropped the initial DLSS 5 integration from lunks; squashed and cherry-picked Sparkles'
+implementation. **Reduces shadow flickering and makes everything much more stable.**"* That
+replacement is `Kim2091/dxvk-remix` branch `gta4-atmos-dlss5`, four commits (`a17f313c`,
+`f9688d60`, `10fa0368`, `5e54f7bc`; the same four appear as `6c9c98ec` / `a69254ab` / `2df9c812` /
+`471ff6c2` on `RemixProjGroup/dxvk-remix` branch `dlss-nr`).
+
+### 9.0 Method, and one thing this does NOT establish
+
+**First, what the shipping mod actually ships — because half of the "it was a squash" caveat turns
+out to be answerable.** v1.5.2's README at the tag names its runtime as
+`xoxor4d/dxvk-remix` branch `game/gta4_atmos10_nr2` (**HARD** — README line 54 at the tag; the
+wiki's "Remix Runtime Changes" page still says `game/gta4_rebase6` and is **stale**, do not use
+it). Comparing that branch against `Kim2091/dxvk-remix@gta4-atmos-dlss5` by GitHub blob SHA —
+content-addressed, so equal SHA is byte equality:
+
+| File | xoxor4d | Kim2091 | |
+|---|---|---|---|
+| `rtx_neural_uplift.cpp` | `f52e639a…` | `f52e639a…` | **identical** |
+| `rtx_neural_uplift.h` | `0226a22d…` | `0226a22d…` | **identical** |
+| `nvsdk_ngx_defs_dlssnr.h` | `df42c808…` | `df42c808…` | **identical** |
+
+The NR-touching lines of `rtx_ngx_wrapper.*` and `rtx_context.cpp` are identical too; those files'
+only deltas are DLSS-**SR** preset plumbing and RR/NRD denoiser work. **So the squash changed
+nothing in the NR implementation** — the shipped code IS Kim's branch, and the only genuine NR
+difference is which ImGui tab the panel sits in. **HARD.** (The runtime binary itself ships as a
+committed 72 MB blob, `assets/.trex/d3d9_runtime.zip`, updated five minutes before the release was
+published; that is documentation and timing, not binary provenance, so "this exact commit" is a
+tight inference rather than proof.)
+
+Note also, and it matters for §9.2: **the shipped runtime contains no NR shader files at all.**
+`rtx_neural_uplift.cpp` includes no shader header, and the display-referred conversion rides
+entirely on the runtime's existing `performSRGBConversion` path. The codec deletion is not an
+artefact of reading a development branch — it is what shipped.
+
+**What remains SOFT is the attribution, not the code.** The changelog line credits the NR swap with
+the improvement, but the same release also refactored the Remix variable plumbing, changed
+particle alpha and quadrupled the RTXDI sample count to 64 ("less noisy headlights"). None of
+those is nothing, and no A/B isolating the NR change is published. So *"Kim's NR implementation is
+what shipped"* is HARD; *"Kim's NR implementation is why it flickers less"* is SOFT.
+
+The useful evidence is therefore the **source diff**, which is public on both sides and was read
+directly rather than inferred from commit messages:
+
+* **Theirs**: `Kim2091/dxvk-remix@gta4-atmos-dlss5`, `src/dxvk/rtx_render/rtx_neural_uplift.{h,cpp}`.
+* **The original ours is a port of**: `lunks/dxvk-remix-plus-dlssnr@dlssnr`,
+  `src/dxvk/rtx_render/rtx_neural_rendering.{h,cpp}` — the tree CLAUDE.md cites at `aa90a180` /
+  `fc4de144`.
+* **Ours**: `src/ngx_nr.cpp`, `src/core/nr_hook_plan.*`, `src/core/nr_codec.*`.
+
+Every claim below is labelled **HARD** (read from one of those three sources), **SOFT** (asserted
+by one of them, not independently verified) or **UNCONFIRMED**. Nothing here has run on the box.
+
+**The largest single difference is the hook point, and it is not available to us.** Kim's commit
+`10fa0368` moves the pass to *after* the runtime's sRGB encode, onto a terminal image, and in doing
+so **deletes the entire HDR codec**: `paperWhiteScale`, `trackAutoExposure`, `transferStrength`,
+`colorStrength` and both codec compute shaders are simply absent from their header (**HARD** — a
+direct diff of the two headers). Every feedback loop CLAUDE.md documents — the exposure ring, the
+`u0` → SSR history conduit, codec-scale drift — is missing from their build *by construction*,
+not by having been fixed. Our two post-tonemap sites were removed on 2026-09-02 because neither
+produced a correct frame on the box, so **our NR runs at exactly one site, inside the intercepted
+TAA dispatch writing `u0`, and the placement fix is not portable to us.** What *is* portable is
+everything about how temporal continuity is tracked, and that is what the table audits.
+
+### 9.1 The difference table, ranked by likely effect on flicker
+
+| # | What they do | What we do | Applies to our hook point? | What it would change |
+|---|---|---|---|---|
+| **1** | `m_forceHistoryReset` is a **sticky** flag on a pass that runs **every frame**, so any frame the network did not see arms the next evaluate's `DLSSNR.Reset` (**HARD**: `rtx_neural_uplift.h:214-226`, `.cpp:165-171`, `.cpp:328-330`). | `nrplan::EvaluateGapLatch` arms only from `refuse_pre_evaluate` (`src/ngx_nr.cpp:391`), which is reached only from inside `apply()` — and **`apply()` is called only when the TAA pass was intercepted AND the SR/RR evaluate succeeded** (`src/taa_hook.cpp:2016`). | **YES — this was the gap.** | Every frame where the TAA hook does not match, SR/RR fails, or `NgxNR` is toggled off and back on (`set_enabled` deliberately KEEPS the feature and its history) was a hole feature 18 never learned about, and the next evaluate reprojected across the whole of it with motion vectors describing one frame. CLAUDE.md measures evaluates tracking dispatches at **99.7%**, so these frames demonstrably exist. **Rank 1. IMPLEMENTED** (`nrplan::note_frame_boundary`, called at the present boundary, `src/ngx_nr.cpp:1795`). |
+| **2** | **No exposure tracking and no codec-scale reset latch exist at all** (**HARD** — neither option is in their header; the codec they would belong to was deleted). | `NgxNRExposureSmoothing` ships **0.05** (τ ≈ 20 frames ≈ 0.33 s) and `NgxNRScaleResetTolerance` ships **0.15**, forcing `DLSSNR.Reset` whenever the smoothed codec scale drifts 15% (`src/app/dlss_app.hpp:46-47`, `src/ngx_nr.cpp:1415`). | **YES.** | **Our own most likely remaining flicker source, and CLAUDE.md already names the anti-pattern**: *"a reset latch is right for a rare discrete change and wrong for a quantity that varies continuously — there it is a metronome"* (measured: 52 fires, image worse). CLAUDE.md's own stated conclusion for the smoothing rate was **0.002** (~500 frames, ~8 s, deliberately below the ~5 s loop); **the shipped default is 25× faster than that.** Walking swings UE4's exposure genuinely, so a fast follower plus a hard 15% latch discards NR's accumulation repeatedly. **Rank 2. NOT CHANGED** — see §9.2. Instrumented instead. |
+| **3** | `m_forceHistoryReset = true` on **successful feature creation** (**HARD**: `.cpp:145`). | Was not explicit; covered only *accidentally*, because the frames before a create are refused as `kRefWarmup` or `kRefRecreating` and those arm the gap latch. | YES, latently. | Correct today by coincidence. It breaks at `NgxNRWarmupFrames=0`, where the feature is created on the first `apply()` with no preceding refusal, and it would break again for any future path that creates a feature without one. **Rank 3. IMPLEMENTED** (`g_new_feature_reset`, `src/ngx_nr.cpp:644`). |
+| **4** | `displayEncoded == false` ⇒ decline the frame **and** arm the sticky reset, rather than evaluate on an input domain the model was not trained on (**HARD**: `.cpp:165-171`). | `nrplan::codec_gate` enumerates `no_codec` / `encode_failed` / `exposure_unknown` / `degenerate_scale`, and **all four go through `refuse_pre_evaluate`**, arming the latch. | Already equivalent. | **No gap.** Ours is strictly stronger: we additionally force a reset when the codec *scale* moves (item 2), which is an encoding-domain change theirs cannot have because it has no codec. |
+| **5** | `motionVectorScale` **1.0**, with per-buffer subrects declaring the guide grid; a 0 is sanitised to 1 because "it does not disable motion, it scales the whole field to zero" (**HARD**: `.h:189-193`, `.cpp:307-310`). | 1.0, subrects declared through `nrparam::build_rects`, and `g_mvec_scale_override` applied only when `> 0.0f`. | Already equivalent. | **No gap — and a useful independent confirmation.** The original our port derives from sent `colorExtent/guideExtent` = **2.0** (`rtx_neural_rendering.cpp:377-384`). Kim moved to 1.0 for the same reason our user's live A/B did. Two independent ports converged on the value we already ship, which retires the lingering doubt in CLAUDE.md's MVecScale note. |
+| **6** | No guide-extent latch — their guides always match the upscaler's grid, which never moves under them. | `nrplan::latch_guide_extent` forces exactly one reset when the grid moves and none on first observation; tested (`tests/test_nr_hook_plan.cpp`). | Ours only. | **No gap; re-verified correct.** We need it and they do not, because our screen percentage moves (50% → 70%) under a fixed output rect, taking MVecScale with it. |
+| **7** | The five controls the snippet force-resets on internally (Style, UseAutoMask, LocalToneStrength, LocalStructureStrength, SkinStructureStrength; ε 1e-5) are clamped constants (**HARD**: `.cpp:294-303`). | `g_intensity=1.0`, `g_local_tone=1.74`, `g_local_structure=1.0`, `g_skin_structure=1.33`, `g_preset=1`, `g_auto_mask=1`, `g_ui_correction=1` — plain file-scope constants, written unchanged every frame (`src/ngx_nr.cpp:163-169`, re-Set at `:1467`). | Verified. | **No gap: not one of ours is computed per frame, so none can trip the snippet's ε-1e-5 internal reset.** Two notes, neither a flicker cause. (a) Kim documents `LocalToneStrength` as the **style blend weight, clamped 0–1** — not a tone control (**SOFT**: their claim; CLAUDE.md's own disassembly does not mention that clamp). If true, our 1.74 resolves to 1.0, i.e. full style blend, and since we never set `Style` it likely blends nothing. (b) `g_skin_structure=1.33` follows RenoDX; theirs uses the `-1` "inherit local" sentinel. Both constant, so both inert with respect to flicker. |
+| **8** | Sets `DLSSNR.Style` explicitly, clamped 0–2, defaulting to 0 = neutral (**HARD**: `.cpp:294-296`). | **We never set `DLSSNR.Style`** — there is no `kStyle` anywhere in `src/ngx_nr.cpp`. | Applies. | Not a flicker cause: an unset parameter yields the snippet's own fallback identically every frame, so it cannot trip the internal reset. It does mean **the style we have been running under is whatever the snippet defaults to, and we have never established which (UNCONFIRMED).** Left alone deliberately: writing their default of 0 would be a look change resting on an unverified assumption about what our current fallback is. |
+| **9** | Stages the colour into `m_intermediateColor` and evaluates staging → output, because *"NGX has no defined behaviour for aliasing DLSSNR.Color with DLSSNR.Output"* (**HARD**: `.cpp:60-63`, `:186-200`). | `DLSSNR.Color` is the codec **proxy**, `DLSSNR.Output` is `g_nr_output` — two textures we own, never aliased. | Already satisfied. | **No gap.** The codec gives us the staging copy for free. |
+| **10** | Records the creation-time key state *before* the create attempt can fail, so a failed create does not read as a pending settings change and retry — each retry a `waitForIdle` (**HARD**: `.cpp:100-105`). | `g_create_latched` latches a failed create off for the whole session. | Already satisfied, differently. | **No gap.** |
+| **11** | Tracks the staging **view** as well as its image on the command list, and `waitForIdle()`s before releasing the feature (commit `f9688d60`). | `src/core/nr_lifetime.*` — graveyard plus fence; the feature is released only at a present whose fence has passed `g_last_eval_tag`. | Already ported. | **No gap.** CLAUDE.md and `set_enabled`'s own comment both cite `a69254ab` by hash. |
+| **12** | The injection point is fixed and unselectable; switching it would force a reset (**HARD**: commit `10fa0368`). | Single site since 2026-09-02; the `no_codec` gate refuses any other. | Already satisfied. | **No gap.** |
+
+### 9.2 What is and is not established
+
+**HARD, and it is the finding.** Kim's branch introduces a sticky, unconditional
+history-continuity flag that **the original our port derives from does not have.**
+`lunks/dxvk-remix-plus-dlssnr@dlssnr` sets only
+`settings.resetAccumulation = resetHistory || resetGuideHistory`
+(`rtx_neural_rendering.cpp:369`) and arms nothing on any of its early returns or on a failed
+evaluate. So item 1 is a genuinely new, stability-motivated behaviour rather than something we
+failed to copy from a common ancestor — which is the strongest available reason to believe the
+changelog line is about something real.
+
+**SOFT:** that this flag is *why* the shipping mod flickers less. Their larger change is the
+placement, which removes the codec and every feedback loop with it, and the changelog describes a
+squash rather than their branch as published.
+
+**UNCONFIRMED, and this is everything below the table:** none of it has run on the box. The
+mechanism in item 2 in particular is an argument from our own documented lesson plus a shipped
+default that contradicts our own documented conclusion. It is not a measurement.
+
+**Why the item-2 defaults were NOT changed, stated loudly.** `NgxNRExposureSmoothing = 0.05` and
+`NgxNRScaleResetTolerance = 0.15` are values a human tuned by eye on the machine, and CLAUDE.md's
+`0.002` recommendation predates them. Either the doc is stale or the default is wrong, and an
+offline agent cannot tell which — changing a hand-tuned default on the strength of a stale
+document would be the same error CLAUDE.md's own retraction log is full of. **So they stand, and
+the counter below is what settles them.**
+
+### 9.3 The one live check that settles all of this
+
+Run one gameplay session with `NgxNR=1`, and **walk** — a static camera moves neither the exposure
+nor the hook match rate, so it cannot exercise either continuous quantity. Then read the new line
+in the periodic report:
+
+```
+[frame N] NR RESETS: total=T  from: frame-gap=A guide-grid=B codec-scale=C camera-cut=D new-feature=E
+```
+
+* **`codec-scale=C` large** (more than a handful per minute) confirms item 2: the exposure latch is
+  a metronome, and the fix is `NgxNRExposureSmoothing=0.002` (CLAUDE.md's own conclusion) or
+  `NgxNRScaleResetTolerance=0` to disable the latch outright. **Check this first** — it is the only
+  reset source we ship that theirs does not have at all.
+* **`frame-gap=A` non-trivial** confirms item 1 was doing real work: those are the continuity holes
+  that used to pass silently, each one a mis-reprojected frame.
+* **All near zero while the flicker persists** clears our reset machinery entirely and points back
+  at placement — i.e. at the thing we cannot change without a working post-tonemap site.
+
+---
+
+## 10. Can we run NR as a STAGE rather than a HOOK? — verdict: YES, at present, and it outranks §9
+
+**This is the recommendation, stated first.** A present-time NR stage is feasible, and if it works
+it deletes more of our NR machinery than every difference in §9 combined fixes. It should be
+built as an **additional site behind a key, not a migration** — the `taa` site stays until the new
+one is confirmed on the box. **Not implemented in this pass; it is the user's call.**
+
+### 10.1 Why this is genuinely a stage and not another hook
+
+The fork's pass is an `RtxPass`/`CommonDeviceObject`: one fixed chosen point, its own resources on
+the framework's lifecycle, its own command list. Our `taa` site is the opposite of all three — it
+runs inside a compute dispatch Unreal scheduled for something else, on the game's list, with the
+game's state bound.
+
+**`src/backend_native/present_owner.*` already has all three properties**, and this is the fact
+that changes the answer (**HARD**, read from the source):
+
+| Property the fork's pass has | Present owner | Where |
+|---|---|---|
+| Its own command list and allocator | **Yes** — a ring of 3 slots, each with its own `ID3D12CommandAllocator` and `ID3D12GraphicsCommandList` (DIRECT) | `present_owner.cpp:51-56`, `:93-117` |
+| Its own fence and completion tracking | **Yes** — one `ID3D12Fence` + event; waits only when reusing an in-flight slot | `present_owner.cpp:110-115`, `:343-348`, `:382-383` |
+| A fixed, chosen point in the frame | **Yes** — inside the patched `Present`, *before* the original, therefore after the game's every submission to that queue | `present_owner.cpp:387-392`, `present_owner.hpp:19-22` |
+
+**And the decisive one: there is no game state on that list to clobber.** The list is `Reset` with a
+null PSO every frame (`present_owner.cpp:351`) and nothing of the game's is ever bound on it. The
+documented cause of the `preui` disaster was *"it clobbered state the next pass was about to
+use"* (CLAUDE.md), a hazard that exists only because `preui` recorded onto **the game's** list —
+its own code says so: *"UE4 filters its own redundant binds, so a clobber that is never undone
+survives into the next draw"* (`da37085^:src/nr_hook.cpp:421-423`). **On the present list that
+failure mode does not exist, because there is no next draw and nothing of the game's is bound.**
+`restore_game_compute_state` is not merely unnecessary there — it would be wrong, exactly as
+CLAUDE.md already argues for ReShade's immediate list.
+
+So the two prior failures do **not** generalise to this site. `preui` failed on state; `present`
+failed because it depended on `reshade_begin_effects`, which never fires with an empty preset. The
+native present owner has neither dependency, and it did not exist when either was tried.
+
+### 10.2 What it deletes
+
+Not "tunes" — *deletes*, because the reason each thing exists is the pre-tonemap anchor:
+
+* **The whole HDR codec.** The back buffer at present is post-tonemap, and Stray never calls
+  `SetColorSpace1`, so `R10G10B10A2_UNORM` is DXGI's default `RGB_FULL_G22_NONE_P709` — **an SDR,
+  display-encoded, [0,1] image, which is precisely feature 18's training domain** (CLAUDE.md
+  §2.1 for the format; the fork reaches the identical conclusion from the other direction in
+  `10fa0368`, and the shipped runtime carries **no NR shaders at all**, §9.0). That retires the
+  proxy encode/decode pair, `NgxNRPaperWhiteScale`, `NgxNRColorStrength`, `NgxNRTransferStrength`.
+* **The entire exposure feedback loop** — `NgxNRTrackExposure`, `NgxNRExposureSmoothing`, the
+  smoothed `OneOverPreExposure` read, and **the codec-scale reset latch that §9's table ranks as
+  our most likely remaining flicker source (item 2)**. There is no pre-exposure left to undo, so
+  there is no loop to close and no metronome to tune.
+* **The `u0` feedback node, and `NgxNRRestoreHistory` with it.** The back buffer at present is
+  terminal: nothing in UE4 carries it into the next frame, so the SSR / `TemporalAAHistory.RT[0]`
+  conduit and the eye-adaptation histogram are both unreachable **by construction**, not by having
+  been closed. NR would never touch `u0` at all.
+* **Pass identification for NR.** The site is a swapchain event, not a shader match.
+
+### 10.3 What it risks, honestly
+
+1. **The HUD is in the image.** The fork runs *before* the screen overlay specifically so the UI is
+   not fed through the model. At present it is composited. Our mitigation is `DLSSNR.UICorrection`,
+   which we already set to 1 — but **what it actually does is UNCONFIRMED** (it is not in the five
+   controls CLAUDE.md read out of the binary). This is a *look* risk, not a crash risk, and one
+   screenshot judges it: softened or denoised HUD text is the tell.
+2. **Typed UAV store on `R10G10B10A2_UNORM`.** NGX writes `DLSSNR.Output` through a typed UAV, and
+   that format's typed-UAV support is optional in D3D12. **The probe already exists and is
+   generic** (`src/nr_codec_pass.cpp:464-471`, `D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW`
+   + `FORMAT_SUPPORT2_UAV_TYPED_STORE`), so this is a gate, not an unknown. **SOFT:** NVIDIA
+   supports `A2B10G10R10` storage images, so it is expected to pass — but it must be probed and
+   refused loudly, never assumed.
+3. **Guide freshness.** Depth and motion vectors are captured at the TAA dispatch and consumed
+   later in the same frame. The publish-a-counter / consume-it-once machinery for exactly this
+   existed and was deleted with `nr_hook.cpp`; it has to be rebuilt, together with re-running
+   `is_resource_live` at present. Modest, and previously working code.
+4. **A compute dispatch has never been recorded on the present list.** Its only users to date are
+   barriers and one `CopyTextureRegion` (`native_backend.cpp:385-399`, `nr_history.cpp:573`). The
+   list is a plain open DIRECT list, so `SetDescriptorHeaps` + root signature + `Dispatch` is
+   legal — but it is new, and it is what the experiment below exists to prove.
+5. **Cost.** `ExecuteCommandLists` on the present list becomes unconditional, plus one staging copy
+   of the back buffer (~33 MB at 4K in `R10G10B10A2`) — *cheaper* than the 66 MB FP16 copies the
+   `taa` site already pays.
+
+### 10.4 Coordinate, do not duplicate: the FG boundary
+
+The frame-generation work wants **the same pre-UI signal** — the frame's first back-buffer
+render-target bind — for its HUD-less input, and has it as an unimplemented, user-gated stage. Our
+old `preui` detector was exactly that signal (identity-test `rtvs[0]` against the swapchain's
+back-buffer list, fire at ordinal N) and was deleted on 2026-09-02; nothing of it survives in
+`src/`.
+
+**The recommendation deliberately does not need it.** A present-time stage requires no boundary
+detection at all, which is its main practical advantage over the `preui` shape and keeps it out of
+FG's way. **If and only if risk 1 above proves unacceptable** does NR need that boundary — and at
+that point it should be built once and shared with FG, not rebuilt privately. Say so before
+starting.
+
+### 10.5 The smallest experiment that proves or kills it
+
+**One launch, no NR machinery, and it answers four questions at once.** Behind a key
+(`NgxNRPresentProbe=1`, default off), record on the present owner's list a **single compute
+dispatch** that writes magenta into a 128×128 centre patch of the back buffer through a typed UAV
+in `R10G10B10A2_UNORM`, then `note_present_list_used()`. Screenshot.
+
+* **Magenta on screen, game healthy** ⇒ compute on the present list works, typed UAV store on the
+  back buffer's format works under vkd3d-proton, the write survives to the display, and the site is
+  viable. Everything after that is plumbing we have already written once.
+* **No magenta** ⇒ either the probe said no (logged) or the write does not reach the display, and
+  the idea dies for the cost of one launch.
+* **Game unhealthy** ⇒ recording compute on that list is not safe here, which is the one thing no
+  amount of source reading can settle.
+
+This is deliberately the same trick as `NgxPaint=1`, which is the debugging step that actually
+cracked "DLSS runs but nothing changes" (CLAUDE.md gotchas ledger): **prove the write path before
+building anything that depends on it.** Note that `NgxPaint` worked precisely because it separated
+"can we write here" from "is the network right", and that separation is what makes this cheap.
+
+**Ranking, plainly: if the probe passes, this outranks every individual difference in §9.** Item 2
+of that table — our exposure-tracked reset latch — is not fixed by a stage, it is *deleted* by one,
+along with the codec that motivates it and the feedback node that motivates `NgxNRRestoreHistory`.
+§9's implemented fixes (the frame-gap latch, the new-feature reset) remain correct and apply at
+either site, so nothing there is wasted.

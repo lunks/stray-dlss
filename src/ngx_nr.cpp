@@ -71,6 +71,7 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 	for (int i = 0; i < kNrRefusalCount; ++i)
 		out[i] = 0;
 }
+ResetCounts reset_counters() { return ResetCounts{}; }
 bool validated() { return false; }
 } // namespace stray_dlss::nr
 
@@ -196,6 +197,32 @@ nrplan::GuideExtentLatch g_guide_latch;
 // Any frame NR declines before the evaluate leaves a hole in feature 18's own temporal
 // continuity, so the next evaluate carries DLSSNR.Reset. (src/core/nr_hook_plan.hpp)
 nrplan::EvaluateGapLatch g_gap_latch;
+// Whether an evaluate actually reached the network in the frame currently being recorded. The
+// refusal path can only see frames NR was ASKED about; this is what lets the present boundary see
+// the frames it was never asked about at all (a TAA dispatch that did not match, an SR/RR
+// evaluate that failed, NgxNR toggled off and back on with the feature kept).
+// nrplan::note_frame_boundary carries the rule.
+bool g_evaluated_this_frame = false;
+// A FRESH FEATURE HAS NO HISTORY, whatever the frame thinks about continuity. Covered accidentally
+// today — the frames before a create are refused as warmup or recreating, and those arm the gap
+// latch — but only accidentally: NgxNRWarmupFrames=0 creates the feature on the first apply() with
+// nothing having been refused before it. The sibling port states this as its own first case
+// ("a feature that was just created has no history"), so state it here rather than rely on the
+// coincidence. (Kim2091/dxvk-remix @ gta4-atmos-dlss5, rtx_neural_uplift.cpp:145)
+bool g_new_feature_reset = false;
+
+// WHY EACH DLSSNR.Reset HAPPENED, counted per source. Not decoration: a reset discards feature
+// 18's whole accumulation, so a reset source that fires often is itself a flicker source — and
+// CLAUDE.md has already been caught once by exactly that ("a reset latch is right for a rare
+// discrete change and wrong for a quantity that varies continuously — there it is a metronome",
+// measured at 52 fires making the image worse). Whether our shipped NgxNRExposureSmoothing=0.05
+// plus NgxNRScaleResetTolerance=0.15 is a metronome or a rarity is a question ONE log line
+// answers and no amount of argument does. Build the counter before you need it.
+std::atomic<std::uint32_t> g_reset_frame_gap{0};
+std::atomic<std::uint32_t> g_reset_guide_grid{0};
+std::atomic<std::uint32_t> g_reset_codec_scale{0};
+std::atomic<std::uint32_t> g_reset_camera_cut{0};
+std::atomic<std::uint32_t> g_reset_new_feature{0};
 // The rect the codec actually processed this frame — the OUTPUT subrect, which can be smaller
 // than the colour texture's allocation (the GetOutputExtent Max() lesson, CLAUDE.md §5). Every
 // validation crop is centred on this rect so the three luminances describe the same pixels.
@@ -613,6 +640,8 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	g_feature_out_w = out_w;
 	g_feature_out_h = out_h;
 	g_last_error[0] = 0;
+	// A feature this new has no history behind it, whatever the frame thinks about continuity.
+	g_new_feature_reset = true;
 	STRAY_LOG_WARN("NR: NGX feature 18 CREATED via the %s.%s",
 		g_use_direct ? "SNIPPET's own exports (direct path)" : "NGX core",
 		g_use_direct ? "" : " The core does not know this pre-release snippet, so this is "
@@ -964,6 +993,17 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 	refused = g_refused.load(std::memory_order_relaxed);
 	for (int i = 0; i < kNrRefusalCount; ++i)
 		out[i] = g_refusals[i].load(std::memory_order_relaxed);
+}
+
+ResetCounts reset_counters()
+{
+	ResetCounts c;
+	c.frame_gap = g_reset_frame_gap.load(std::memory_order_relaxed);
+	c.guide_grid = g_reset_guide_grid.load(std::memory_order_relaxed);
+	c.codec_scale = g_reset_codec_scale.load(std::memory_order_relaxed);
+	c.camera_cut = g_reset_camera_cut.load(std::memory_order_relaxed);
+	c.new_feature = g_reset_new_feature.load(std::memory_order_relaxed);
+	return c;
 }
 
 void set_warmup_frames(unsigned int frames) { g_warmup_frames = frames; }
@@ -1331,6 +1371,16 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// nothing else in the pipeline notices. Latch the extent and force ONE reset frame when it
 	// moves, exactly as the reference deployment does. (src/core/nr_hook_plan.hpp)
 	bool reset = in.reset;
+	if (reset)
+		g_reset_camera_cut.fetch_add(1, std::memory_order_relaxed);
+
+	// A FRESH FEATURE HAS NO HISTORY. Set where the feature is created, taken here, once.
+	if (g_new_feature_reset)
+	{
+		g_new_feature_reset = false;
+		reset = true;
+		g_reset_new_feature.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	// A FRAME NR DECLINED IS A HOLE IN FEATURE 18'S OWN TEMPORAL CONTINUITY. It reprojects its
 	// accumulation with motion vectors that describe exactly one frame of motion, so reprojecting
@@ -1341,6 +1391,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (nrplan::take_evaluate_reset(g_gap_latch))
 	{
 		reset = true;
+		g_reset_frame_gap.fetch_add(1, std::memory_order_relaxed);
 		static bool s_gap_logged = false;
 		if (!s_gap_logged)
 		{
@@ -1364,6 +1415,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (nrc::codec_scale_invalidates_history(g_scale_latched, codec_scale, g_scale_tolerance))
 	{
 		reset = true;
+		g_reset_codec_scale.fetch_add(1, std::memory_order_relaxed);
 		STRAY_LOG_WARN("NR: the codec scale moved %.4f -> %.4f (past the %.0f%% tolerance). "
 			"Feature 18's temporal accumulation is in display-referred units DEFINED by that "
 			"scale, so it is stale; DLSSNR.Reset is forced for this one frame.",
@@ -1376,6 +1428,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	if (nrplan::latch_guide_extent(g_guide_latch, in.render_width, in.render_height))
 	{
 		reset = true;
+		g_reset_guide_grid.fetch_add(1, std::memory_order_relaxed);
 		STRAY_LOG_WARN("NR: the guide grid moved to %ux%u (MVecScale is now %.5f/%.5f). Feature "
 			"18's temporal accumulation was built against the old grid and nothing else in the "
 			"pipeline notices, so DLSSNR.Reset is forced for this one frame.",
@@ -1473,6 +1526,13 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		set_error("EvaluateFeature(18)", result);
 		return refuse_pre_evaluate(kRefEvaluateFailed, g_last_error);
 	}
+
+	// THE NETWORK SAW THIS FRAME, so its accumulation advanced by exactly one frame of motion and
+	// the present boundary must not treat this frame as a hole. Set here rather than at the end of
+	// apply(): the refusals BELOW this point (validating, degenerate output) happen AFTER a
+	// successful evaluate, and forcing a reset for those would discard the accumulation on every
+	// frame of the validation window — which is the reasoning refuse() already documents.
+	g_evaluated_this_frame = true;
 
 	// Hold everything NGX touched alive past GPU execution, under the tag taken above.
 	if (g_keep_alive_count >= sizeof(g_keep_alive) / sizeof(g_keep_alive[0]))
@@ -1720,6 +1780,21 @@ void on_present(ID3D12CommandQueue *queue)
 	// to manage, so a session with NgxNR=0 from the start never creates a fence and never
 	// signals the game's queue — ngx_nr.hpp promises that configuration is byte-identical to
 	// before, and an unconditional per-present Signal would quietly break that promise.
+	// THE FRAME BOUNDARY, and it is ABOVE the early-out on purpose.
+	//
+	// Feature 18 reprojects its own accumulation with motion vectors describing exactly ONE frame
+	// of motion, so every frame it did not see is a hole. refuse_pre_evaluate() covers the frames
+	// NR was asked about and declined; it structurally cannot cover the frames it was never asked
+	// about — a TAA dispatch that did not match, an SR/RR evaluate that failed, or NgxNR toggled
+	// off and back on, which deliberately KEEPS the feature and its history (set_enabled). Those
+	// are not hypothetical: CLAUDE.md measures evaluates tracking dispatches at 99.7%.
+	//
+	// Two CPU bools and no GPU work, so this does NOT break ngx_nr.hpp's promise that NgxNR=0 is
+	// byte-identical: no fence is created and the game's queue is never signalled.
+	// (src/core/nr_hook_plan.hpp, note_frame_boundary)
+	nrplan::note_frame_boundary(g_gap_latch, g_evaluated_this_frame);
+	g_evaluated_this_frame = false;
+
 	const bool anything_to_do = g_enabled || g_teardown_requested ||
 		g_release_feature_requested || !g_graves.empty() || g_keep_alive_count != 0 ||
 		g_fence != nullptr;

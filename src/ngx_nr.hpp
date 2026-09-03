@@ -242,4 +242,25 @@ extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();
 
+// WHY EACH DLSSNR.Reset HAPPENED, by source.
+//
+// A reset discards feature 18's entire temporal accumulation, so a reset SOURCE that fires often
+// is itself a flicker source — the accumulation never gets long enough to converge. This project
+// has already been caught by exactly that once: a reset latch put on a continuously varying
+// quantity fired 52 times and made the image worse (CLAUDE.md, "there it is a metronome").
+//
+// Two of the five sources below are on quantities that vary continuously — `codec_scale`, which
+// follows the engine's exposure, and `frame_gap`, which follows how reliably the TAA hook matches
+// — so whether either is a rarity or a metronome is an empirical question. This is the counter
+// that answers it in one session instead of one argument per round trip.
+struct ResetCounts
+{
+	std::uint32_t frame_gap = 0;   // a frame NR declined, or was never asked about at all
+	std::uint32_t guide_grid = 0;  // the render resolution moved under a fixed output rect
+	std::uint32_t codec_scale = 0; // the exposure-tracked codec scale drifted past the tolerance
+	std::uint32_t camera_cut = 0;  // the engine's own cut signal (CLAUDE.md §2.8)
+	std::uint32_t new_feature = 0; // the first evaluate against a freshly created feature
+};
+ResetCounts reset_counters();
+
 } // namespace stray_dlss::nr

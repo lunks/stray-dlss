@@ -1366,6 +1366,19 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 					off += std::snprintf(nr_line + off, sizeof(nr_line) - off, " %s=%u",
 						nr::kNrRefusalNames[i], nr_reasons[i]);
 			STRAY_LOG_INFO("%s", nr_line);
+
+			// EVERY DLSSNR.Reset DISCARDS FEATURE 18'S WHOLE ACCUMULATION, so a source that
+			// fires often is a flicker source rather than a fix for one. Two of these follow
+			// continuously varying quantities — `codec-scale` follows the engine's exposure,
+			// `frame-gap` follows how reliably the TAA hook matches — and CLAUDE.md has already
+			// measured a latch on such a quantity firing 52 times and making the image WORSE.
+			// So this line is the one that says whether our own reset machinery is the problem.
+			// Read it while WALKING: a static camera moves neither exposure nor the hook rate.
+			const nr::ResetCounts rc = nr::reset_counters();
+			STRAY_LOG_INFO("[%s] NR RESETS: total=%u  from: frame-gap=%u guide-grid=%u "
+				"codec-scale=%u camera-cut=%u new-feature=%u", when,
+				rc.frame_gap + rc.guide_grid + rc.codec_scale + rc.camera_cut + rc.new_feature,
+				rc.frame_gap, rc.guide_grid, rc.codec_scale, rc.camera_cut, rc.new_feature);
 		}
 	}
 

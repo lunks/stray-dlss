@@ -1873,6 +1873,52 @@ history, feature 18 keeps its own accumulator, and the hook point is a feedback 
 changed is the remedy — `NgxNRTrackExposure` and `NgxNRRestoreHistory` at the `taa` site — not
 the diagnosis.
 
+### The rival NR implementation, and the STAGE question it raises (2026-09-02)
+
+A shipping mod (`xoxor4d/gta4-rtx` v1.5.2) replaced the user's own DLSS 5 integration — the one
+our NR path is a port of — with `Kim2091/dxvk-remix@gta4-atmos-dlss5`, crediting the swap with
+*"reduces shadow flickering"*. The full diff of the two implementations against ours, twelve
+differences ranked by effect on temporal stability, is **`docs/RESEARCH-RENODX-DLSS5.md` §9**, and
+the stage-vs-hook verdict is **§10**. Do not re-derive either; the highlights:
+
+* **HARD: the shipped runtime's NR code IS Kim's branch byte-identical** (blob-SHA comparison,
+  §9.0), and it contains **no NR shaders at all** — its display-referred conversion rides on the
+  runtime's own sRGB pass. **SOFT: that the NR swap is why it flickers less**, since the same
+  release also refactored the Remix vars and quadrupled the RTXDI sample count.
+* **Two real gaps, both closed.** Their force-reset is sticky over *every* frame the network did
+  not see; ours only covered frames NR was ASKED about and declined, because the arming path lives
+  inside `apply()` — which is reached only when the TAA pass matched AND the SR/RR evaluate
+  succeeded. `nrplan::note_frame_boundary` now arms at the present boundary. A fresh feature also
+  forces one reset explicitly rather than by coincidence.
+* **Our biggest remaining reset source is one THEY DO NOT HAVE.** `NgxNRExposureSmoothing` ships
+  0.05 while the exposure-tracking section above concludes **0.002**, and `NgxNRScaleResetTolerance`
+  ships 0.15 — a hard reset latch on a continuously varying quantity, which is the exact shape this
+  file already records firing 52 times and making the image worse. **The defaults were NOT changed**
+  (they are eye-tuned and the doc may be stale); the new **`NR RESETS`** line in the periodic report
+  breaks every reset down by source and settles it in one *walked* session. Read `codec-scale=`
+  first.
+
+**And the bigger prize, §10: NR can run as a STAGE rather than a hook, and it should be tried.**
+`src/backend_native/present_owner.*` already owns its own command-list ring, allocators and fence,
+and runs after the game's last submission and before Present — the three properties the fork's
+`RtxPass` has and our TAA hook does not. **Crucially, nothing of the game's is bound on that list**,
+so the clobbered-state failure that wrecked `preui` cannot occur there; and `present` failed only
+because it depended on a ReShade event that never fires with an empty preset. Neither prior failure
+generalises, and neither was tried against the native present owner, which did not exist then.
+
+A present-time stage would **delete** rather than tune: the whole HDR codec (the back buffer is
+post-tonemap `R10G10B10A2_UNORM` with no `SetColorSpace1`, i.e. SDR display-encoded — the network's
+own training domain), the entire exposure feedback loop *including* the reset latch above, and the
+`u0` feedback node with `NgxNRRestoreHistory`. Risks: the HUD is in the image (mitigation
+`DLSSNR.UICorrection`, effect UNCONFIRMED), typed UAV store on `R10G10B10A2_UNORM` must be probed
+(the probe exists, `src/nr_codec_pass.cpp:464`), and no compute dispatch has ever been recorded on
+that list.
+
+**The experiment is one launch:** write a magenta patch into the back buffer through a typed UAV on
+the present list, behind a key, and screenshot — the same `NgxPaint` separation of "can we write
+here" from "is the network right" that cracked "DLSS runs but nothing changes". If it passes, this
+outranks every difference in §9. **Not built; the user decides.**
+
 ### Feature 18 has its OWN temporal history, and we were invalidating it silently
 
 Confirmed in the reference (`fc4de144:src/dxvk/rtx_render/rtx_neural_rendering.cpp:220-230`),
