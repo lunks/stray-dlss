@@ -2255,6 +2255,32 @@ scales local tone, B scales local structure. **It has no skin channel**, so skin
 expressible per-pixel. The explicit path is per-pixel with no skin term; the auto path is global
 and is the only place skin exists.
 
+> **CORRECTED 2026-09-03 from the runtime's own compiled kernels: G AND B ARE DEAD.** The mask is
+> fetched once, by `cc_tinlayout_fused_post_block_swin_1h_32_control_mask` and
+> `cg2r_post_process_kernel`, with a single `tex.2d.v4.f32.f32`, and the arithmetic that follows is
+> `w = saturate(DLSSNR.Intensity * mask.x)` then `out.rgb = saturate(lerp(original, network, w))`.
+> The `.y`/`.z`/`.w` registers that same instruction produces appear **exactly once each in 9.9 MB
+> of decompressed PTX** — as its own destinations — and are never read. R is the blend weight as
+> recorded; nothing else in the texture does anything in 310.8.0. "No skin channel" stands.
+>
+> Three more facts from the same pass, each of which changes what is buildable. **The cubins are
+> not where this document implied**: `.rsrc` is the weight blob, and the code is 15 NVIDIA fatbins
+> in `.data` (~57 MB decompressed, with real sm_89 cubins carrying the sm_120 symbol set). **The
+> format is not validated at all** — `GetInputTextureViewHandle64` (0x18005d640) canonicalizes a
+> caller's `DXGI_FORMAT` and builds a TEXTURE2D SRV with no whitelist and no rejection, so UNORM
+> and FLOAT are both correct and only `*_UINT`/`*_SINT` is broken (a float fetch against an integer
+> texture: undefined values, no error). And **the mask is sampled POINT/CLAMP at LOD 0 in
+> normalised coordinates through its own guide rect**, so any resolution "works" and a mismatched
+> one is silently nearest-neighbour resampled.
+>
+> **`DLSSNR.BidirectionalDistortionField` is INERT** in this build — parsed into the input struct
+> and then touched exactly once more, to set a presence bit in the stats record. **And
+> `DLSSNR.UICorrection`, which we have written as 1 for months, cannot arm without a
+> `DLSSNR.Backbuffer`**, which we do not bind — so it has never done anything.
+>
+> Full addresses, method and the honest SOFT/UNCONFIRMED items: `docs/RESEARCH-DLSSNR-STYLES.md`
+> §8, and `src/core/nr_mask_plan.hpp` for the part the code depends on.
+
 **`DLSSNR.ScalingRatio` is INERT** — read, then unconditionally overwritten with `1.0f` at
 `0x18001a96a`. Neither it nor the absent `DLSSNR.Scale` ever mattered.
 
