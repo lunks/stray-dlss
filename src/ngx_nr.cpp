@@ -1311,9 +1311,11 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 			const nrmaskplan::ResolvedStructure rs = nrmaskplan::resolve_structure(bound,
 				g_auto_mask, g_skin_structure, g_local_structure);
 			if (bound)
-				STRAY_LOG_INFO("NR: DLSSNR.ControlMask BOUND (%p, %ux%u). R is the per-pixel final "
-					"blend weight, G scales local tone, B scales local structure; there is no skin "
-					"channel. Binding it FORCES UseAutoMask to 0 whatever we asked for (we asked "
+				STRAY_LOG_INFO("NR: DLSSNR.ControlMask BOUND (%p, %ux%u). ONLY ITS RED CHANNEL IS "
+					"LIVE in this runtime — the kernel computes saturate(Intensity * mask.x) and "
+					"lerps the original towards the neural result by it; G and B are fetched and "
+					"never read, and there is no skin channel at all. Binding it FORCES "
+					"UseAutoMask to 0 whatever we asked for (we asked "
 					"%u -> effective %u) and drives BOTH resolved structure strengths to %.1f, so "
 					"the SkinStructure=%.2f and LocalStructure=%.2f we set no longer reach the "
 					"resolved pair. That is the trade, and it is the runtime's, not ours.",

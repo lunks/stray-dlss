@@ -8,6 +8,7 @@ const char *const kMaskResultNames[kMaskResultCount] = {
 	"disabled",
 	"zero-extent",
 	"no-typed-uav-store",
+	"integer-format",
 	"alloc-failed",
 };
 
@@ -21,6 +22,43 @@ bool takes_own_skin(float skin_raw)
 }
 
 } // namespace
+
+// Every DXGI_FORMAT whose SRV is read as integers. Enumerated rather than derived, because the
+// numeric values are the contract and a clever predicate over them would be a second thing to get
+// wrong. (dxgiformat.h; the typeless members of each family are absent on purpose — the runtime's
+// canonicalizer maps them to FLOAT or UNORM before the SRV is created.)
+bool format_is_integer(int dxgi_format)
+{
+	switch (dxgi_format)
+	{
+	case 3:   // R32G32B32A32_UINT
+	case 4:   // R32G32B32A32_SINT
+	case 7:   // R32G32B32_UINT
+	case 8:   // R32G32B32_SINT
+	case 13:  // R16G16B16A16_UINT
+	case 14:  // R16G16B16A16_SINT
+	case 17:  // R32G32_UINT
+	case 18:  // R32G32_SINT
+	case 22:  // X32_TYPELESS_G8X24_UINT
+	case 23:  // R10G10B10A2_UINT
+	case 30:  // R8G8B8A8_UINT
+	case 32:  // R8G8B8A8_SINT
+	case 36:  // R16G16_UINT
+	case 38:  // R16G16_SINT
+	case 42:  // R32_UINT
+	case 43:  // R32_SINT
+	case 47:  // X24_TYPELESS_G8_UINT
+	case 50:  // R8G8_UINT
+	case 52:  // R8G8_SINT
+	case 57:  // R16_UINT
+	case 59:  // R16_SINT
+	case 62:  // R8_UINT
+	case 64:  // R8_SINT
+		return true;
+	default:
+		return false;
+	}
+}
 
 const char *mask_result_name(MaskResult result)
 {
@@ -55,7 +93,7 @@ ResolvedStructure resolve_structure(bool mask_bound, unsigned int use_auto_mask,
 }
 
 Plan plan_mask(const Config &cfg, std::uint32_t colour_width, std::uint32_t colour_height,
-               const FormatSupport &support)
+               int dxgi_format, const FormatSupport &support)
 {
 	Plan plan;
 	if (!cfg.enabled)
@@ -66,6 +104,14 @@ Plan plan_mask(const Config &cfg, std::uint32_t colour_width, std::uint32_t colo
 	if (colour_width == 0 || colour_height == 0)
 	{
 		plan.result = MaskResult::zero_extent;
+		return plan;
+	}
+	// Checked BEFORE the typed-UAV probe, so the log names the real problem: a *_UINT format is
+	// perfectly storable through a typed UAV and would sail past that gate on its way to a float
+	// fetch against an integer texture.
+	if (format_is_integer(dxgi_format))
+	{
+		plan.result = MaskResult::integer_format;
 		return plan;
 	}
 	// We fill the mask with our own compute shader, so a format the device cannot STORE to

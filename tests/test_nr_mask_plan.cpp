@@ -17,6 +17,9 @@ using namespace stray_dlss::nrmaskplan;
 
 namespace {
 
+// DXGI_FORMAT_R8G8B8A8_UNORM: normalised, non-integer, and what the WARP lane round-trips.
+constexpr int kOkFormat = 28;
+
 FormatSupport good_format()
 {
 	FormatSupport s;
@@ -94,7 +97,7 @@ TEST_CASE("ControlMask: the INHERIT lives on the auto path only")
 TEST_CASE("ControlMask: default is OFF and emits no rect")
 {
 	Config cfg; // default-constructed
-	const Plan p = plan_mask(cfg, 2560, 1440, good_format());
+	const Plan p = plan_mask(cfg, 2560, 1440, kOkFormat, good_format());
 	CHECK(p.result == MaskResult::disabled);
 	CHECK(subrect_for(p).present == false);
 }
@@ -105,24 +108,24 @@ TEST_CASE("ControlMask: an unwritable format refuses rather than binding an unin
 
 	FormatSupport no_store = good_format();
 	no_store.store = false;
-	CHECK(plan_mask(cfg, 2560, 1440, no_store).result == MaskResult::no_typed_uav_store);
+	CHECK(plan_mask(cfg, 2560, 1440, kOkFormat, no_store).result == MaskResult::no_typed_uav_store);
 
 	FormatSupport no_view = good_format();
 	no_view.view = false;
-	CHECK(plan_mask(cfg, 2560, 1440, no_view).result == MaskResult::no_typed_uav_store);
+	CHECK(plan_mask(cfg, 2560, 1440, kOkFormat, no_view).result == MaskResult::no_typed_uav_store);
 
 	// A FAILED query is not evidence of support.
 	FormatSupport unqueried;
-	CHECK(plan_mask(cfg, 2560, 1440, unqueried).result == MaskResult::no_typed_uav_store);
+	CHECK(plan_mask(cfg, 2560, 1440, kOkFormat, unqueried).result == MaskResult::no_typed_uav_store);
 
-	CHECK(subrect_for(plan_mask(cfg, 2560, 1440, no_store)).present == false);
+	CHECK(subrect_for(plan_mask(cfg, 2560, 1440, kOkFormat, no_store)).present == false);
 }
 
 TEST_CASE("ControlMask: a zero extent refuses")
 {
 	const Config cfg = enabled_all(0.5f, 0.5f, 0.5f);
-	CHECK(plan_mask(cfg, 0, 1440, good_format()).result == MaskResult::zero_extent);
-	CHECK(plan_mask(cfg, 2560, 0, good_format()).result == MaskResult::zero_extent);
+	CHECK(plan_mask(cfg, 0, 1440, kOkFormat, good_format()).result == MaskResult::zero_extent);
+	CHECK(plan_mask(cfg, 2560, 0, kOkFormat, good_format()).result == MaskResult::zero_extent);
 }
 
 TEST_CASE("ControlMask: an all-neutral mask binds, and says so")
@@ -135,7 +138,7 @@ TEST_CASE("ControlMask: an all-neutral mask binds, and says so")
 	cfg.channel_r = cfg.channel_g = cfg.channel_b = true;
 	cfg.value_r = cfg.value_g = cfg.value_b = 1.0f;
 
-	const Plan p = plan_mask(cfg, 2560, 1440, good_format());
+	const Plan p = plan_mask(cfg, 2560, 1440, kOkFormat, good_format());
 	CHECK(p.result == MaskResult::ok);
 	CHECK(p.is_identity);
 	CHECK(p.value_r == 1.0f);
@@ -153,7 +156,7 @@ TEST_CASE("ControlMask: a disabled channel writes neutral, not its configured va
 	cfg.channel_g = false;
 	cfg.channel_b = false;
 
-	const Plan p = plan_mask(cfg, 2560, 1440, good_format());
+	const Plan p = plan_mask(cfg, 2560, 1440, kOkFormat, good_format());
 	REQUIRE(p.result == MaskResult::ok);
 	CHECK(p.value_r == doctest::Approx(0.25f));
 	CHECK(p.value_g == kNeutral);
@@ -163,7 +166,7 @@ TEST_CASE("ControlMask: a disabled channel writes neutral, not its configured va
 
 TEST_CASE("ControlMask: the subrect is the COLOUR rect, based at the origin")
 {
-	const Plan p = plan_mask(enabled_all(0.5f, 1.0f, 1.0f), 2560, 1440, good_format());
+	const Plan p = plan_mask(enabled_all(0.5f, 1.0f, 1.0f), 2560, 1440, kOkFormat, good_format());
 	REQUIRE(p.result == MaskResult::ok);
 	const Subrect r = subrect_for(p);
 	CHECK(r.present);
@@ -188,4 +191,58 @@ TEST_CASE("ControlMask: every result has a name")
 		CHECK(n[0] != '?');
 	}
 	CHECK(std::string(mask_result_name(static_cast<MaskResult>(kMaskResultCount))) == "?");
+}
+
+TEST_CASE("ControlMask: an integer format is refused, and BEFORE the typed-UAV gate")
+{
+	// A *_UINT texture is perfectly storable through a typed UAV, so it would sail past the other
+	// gate — and the runtime creates its SRV without complaint, after which the kernel does a
+	// `tex.2d.v4.f32.f32` float fetch against an integer texture. Undefined values, no error.
+	const Config cfg = enabled_all(0.5f, 0.5f, 0.5f);
+	CHECK(plan_mask(cfg, 2560, 1440, 28, good_format()).result == MaskResult::ok);      // RGBA8_UNORM
+	CHECK(plan_mask(cfg, 2560, 1440, 10, good_format()).result == MaskResult::ok);      // RGBA16_FLOAT
+	CHECK(plan_mask(cfg, 2560, 1440, 30, good_format()).result == MaskResult::integer_format); // RGBA8_UINT
+	CHECK(plan_mask(cfg, 2560, 1440, 42, good_format()).result == MaskResult::integer_format); // R32_UINT
+
+	// The ordering matters for the log, not the outcome: with BOTH problems present the reported
+	// reason must be the integer format, because that is the one the operator can act on.
+	FormatSupport no_store = good_format();
+	no_store.store = false;
+	CHECK(plan_mask(cfg, 2560, 1440, 30, no_store).result == MaskResult::integer_format);
+}
+
+TEST_CASE("ControlMask: format_is_integer covers the families, and nothing else")
+{
+	for (int f : { 3, 4, 7, 8, 13, 14, 17, 18, 22, 23, 30, 32, 36, 38, 42, 43, 47, 50, 52, 57,
+	               59, 62, 64 })
+		CHECK_MESSAGE(format_is_integer(f), "DXGI_FORMAT ", f, " is an integer format");
+	// The formats a mask would plausibly be built in, and the ones the runtime's own canonicalizer
+	// produces, must all pass.
+	for (int f : { 2, 10, 11, 24, 26, 28, 29, 34, 41, 54, 61, 87 })
+		CHECK_MESSAGE(!format_is_integer(f), "DXGI_FORMAT ", f, " is not an integer format");
+}
+
+TEST_CASE("ControlMask: an identity mask leaves the BLEND WEIGHT untouched")
+{
+	// The kernel computes `saturate(DLSSNR.Intensity * mask.x)`, and the no-mask path is
+	// `saturate(DLSSNR.Intensity)` — so mask.R == 1.0 is exactly the unmasked weight, whatever
+	// Intensity is. That is what makes the identity mask a clean control for the PLUMBING.
+	//
+	// It is NOT a clean control for the whole feature: binding a mask also drives the resolved
+	// structure pair to the sentinel, which changes the network's own input channels. The
+	// comparison that isolates the mask alone is identity-mask against UseAutoMask=0-and-no-mask,
+	// because those two agree on both the weight and the resolved pair.
+	Config identity;
+	identity.enabled = true;
+	identity.channel_r = identity.channel_g = identity.channel_b = true;
+	const Plan p = plan_mask(identity, 2560, 1440, kOkFormat, good_format());
+	REQUIRE(p.result == MaskResult::ok);
+	CHECK(p.value_r == kNeutral);
+	CHECK(p.is_identity);
+
+	const ResolvedStructure with_mask = resolve_structure(true, 1, 1.33f, 1.74f);
+	const ResolvedStructure auto_off = resolve_structure(false, 0, 1.33f, 1.74f);
+	CHECK(with_mask.skin == auto_off.skin);
+	CHECK(with_mask.local == auto_off.local);
+	CHECK(with_mask.effective_auto_mask == auto_off.effective_auto_mask);
 }

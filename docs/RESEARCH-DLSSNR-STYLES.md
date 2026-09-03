@@ -375,3 +375,91 @@ ControlMask pointer itself.
 to -1.0), so `NgxNRMask` 0 -> 1 and 1 -> 0 each wipe feature 18's accumulation for a frame.
 Changing what the mask CONTAINS moves none of them. So a mask-value A/B is clean and immediate,
 while an on/off A/B has to be judged a second or two after the toggle. **HARD.**
+
+### 8.8 What the KERNEL does with the mask — G and B are dead, and the format question is closed
+
+§8.2 established that the host registers the mask and gives it a guide rect. This section is the
+other end: what the compiled kernel actually fetches. All **HARD** unless marked.
+
+**Extraction.** The cubins and PTX are **not** in `.rsrc` — that 147 MB section is a single
+resource named `WEIGHTS_HTS` holding the weight blob. The code lives in **`.data`** as **15 NVIDIA
+fatbins** (magic `50 ED 55 BA`), 45 entries in all — 15 × (sm_89 cubin, sm_120 PTX, sm_120 cubin),
+~57 MB decompressed. This copy carries **real sm_89 cubins with the same kernel symbol set as
+sm_120**, so the PTX is a faithful proxy for what runs on Ada. (This also corrects §6's note that
+the payload lives where `patch_dlssnr.py` looked.)
+
+**Only two kernels read the mask**, both with a single bindless
+`tex.2d.v4.f32.f32` — float coordinates, float4 result:
+`cc_tinlayout_fused_post_block_swin_1h_32_control_mask` (and its `_fp8` / `_full_rect` variants,
+texture object at `param+256` of a 312-byte struct) and `cg2r_post_process_kernel`
+(`param_0+96`). There is no `tld4`, no `suld` and no `sured` anywhere in the corpus.
+
+**The arithmetic, and it is short:**
+
+```
+w       = saturate(DLSSNR.Intensity * mask.x)      // cvt.ftz.sat.f32.f32
+out.rgb = saturate(lerp(originalColour.rgb, network.rgb, w))
+out.a   = 1.0f
+```
+
+`Intensity` is proven to be the other factor by the sibling `..._simple_blend` kernel, which is
+the identical block with `saturate(Intensity)` used directly and no texture at all, and by the
+host's own gate at 0x18001c9f2: the blend path is taken when
+`1.0f > Intensity || ControlMask != null`.
+
+**`mask.R` is the per-pixel final blend weight — CONFIRMED. `G` and `B` are DEAD — REFUTED.**
+The `.y`/`.z`/`.w` registers the `tex` instruction produces appear **exactly once each in 9.9 MB
+of PTX**, as its own destinations, and are never read. CLAUDE.md's "G scales local tone, B scales
+local structure" does not hold for 310.8.0. "No skin channel" is confirmed: the pre-block has five
+texture slots, none of them a mask, and no `_control_mask` variant exists.
+
+**Format: no validation of any kind.** `NGXCubinD3D12::GetInputTextureViewHandle64` (0x18005d640,
+vtable slot +0xA8) calls `GetDesc`, runs the format through a pure typeless/sRGB/depth
+canonicalizer (0x18005da00 — `R16G16B16A16_TYPELESS→_FLOAT`, `R8G8B8A8_UNORM_SRGB→_UNORM`,
+`D32_FLOAT→R32_FLOAT`, everything else passed through unchanged), builds
+`{Format, TEXTURE2D, Shader4ComponentMapping = 0x1688, MipLevels = desc.MipLevels}` and calls
+`CreateShaderResourceView`, then `NvAPI_D3D12_GetCudaMergedTextureSamplerObject`. **No whitelist,
+no rejection.** So the texture unit resolves the format: **UNORM comes back normalised to [0,1],
+FLOAT comes back raw, and both are correct.** The `NGXCubinFormat_*` enum is used only for the
+runtime's own allocations.
+
+**The one broken class is `*_UINT` / `*_SINT`:** the canonicalizer passes it through, the SRV is
+created, and `tex.2d.v4.f32.f32` then reads an integer texture as float — undefined values, no
+error. `nrmaskplan::format_is_integer` refuses it.
+
+**Coordinates are normalised and the guide rect's `1/texW, 1/texH` terms ARE used:**
+`u = (activeW * (px + 0.5)/blendW + baseX) * (1/texW)`. A zero subrect means the whole texture and
+the reciprocals are zero-guarded, so a mask of **any resolution works**. But the sampler is
+**`MIN_MAG_MIP_POINT`, CLAMP, `MinLOD == MaxLOD == 0`** (template 0x1800b7770, selected as kind 2
+at 0x18001cbae for every caller guide), so a mismatched mask is nearest-neighbour resampled —
+blocky, with no error. Matching the blended rect buys 1:1 texels; at a present-stage hook that
+rect is the back buffer.
+
+**Range: `saturate` on the product clamps everything, NaN to 0**, so out-of-range values are safe
+but only [0,1] is meaningful.
+
+**Hazards, in order.** (1) A non-`TEXTURE2D` or MSAA resource: the SRV is built with
+`ViewDimension = TEXTURE2D` unconditionally and `desc.Dimension` is never checked, so a buffer or
+a multisampled texture yields an invalid SRV that reaches the cubin — the highest hang risk.
+(2) An integer format, as above. (3) A wrong resource state; the mask wants
+`NON_PIXEL_SHADER_RESOURCE` like every other guide. (4) Mip levels are **benign here** — the SRV
+exposes them all but the sampler pins LOD 0; this is the input path and is unrelated to the
+documented `DXGI_ERROR_DEVICE_HUNG` from a mipped *output*, which goes through the surface path
+(vtable +0xB0). (5) A wrong size is benign but silently wrong.
+
+**`DLSSNR.UI` / `DLSSNR.UIAlpha`, from `cg2r_post_process_kernel`:** only `UIAlpha.x` (RED) is
+used, and only `UI.w` (ALPHA) as its fallback — the UI texture's RGB is fetched and never read, so
+this kernel reads UI *opacity* and does not composite UI colour. The combined weight is
+`Intensity × ControlMask.R × (1 − saturate(uiAlpha))`, i.e. **suppress the neural effect where the
+HUD is opaque**. Format, coordinates and sampler are identical to the mask's in every respect.
+
+**One semantic footgun:** binding a ControlMask forces the blend path on even at `Intensity == 1.0`
+(host gate 0x18001ca04), and the blended result is written to a **different surface** (`param+192`)
+with RGB saturated to [0,1] and alpha forced to 1.0, while the raw unsaturated network output goes
+to `param+16`. At a post-tonemap hook that saturation costs nothing — the back buffer is
+`R10G10B10A2_UNORM` already — but it would have mattered at the old TAA site.
+
+The `param+224` "blend-toward" texture is the un-processed image: **SOFT** on the wiring (the
+launch site was not walked), **HARD** on the semantics, since `simple_blend` lerps toward it by
+`Intensity` alone and `EvaluateFeature` creates and fills a `dlssnr_original_color` RGBA16F
+snapshot at 0x180019664 for exactly this shape.

@@ -314,9 +314,9 @@ bool ensure(ID3D12Device *device, std::uint32_t width, std::uint32_t height, std
 	g_stats.bytes = g_live.bytes;
 
 	STRAY_LOG_INFO("NR mask: allocated a %ux%u DLSSNR.ControlMask in DXGI_FORMAT %d "
-		"([STRAYDLSS] NgxNRMaskFormat), %llu bytes. The runtime does not inspect a caller's "
-		"format on this path, so if the mask has an effect but the WRONG one, this number is the "
-		"first thing to change.",
+		"([STRAYDLSS] NgxNRMaskFormat), %llu bytes. The runtime creates the SRV from whatever "
+		"format this is and lets the texture unit resolve it, so UNORM and FLOAT are both correct "
+		"and only integer formats are not (those are refused before we get here).",
 		width, height, g_format, static_cast<unsigned long long>(g_live.bytes));
 	return true;
 }
@@ -365,10 +365,12 @@ bool record_fill(ID3D12GraphicsCommandList *cmd, const nrmaskplan::Plan &plan)
 	++g_stats.fills;
 
 	STRAY_LOG_INFO("NR mask: filled the %ux%u ControlMask with RGBA (%.3f, %.3f, %.3f, %.3f)%s. "
-		"R is the per-pixel final blend weight, G scales local tone, B scales local structure; "
-		"1.0 in every channel is the identity. Binding a mask AT ALL forces DLSSNR.UseAutoMask "
-		"to 0 and drives both resolved structure strengths to -1.0 (src/core/nr_mask_plan.hpp), "
-		"so this line changing the image is not by itself evidence that the mask VALUES did.",
+		"ONLY R IS LIVE in this runtime: the kernel computes saturate(DLSSNR.Intensity * mask.x) "
+		"and lerps the original towards the neural result by it, while the .y/.z/.w it fetches are "
+		"never read. R=1.0 is therefore exactly the unmasked blend weight. Binding a mask AT ALL "
+		"forces DLSSNR.UseAutoMask to 0 and drives both resolved structure strengths to -1.0 "
+		"(src/core/nr_mask_plan.hpp), so this line changing the image is not by itself evidence "
+		"that the mask VALUES did.",
 		g_live.width, g_live.height, static_cast<double>(want[0]), static_cast<double>(want[1]),
 		static_cast<double>(want[2]), static_cast<double>(want[3]),
 		plan.is_identity ? " — the IDENTITY mask" : "");

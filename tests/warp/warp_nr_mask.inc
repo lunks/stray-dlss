@@ -14,10 +14,11 @@
 // UAV write and two transitions on the present list forever, and the fill count is the number
 // that says whether it is happening.
 //
-// WHAT IT CANNOT PROVE: that R16G16B16A16_FLOAT is the format the neural kernel expects, or that
-// the runtime does anything at all with the values. The mask is filled here in R8G8B8A8_UNORM
-// purely so readback_rgba8 can read it; the shipping format is a knob for exactly the reason this
-// test cannot settle it.
+// WHAT IT CANNOT PROVE: that the runtime does anything at all with the values. That needs the
+// game. What it does NOT need to prove any more is the format — the runtime creates the SRV from
+// whatever DXGI_FORMAT it is handed and lets the texture unit resolve it, so UNORM and FLOAT are
+// both correct and only the integer families are not (refused in nrmaskplan, tested in the doctest
+// lane).
 
 #include "core/nr_mask_plan.hpp"
 #include "nr_mask.hpp"
@@ -46,8 +47,8 @@ bool test_nr_control_mask_fill(Gpu &gpu)
 	constexpr UINT kW = 64;
 	constexpr UINT kH = 32;
 
-	// R8G8B8A8_UNORM here so readback_rgba8 can read it; the shipping default is a knob
-	// (nrmask::kDefaultMaskFormat) precisely because the binary does not settle it.
+	// R8G8B8A8_UNORM, which is both what readback_rgba8 can read and the shipping default —
+	// the kernel's weight is saturate(Intensity * mask.x), so [0,1] is the whole meaningful range.
 	stray_dlss::nrmask::set_format(static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM));
 
 	check(stray_dlss::nrmask::ensure(gpu.device.Get(), kW, kH, /*frame=*/1),
@@ -66,8 +67,8 @@ bool test_nr_control_mask_fill(Gpu &gpu)
 
 	stray_dlss::nrmaskplan::FormatSupport support;
 	support.queried = support.view = support.store = true;
-	const stray_dlss::nrmaskplan::Plan plan =
-		stray_dlss::nrmaskplan::plan_mask(cfg, kW, kH, support);
+	const stray_dlss::nrmaskplan::Plan plan = stray_dlss::nrmaskplan::plan_mask(cfg, kW, kH,
+		static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM), support);
 	check(plan.result == stray_dlss::nrmaskplan::MaskResult::ok, "the plan admits the fill");
 	check(!plan.is_identity, "and it is not the identity mask");
 
@@ -151,8 +152,8 @@ bool test_nr_control_mask_resize_retires(Gpu &gpu)
 	cfg.value_r = 0.25f;
 	stray_dlss::nrmaskplan::FormatSupport support;
 	support.queried = support.view = support.store = true;
-	const stray_dlss::nrmaskplan::Plan p32 =
-		stray_dlss::nrmaskplan::plan_mask(cfg, 32, 16, support);
+	const stray_dlss::nrmaskplan::Plan p32 = stray_dlss::nrmaskplan::plan_mask(cfg, 32, 16,
+		static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM), support);
 	check(stray_dlss::nrmask::record_fill(gpu.list.Get(), p32), "and it fills");
 	if (!flush(gpu))
 		return false;

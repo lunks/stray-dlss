@@ -120,31 +120,62 @@ enum class MaskResult
 	// than bind: an uninitialised control texture is the "silently wrong image" failure this
 	// project exists to avoid.
 	no_typed_uav_store,
+	// The chosen format is *_UINT or *_SINT. The runtime creates the SRV happily and the kernel
+	// then does a float fetch against an integer texture — undefined values, no error.
+	integer_format,
 	// Allocation or descriptor creation failed.
 	alloc_failed,
 };
 
-constexpr int kMaskResultCount = 5;
+constexpr int kMaskResultCount = 6;
 const char *mask_result_name(MaskResult result);
 
-// The three channels, from CLAUDE.md's own disassembly notes: R is the per-pixel FINAL BLEND
-// WEIGHT, G scales local tone, B scales local structure. There is no skin channel — skin is not
-// expressible per-pixel at all.
+// THE CHANNELS — and CLAUDE.md's note that "G scales local tone, B scales local structure" is
+// REFUTED for this build. [HARD, from the decompressed PTX, 2026-09-03]
 //
-// Each channel has its own switch so R, G and B can be tested APART. A channel that is off writes
-// kNeutral, so turning two off is not the same as not binding a mask: the plumbing, the format and
-// the registration are all still exercised, and only the value changes. That distinction is the
-// whole point of having per-channel switches rather than one.
+// The mask is fetched by `cc_tinlayout_fused_post_block_swin_1h_32_control_mask` (and its _fp8 /
+// _full_rect variants) with a single `tex.2d.v4.f32.f32`, and the arithmetic that follows is:
+//
+//     w       = saturate(DLSSNR.Intensity * mask.x)
+//     out.rgb = saturate(lerp(originalColour.rgb, network.rgb, w))
+//     out.a   = 1.0f
+//
+// `mask.x` is therefore the per-pixel final blend weight, exactly as recorded. But the `.y`, `.z`
+// and `.w` registers the same `tex` instruction produces appear EXACTLY ONCE each in the whole
+// 9.9 MB of decompressed PTX — as its own destinations — and are never read. **G and B do nothing
+// in the 310.8.0 runtime.** The proof that `Intensity` is the other factor is the sibling
+// `..._simple_blend` kernel, which is the identical block with `saturate(Intensity)` used directly
+// as the weight and no texture at all.
+//
+// The switches for G and B are KEPT anyway, defaulting to the neutral 1.0, for two reasons: the
+// texture is four-channel regardless, so writing 1.0 into the dead lanes costs nothing and leaves
+// it correct if a later runtime starts reading them; and a future session that wants to re-test
+// the claim can do so without re-plumbing. Nothing should EXPECT them to work here.
 struct Config
 {
 	bool enabled = false;
-	bool channel_r = false; // final blend weight
-	bool channel_g = false; // local tone scale
-	bool channel_b = false; // local structure scale
+	bool channel_r = false; // the per-pixel final blend weight — the ONE live channel
+	bool channel_g = false; // dead in 310.8.0 (see above)
+	bool channel_b = false; // dead in 310.8.0 (see above)
 	float value_r = kNeutral;
 	float value_g = kNeutral;
 	float value_b = kNeutral;
 };
+
+// INTEGER FORMATS ARE UNDEFINED, and nothing anywhere will say so. [HARD]
+//
+// `NGXCubinD3D12::GetInputTextureViewHandle64` (0x18005d640) runs a caller's DXGI_FORMAT through a
+// pure typeless/sRGB/depth canonicalizer (0x18005da00) and then creates a TEXTURE2D SRV from it.
+// There is no whitelist, no validation and no rejection path — a UNORM format comes back
+// normalised to [0,1] by the texture unit and a FLOAT format comes back raw, so both work. But a
+// `*_UINT` / `*_SINT` format passes the canonicalizer untouched, gets its SRV, and is then read by
+// `tex.2d.v4.f32.f32` — a float fetch against an integer texture, whose result is undefined values
+// rather than any kind of error.
+//
+// So this is the one format class that must be refused rather than left to the knob. It is a
+// blocklist and not an allowlist on purpose: the knob exists so a format can be A/B'd on the box,
+// and only this class is KNOWN broken.
+bool format_is_integer(int dxgi_format);
 
 // What CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT) said about the mask format. Same shape
 // as nrplan::ColourDesc's three bits, and separate for the same reason: the log must be able to
@@ -175,13 +206,24 @@ struct Plan
 	bool is_identity = false;
 };
 
+// `dxgi_format` is the mask texture's format, checked against format_is_integer.
 Plan plan_mask(const Config &cfg, std::uint32_t colour_width, std::uint32_t colour_height,
-               const FormatSupport &support);
+               int dxgi_format, const FormatSupport &support);
 
 // The mask's subrect. It is the COLOUR rect, not the guide rect: the mask is per-pixel over the
 // image the network is improving, and at the present stage the colour rect is the back buffer's.
 // Base is (0,0) for the same reason every other rect's is — we never hand the runtime a
 // sub-rectangle of a larger allocation.
+//
+// THE RESOLUTION IS ACTUALLY FREE, which is worth knowing before anyone "fixes" this. The kernel
+// addresses the mask in NORMALISED coordinates through its own guide rect —
+// `u = (activeW * (px + 0.5)/blendW + baseX) * (1/texW)` — so any extent works, and a zero
+// subrect means "the whole texture" (0x18001c520 fills it in from the resource's own extent). But
+// the sampler is kind 2, `MIN_MAG_MIP_POINT` with CLAMP addressing and MinLOD == MaxLOD == 0
+// (templates at 0x1800b7770, chosen at 0x18001cbae), so a mask that does not match the rect it
+// modulates is nearest-neighbour blown up or decimated — blocky, with no error. Matching the
+// blended rect exactly is what buys 1:1 texels, and at the present stage that rect IS the back
+// buffer.
 //
 // Returned as its own type rather than reusing nrparam::Rects because the mask is optional and
 // the four other rects are not: an absent mask must emit NO subrect entries at all, and a struct

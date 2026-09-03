@@ -30,25 +30,26 @@ struct ID3D12Resource;
 
 namespace stray_dlss::nrmask {
 
-// THE MASK FORMAT, and the honest state of the evidence for it.
+// THE MASK FORMAT — no longer a guess. [HARD, 2026-09-03]
 //
-// The runtime does NOT inspect a caller-supplied texture's DXGI_FORMAT anywhere on this path:
-// the guide-rect builder at 0x18001c520 reads only Width and Height out of the resource
-// description, and the registration call at 0x18001cbb5 passes the resource and a usage word and
-// nothing else. So the format is interpreted entirely by the CUDA texture object the driver
-// mints from the D3D12 descriptor, and the kernel's assumed channel type has to match it. That
-// is exactly the class of thing that produces a wrong image with no error [CLAUDE.md §0.2], so
-// it is a KNOB rather than a constant, logged with its probe result, and one run can A/B two
-// candidates instead of costing a round trip each.
+// `NGXCubinD3D12::GetInputTextureViewHandle64` (0x18005d640) takes a caller's texture, runs its
+// DXGI_FORMAT through a pure typeless/sRGB/depth canonicalizer (0x18005da00), builds a TEXTURE2D
+// SRV from the result and hands it to NvAPI's CUDA-texture entry point. There is no whitelist and
+// no rejection path anywhere on that route, and the `NGXCubinFormat_*` enum the runtime carries is
+// used only for its OWN allocations. So the format is resolved by the texture unit: a UNORM
+// format comes back normalised to [0,1], a FLOAT format comes back raw, and both are correct.
+// The one class that is NOT correct is `*_UINT` / `*_SINT`, which the kernel's
+// `tex.2d.v4.f32.f32` reads as floats — undefined values, no error — and which
+// nrmaskplan::format_is_integer refuses outright.
 //
-// R16G16B16A16_FLOAT is the default because it is the format the runtime uses for every internal
-// texture it creates for this same kernel family — the two it names in its own log lines are
-// `dlssnr_prev_output` and `dlssnr_network_output_scratch`, both "RGBA16F", and the create
-// descriptor it fills in for them carries format enum 2 at +0x0c (0x180019636). That is a SOFT
-// argument by analogy, not a HARD reading of how the mask itself is sampled, and it is labelled
-// as such here so nobody later mistakes it for one. [STRAYDLSS] NgxNRMaskFormat overrides it with
-// a raw DXGI_FORMAT number.
-constexpr int kDefaultMaskFormat = 10; // DXGI_FORMAT_R16G16B16A16_FLOAT
+// R8G8B8A8_UNORM is the default, and the reason is the arithmetic rather than a preference: the
+// kernel computes `saturate(DLSSNR.Intensity * mask.x)`, so the only meaningful range is [0,1] and
+// a normalised 8-bit channel spends every one of its 256 codes inside it. It also halves the
+// footprint against RGBA16F (14.7 MB against 29.5 MB at 2560x1440) and is the format the WARP lane
+// round-trips texel-for-texel. FLOAT remains a legitimate A/B — [STRAYDLSS] NgxNRMaskFormat takes
+// a raw DXGI_FORMAT number — and 10 (R16G16B16A16_FLOAT) is the obvious other candidate if 8-bit
+// quantisation of a blend weight ever turns out to matter, which at 1/255 it should not.
+constexpr int kDefaultMaskFormat = 28; // DXGI_FORMAT_R8G8B8A8_UNORM
 
 void set_format(int dxgi_format);
 int format();

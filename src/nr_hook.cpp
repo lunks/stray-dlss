@@ -298,7 +298,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 		nrmaskplan::FormatSupport fs;
 		if (cfg.enabled)
 			fs = nrmask::probe(device);
-		mask_plan = nrmaskplan::plan_mask(cfg, plan.width, plan.height, fs);
+		mask_plan = nrmaskplan::plan_mask(cfg, plan.width, plan.height, nrmask::format(), fs);
 
 		if (mask_plan.result == nrmaskplan::MaskResult::ok)
 		{
