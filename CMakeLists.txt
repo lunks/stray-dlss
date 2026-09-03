@@ -91,6 +91,8 @@ add_library(stray_dlss_core STATIC
     src/core/present_plan.hpp
     src/core/fg_plan.cpp
     src/core/fg_plan.hpp
+    src/core/exposure_plan.cpp
+    src/core/exposure_plan.hpp
     src/core/nr_history_plan.cpp
     src/core/nr_history_plan.hpp
     src/core/ring.hpp
@@ -209,6 +211,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         # The framework-free application, behind the seam.
         src/app/dlss_app.cpp
         src/app/dlss_app.hpp
+        src/exposure_texture.cpp
+        src/exposure_texture.hpp
         src/ngx_backend.cpp
         src/ngx_backend.hpp
         src/ngx_nr.cpp
@@ -473,7 +477,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_ini.cpp
         tests/test_intercept_types.cpp
         tests/test_native_core.cpp
-        tests/test_fg_plan.cpp)
+        tests/test_fg_plan.cpp
+        tests/test_exposure_plan.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

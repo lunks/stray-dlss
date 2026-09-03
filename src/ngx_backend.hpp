@@ -11,6 +11,8 @@
 //   * Teardown order, GPU idle first: ReleaseFeature -> DestroyParameters -> Shutdown1.
 #pragma once
 
+#include "core/exposure_plan.hpp"
+
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12GraphicsCommandList;
@@ -70,26 +72,43 @@ struct FeatureDesc
 // Returns false and records last_error() on failure; the caller must then not evaluate.
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
 
-// [STRAYDLSS] NgxExposure: false = "auto" (today's behaviour — the feature is created
-// with NVSDK_NGX_DLSS_Feature_Flags_AutoExposure and DLSS estimates exposure itself);
-// true = "texture" (the flag is dropped and the engine's own eye-adaptation texture is
-// passed as pInExposureTexture at every evaluate). CREATION-TIME property: read once at
-// init, A/B'd across launches. The official UE plugin implements exactly this pair
-// (r.NGX.DLSS.AutoExposure; NGXRHI.cpp:537-546 sets the flag from it, NGXD3D12RHI.cpp:
-// 267-269 nulls the texture under auto — v3.7.3 mirror, fetched 2026-08-31).
-void set_exposure_from_texture(bool use_texture);
-bool exposure_from_texture();
+// [STRAYDLSS] NgxExposure, as parsed by exposure::parse_mode:
+//   auto    — the AutoExposure create flag, DLSS estimates exposure itself (default, and the
+//             official plugin's own default: r.NGX.DLSS.AutoExposure defaults to 1).
+//   texture — the flag is dropped and the ENGINE's eye-adaptation texture (TAA t0) is passed.
+//   owned   — the flag is dropped and OUR OWN 1x1 R32_FLOAT is passed, carrying View row
+//             135.y times [STRAYDLSS] NgxExposureValue. See src/exposure_texture.hpp for why
+//             owning the resource is what makes the experiment decidable.
+//
+// CREATION-TIME property (the flag is), read once at init and A/B'd across launches.
+//
+// READ THE PRESET GATE BEFORE USING EITHER TEXTURE MODE. DLSS Programming Guide 310.6.0 §3.9:
+// "Only supported by Presets J and K. Preset L always uses AutoExposure." Everything below is
+// inert on a preset outside {J, K}, and the driver default resolves to M at this title's
+// shipped 50% screen percentage. exposure::exposure_will_be_ignored() detects that combination
+// and dlss_app warns at init.
+void set_exposure_mode(exposure::Mode mode);
+exposure::Mode exposure_mode();
 
-// [STRAYDLSS] NgxExposureScale (default 1.0): the InExposureScale passed to the SR
-// evaluate under NgxExposure=texture — DLSS multiplies the exposure-texture value by this
-// (nvsdk_ngx_helpers.h:508). The DEFINITIVE consume test: the on-screen indicator's
-// "Auto Exposure" text is ambiguous, so feed a deliberately wrong scale (0.25 / 4.0) and
-// watch the image — a brightness/bright-region response proves DLSS reads our exposure;
-// no response at either extreme proves the texture never reaches DLSS's math. 1.0 is
-// behaviourally identical to today (the helper maps our previous 0 to 1.0 anyway). Read
-// once at init; only meaningful under NgxExposure=texture.
+// [STRAYDLSS] NgxExposureScale (default 1.0): InExposureScale on the SR evaluate under either
+// texture mode. nvsdk_ngx_helpers.h:508 forwards it as DLSS.Exposure.Scale, with 0 rewritten
+// to 1.0.
+//
+// DEMOTED FROM "the definitive consume test", deliberately. DLSS.Exposure.Scale has ZERO
+// explanatory prose in the entire 84-page Programming Guide (revision 310.6.0) — the name
+// appears only in the parameter listing, and whether it multiplies or divides into the
+// texture's value is UNCONFIRMED from any primary source. A null result from a sweep of it is
+// therefore not evidence about the exposure TEXTURE. NgxExposureValue under NgxExposure=owned
+// is the sound consume test, because it perturbs the one quantity the guide does document.
 void set_exposure_scale(float scale);
 float exposure_scale();
+
+// [STRAYDLSS] NgxExposureValue (default 1.0): multiplies the value written into the OWNED
+// exposure texture. 1.0 is the honest value (the engine's own exposure). Anything else is the
+// deliberately-wrong number of the consume test — if 0.25 and 4.0 produce the same image, the
+// runtime is not reading the texture.
+void set_exposure_value_multiplier(float multiplier);
+float exposure_value_multiplier();
 
 struct EvaluateInputs
 {
@@ -97,9 +116,13 @@ struct EvaluateInputs
 	ID3D12Resource *depth = nullptr;           // render-res depth, reversed-Z
 	ID3D12Resource *motion_vectors = nullptr;  // our dense RG16_FLOAT field
 	ID3D12Resource *output = nullptr;          // output-res UAV, ALLOW_UNORDERED_ACCESS
-	// The engine's eye-adaptation texture (TAA register t0: 1x1 RGBA32F), consumed only
-	// under NgxExposure=texture; null falls back to DLSS's default exposure of 1.0 for
-	// that frame (the helper's InExposureScale 0->1 mapping, nvsdk_ngx_helpers.h:508).
+	// The exposure texture for this frame — the engine's eye-adaptation buffer (TAA
+	// register t0: 1x1 RGBA32F) under NgxExposure=texture, our own 1x1 R32_FLOAT under
+	// NgxExposure=owned, null under auto. Either format is legal: DLSS Programming Guide
+	// 310.6.0 §3.9 says "Only the first channel is sampled in the texture so multiple
+	// formats will work but something such as R16F is preferred". §3.4 requires it in
+	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in the same input class as colour
+	// and depth — which is where the game's own compute dispatch already leaves t0.
 	// VALUE SEMANTICS, the load-bearing point: texel .x is UE's smoothed exposure
 	// multiplier — `OutColor.x = MiddleGreyExposureCompensation * SmoothedExposureScale`
 	// (PostProcessEyeAdaptation.usf:95-112, 4.27.2 mirror, fetched 2026-08-31) — the value
@@ -121,6 +144,12 @@ struct EvaluateInputs
 	unsigned int render_height = 0;
 	bool reset = false;                        // camera cut / invalid history
 	float pre_exposure = 1.0f;
+	// ue4::pre_exposure_plausible on the View CB this frame: row 135 must read
+	// (denormal, P, 1/P, 0.0) with P*(1/P) == 1 exactly (CLAUDE.md §2.6). FALSE means we do
+	// not know the exposure, and InPreExposure is then sent as a deliberate 1.0 rather than
+	// as whatever the row happened to hold. The NR path has always gated this row; the SR
+	// path did not, which let a misread reach DLSS silently.
+	bool pre_exposure_ok = true;
 };
 
 bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in);
@@ -129,6 +158,11 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in);
 // [STRAYDLSS] NgxPreset: 0=driver default, 10=J, 11=K (default), 12=L, 13=M. J is often
 // calmer on specular sparkle. Takes effect at the next feature (re)creation.
 void set_preset(int preset);
+
+// The preset hint currently configured (0 = driver default). Needed because exposure input is
+// PRESET-GATED: DLSS Programming Guide 310.6.0 §3.9, "Only supported by Presets J and K.
+// Preset L always uses AutoExposure."
+int preset();
 
 void release_feature();
 

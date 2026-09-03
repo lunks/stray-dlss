@@ -12,7 +12,9 @@
 #include "backend_native/native_backend.hpp"
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
+#include "core/exposure_plan.hpp"
 #include "ext_unhook.hpp"
+#include "exposure_texture.hpp"
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
 #include "host/config.hpp"
@@ -278,6 +280,9 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		nrhist::shutdown();
 		ngxfg::shutdown();
 		nr::shutdown();
+		// Before ngx::shutdown, which is where the caller has already made the GPU idle.
+		// Our owned exposure texture belongs to this device and must not outlive it.
+		exposure_texture::release();
 		if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 			ngx::shutdown(g_state.native_device);
 		g_state.native_device = nullptr;
@@ -420,33 +425,69 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		STRAY_LOG_INFO("RR-1 guide resolve records at the SSD-dispatch trigger, hoisted "
 			"ABOVE suppression (content alive; GBufferResolveAt is forced to ssd for RR-1).");
 
-	// [STRAYDLSS] NgxExposure: "auto" (default — today's behaviour, DLSS estimates
-	// exposure itself via the AutoExposure create flag) | "texture" (the flag is dropped
-	// and the engine's eye-adaptation texture rides every SR evaluate as
-	// pInExposureTexture). Creation-time property; A/B across launches. The candidate fix
-	// for the red/cyan single-pixel pops: bright neon highlights mis-weighted by DLSS's
-	// own exposure estimate in a dark scene.
-	char exposure_mode[16] = "auto";
-	host::cfg::get_string("NgxExposure", exposure_mode, sizeof(exposure_mode));
-	const bool exposure_texture = std::strcmp(exposure_mode, "texture") == 0;
-	ngx::set_exposure_from_texture(exposure_texture);
-	STRAY_LOG_INFO("DLSS exposure source: %s ([STRAYDLSS] NgxExposure=auto|texture).",
-		exposure_texture
-			? "engine eye-adaptation TEXTURE (AutoExposure flag dropped at create)"
-			: "DLSS AUTO-exposure (the AutoExposure create flag, today's behaviour)");
+	// [STRAYDLSS] NgxExposure = auto (default) | texture | owned.
+	//
+	//   auto    — the AutoExposure create flag; DLSS estimates exposure itself. This is also
+	//             the official UE plugin's default (r.NGX.DLSS.AutoExposure = 1, whose help
+	//             text calls the engine-exposure path the thing to try "in some cases [to]
+	//             reduce artifacts").
+	//   texture — drop the flag and ride the engine's own eye-adaptation buffer (TAA t0) on
+	//             every SR evaluate as pInExposureTexture, exactly as the plugin does.
+	//   owned   — drop the flag and pass OUR OWN 1x1 R32_FLOAT, carrying View row 135.y times
+	//             NgxExposureValue. src/exposure_texture.hpp explains why: it is the only
+	//             configuration in which we can perturb the number DLSS reads, which is the
+	//             only sound test of whether it reads it.
+	//
+	// Creation-time property (the flag is), A/B'd across launches.
+	char exposure_mode_str[16] = "auto";
+	host::cfg::get_string("NgxExposure", exposure_mode_str, sizeof(exposure_mode_str));
+	const exposure::Mode exposure_mode = exposure::parse_mode(exposure_mode_str);
+	ngx::set_exposure_mode(exposure_mode);
+	STRAY_LOG_INFO("DLSS exposure source: %s ([STRAYDLSS] NgxExposure=auto|texture|owned).",
+		exposure_mode == exposure::Mode::engine_texture
+			? "the ENGINE's eye-adaptation texture (AutoExposure flag dropped at create)"
+			: (exposure_mode == exposure::Mode::owned_texture
+				? "OUR OWN 1x1 R32_FLOAT carrying View row 135.y (AutoExposure flag dropped)"
+				: "DLSS AUTO-exposure (the AutoExposure create flag; the shipped default)"));
+	if (exposure_mode == exposure::Mode::automatic &&
+		std::strcmp(exposure_mode_str, "auto") != 0 && exposure_mode_str[0] != 0)
+		STRAY_LOG_WARN("NgxExposure=\"%s\" is not one of auto|texture|owned; using auto.",
+			exposure_mode_str);
 
-	// [STRAYDLSS] NgxExposureScale (default 1.0): the InExposureScale passed to the SR
-	// evaluate under NgxExposure=texture. The DEFINITIVE consume test — the DLSS on-screen
-	// indicator's "Exposure level" field echoes this exact value, and a wrong scale
-	// (0.25 / 4.0) must move the image if the exposure texture reaches DLSS's math. Only
-	// meaningful under NgxExposure=texture; 1.0 is behaviourally identical to before.
+	// THE PRESET GATE, restated at init so it is in the log before anything is measured.
+	// DLSS Programming Guide 310.6.0 §3.9: "Only supported by Presets J and K. Preset L always
+	// uses AutoExposure." The feature's quality mode is not known until it is created, so the
+	// authoritative check lives at CreateFeature (ngx_backend.cpp) — but the preset itself is
+	// known now, and an explicitly-configured L or M with a texture mode is already decided.
+	if (exposure::wants_texture(exposure_mode))
+		STRAY_LOG_INFO("Exposure input is preset-gated: the DLSS Programming Guide (310.6.0 "
+			"§3.9) supports it on presets J and K ONLY, and the driver default resolves to M "
+			"at this title's shipped 50%% screen percentage (Performance). Watch for the "
+			"'DLSS EXPOSURE:' line at feature creation — presetSupportsExposureInput=NO means "
+			"nothing downstream of this setting can matter. [STRAYDLSS] NgxPreset=11 pins K.");
+
+	// [STRAYDLSS] NgxExposureScale (default 1.0): InExposureScale on the SR evaluate under a
+	// texture mode. NOT the consume test it was once billed as: DLSS.Exposure.Scale has zero
+	// explanatory prose in the whole Programming Guide (revision 310.6.0) — the name appears
+	// only in the parameter listing, and multiply-versus-divide is UNCONFIRMED from any
+	// primary source — so a null result from sweeping it says nothing about the texture.
 	float exposure_scale = 1.0f;
 	exposure_scale = host::cfg::get_float("NgxExposureScale", exposure_scale);
 	ngx::set_exposure_scale(exposure_scale);
-	if (exposure_texture)
-		STRAY_LOG_INFO("DLSS InExposureScale = %.4f ([STRAYDLSS] NgxExposureScale). The "
-			"indicator's 'Exposure level' should read this; a 0.25/1.0/4.0 sweep that moves "
-			"the image proves DLSS consumes our exposure texture.", exposure_scale);
+
+	// [STRAYDLSS] NgxExposureValue (default 1.0): the multiplier on the OWNED texel. This IS
+	// the consume test, because it perturbs the one quantity the guide documents — "a 1x1
+	// texture containing the final exposure scale" (nvsdk_ngx_defs.h:766). Run the session
+	// three times at 0.25 / 1.0 / 4.0 with NgxExposure=owned and NgxPreset=11: if the image
+	// does not move, DLSS is not reading the texture, and that is finally a measurement
+	// rather than an absence of one.
+	float exposure_value = 1.0f;
+	exposure_value = host::cfg::get_float("NgxExposureValue", exposure_value);
+	ngx::set_exposure_value_multiplier(exposure_value);
+	if (exposure::wants_texture(exposure_mode))
+		STRAY_LOG_INFO("DLSS InExposureScale=%.4f ([STRAYDLSS] NgxExposureScale, undocumented "
+			"by NVIDIA), owned-texel multiplier=%.4f ([STRAYDLSS] NgxExposureValue, the sound "
+			"consume test under NgxExposure=owned).", exposure_scale, exposure_value);
 
 	// [STRAYDLSS] NgxNR: DLSS Neural Rendering (NGX feature 18 / DLSSNR). 0 = off (default,
 	// byte-identical to today), 1 = on. Runs AFTER the SR/RR evaluate as a post-pass on the

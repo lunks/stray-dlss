@@ -1,5 +1,8 @@
 #include "taa_hook.hpp"
 
+#include "core/exposure_plan.hpp"
+#include "exposure_texture.hpp"
+
 #include "gbuffer_finder.hpp"
 #include "gbuffer_resolve.hpp"
 #include "ngx_nr.hpp"
@@ -1856,18 +1859,29 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							// TemporalAAJitter.zw == .xy, and a 1x1 history/velocity dummy.
 							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
 							ei.pre_exposure = view.pre_exposure;
+							// The row-135 self-check, at the SR site. The NR path has always
+							// gated this row (below) while SR forwarded it blind, so a misread
+							// reached DLSS with nothing to notice — and a misread of 0 becomes a
+							// literal 1.0 inside nvsdk_ngx_helpers.h:507, which tells DLSS the
+							// colour buffer carries no pre-exposure while it carries ~0.45.
+							ei.pre_exposure_ok = view_ok && ue4::pre_exposure_plausible(view);
 
-							// [STRAYDLSS] NgxExposure=texture: the engine's eye-adaptation
-							// texture (register t0 of this very dispatch — 1x1 RGBA32F,
-							// present every frame, CLAUDE.md §2.3) becomes DLSS's exposure
-							// source; .x is UE's ExposureScale and the official plugin
-							// passes the texture unmodified alongside PreExposure
-							// (ngx_backend.hpp carries the full derivation). Liveness-
-							// checked like every capture. A miss cannot fall back to
-							// AutoExposure per frame — that is a creation-time flag — so
-							// the frame gets DLSS's default exposure 1.0 instead, loudly,
-							// once; a PERSISTENT miss means flip NgxExposure back to auto.
-							if (ngx::exposure_from_texture())
+							// The exposure texture, per [STRAYDLSS] NgxExposure.
+							//
+							//   texture — the engine's own eye-adaptation buffer, register t0 of
+							//             this very dispatch (1x1 RGBA32F, present every frame,
+							//             CLAUDE.md §2.3), liveness-checked like every capture.
+							//             This is what the official plugin passes.
+							//   owned   — our own 1x1 R32_FLOAT, written this frame with row
+							//             135.y x NgxExposureValue and transitioned by us.
+							//             src/exposure_texture.hpp explains why owning it is
+							//             what makes the "is it inert?" question decidable.
+							//
+							// A miss cannot fall back to AutoExposure per frame — that is a
+							// creation-time flag — so the frame gets DLSS's default exposure of
+							// 1.0 instead, and ngx::evaluate counts and reports it.
+							const exposure::Mode exposure_mode = ngx::exposure_mode();
+							if (exposure_mode == exposure::Mode::engine_texture)
 							{
 								const std::uint64_t eye = find_eye_adaptation_srv(b.srvs);
 								if (eye != 0 && icept::backend()->is_resource_live(eye))
@@ -1883,12 +1897,21 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 										STRAY_LOG_WARN("NgxExposure=texture but no live 1x1 "
 											"RGBA32F eye-adaptation SRV on this dispatch "
 											"(found=%d live=%d); DLSS gets default exposure "
-											"1.0 for such frames. If this persists, set "
-											"NgxExposure=auto. First occurrence only.",
+											"1.0 for such frames. NgxExposure=owned does not "
+											"depend on finding this binding at all. First "
+											"occurrence only.",
 											eye != 0 ? 1 : 0,
 											eye != 0 && icept::backend()->is_resource_live(eye) ? 1 : 0);
 									}
 								}
+							}
+							else if (exposure_mode == exposure::Mode::owned_texture)
+							{
+								const float texel = exposure::owned_texel_value(
+									view.pre_exposure, ei.pre_exposure_ok,
+									ngx::exposure_value_multiplier());
+								ei.exposure = exposure_texture::update(native_device, native,
+									texel);
 							}
 
 							NGX_TRACE("evaluate colour=%p depth=%p mv=%p out=%p",
@@ -1925,17 +1948,17 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 									eval_no);
 							}
 
-							// EXPOSURE DIAGNOSIS (NgxExposure=texture + NgxDumpInputs=1): DLSS
-							// silently reverts to auto-exposure in the live run, which means it
-							// received our texture and REJECTED it — likeliest an invalid
-							// VALUE (0/negative/NaN => DLSS auto-exposes). The API side is
-							// confirmed (flags 0x0b, one feature, no fallback warnings), so the
-							// missing evidence is the texel itself. Capture it at the first
-							// exposure evaluate and at eval 300/600, and log what we pass NGX
-							// and the state we ASSUME t0 is in (we do NOT barrier it — it is
-							// already NON_PIXEL_SHADER_RESOURCE from the game's own compute
-							// dispatch, which is exactly what NGX needs to read it).
-							if (ngx::exposure_from_texture() && input_dump::enabled())
+							// THE EXPOSURE DIAGNOSTIC. It runs whenever an exposure texture
+							// mode is configured — NOT behind NgxDumpInputs, which also turns
+							// on 66 MB colour/depth dumps and was therefore never on during an
+							// ordinary session. That gating is the reason "the texture mode
+							// measured inert" has no log excerpt behind it.
+							//
+							// It fires at the first exposure evaluate and at evaluates 300 and
+							// 600, and it reads back the texel we actually handed NGX. The
+							// readback is a 1x1 copy (a few hundred bytes) at three points in a
+							// session, so it costs nothing worth gating.
+							if (exposure_mode != exposure::Mode::automatic)
 							{
 								static bool s_first_done = false;
 								const bool at_point = !s_first_done || eval_no == 300 ||
@@ -1943,25 +1966,32 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								if (at_point)
 								{
 									s_first_done = true;
-									STRAY_LOG_INFO("EXPOSURE eval %llu: exposure=%p (colour=%p "
-										"depth=%p) InPreExposure=%.6f InExposureScale=%.6f "
-										"([STRAYDLSS] NgxExposureScale; DLSS indicator's "
-										"'Exposure level' should echo this) assumedState="
-										"NON_PIXEL_SHADER_RESOURCE barriered=no (same state and "
-										"discipline as colour/depth, which NGX consumes fine) "
-										"createFlags=0x0b",
+									STRAY_LOG_INFO("EXPOSURE eval %llu: mode=%s exposure=%p "
+										"(colour=%p depth=%p) InPreExposure=%.6f "
+										"pre_exposure_ok=%d InExposureScale=%.6f "
+										"valueMul=%.4f ownedTexel=%.6f "
+										"assumedState=NON_PIXEL_SHADER_RESOURCE (guide 310.6.0 "
+										"3.4 requires exactly this for every D3D12 input; the "
+										"engine's own compute dispatch already left t0 there, "
+										"and the owned texture is transitioned by us)",
 										static_cast<unsigned long long>(eval_no),
+										exposure::mode_name(exposure_mode),
 										static_cast<void *>(ei.exposure),
 										static_cast<void *>(ei.color),
 										static_cast<void *>(ei.depth), ei.pre_exposure,
-										ngx::exposure_scale());
+										ei.pre_exposure_ok ? 1 : 0, ngx::exposure_scale(),
+										ngx::exposure_value_multiplier(),
+										exposure_mode == exposure::Mode::owned_texture
+											? exposure_texture::last_value() : 0.0f);
 									if (ei.exposure != nullptr)
 									{
 										char label[32];
 										std::snprintf(label, sizeof(label), "exposure_%llu",
 											static_cast<unsigned long long>(eval_no));
-										// Same state we hand NGX: the game bound t0 as a
-										// compute SRV, so NON_PIXEL_SHADER_RESOURCE.
+										// The state both textures are in at this point: the
+										// engine's t0 because its own compute dispatch bound it
+										// as an SRV, ours because exposure_texture::update left
+										// it there. Not a guess in either case.
 										input_dump::capture_texel(
 											native_device, native, ei.exposure,
 											D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1969,11 +1999,11 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 									}
 									else
 									{
-										STRAY_LOG_WARN("EXPOSURE eval %llu: ei.exposure is NULL "
-											"despite NgxExposure=texture — the finder returned "
-											"nothing live this frame (see any 'no live 1x1' "
-											"warning above).",
-											static_cast<unsigned long long>(eval_no));
+										STRAY_LOG_WARN("EXPOSURE eval %llu: no exposure texture "
+											"this frame despite NgxExposure=%s — DLSS uses its "
+											"default exposure of 1.0 for it.",
+											static_cast<unsigned long long>(eval_no),
+											exposure::mode_name(exposure_mode));
 									}
 								}
 							}
