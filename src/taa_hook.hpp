@@ -111,30 +111,4 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
 
-// [STRAYDLSS] ViewCbAudit (default 1). Keeps the View-CB scan going past the winner so ambiguity
-// can be measured. 0 restores the old stop-at-the-first-survivor scan exactly.
-void set_view_cb_audit(bool enabled);
-
-// THE QUIET HALF OF THE WRONG-VIEW BUG, COUNTED.
-//
-// `wrong_view` above counts impostors that `view_fits_dispatch` threw out - the LOUD case, which
-// used to make the matcher refuse the real TAA dispatch (facts §36.18). It cannot count the case
-// it cannot detect: a second View uniform buffer whose rect is SMALLER than the dispatch covers
-// passes plausibility, row 135 and the fit bound alike, so on a lower root parameter it wins the
-// slot-order search and DLSS SR is fed another view's jitter, ClipToPrevClip and CameraCut with
-// nothing firing. `wrongView` ran at ~1.8 per candidate dispatch, so impostors are offered
-// constantly and only the loud subset was ever measured.
-//
-// `single` is the FORCED case (exactly one survivor - the search had no choice to get wrong),
-// `ambiguous` is any dispatch with two distinguishable survivors, and `ambiguous_claimed`
-// restricts that to dispatches that claimed the engine's own announcement. **That last number is
-// the residue**: it is how often slot order, rather than evidence, chose the view DLSS SR ran on.
-//
-// `cb_reads` is the search's own cost: every bound root CBV it TRIED, i.e. one describe_resource
-// plus one 2448-byte buffer read each. Divided by the dispatch count it is candidates-per-dispatch,
-// which is what identity from the engine would replace - so "deleting the search saves X" becomes
-// arithmetic over a measurement instead of over a guess.
-void view_ambiguity_counters(std::uint64_t &single, std::uint64_t &ambiguous,
-                             std::uint64_t &ambiguous_claimed, std::uint64_t &cb_reads);
-
 } // namespace stray_dlss::taa_hook

@@ -356,15 +356,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		host::cfg::get_bool("EngineSeamFallback", true),
 		host::cfg::get_bool("EngineSeamInputs", true));
 
-	// [STRAYDLSS] ViewCbAudit, default 1. The View constant buffer is still located by SEARCH,
-	// and `view_fits_dispatch` closed only the LOUD half of the wrong-view bug (facts §36.18-19):
-	// an impostor whose rect is SMALLER than the dispatch covers passes every test we have and
-	// wins on a lower root parameter, silently. This keeps the scan going past the winner so
-	// AMBIGUITY can be counted — see `[view] ... single= ambiguous= ambiguousClaimed=`. It costs
-	// one describe_resource + one 2448-byte read per surviving candidate per candidate dispatch;
-	// 0 restores the old stop-at-the-winner scan byte for byte.
-	taa_hook::set_view_cb_audit(host::cfg::get_bool("ViewCbAudit", true));
-
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
 	// closed. What it still costs is SIX synchronous open-write-close cycles per intercepted
@@ -1140,34 +1131,16 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		std::uint64_t r135_bad = 0;
 		std::uint64_t wrong_view = 0;
 		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view);
-		std::uint64_t v_single = 0;
-		std::uint64_t v_ambig = 0;
-		std::uint64_t v_ambig_claimed = 0;
-		std::uint64_t v_cb_reads = 0;
-		taa_hook::view_ambiguity_counters(v_single, v_ambig, v_ambig_claimed, v_cb_reads);
 		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0)
 			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
 				"(candidates that were A View buffer but not THIS view - the search skipped "
-				"them; each was an unclaimed frame before facts 36.18) | single=%llu "
-				"ambiguous=%llu ambiguousClaimed=%llu cbReads=%llu%s%s", when,
+				"them; each was an unclaimed frame before facts 36.18)%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
 				static_cast<unsigned long long>(wrong_view),
-				static_cast<unsigned long long>(v_single),
-				static_cast<unsigned long long>(v_ambig),
-				static_cast<unsigned long long>(v_ambig_claimed),
-				static_cast<unsigned long long>(v_cb_reads),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"
-					: "",
-				// ambiguousClaimed is the residue the fit bound cannot catch: on those frames the
-				// view DLSS SR ran on was chosen by root-parameter order between two candidates
-				// nothing separates. Zero means the search's answer was FORCED, which is the only
-				// evidence that would retire the wrong-view question rather than park it.
-				v_ambig_claimed != 0
-					? "  <- SLOT ORDER CHOSE DLSS SR's VIEW on those frames; the fit bound cannot "
-					  "separate them and identity from the engine is the fix"
 					: "");
 	}
 
