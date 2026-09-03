@@ -277,6 +277,13 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 
 	// --- DLSSNR.ControlMask, if it is turned on ---
 	//
+	// RECORDED AFTER record_capture, and that ordering is load-bearing under the ReShade backend.
+	// ReShade flushes its immediate list only when its OWN api recorded something
+	// (`_has_commands`, d3d12_impl_command_list_immediate.cpp:122), and a native dispatch of ours
+	// does not set it. record_capture's barriers go through icept::present_barrier, which does —
+	// so by the time the fill is recorded the list is guaranteed to be flushed. A fill recorded
+	// before it, on a frame where nothing else ran, would sit in an open list forever.
+	//
 	// The mask's own typed-UAV probe is on the MASK's format, not the back buffer's: we write it
 	// with our own compute shader, and a format this device cannot store to through a typed UAV
 	// would leave the texture uninitialised while the runtime sampled it anyway (it validates

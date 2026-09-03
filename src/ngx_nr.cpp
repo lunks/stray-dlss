@@ -113,6 +113,20 @@ constexpr const char *kEnabled      = "DLSSNR.Enabled";
 constexpr const char *kPreset       = "DLSSNR.Hint.Render.Preset";
 constexpr const char *kSkinStruct   = "DLSSNR.SkinStructureStrength";
 constexpr const char *kUseAutoMask  = "DLSSNR.UseAutoMask";
+// MEASURED INERT IN OUR CONFIGURATION, 2026-09-03, from the runtime's own code — recorded here
+// because we have set it to 1 for months and its effect has never been confirmed, and now it is
+// clear why. Both consumers of DLSSNR.UICorrection require a DLSSNR.Backbuffer to be bound:
+//
+//   * EvaluateFeature at 0x180019016: the flag is armed only when
+//     `UICorrection != 0 && Backbuffer != 0 && !(UI || UIAlpha)`.
+//   * the registration path at 0x18001cbec: armed only when
+//     `UICorrection != 0 && (UI || UIAlpha) && Backbuffer != 0`.
+//
+// Two different modes — infer the UI from a backbuffer/colour difference, or take an explicit UI
+// texture — and NEITHER can arm without a Backbuffer. We bind none, so this parameter has been a
+// no-op the whole time. That is not an argument for binding one: `DLSSNR: Skip feature evaluate:
+// Invalid Backbuffer/active Output rect configuration` is a real string in this runtime, and a
+// mismatched Backbuffer rect makes the whole evaluate a silent no-op rather than an error.
 constexpr const char *kUICorrection = "DLSSNR.UICorrection";
 // Confirmed present by exact string search over the 310.8.0 runtime (appears once, as a bare
 // parameter name — docs/RESEARCH-DLSSNR-STYLES.md). NOT the same axis as kPreset: preset selects
