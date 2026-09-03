@@ -1381,6 +1381,38 @@ kernel's 3 = "headphones muted, speaker gets R". `PadSpeakerPath` is Sony's;
 * **`auto` never writes the claim speculatively** — only after Sony's API has been tried and
   refused. In the world where the speaker works, the coils never see it at all.
 
+### `HidMode` is NOT redundant, and `scePadSetVibrationMode` does not replace it
+
+Recorded because the opposite was proposed and is wrong. **The game already calls
+`scePadSetVibrationMode` itself** — the shim only *forwarded* it
+(`libScePad_shim.c:542-555`), with a `vibmode` debug command that could override the mode
+(`:453-459`, default `-1` = no override). That override existed as an **A/B knob because nobody
+knew whether the game's chosen mode was right**, and that question is still open.
+
+So the likely reading is the reverse of "Sony's API already does this": `valid_flag0 = 0x00`
+exists because the game's chosen vibration mode does **not** leave the coils accepting
+waveforms, and we are **countermanding** the game rather than duplicating Sony. Leave `HidMode`
+alone without evidence; "can Sony's API replace it" is a separate question for a later session.
+
+Corroboration from the same function: it captured the pad handle as `g_lastPadHandle = a`, a
+second source besides `scePadOpen`. Not needed now that `scePadGetHandle` is confirmed present,
+but it does establish that the game calls this with a live handle.
+
+**What this change does to `HidMode`: nothing, in the default path.** With no claim set
+(`PadSpeakerRoute = sony` succeeding, or `off`), `ComposeValidFlag0(base, {})` returns `base`,
+`valid_flag1` stays 0, the length floor is unchanged and no extra byte is written — the report
+is **byte-identical** to the one §12 measured working.
+
+### `kSpeakerBoost` must NOT be carried across to the live tap
+
+Flagged now so step 2 does not inherit it silently. `AudioPlayer.hpp` bakes in the game's
+`SBFX_Boost` as `kSpeakerBoost = 1.7783` (+5 dB, §10) because the asset path replays a
+`SoundWave` from disk and therefore bypasses `Submix_controllerPre`, where that trim lives.
+**On a rerouted-submix path the engine applies its own submix chain, so the +5 dB is already in
+the signal and applying it again would double it.** The shim had a `spkboost` runtime A/B
+(`libScePad_shim.c:450-452`) precisely because the value was being questioned; keep it
+configurable, and re-derive it for the tap rather than porting the constant.
+
 ### The target shape, and how much of this stays bespoke
 
 The end state the user has set: **a drop-in DLL, no extracted assets, ever.** The `spk/*.f32`
