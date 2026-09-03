@@ -1687,16 +1687,23 @@ writing down so the next session does not re-derive them:
   resolved values to `-1.0f`, and **the mask has no skin channel** — skin exists only on the auto
   path. The user currently runs `NgxNRAutoMask=1` with `NgxNRSkinStructure=2` over a world that
   "looks 100% perfect". C trades that away to fix one subject.
-* **Five unknowns, none of them free.** Does gFur render into the custom-depth pass at all (its
-  VFs declare `bSupportsPositionOnly = false`; the depth-pass permutations are UNCONFIRMED)? Can
-  we *find* the custom-depth target at present time — it is bound as a DSV and never as a compute
-  UAV, so our pass walk never sees it, and identifying it by shape is the same identification
-  problem the TAA pass cost sessions? Is its content valid at Present? What extent does
-  `ControlMask` want — it has `Subrect` fields but, unlike `MVec`, **no `ScaleX/Y`**, so whether a
-  render-res mask is legal against an output-res colour grid is UNCONFIRMED, and if it is not the
-  upscale needs **the first compute dispatch we have ever recorded on the present list**. And do
-  `G`/`B` scale ABOVE 1, or only damp? If only damp, the design inverts: raise the global and
-  attenuate the world, which changes the half that is already right.
+* **Four unknowns, none of them free.** Does gFur render into the custom-depth pass at all (its
+  VFs declare `bSupportsPositionOnly = false`, so the depth pass would use the full VS; the
+  permutations are UNCONFIRMED)? Is the target's content still valid at Present — it is a
+  persistent `FSceneRenderTargets` entry rather than a transient RDG allocation, so it should
+  survive the frame, but that is SOFT? What extent does `ControlMask` want — it has `Subrect`
+  fields but, unlike `MVec`, **no `ScaleX/Y`**, so whether a render-res mask is legal against an
+  output-res colour grid is UNCONFIRMED, and if it is not the upscale needs **the first compute
+  dispatch we have ever recorded on the present list**. And do `G`/`B` scale ABOVE 1, or only
+  damp? If only damp, the design inverts: raise the global and attenuate the world, which changes
+  the half that is already right.
+* **Finding the target is NOT one of the unknowns**, contrary to the first instinct. The native
+  backend hooks `ID3D12Device::CreateDepthStencilView` and shadows every DSV with its resource
+  (`backend_native/d3d12_hooks.cpp:454-467`), so a custom-depth target is observable the moment
+  it is created — and the discriminator is two-way rather than a search: exactly two resources
+  in the frame carry a DSV at the scene-buffer extent, and we already know which one is
+  `SceneDepthZ` because it is the TAA pass's own depth SRV. The other one is custom depth. This
+  is not the TAA identification problem.
 * **It is not free at runtime either.** `r.CustomDepth=3` re-draws the tagged primitives, and with
   `LAYERS=48` that is 48 extra shell draws per frame on a title already at ~55 fps with FG on.
 
