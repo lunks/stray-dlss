@@ -1,5 +1,6 @@
 #include "input_dump.hpp"
 
+#include "core/dump_plan.hpp"
 #include "log.hpp"
 
 #include <cstdio>
@@ -14,8 +15,10 @@ namespace {
 
 bool g_enabled = false;
 
-// Steady-state gameplay moments, far apart enough that a live scene colour must differ.
-constexpr std::uint64_t kDumpPoints[] = { 600, 900 };
+// Steady-state gameplay moments, far apart enough that a live scene colour must differ — but
+// only if the run REACHED gameplay by then, which is what [STRAYDLSS] NgxDumpAt exists to fix.
+// The arithmetic is pure and pinned in CI (src/core/dump_plan.hpp).
+core::DumpPlan g_points = core::plan_dump_points(0);
 
 struct Pending
 {
@@ -38,14 +41,15 @@ std::vector<Pending> g_pending;
 void set_enabled(bool enabled) { g_enabled = enabled; }
 bool enabled() { return g_enabled; }
 
+void set_points(int configured) { g_points = core::plan_dump_points(configured); }
+std::uint64_t first_point() { return g_points.first; }
+std::uint64_t second_point() { return g_points.second; }
+
 bool wants(std::uint64_t evaluate_count)
 {
 	if (!g_enabled)
 		return false;
-	for (const std::uint64_t p : kDumpPoints)
-		if (evaluate_count == p)
-			return true;
-	return false;
+	return core::dump_wants(g_points, evaluate_count);
 }
 
 bool capture(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, ID3D12Resource *resource,

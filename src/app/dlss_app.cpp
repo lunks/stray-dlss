@@ -676,9 +676,15 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	bool dump_inputs = false;
 	dump_inputs = host::cfg::get_bool("NgxDumpInputs", dump_inputs);
 	input_dump::set_enabled(dump_inputs);
+	// 0 keeps the shipped 600/900. Raise it when the run is still on a loading screen there —
+	// a black capture answers nothing and costs a whole round trip (src/core/dump_plan.hpp).
+	input_dump::set_points(host::cfg::get_int("NgxDumpAt", 0));
 	if (dump_inputs)
-		STRAY_LOG_WARN("NgxDumpInputs is ON: the DLSS colour/depth inputs and output are dumped "
-			"to straydlss_*.bin at evaluates 600 and 900.");
+		STRAY_LOG_WARN("NgxDumpInputs is ON: the DLSS colour/depth inputs, the engine's raw "
+			"sparse velocity, our resolved motion vectors and the output are dumped to "
+			"straydlss_*.bin at evaluates %llu and %llu ([STRAYDLSS] NgxDumpAt moves them).",
+			static_cast<unsigned long long>(input_dump::first_point()),
+			static_cast<unsigned long long>(input_dump::second_point()));
 
 	bool ngx_paint = false;
 	ngx_paint = host::cfg::get_bool("NgxPaint", ngx_paint);

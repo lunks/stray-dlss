@@ -1931,6 +1931,44 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								input_dump::capture(native_device, native, ei.depth,
 									D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "depth",
 									eval_no);
+
+								// THE ENGINE'S OWN SPARSE VELOCITY, undecoded. This is the only
+								// resource in the frame that says WHICH PIXELS UE4 WROTE AN
+								// OBJECT VELOCITY FOR, and that is a question our resolved
+								// output cannot answer: mv_resolve.hlsl writes a plausible
+								// vector either way — decoded object motion where
+								// `EncodedVelocity.x > 0`, reconstructed camera motion
+								// everywhere else (CLAUDE.md §2.5). The two are
+								// indistinguishable downstream, so a pixel handed the wrong
+								// branch looks like a pixel handed the right one.
+								//
+								// The reason to care, 2026-09-03: the cat is drawn by the GFur
+								// shell-fur plugin, whose ~48 shell layers are a separate draw
+								// from the skeletal body. If those shells write no velocity
+								// then every fur pixel takes the camera-reconstruction branch,
+								// which computes the motion of a STATIC world point at that
+								// depth — precisely wrong for the one object in the scene that
+								// is always moving relative to the camera. `R > 0` over the
+								// cat's silhouette settles it in one look; tools/rawdump2png.py
+								// renders exactly that mask from this file.
+								//
+								// Same state assumption as colour and depth: the game bound it
+								// as an SRV of the compute dispatch we are replacing.
+								if (velocity_resource != 0)
+									input_dump::capture(native_device, native,
+										reinterpret_cast<ID3D12Resource *>(velocity_resource),
+										D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+										"velocity_raw", eval_no);
+
+								// Our resolved dense field, as NGX and (through
+								// nrhook::note_guides) feature 18 receive it. Already
+								// transitioned to NON_PIXEL_SHADER_RESOURCE above for the
+								// evaluate. Dumped beside the raw buffer so the resolve's two
+								// branches can be compared against the mask that selected them.
+								if (ei.motion_vectors != nullptr)
+									input_dump::capture(native_device, native, ei.motion_vectors,
+										D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "mv",
+										eval_no);
 							}
 
 							// EXPOSURE DIAGNOSIS (NgxExposure=texture + NgxDumpInputs=1): DLSS
