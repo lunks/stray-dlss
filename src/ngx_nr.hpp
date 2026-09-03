@@ -126,6 +126,17 @@ struct ApplyInputs
 	// either is changed.
 	float mvec_scale_x = 0.0f;
 	float mvec_scale_y = 0.0f;
+
+	// DLSSNR.ControlMask, or null for "no mask this frame". Owned and filled by src/nr_mask.cpp;
+	// this path only binds it.
+	//
+	// NULL IS NOT THE SAME AS OMITTING IT. The NGX parameter block persists across evaluates and
+	// nothing clears it, so a frame that stops wanting a mask must write a null pointer rather
+	// than simply not writing the key — the runtime's own reader treats a successfully-fetched
+	// null exactly as an absent parameter (0x18001a3f4), so this is the supported way to unbind.
+	ID3D12Resource *control_mask = nullptr;
+	std::uint32_t control_mask_width = 0;
+	std::uint32_t control_mask_height = 0;
 };
 
 // Runs feature 18 and, once validated, copies the neural result back over `image`. Returns

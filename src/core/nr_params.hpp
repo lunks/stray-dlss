@@ -61,6 +61,12 @@ struct Rects
 };
 
 constexpr int kMaxRectEntries = 16;  // four rects x baseX/baseY/width/height
+
+// The OPTIONAL fifth rect: DLSSNR.ControlMask's. Separate from build_rects because the mask is
+// optional and the other four are not — an absent mask must emit no subrect entries at all, and a
+// leftover subrect from a frame that had one is a rect the runtime would keep reading. (The
+// parameter block persists across evaluates; nothing clears it.)
+constexpr int kMaxMaskRectEntries = 4;
 constexpr int kMaxCreateEntries = 3; // Width, Height, ScalingRatio
 
 // Writes the evaluate-time rect block. Returns the number of entries written, or 0 if `cap` is
@@ -71,5 +77,9 @@ int build_rects(const Rects &rects, Entry *out, int cap);
 // Writes the create-time extent block. `in_width`/`in_height` are the rect the network works at.
 int build_create(std::uint32_t in_width, std::uint32_t in_height, float scaling_ratio,
                  Entry *out, int cap);
+
+// The ControlMask subrect, in the same types as the other four (int, vtable slot +0x58 — the
+// runtime reads it through exactly the same getter as the Color/Depth/MVec/Output subrects).
+int build_mask_rect(std::uint32_t width, std::uint32_t height, Entry *out, int cap);
 
 } // namespace stray_dlss::nrparam

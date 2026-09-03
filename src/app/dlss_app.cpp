@@ -25,6 +25,7 @@
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
 #include "nr_hook.hpp"
+#include "nr_mask.hpp"
 #include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
@@ -508,6 +509,34 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	nr_ui_correction = host::cfg::get_int("NgxNRUICorrection", nr_ui_correction);
 	g_nr_ui.auto_mask = nr_auto_mask != 0;
 	g_nr_ui.ui_correction = nr_ui_correction != 0;
+	// [STRAYDLSS] NgxNRMask + NgxNRMaskChannelR/G/B + NgxNRMaskR/G/B + NgxNRMaskFormat.
+	//
+	// DLSSNR.ControlMask: the per-pixel RGB control texture the runtime genuinely consumes (the
+	// disassembly is in src/core/nr_mask_plan.hpp) and the only channel through which structure
+	// and tone can vary SPATIALLY. Default OFF, and every channel default 1.0 = the identity, so
+	// `NgxNRMask=1` alone binds a mask that provably changes nothing — which is the experiment to
+	// run FIRST, because a mask that is silently ignored and a mask that does nothing look
+	// identical on a screenshot.
+	//
+	// The channel switches exist so R, G and B can be tested apart: a channel that is off writes
+	// the neutral 1.0, so turning two off still exercises the whole binding path.
+	{
+		nrmaskplan::Config mask;
+		mask.enabled = host::cfg::get_int("NgxNRMask", 0) != 0;
+		mask.channel_r = host::cfg::get_int("NgxNRMaskChannelR", 1) != 0;
+		mask.channel_g = host::cfg::get_int("NgxNRMaskChannelG", 1) != 0;
+		mask.channel_b = host::cfg::get_int("NgxNRMaskChannelB", 1) != 0;
+		mask.value_r = host::cfg::get_float("NgxNRMaskR", nrmaskplan::kNeutral);
+		mask.value_g = host::cfg::get_float("NgxNRMaskG", nrmaskplan::kNeutral);
+		mask.value_b = host::cfg::get_float("NgxNRMaskB", nrmaskplan::kNeutral);
+		nrhook::set_mask(mask);
+
+		// The mask's DXGI_FORMAT. A KNOB and not a constant because the runtime never inspects a
+		// caller-supplied texture's format on this path, so getting it wrong is the silent-wrong-
+		// image class rather than an error (src/nr_mask.hpp carries the evidence for the default).
+		nrmask::set_format(host::cfg::get_int("NgxNRMaskFormat", nrmask::kDefaultMaskFormat));
+	}
+
 	const float nr_intensity = g_nr_ui.intensity;
 	const float nr_local_tone = g_nr_ui.local_tone;
 	const float nr_local_structure = g_nr_ui.local_structure;
@@ -1459,6 +1488,18 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 							nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)),
 							sc.reasons[i]);
 				STRAY_LOG_INFO("%s", line);
+
+				// THE MASK, reported separately and by its ACTUAL content. "Bound and
+				// deliberately neutral" and "refused" must never look alike here — an identity
+				// mask is a real experimental state, not an absence.
+				STRAY_LOG_INFO("[%s] NR MASK: %s bound=%d verdict=%s live RGB=(%.3f, %.3f, %.3f) "
+					"fills=%llu format=%d %lluKB", when,
+					sc.mask_bound ? "DLSSNR.ControlMask IS BOUND" : "no ControlMask",
+					sc.mask_bound ? 1 : 0, nrmaskplan::mask_result_name(sc.last_mask_result),
+					static_cast<double>(sc.mask_r), static_cast<double>(sc.mask_g),
+					static_cast<double>(sc.mask_b),
+					static_cast<unsigned long long>(sc.mask_fills), nrmask::format(),
+					static_cast<unsigned long long>(sc.mask_bytes >> 10));
 		}
 	}
 

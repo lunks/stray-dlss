@@ -17,6 +17,7 @@
 #pragma once
 
 #include "core/nr_hook_plan.hpp"
+#include "core/nr_mask_plan.hpp"
 #include "intercept/types.hpp"
 
 #include <cstdint>
@@ -42,6 +43,22 @@ namespace stray_dlss::nrhook {
 // one ini key is cheaper than a round trip.
 void set_back_buffer_state(std::uint32_t d3d12_resource_states);
 std::uint32_t back_buffer_state();
+
+// [STRAYDLSS] NgxNRMask + NgxNRMaskR/G/B and their three enables, default OFF.
+//
+// DLSSNR.ControlMask is a per-pixel RGB control texture the runtime genuinely consumes (the
+// disassembly is in src/core/nr_mask_plan.hpp). This is the only channel through which structure
+// and tone can vary SPATIALLY — every other strength the runtime takes is a global scalar
+// broadcast to every pixel.
+//
+// It costs something, and the cost is not obvious: binding a mask AT ALL forces
+// DLSSNR.UseAutoMask to 0 and drives both resolved structure strengths to the -1.0 sentinel,
+// whatever NgxNRSkinStructure and NgxNRLocalStructure were set to. So "mask on" is never a pure
+// addition, and the A/B has to be judged with that in mind — which is exactly why the first
+// experiment is an IDENTITY mask (all channels 1.0): it isolates "does binding a mask change the
+// image at all" from "do the mask's VALUES change the image".
+void set_mask(const nrmaskplan::Config &cfg);
+nrmaskplan::Config mask_config();
 
 // --- the feed ---
 
@@ -102,6 +119,16 @@ struct Counters
 	float last_mvec_scale_x = 0.0f;
 	float last_mvec_scale_y = 0.0f;
 	std::uint64_t staging_bytes = 0;
+	// The mask's own verdict for the most recent triggered frame, and what the live texture
+	// actually holds. "Bound and deliberately neutral" and "refused" must never look alike in a
+	// log.
+	nrmaskplan::MaskResult last_mask_result = nrmaskplan::MaskResult::disabled;
+	bool mask_bound = false;
+	float mask_r = 0.0f;
+	float mask_g = 0.0f;
+	float mask_b = 0.0f;
+	std::uint64_t mask_fills = 0;
+	std::uint64_t mask_bytes = 0;
 };
 
 Counters counters();
