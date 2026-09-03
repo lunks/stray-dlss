@@ -872,10 +872,6 @@ struct DriveTestSink final : stray_dlss::icept::Sink
 		}
 		return suppress;
 	}
-	void on_render_targets(const stray_dlss::icept::CommandContext &, std::uint32_t, const stray_dlss::icept::DescriptorId *, stray_dlss::icept::DescriptorId) override {}
-	void on_draw(const stray_dlss::icept::CommandContext &, std::uint32_t) override {}
-	void on_copy(const stray_dlss::icept::CommandContext &, stray_dlss::icept::ResourceId, stray_dlss::icept::ResourceId) override {}
-	void on_execute(const stray_dlss::icept::CommandContext &) override {}
 	void on_swapchain(const stray_dlss::icept::ResourceId *, std::uint32_t, bool) override {}
 	std::uint64_t next_frame() override { return 0; }
 	void on_present(const stray_dlss::icept::PresentContext &) override {}

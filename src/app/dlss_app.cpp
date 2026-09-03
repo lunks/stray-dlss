@@ -26,7 +26,6 @@
 #include "ngx_snippet.hpp"
 #include "nr_hook.hpp"
 #include "nr_mask.hpp"
-#include "pass_finder.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
@@ -868,7 +867,6 @@ void DlssApp::on_command_list_reset(const icept::CommandContext &ctx)
 {
 
 	taa_hook::forget_command_list(ctx);
-	pass_finder::forget_command_list(ctx);
 }
 
 
@@ -879,7 +877,6 @@ void DlssApp::on_pipeline(std::uint64_t pipeline, const void *code, std::size_t 
 	{
 		// ID3D12PipelineState pointers get recycled, so eviction is not optional.
 		taa_hook::forget_pipeline(pipeline);
-		pass_finder::forget_pipeline(pipeline);
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		g_state.compute_pipeline_hashes.erase(pipeline);
 		return;
@@ -896,20 +893,15 @@ void DlssApp::on_pipeline(std::uint64_t pipeline, const void *code, std::size_t 
 		g_state.distinct_shader_hashes.insert(hash);
 	}
 
+	// The census counts PS too, but only CS is hashed for identification.
 	if (!is_compute)
-	{
-		// The census counts PS too, but only CS is hashed for identification. The pass
-		// finder additionally attributes draws by pixel-shader hash.
-		pass_finder::note_pipeline(pipeline, hash, /*is_compute=*/false);
 		return;
-	}
 
 	{
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		g_state.compute_pipeline_hashes[pipeline] = hash;
 	}
 	g_state.compute_pipelines_seen.fetch_add(1, std::memory_order_relaxed);
-	pass_finder::note_pipeline(pipeline, hash, /*is_compute=*/true);
 
 	// Getting the real bytecode off the user's machine settles the binding layout
 	// offline, which is worth far more than any inference we could make here.
@@ -944,7 +936,6 @@ void DlssApp::on_bind_pipeline(const icept::CommandContext &ctx, std::uint64_t p
 
 	// Remember the pipeline per command list so a dispatch can be attributed to a hash.
 	taa_hook::set_bound_pipeline(ctx, pipeline);
-	pass_finder::note_bind_pipeline(ctx, pipeline);
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	if (g_state.compute_pipeline_hashes.count(pipeline) != 0)
 		g_state.bound_compute_pipeline[ctx.native] = pipeline;
@@ -986,10 +977,6 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 		diff::publish_expected(ctx.native, hash, x, y, expected);
 	}
 
-	// Strictly AFTER the intercept decision: a suppressed dispatch never executes, and
-	// recording one would enter a phantom writer into the pass finder's last-writer table.
-	pass_finder::note_dispatch(ctx, x, y, z);
-
 	if (shader_dump::enabled())
 	{
 		std::uint64_t hash = 0;
@@ -1014,36 +1001,6 @@ bool DlssApp::on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std
 	// Skeleton stage: observe only. Returning true here is what will eventually suppress the
 	// engine's TAA dispatch — it is the only skip-capable event on our path.
 	return false;
-}
-
-void DlssApp::on_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
-                                const icept::DescriptorId *rtvs, icept::DescriptorId dsv,
-                                bool via_render_pass)
-{
-	// The render-target event feeds both finders, each a cheap no-op when its feature is off.
-	//
-	// `via_render_pass` is currently unread. It distinguished begin_render_pass from a plain
-	// OMSetRenderTargets for the `preui` NR trigger, which was removed on 2026-09-02 and is not
-	// coming back — the present stage needs no render-target event at all. The parameter stays
-	// because the two hosts already compute it and a finder that needs the distinction should not
-	// have to re-plumb it.
-	(void)via_render_pass;
-	pass_finder::note_render_targets(ctx, count, rtvs, dsv);
-}
-
-void DlssApp::on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count)
-{
-	pass_finder::note_draw(ctx, vertex_or_index_count);
-}
-
-void DlssApp::on_copy(const icept::CommandContext &ctx, icept::ResourceId src, icept::ResourceId dst)
-{
-	pass_finder::note_copy(ctx, src, dst);
-}
-
-void DlssApp::on_execute(const icept::CommandContext &ctx)
-{
-	pass_finder::note_execute(ctx);
 }
 
 void DlssApp::on_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count, bool created)
@@ -1154,11 +1111,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
 	input_dump::on_present();
-
-	// The pass finder's frame boundary. The presented back buffer is its fallback anchor
-	// when no tonemapper (3D LUT SRV) was seen this frame.
-	if (pass_finder::enabled())
-		pass_finder::on_present(frame, reinterpret_cast<icept::ResourceId>(pc.back_buffer));
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every StatusFileFrames presents (default 30);
@@ -1553,16 +1505,16 @@ EventNeeds DlssApp::configure_events()
 	bool hash_shaders = true;
 	hash_shaders = host::cfg::get_bool("HashShaders", hash_shaders);
 
-	// [STRAYDLSS] PassFinder, default OFF: dataflow identification of the TAA pass — the
-	// bounded walk backwards from the tonemapper (core/pass_walk.hpp), proven in CI and here
-	// only LOGGING its verdict against the live game. It attributes events by shader hash,
-	// so enabling it forces the pipeline events (and their PSO-cache cost) on.
-	bool pass_finder_enabled = false;
-	pass_finder_enabled = host::cfg::get_bool("PassFinder", pass_finder_enabled);
-	pass_finder::set_enabled(pass_finder_enabled);
+	// [STRAYDLSS] PassFinder is GONE, and a leftover key is answered rather than ignored: it
+	// was the dataflow walk backwards from the tonemapper, deleted because the engine seam
+	// (EngineSeam=3) now NAMES the primary temporal upscale through ITemporalUpscaler::AddPasses,
+	// which is the identity the walk was reconstructing from descriptors.
+	if (host::cfg::get_bool("PassFinder", false))
+		STRAY_LOG_WARN("[STRAYDLSS] PassFinder=1 is IGNORED: the dataflow pass finder was "
+			"deleted. The engine announces the primary temporal upscale directly "
+			"(EngineSeam, docs/RESEARCH-ENGINE-TAA-HOOK.md); read `[seam]` instead.");
 
-
-	needs.pipeline_events = hash_shaders || shader_dump::enabled() || pass_finder_enabled;
+	needs.pipeline_events = hash_shaders || shader_dump::enabled();
 
 	if (needs.pipeline_events)
 	{
@@ -1578,12 +1530,6 @@ EventNeeds DlssApp::configure_events()
 	// ReShade's own state_tracking does not register this, which is why its state_block can
 	// never replay root constants.
 
-	if (pass_finder_enabled)
-	{
-		needs.finder_rt_events = true;
-		// Logged so a pasted log PROVES the events were registered for this flag.
-		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=1).");
-	}
 	// [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which
 	// equals COMMON). D3D12 REQUIRES the back buffer to be in that state at Present and the
 	// stage runs inside it, so this is stronger than a derivation — but "required by the API"
@@ -1594,10 +1540,6 @@ EventNeeds DlssApp::configure_events()
 		bb_state = host::cfg::get_int("NgxNRStageBackBufferState", bb_state);
 		nrhook::set_back_buffer_state(bb_state < 0 ? 0u : static_cast<std::uint32_t>(bb_state));
 	}
-
-	if (pass_finder_enabled)
-		needs.pass_finder_events = true;
-
 
 	return needs;
 }

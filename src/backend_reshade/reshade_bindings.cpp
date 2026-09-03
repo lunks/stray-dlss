@@ -123,8 +123,8 @@ void describe(reshade::api::device *device, reshade::api::resource_view view,
 	t.format = to_tex_format(vd.format != reshade::api::format::unknown ? vd.format : rd.texture.format);
 	t.width = rd.texture.width;
 	t.height = rd.texture.height;
-	// The pass finder's dataflow walk anchors on the only 3D SRV in an Unreal frame: the
-	// tonemapper's colour-grading LUT. (pass_walk.hpp)
+	// A 3D SRV in an Unreal frame is the tonemapper's colour-grading LUT and nothing else;
+	// the deleted dataflow pass finder anchored on it. Reported because it is free.
 	t.is_3d = rd.type == reshade::api::resource_type::texture_3d;
 	out.push_back(t);
 }
@@ -340,76 +340,6 @@ void describe_bound_view(reshade::api::device *device, reshade::api::resource_vi
                          std::uint32_t reg, std::vector<BoundTexture> &out)
 {
 	describe(device, view, reg, out);
-}
-
-bool resolve_graphics_srvs(reshade::api::command_list *cmd_list, std::vector<BoundTexture> &out)
-{
-	// The graphics twin of the compute table walk below, stripped to SRVs. The pass finder
-	// needs it for exactly one thing: a full-screen draw's inputs, because the tonemapper's
-	// 3D colour-grading LUT SRV is the dataflow walk's anchor. Graphics root descriptors are
-	// not merged in — UE4 pushes uniform buffers through them, never textures — and UAV/CBV
-	// ranges are skipped. Kept separate from the compute resolver rather than templated over
-	// it so that the working interception path is not destabilised by a diagnostic.
-	reshade::api::device *device = cmd_list->get_device();
-
-	auto *state = cmd_list->get_private_data<state_tracking>();
-	auto *desc = device->get_private_data<descriptor_tracking>();
-	if (state == nullptr || desc == nullptr)
-		return false;
-
-	constexpr auto kComputeBits = static_cast<uint32_t>(reshade::api::shader_stage::all_compute);
-
-	for (const auto &entry : state->descriptor_tables)
-	{
-		// Everything that is not the compute key: ReShade's D3D12 backend reports the
-		// compute root signature as `all_compute | all_ray_tracing` and the graphics one
-		// without the compute bit. (docs/RESEARCH.md §2.6)
-		if ((static_cast<uint32_t>(entry.first) & kComputeBits) != 0)
-			continue;
-
-		const reshade::api::pipeline_layout layout = entry.second.first;
-		const std::vector<reshade::api::descriptor_table> &tables = entry.second.second;
-
-		for (uint32_t param = 0; param < tables.size(); ++param)
-		{
-			if (tables[param].handle == 0)
-				continue;
-
-			std::vector<reshade::api::descriptor_range> ranges;
-			{
-				std::lock_guard<std::mutex> lock(g_mutex);
-				const auto lit = g_layouts.find(layout.handle);
-				if (lit == g_layouts.end() || param >= lit->second.size())
-					continue;
-				if (!lit->second[param].is_table)
-					continue;
-				ranges = lit->second[param].ranges;
-			}
-
-			for (const reshade::api::descriptor_range &range : ranges)
-			{
-				if (range.type != reshade::api::descriptor_type::shader_resource_view)
-					continue;
-				if (range.count == UINT32_MAX) // unbounded; UE4 does not use them here
-					continue;
-
-				for (uint32_t i = 0; i < range.count; ++i)
-				{
-					reshade::api::descriptor_heap heap = { 0 };
-					uint32_t offset = 0;
-					device->get_descriptor_heap_offset(tables[param], range.binding + i, 0,
-						&heap, &offset);
-					if (heap.handle == 0)
-						continue;
-
-					describe(device, desc->get_resource_view(heap, offset),
-						range.dx_register_index + i, out);
-				}
-			}
-		}
-	}
-
-	return !out.empty();
 }
 
 bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBindings &out)

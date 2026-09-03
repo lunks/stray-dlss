@@ -1364,8 +1364,9 @@ will not. Three separate mechanisms get called "the shadow" and their consumers 
 
 * **The descriptor shadow proper — `shadow-write` + `shadow-copy`, 1.694 ms, 58% of the total — has
   exactly ONE reader on the shipping path**: the SRV/UAV table walk that names the output UAV `u0`
-  and scene colour by register. The differential observer needs `NativeMode=observe`; the pass
-  finder is off by default and its native `resolve_graphics_srvs` is not even implemented.
+  and scene colour by register. The differential observer needs `NativeMode=observe`; **the
+  dataflow pass finder is DELETED** (see below), which leaves the RTV and DSV halves of the
+  shadow with no reader at all.
 * **`restore_game_compute_state` does NOT touch it.** It calls `root::snapshot` and replays opaque
   table handles, so it keeps the **root** shadow (0.681 ms) alive and none of the 1.694 ms. That
   correction matters because the restore was assumed to be the biggest consumer; the table walk is.
@@ -1380,12 +1381,28 @@ will not. Three separate mechanisms get called "the shadow" and their consumers 
   mid-frame `ExecuteCommandLists` of our own list would run BEFORE the game's still-unsubmitted
   work, since one queue executes in submission order. **Ordering, and it is decisive.**
 
-**What can still be done, today and without the box:** stop shadowing RTV/DSV heaps unless
-`PassFinder` is on (their only readers are off), and add a read-bit per slot so the derived claim
-that **~2% of the 4059 descriptors copied per frame are ever looked up** becomes a measurement.
+**What can still be done, today and without the box:** stop shadowing RTV/DSV heaps (with the pass
+finder deleted, nothing reads them), and add a read-bit per slot so the derived claim that **~2% of
+the 4059 descriptors copied per frame are ever looked up** becomes a measurement.
 **What must NOT be done:** storing dst→src and resolving lazily at lookup. That is ReShade's design
 and facts §16 convicted it over 137 811 slots — D3D12 copies descriptors by value, and a shadow that
 does the same is right.
+
+**THE DATAFLOW PASS FINDER IS DELETED (2026-09-03).** `src/pass_finder.{cpp,hpp}` and
+`src/core/pass_walk.{cpp,hpp}` reconstructed the TAA pass's identity by walking one frame's
+recorded dispatches, draws and copies BACKWARDS from the tonemapper, anchored on the only 3D SRV
+in an Unreal frame. It was a good idea and it is exactly the class of reconstruction the engine
+seam retired: `ITemporalUpscaler::AddPasses` now NAMES the primary temporal upscale
+(`EngineSeam=3`, the default), and a walk that infers what the engine states is a second oracle to
+debug. Three facts made it a clean cut, each checked rather than assumed: `[STRAYDLSS] PassFinder`
+defaulted **OFF**; the native backend's `resolve_graphics_srvs` was **never implemented**, so it
+could not run at all under the shipping host even when enabled; and every entry point was a
+`g_enabled` bool test, so **it cost nothing measurable at runtime** — the deletion buys code, not
+frame time. What went with it, and this is the interesting part: `resolve_graphics_srvs` off
+`icept::Backend` (its only caller), and `on_render_targets` / `on_draw` / `on_copy` / `on_execute`
+off `icept::Sink` — **four events only the ReShade host ever raised, which the native host never
+produced.** A leftover `PassFinder=1` logs a WARN and is ignored. **Do not rebuild it**: the
+answer it computed now comes from the engine, and `docs/RESEARCH-ENGINE-TAA-HOOK.md` is where.
 
 ### ReShade 6.8 add-on API
 

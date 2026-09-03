@@ -450,9 +450,8 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 	// The application's one-time configuration (which events a host must deliver; here the
 	// native hooks deliver them all, so the answer is only logged).
 	const app::EventNeeds needs = app::instance().configure_events();
-	STRAY_LOG_INFO("host: event needs: pipeline=%d finder-rt=%d pass-finder=%d (the native hooks deliver pipelines, binds, "
-		"resets and dispatches; the finders' render-target/draw/copy taps are NOT delivered by this host)",
-		needs.pipeline_events ? 1 : 0, needs.finder_rt_events ? 1 : 0, needs.pass_finder_events ? 1 : 0);
+	STRAY_LOG_INFO("host: event needs: pipeline=%d (the native hooks deliver pipelines, binds, resets and "
+		"dispatches, which is now the whole seam)", needs.pipeline_events ? 1 : 0);
 
 	if (install_device_hook())
 		STRAY_LOG_INFO("host: d3d12.dll was already loaded at start_mod; hook installed now");

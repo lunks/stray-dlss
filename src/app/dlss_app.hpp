@@ -12,15 +12,17 @@
 
 namespace stray_dlss::app {
 
-// Which events the host has to deliver, decided from the ini (HashShaders, PassFinder,
-// GBufferFinder, NgxRR). Registering the pipeline events is not free under
-// ReShade — it drops the PSO cache (docs/RESEARCH.md §2.5) — which is why this is a decision
-// rather than "everything, always".
+// Which events the host has to deliver, decided from the ini (HashShaders, DumpShaders).
+// Registering the pipeline events is not free under ReShade — it drops the PSO cache
+// (docs/RESEARCH.md §2.5) — which is why this is a decision rather than "everything, always".
+//
+// It used to carry `finder_rt_events` and `pass_finder_events` for the two heuristic
+// pass finders. Both are deleted (the G-buffer finder in f2407fe, the dataflow pass finder
+// with this comment), and with them went every render-target, draw, copy and
+// execute-command-list event: nothing else in this project ever consumed one.
 struct EventNeeds
 {
 	bool pipeline_events = false;    // on_pipeline (init/destroy)
-	bool finder_rt_events = false;   // on_render_targets + on_draw (either finder)
-	bool pass_finder_events = false; // on_copy + on_execute
 };
 
 // Live DLSS Neural Rendering tuning (the overlay's state, formerly NrUiState). Every value is
@@ -79,18 +81,6 @@ public:
 	void on_command_list_reset(const icept::CommandContext &ctx) override;
 	void on_bind_pipeline(const icept::CommandContext &ctx, std::uint64_t pso) override;
 	bool on_dispatch(const icept::CommandContext &ctx, std::uint32_t x, std::uint32_t y, std::uint32_t z) override;
-	void on_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
-	                       const icept::DescriptorId *rtvs, icept::DescriptorId dsv) override
-	{
-		on_render_targets(ctx, count, rtvs, dsv, /*via_render_pass=*/false);
-	}
-	// `via_render_pass` distinguishes begin_render_pass from OMSetRenderTargets. Both finders
-	// take both kinds, so nothing reads it today — see the .cpp for why it is kept.
-	void on_render_targets(const icept::CommandContext &ctx, std::uint32_t count,
-	                       const icept::DescriptorId *rtvs, icept::DescriptorId dsv, bool via_render_pass);
-	void on_draw(const icept::CommandContext &ctx, std::uint32_t vertex_or_index_count) override;
-	void on_copy(const icept::CommandContext &ctx, icept::ResourceId src, icept::ResourceId dst) override;
-	void on_execute(const icept::CommandContext &ctx) override;
 	void on_swapchain(const icept::ResourceId *back_buffers, std::uint32_t count, bool created) override;
 	void on_present(const icept::PresentContext &ctx) override;
 
