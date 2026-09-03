@@ -1094,6 +1094,22 @@ hazards; the ReShade backend remains the default only until Stage 4.**
 
 * **Feature flags for Stray: `IsHDR | MVLowRes | DepthInverted | AutoExposure` = `0x4B`.** Never set
   `DoSharpening` (deprecated, does nothing).
+* **Application-supplied exposure is PRESET-GATED.** Programming Guide 310.6.0 §3.9: *"Only
+  supported by Presets J and K. Preset L always uses AutoExposure."* `Preset_Default` resolves to
+  **M at Performance** (this title's shipped 50% screen percentage) and **L at UltraPerf**
+  (`nvsdk_ngx_defs.h:82-85`), so `NgxExposure=texture|owned` needs an explicit `NgxPreset=11`.
+  The add-on logs `presetSupportsExposureInput=` at feature creation and warns when the pair is
+  self-defeating. **Corollary worth keeping: `NgxPreset` is no longer only an image-quality
+  knob — it silently gates a whole input.**
+* **`InPreExposure` is `View.PreExposure`, NOT its reciprocal**, and it is independent of the
+  exposure texture: the official plugin sets both, and only the texture is nulled under
+  auto-exposure (`DLSSUpscalerPrivate.h` `PreExposure(View.PreExposure)`;
+  `NGXD3D12RHI.cpp:275-276`). Guard it on the row-135 self-check — `helpers.h:507` rewrites a 0
+  to **1.0**, which silently claims the buffer is not pre-exposed.
+* **`InExposureScale` is not a consume test.** NVIDIA documents it nowhere (zero prose in the
+  84-page guide) and the official plugin never sets it (zero hits repo-wide). To test whether
+  DLSS reads the exposure texture, change the number INSIDE the texture — which means owning it
+  (`NgxExposure=owned` + `NgxExposureValue`).
 * **Motion vectors: `RG16_FLOAT`, render-resolution pixels, [0,0] upper-left, pointing BACKWARD.**
   `MV_pixels = (PrevScreen - ThisScreen) * (0.5·W, -0.5·H)`, `InMVScaleX/Y = (1,1)`. Guard with
   `PrevClipPos.w > 0`. This is NVIDIA's own `VelocityCombine.usf` math — copy it, don't invent it.
@@ -1955,10 +1971,60 @@ not decode. One `NR codec scale` line reports the decomposition, so "0.1 looks b
 off as "tracking has made 1.0 the new correct value".
 
 **The asymmetry, so it is not re-litigated:** the SR path's exposure goes through NGX
-(`InPreExposure`, the exposure texture, the AutoExposure flag) and is at the runtime's mercy — the
-texture mode measured INERT for us, and the NR codec reportedly ignores `DLSS.Pre.Exposure`
-outright. **The codec's scale is our own shader arithmetic and cannot be ignored by the runtime**,
+(`InPreExposure`, the exposure texture, the AutoExposure flag) and is at the runtime's mercy,
+while **the codec's scale is our own shader arithmetic and cannot be ignored by the runtime** —
 which is why this is expected to work where the SR exposure attempt did not.
+
+> **CORRECTED 2026-09-03.** This paragraph used to assert that the SR "texture mode measured
+> INERT for us", and that sentence has been repeated as settled ever since, including in
+> `docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md`. **What was actually measured is narrower, and the
+> explanation was in NVIDIA's documentation the whole time.**
+>
+> Measured (`5d848d3`, live): with `NgxExposure=texture` the create flags really were `0x0b`, one
+> feature was created, the eye-adaptation finder never missed, a non-null `pInExposureTexture`
+> rode every evaluate, and the texel was healthy (1x1 RGBA32F, `.x` ≈ 0.45, stable). And yet the
+> indicator read "Auto Exposure: ON" in BOTH modes and the image was unchanged. **Never
+> measured:** the consume test. `NgxExposureScale` was built in `17265f2` to settle it and there
+> is no record of the sweep ever being run. "Inert" was a null result from an instrument whose
+> sensitivity was never established.
+>
+> **THE GATE, and it is HARD.** DLSS Programming Guide, revision 310.6.0
+> (`NVIDIA/DLSS@main:doc/DLSS_Programming_Guide_Release.pdf`), §3.9 "Exposure", first line:
+> *"Only supported by Presets J and K. Preset L always uses AutoExposure."* — added by the
+> v310.5.0 changelog entry *"Exposure input is only supported by Presets J and K."* So on any
+> preset outside {J, K} the runtime auto-exposes whatever the flag says and whatever texture is
+> passed, which is precisely the symptom. **And this title defaults onto the wrong side:**
+> `Preset_Default` resolves per quality mode (`nvsdk_ngx_defs.h:82-85`) — K for
+> DLAA/Quality/Balanced, L for UltraPerf, **M for Perf** — and Stray ships
+> `ScreenPercentage=50` (§2.3.1), a 2.0x ratio, i.e. Performance. M excludes exposure input.
+> (`g_preset` defaults to K, so a session that sets no `NgxPreset` is fine; but the deploy
+> tooling writes only the keys it is passed and **stale `[STRAYDLSS]` keys persist across
+> deploys** (§5) — and the preset J/K/M sweep happened the SAME DAY as the exposure runs. That a
+> stale `NgxPreset=13` was live is a hypothesis, not a fact, and the log has never carried the
+> preset next to the exposure mode. It does now.)
+>
+> **The rest of the audit came back CLEAN**, verified against the official UE plugin at a pinned
+> commit (`moumee/ProjectS@563205ea`, `8.3.0-NGX310.4.0`) and the guide:
+> `InPreExposure = View.PreExposure`, **not** its reciprocal (`DLSSUpscalerPrivate.h`,
+> `PreExposure(View.PreExposure)`); pre-exposure and the exposure texture are **independent**,
+> both set unconditionally at the call site with only the texture nulled in the RHI backend
+> (`NGXD3D12RHI.cpp:275-276`); RGBA32F is a legal exposure texture (§3.9, "Only the first channel
+> is sampled"); and `NON_PIXEL_SHADER_RESOURCE` is the required state (§3.4). **Two things did
+> change.** The plugin never sets `InExposureScale` at all — zero hits repo-wide — so sweeping
+> it was never going to test the texture. And the plugin **transitions** the exposure texture
+> rather than assuming its state, which we cannot do for a resource the game owns; hence
+> `NgxExposure=owned`, our own 1x1 R32_FLOAT that we write and barrier, with
+> `[STRAYDLSS] NgxExposureValue` as the sound consume test.
+>
+> **Also fixed in the same change, and it was a real hole:** the SR path forwarded View row 135.y
+> to `InPreExposure` with no plausibility check while the NR path has always gated the same row,
+> so a misread reached DLSS silently — and a misread of 0 becomes a literal 1.0 at
+> `nvsdk_ngx_helpers.h:507`, telling DLSS the buffer carries no pre-exposure when it carries
+> ~0.45. Both SR and RR now send a deliberate 1.0 when the self-check fails, and log it.
+>
+> **What the NR half of the sentence claimed is separately CONFIRMED** — see the NR section: an
+> exhaustive string search over `nvngx_dlssnr.dll` finds no exposure parameter of any kind, so
+> feature 18 genuinely cannot be told about exposure and `NgxNRTrackExposure` is the only lever.
 
 ### The NR luminance diagnostic must not run during a loading screen
 
@@ -2137,6 +2203,33 @@ noise on screen is what an out-of-domain input looks like, not a broken runtime.
 **There is no HDR, colour-space or exposure parameter anywhere in the runtime** (exhaustive
 null-terminated string search over `nvngx_dlssnr.dll`), so the conversion has to happen in OUR
 pixels, on both sides of the evaluate. Two compute dispatches now wrap the NGX call:
+
+> **RE-CHECKED 2026-09-03, and it stands. Feature 18 has NO exposure parameter — do not go
+> looking again.** This was a DOCUMENTARY re-verification, not a fresh binary search: the DLL
+> lives on the box and the box was in use. The evidence is three independent lines pointing the
+> same way. (1) The original exhaustive null-terminated string search over
+> `nvngx_dlssnr.dll` 310.8.0 (md5 `eea91faf…`), ASCII **and** UTF-16, case-insensitive, found
+> none of `isHDR`, `ColorSpace`, `PaperWhite`, `Exposure`, `Pre.Exposure`,
+> `Feature.Create.Flags`. (2) `docs/RESEARCH-RENODX-DLSS5.md` §2.2.1 enumerates every
+> `DLSSNR.*` name the runtime actually knows, from the same search — colour, depth, MVec,
+> output, their subrects, `MVecScaleX/Y`, `DepthInverted`, `Reset`, `Intensity`,
+> `LocalToneStrength`, `LocalStructureStrength`, `SkinStructureStrength`, `UseAutoMask`,
+> `Style`, `UICorrection`, `Hint.Render.Preset`, `Enabled`, `ScalingRatio` — and **nothing
+> exposure-shaped is in it**. RenoDX *reads* `DLSS.Pre.Exposure` off the game's SR block and
+> re-emits the whole block under `DLSSNR.*`, where no such key exists, so that value goes
+> nowhere. (3) The reverse check, which is the one that keeps this honest: RenoDX also writes
+> six names this build does **not** implement (`DLSSNR.Scale`, `InputWidth/Height`,
+> `OutputWidth/Height`, `Output.Width/Height`, `Upscaling`), so **a name being written by
+> another integration proves nothing** — an NGX parameter block is an unvalidated string map
+> and a stale key is indistinguishable from an accepted one.
+>
+> Independent corroboration from a *different* integration: OptiScaler's DLSSNR fork solves NR
+> exposure entirely in its own codec white point (`DlssNrWhitePointFromExposure`,
+> `docs/RESEARCH-DLSSNR-STYLES.md` §4.3), not through any NGX parameter. If one existed, they
+> would use it.
+>
+> **Consequence: `NgxNRTrackExposure` is the whole lever and there is nothing to add.** No code
+> was written for NR in the 2026-09-03 exposure work, deliberately.
 
 ```
 encode:  proxy  = SrgbEncode(SoftClip(max(image,0) * s))      -> DLSSNR.Color = the PROXY

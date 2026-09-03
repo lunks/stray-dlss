@@ -60,8 +60,8 @@ bool wants_texture(Mode mode)
 unsigned int create_flag_bits(Mode mode)
 {
 	// The flag and the texture are mutually exclusive by construction in the official plugin:
-	// `bUseAutoExposure ? Flags_AutoExposure : 0` at create (NGXRHI.cpp:537-546) with the
-	// texture nulled only under auto (NGXD3D12RHI.cpp:267-269). Reproduce that exactly — a
+	// `bUseAutoExposure ? Flags_AutoExposure : 0` at create (NGXRHI.cpp:550-565) with the
+	// texture nulled only under auto (NGXD3D12RHI.cpp:275-276). Reproduce that exactly — a
 	// build that sets both would be asking DLSS a question with two answers.
 	return wants_texture(mode) ? 0u : kAutoExposureFlag;
 }
@@ -150,7 +150,7 @@ EvalPlan plan_evaluate(Mode mode,
 {
 	EvalPlan plan;
 	// InPreExposure is passed in BOTH modes. That is not an oversight copied from us into the
-	// reference — DLSSUpscaler.cpp:1085-1089 sets PreExposure unconditionally and keys only the
+	// reference — DLSSUpscaler.cpp:1111-1115 sets PreExposure unconditionally and keys only the
 	// flag and the texture off the mode. Pre-exposure names what is baked into the colour
 	// buffer; the exposure texture names the tonemapper's multiplier. NGX separates them.
 	plan.pre_exposure = sr_pre_exposure(view_pre_exposure, pre_exposure_ok);

@@ -435,8 +435,150 @@ r.NGX.DLSS.AutoExposure
 
 **HARD.** So the official default is the same `AutoExposure` flag this project ships
 (`CLAUDE.md` §5, feature flags `0x4B`), and NVIDIA treats the engine-exposure path as the *fallback
-for artifacts*, not the primary. That is useful context for our own finding that the NGX
-exposure-texture path measured inert.
+for artifacts*, not the primary.
+
+> **This section previously ended "That is useful context for our own finding that the NGX
+> exposure-texture path measured inert." That framing is retracted — see §A.4.1, which was
+> written after re-reading the plugin from a pinned commit and after finding the gate in
+> NVIDIA's own Programming Guide.**
+
+### A.4.1 Exposure, re-verified from source and settled (2026-09-03)
+
+The line numbers cited above could not be reproduced against any live mirror: the plugin has
+grown and every mirror's numbering drifts. Everything below is re-read from **`moumee/ProjectS`
+@ `563205ea712e7aa248983c02ed906e0fb7cf30ff`**, whose `DLSS.uplugin` reads
+`"VersionName": "8.3.0-NGX310.4.0"`, `"EngineVersion": "5.5.0"`, with the NVIDIA copyright header
+intact and identical content cross-checked against a second mirror. **The logic is unchanged
+across every plugin version checked, from v2.3.2 (UE 5.0) to v8.5.0 (UE 5.6) — only the line
+numbers move.** Cite the commit, not the line, when this matters again.
+
+**1. `InPreExposure` is `View.PreExposure`. Not its reciprocal, not 1.0. HARD.**
+`DLSSUpscalerPrivate.h`, `FDLSSPassParameters`'s pre-5.3 constructor — the branch whose shape UE
+4.27 exposes — initialises the member directly:
+
+```cpp
+FDLSSPassParameters(const FViewInfo& View, const ITemporalUpscaler::FPassInputs& PassInputs)
+    : InputViewRect(View.ViewRect)
+    ...
+    , PreExposure(View.PreExposure)
+```
+
+and `DLSSUpscaler.cpp:1111-1115` forwards it unchanged. This closes the question the task
+raised: our `eval.InPreExposure = View row 135.y` matches the reference exactly. The guide gives
+the reason (§3.9.2): engines "pre-multiply frames with a 'pre-exposure factor' that is later
+removed (divided out) during tonemapping ... If there is a pre-exposure value, you must pass it
+to DLSS during every DLSS evaluation call using the InPreExposure parameter."
+
+**2. `PreExposure` and the exposure texture are INDEPENDENT, and the null-out is one layer
+deeper than we documented. HARD.** At the `DLSSUpscaler.cpp:1111-1115` call site BOTH are set
+unconditionally — `check(PassParameters->EyeAdaptation)` runs whatever the exposure mode is. The
+mode is applied in the RHI backend, `NGXD3D12RHI.cpp:275-276`:
+
+```cpp
+EvalParams.pInExposureTexture = InArguments.bUseAutoExposure ? nullptr : GetResidentD3D12Resource(D3D12RHI, CmdList, InArguments.InputExposure, true);
+EvalParams.InPreExposure      = InArguments.PreExposure;
+```
+
+`InPreExposure` is outside the ternary. The D3D11 and Vulkan backends carry the byte-identical
+shape (`NGXD3D11RHI.cpp:211-212`, `NGXVulkanRHI.cpp:334-335` and `:451-452`), and the same
+templated helper serves the DLSSD (RR) eval params, so SR and RR agree too.
+
+**3. The flag block, verified in full.** `NGXRHI.cpp:550-565`, `GetNGXCommonDLSSFeatureFlags()`,
+called from BOTH `GetNGXDLSSCreateParams()` and `GetNGXDLSSRRCreateParams()`:
+
+```cpp
+DLSSFeatureFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+if (DenoiserMode == ENGXDLSSDenoiserMode::Off)
+    DLSSFeatureFlags |= bool(ERHIZBuffer::IsInverted) ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0;
+DLSSFeatureFlags |= !bHighResolutionMotionVectors ? NVSDK_NGX_DLSS_Feature_Flags_MVLowRes : 0;
+DLSSFeatureFlags |= bUseAutoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0;
+DLSSFeatureFlags |= bEnableAlphaUpscaling ? NVSDK_NGX_DLSS_Feature_Flags_AlphaUpscaling : 0;
+```
+
+`bUseAutoExposure` is the ONLY flag keyed off the exposure mode — our `create_flag_bits` matches.
+Two incidental confirmations: `DepthInverted` is suppressed for RR because "DLSS-SR uses hardware
+depth, DLSS-RR uses linear depth" (their comment), and the oldest mirror reachable (v2.3.2) still
+set the deprecated `DoSharpening`, which this version has dropped.
+
+**4. `InExposureScale` IS NEVER SET BY THE PLUGIN. HARD (an absence, searched).** Repo-wide code
+search for `InExposureScale` and for `ExposureScale` returns **zero hits** across the whole plugin
+tree, confirmed by grep over the downloaded RHI sources. The field is left at whatever
+`FMemory::Memzero(EvalParams)` produced — 0 — which `nvsdk_ngx_helpers.h:508` rewrites to 1.0.
+**The reference integration carries exposure through `InPreExposure` and the texture alone.**
+Our `[STRAYDLSS] NgxExposureScale` is therefore an invention of ours on a parameter NVIDIA
+documents nowhere, which is why it is no longer treated as a consume test.
+
+**5. The plugin TRANSITIONS the exposure texture; it does not assume its state. HARD.** The same
+`GetResidentD3D12Resource` helper that resolves `pInExposureTexture`
+(`NGXD3D12RHI.cpp:211-238`):
+
+```cpp
+D3D12RHI->RHITransitionResource(CmdList, InTexture,
+    bInIsInputTexture ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+```
+
+(on UE ≥5.6 replaced by `RHIUpdateResourceResidency`, trusting RDG). **This is the one place our
+`NgxExposure=texture` genuinely diverges from the reference**, and it cannot be fixed on a
+resource the game owns: UE's RHI knows the resource's true current state and can transition
+correctly, while D3D12 exposes no way for us to query it and a guessed `StateBefore` is the exact
+hazard `CLAUDE.md` §5 documents. It is the strongest argument for `NgxExposure=owned`, where the
+resource is ours and the transition is ours.
+
+**6. UE 4.27's eye adaptation is 1x1 `PF_A32B32G32R32F`. HARD, from the engine.**
+`PostProcessEyeAdaptation.cpp:820`:
+
+```cpp
+FPooledRenderTargetDesc Desc(FPooledRenderTargetDesc::Create2DDesc(FIntPoint(1, 1), PF_A32B32G32R32F, ...));
+```
+
+which is exactly the shape `find_eye_adaptation_srv` matches and exactly what `CLAUDE.md` §2.3
+measured at `t0`. Worth knowing for later: UE **5.2** made eye adaptation a BUFFER, and the
+plugin answers with a dedicated `AddCopyEyeAdaptationDataToTexturePass`; UE ≥5.3 hands it back as
+a texture through `ITemporalUpscaler::FInputs`. Irrelevant to 4.27, relevant to anyone porting.
+
+**7. The plugin knows nothing about a preset/exposure interaction.** Searching every `Preset`
+occurrence in `DLSSUpscaler.cpp` and `NGXRHI.cpp` finds no coupling; `bUseAutoExposure` comes
+from one cvar read once per pass. **That is not a contradiction of the gate in §A.4.2 — it is
+a statement about the integration layer, and the gate lives in the runtime.** The plugin also
+defaults to auto-exposure, so the gate would rarely bite it.
+
+### A.4.2 THE GATE: exposure input is supported by presets J and K only
+
+**HARD.** DLSS Programming Guide, document revision **310.6.0**
+(`NVIDIA/DLSS@main:doc/DLSS_Programming_Guide_Release.pdf`), §3.9 "Exposure", opening line:
+
+> "Only supported by Presets J and K. Preset L always uses AutoExposure."
+
+introduced by the v310.5.0 changelog entry: *"Updated Section 3.9 Exposure input is only
+supported by Presets J and K."*
+
+So the application-supplied exposure path is **preset-gated**, and on a preset outside {J, K} the
+runtime auto-exposes regardless of the create flag and regardless of any texture passed. Preset M
+is excluded by the exclusive list rather than by a per-preset sentence, so that half is **SOFT**;
+L is explicit and **HARD**.
+
+**This reproduces the recorded symptom exactly** — flag dropped, a healthy texel passed every
+frame, and the on-screen indicator still reading "Auto Exposure: ON" (commit `5d848d3`).
+
+**And this title defaults onto the wrong side of it.** `NVSDK_NGX_DLSS_Hint_Render_Preset_Default`
+resolves per quality mode, from `nvsdk_ngx_defs.h:82-85`'s own comments — K for
+DLAA/Quality/Balanced, **L for UltraPerf, M for Perf** — and Stray ships `ScreenPercentage=50`
+(`CLAUDE.md` §2.3.1), a 2.0x ratio, i.e. Performance. A session on the driver default preset gets
+**M**. `src/core/exposure_plan.cpp` encodes this table, `tests/test_exposure_plan.cpp` pins it,
+and `ngx_backend.cpp` warns at feature creation when the combination is self-defeating.
+
+Two further answers from the same guide reading, both **HARD**, both confirming the current
+implementation rather than changing it: §3.4 puts exposure in the same input class as colour,
+depth and motion vectors, requiring `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE`; and §3.9
+says "**Only the first channel is sampled in the texture so multiple formats will work but
+something such as R16F is preferred**", so RGBA32F is legal and format was never the fault.
+
+**Not answered by any primary source, and still UNCONFIRMED:** whether `DLSS.Exposure.Scale`
+multiplies or divides (no prose anywhere), what the production on-screen indicator's fields
+actually report (§3.18.1 enumerates version, API, scaling factor, timing and overlay name — no
+"Auto Exposure" line at all), and what the runtime substitutes when the flag is clear and no
+texture is supplied.
 
 **Mip bias is not computed per pass. It is a global cvar override set once at module startup.**
 `DLSS/Source/DLSS/Private/DLSS.cpp:459-468`:

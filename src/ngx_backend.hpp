@@ -94,10 +94,14 @@ exposure::Mode exposure_mode();
 // texture mode. nvsdk_ngx_helpers.h:508 forwards it as DLSS.Exposure.Scale, with 0 rewritten
 // to 1.0.
 //
-// DEMOTED FROM "the definitive consume test", deliberately. DLSS.Exposure.Scale has ZERO
-// explanatory prose in the entire 84-page Programming Guide (revision 310.6.0) — the name
-// appears only in the parameter listing, and whether it multiplies or divides into the
-// texture's value is UNCONFIRMED from any primary source. A null result from a sweep of it is
+// DEMOTED FROM "the definitive consume test", deliberately, for two independent reasons.
+// DLSS.Exposure.Scale has ZERO explanatory prose in the entire 84-page Programming Guide
+// (revision 310.6.0) — the name appears only in the parameter listing, and whether it
+// multiplies or divides into the texture's value is UNCONFIRMED from any primary source. AND
+// the official UE plugin NEVER SETS IT: a repo-wide search of the plugin tree for
+// `InExposureScale` and `ExposureScale` returns zero hits, so the field is left at whatever
+// FMemory::Memzero left it (0, which helpers.h:508 rewrites to 1.0). The reference integration
+// carries exposure through InPreExposure and the texture alone. A null result from a sweep is
 // therefore not evidence about the exposure TEXTURE. NgxExposureValue under NgxExposure=owned
 // is the sound consume test, because it perturbs the one quantity the guide does document.
 void set_exposure_scale(float scale);
@@ -117,18 +121,40 @@ struct EvaluateInputs
 	ID3D12Resource *motion_vectors = nullptr;  // our dense RG16_FLOAT field
 	ID3D12Resource *output = nullptr;          // output-res UAV, ALLOW_UNORDERED_ACCESS
 	// The exposure texture for this frame — the engine's eye-adaptation buffer (TAA
-	// register t0: 1x1 RGBA32F) under NgxExposure=texture, our own 1x1 R32_FLOAT under
-	// NgxExposure=owned, null under auto. Either format is legal: DLSS Programming Guide
-	// 310.6.0 §3.9 says "Only the first channel is sampled in the texture so multiple
-	// formats will work but something such as R16F is preferred". §3.4 requires it in
-	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in the same input class as colour
-	// and depth — which is where the game's own compute dispatch already leaves t0.
+	// register t0) under NgxExposure=texture, our own 1x1 R32_FLOAT under
+	// NgxExposure=owned, null under auto.
+	//
+	// SHAPE, HARD from UE 4.27.2's own source: eye adaptation is allocated
+	// `Create2DDesc(FIntPoint(1, 1), PF_A32B32G32R32F, ...)`
+	// (PostProcessEyeAdaptation.cpp:820) — 1x1 R32G32B32A32_FLOAT, exactly what
+	// find_eye_adaptation_srv looks for and exactly what CLAUDE.md §2.3 measured at t0.
+	//
+	// FORMAT is not a constraint: DLSS Programming Guide 310.6.0 §3.9, "Only the first
+	// channel is sampled in the texture so multiple formats will work but something such
+	// as R16F is preferred". So the engine's RGBA32F and our R32_FLOAT are both legal.
+	//
+	// STATE: §3.4 requires D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, listing
+	// exposure in the same input class as colour, depth and motion vectors.
+	//
+	// THE ONE PLACE WE DIVERGE FROM THE REFERENCE, and it is why `owned` exists. The
+	// official plugin does not assume that state, it TRANSITIONS to it — the same
+	// GetResidentD3D12Resource helper that resolves pInExposureTexture calls
+	// `RHITransitionResource(CmdList, InTexture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_
+	// RESOURCE, ALL_SUBRESOURCES)` for every input texture (NGXD3D12RHI.cpp, plugin
+	// v8.3.0-NGX310.4.0). UE's D3D12 RHI tracks the real current state, so that
+	// transition is correct rather than guessed. WE CANNOT DO THAT for the game's
+	// texture: D3D12 exposes no way to query a resource's state, and a barrier with a
+	// guessed StateBefore is the exact hazard CLAUDE.md §5 documents. Under
+	// NgxExposure=texture we therefore rely on the game's own dispatch having left t0 in
+	// that state (true, and the same reliance we already place on colour and depth);
+	// under NgxExposure=owned we transition it ourselves, which is the reference's
+	// discipline reproduced rather than approximated.
 	// VALUE SEMANTICS, the load-bearing point: texel .x is UE's smoothed exposure
 	// multiplier — `OutColor.x = MiddleGreyExposureCompensation * SmoothedExposureScale`
 	// (PostProcessEyeAdaptation.usf:95-112, 4.27.2 mirror, fetched 2026-08-31) — the value
 	// the tonemapper multiplies scene colour by. The official
 	// plugin passes this texture UNMODIFIED while ALSO passing View.PreExposure as
-	// InPreExposure in BOTH exposure modes (DLSSUpscaler.cpp:1085-1089) — no reciprocal,
+	// InPreExposure in BOTH exposure modes (DLSSUpscaler.cpp:1111-1115) — no reciprocal,
 	// no combining, no double-apply at the integration layer: NGX separates the two
 	// internally (pre-exposure names what is baked into the colour buffer; the exposure
 	// texture names the tonemapper's multiplier). We reproduce that exactly: this texture

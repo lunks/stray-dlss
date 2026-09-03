@@ -17,12 +17,32 @@
 //     ever being run. "Inert" therefore rests on a NULL RESULT from an instrument whose
 //     sensitivity was never established.
 //
-// The three variables that null result cannot separate are the resource's FORMAT, its STATE and
-// its VALUE — all of which belong to a texture the ENGINE owns, that we neither allocate nor
-// barrier, and whose D3D12 state cannot be queried. `Mode::owned` exists to collapse all three:
-// our own 1x1 R32_FLOAT, transitioned by us, carrying a number we choose. If the image does not
-// move when that number is deliberately wrong, the runtime genuinely ignores application
-// exposure and the question is closed for good.
+// THE LEADING EXPLANATION IS THE PRESET GATE below, and it is documented rather than guessed:
+// exposure input is supported by presets J and K only, and this title's shipped 50% screen
+// percentage puts a default-preset session on M. Read that section next; it is the one thing
+// here that would make every measurement above come out exactly as it did.
+//
+// `Mode::owned` exists for what the preset gate does NOT settle. Two things survive it:
+//
+//   1. STATE. The official plugin does not ASSUME the exposure texture's resource state, it
+//      TRANSITIONS to it — `RHITransitionResource(CmdList, InTexture,
+//      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, ALL_SUBRESOURCES)` inside the same
+//      GetResidentD3D12Resource helper that resolves pInExposureTexture (NGXD3D12RHI.cpp,
+//      plugin v8.3.0-NGX310.4.0). UE's RHI knows the real current state, so that is a correct
+//      transition. We cannot reproduce it on a resource the GAME owns — D3D12 cannot be asked
+//      for a resource's state and a guessed StateBefore is the hazard CLAUDE.md §5 documents —
+//      so under NgxExposure=texture we ASSUME, and under NgxExposure=owned we transition.
+//   2. PERTURBABILITY. The only sound test of "does the runtime read this texture" is changing
+//      the number inside it, which requires a texture we can write. The instrument built for
+//      that job in 17265f2 — sweeping DLSS.Exposure.Scale — cannot do it: that parameter has
+//      zero explanatory prose in the entire Programming Guide, and the official plugin never
+//      sets it at all (repo-wide search: zero hits for InExposureScale). A null result from an
+//      undocumented parameter that the reference integration does not even use is not evidence
+//      about the texture.
+//
+// FORMAT and VALUE are NOT reasons, and saying so matters: the guide settles format ("Only the
+// first channel is sampled in the texture so multiple formats will work", §3.9) and the texel
+// dump settled value. The engine texture is legitimate on both.
 #pragma once
 
 #include "dlss_quality.hpp"
@@ -42,8 +62,8 @@ enum class Mode
 
 	// The engine's own eye-adaptation texture (TAA register t0, 1x1 RGBA32F) is passed as
 	// pInExposureTexture and the AutoExposure flag is dropped, mirroring the plugin's
-	// bUseAutoExposure=false path (NGXRHI.cpp:537-546 keys only the flag off the mode;
-	// NGXD3D12RHI.cpp:267-269 nulls only the texture under auto).
+	// bUseAutoExposure=false path (NGXRHI.cpp:550-565 keys only the flag off the mode;
+	// NGXD3D12RHI.cpp:275-276 nulls only the texture under auto).
 	engine_texture,
 
 	// Our own 1x1 R32_FLOAT, written and barriered by us, carrying `View.PreExposure`

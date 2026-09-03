@@ -887,7 +887,7 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	// DoSharpening — deprecated and inert. AutoExposure (1<<6 = 0x40, nvsdk_ngx_defs.h:297)
 	// only under NgxExposure=auto: in texture mode the engine's eye-adaptation texture is
 	// the exposure source and the flag must be ABSENT — exactly the official UE plugin's
-	// pair (NGXRHI.cpp:537-546: `bUseAutoExposure ? Flags_AutoExposure : 0`).
+	// pair (NGXRHI.cpp:550-565: `bUseAutoExposure ? Flags_AutoExposure : 0`).
 	create.InFeatureCreateFlags = static_cast<int>(
 		static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_IsHDR) |
 		static_cast<unsigned int>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) |
