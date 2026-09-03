@@ -1213,9 +1213,57 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		}
 
 		const bool hooked = report_vkd3d_ext_hook(native, "pre-NGX");
-		if (hooked || frame >= kNgxDecisionDeadline)
+
+		// WAIT FOR THE HOOK ONLY IF SOMETHING COULD STILL INSTALL IT.
+		//
+		// The deadline above is a ReShade-era assumption that outlived its host. ONLY ReShade
+		// installs this patch, and only from inside its own proxy device's QueryInterface
+		// (v6.8.0 d3d12_extensions.cpp) - so if no ReShade proxy is wrapping this device, the
+		// patch can never appear and `hooked` is false forever. Under the UE4SS plugin that is
+		// every session, and it cost the full deadline to decide something already decided:
+		// kNgxDecisionDeadline - kNgxInitFrame presents of DLSS-less startup, every launch.
+		//
+		// The test is THE PROXY, not icept::backend()->name(). The name answers "who drives
+		// our seam", which is a different question and is wrong in BOTH directions here:
+		//   * the ReShade host running NativeMode=drive reports
+		//     "native(drive)+reshade(present)" while ReShade is plainly present, and
+		//   * the plugin host reports "native" even when ReShade is loaded alongside it -
+		//     which is not hypothetical but a DOCUMENTED, SUPPORTED setup:
+		//     mods/StrayDLSS/README.md's "Config B (ReShade coexists): keep ReShade as
+		//     dxgi.dll; the plugin unwraps its proxies".
+		// Either misreading skips a wait that is load-bearing and lands us on the silent
+		// wrong-texture row of the truth table in CLAUDE.md §1. Config B is exactly the case
+		// a name test gets wrong AND the case where getting it wrong costs an image.
+		//
+		// Evaluated ONCE. ReShade registers the proxy in its D3D12Device constructor, inside
+		// D3D12CreateDevice, so by the first present it is either there or never will be - and
+		// a per-present GetPrivateData would AddRef a proxy we do not own. A null device latches
+		// -1 and keeps the old deadline behaviour rather than initialising NGX on nothing.
+		static const int s_reshade_proxy =
+			native == nullptr ? -1 : (reshade_proxy_device(native) != nullptr ? 1 : 0);
+		const bool waiting_is_pointless = s_reshade_proxy == 0;
+
+		if (hooked || waiting_is_pointless || frame >= kNgxDecisionDeadline)
 		{
 			g_state.ngx_attempted.store(true, std::memory_order_relaxed);
+
+			// Say which path this session took, and when. The two are indistinguishable from
+			// the rest of the log otherwise, and the whole point of the change is a frame
+			// number a pasted log can be checked against.
+			if (waiting_is_pointless && !hooked)
+				STRAY_LOG_INFO("NGX decision taken at frame %llu WITHOUT waiting for the "
+					"deadline (%d): no ReShade proxy wraps this device, so nothing in this "
+					"process can install the vkd3d ext-vtable patch. Under a ReShade host this "
+					"waits exactly as it always did.",
+					static_cast<unsigned long long>(frame), kNgxDecisionDeadline);
+			else
+				STRAY_LOG_INFO("NGX decision taken at frame %llu after waiting for the ext-hook "
+					"question to settle (hook %s, deadline %d, ReShade proxy %s).",
+					static_cast<unsigned long long>(frame), hooked ? "INSTALLED" : "still absent",
+					kNgxDecisionDeadline,
+					s_reshade_proxy == 1 ? "present - the patch could appear at any time"
+						: s_reshade_proxy == 0 ? "absent"
+						: "unknown, the device was null at the first check");
 
 			// [STRAYDLSS] NgxDevice: auto (default), native, or proxy.
 			//
@@ -1255,9 +1303,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			}
 			else
 			{
-				STRAY_LOG_INFO("NGX will use the NATIVE device (%p): no ext hook after %d "
-					"frames, so nothing will convert our handles.",
-					static_cast<void *>(native), kNgxDecisionDeadline);
+				STRAY_LOG_INFO("NGX will use the NATIVE device (%p): no ext hook at frame "
+					"%llu, so nothing will convert our handles.",
+					static_cast<void *>(native), static_cast<unsigned long long>(frame));
 			}
 
 			STRAY_LOG_INFO("Initialising NGX (frame %llu)...",
@@ -1266,9 +1314,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		}
 		else if (frame == kNgxInitFrame)
 		{
-			STRAY_LOG_INFO("Deferring NGX: waiting to see whether ReShade's vkd3d ext hook gets "
-				"installed, which decides which device NGX must use (deadline frame %d).",
-				kNgxDecisionDeadline);
+			STRAY_LOG_INFO("Deferring NGX: a ReShade proxy wraps this device, so its vkd3d ext "
+				"hook may still be installed, and that decides which device NGX must use "
+				"(deadline frame %d).", kNgxDecisionDeadline);
 		}
 	}
 
