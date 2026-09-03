@@ -492,8 +492,8 @@ So the gate becomes a consequence of the identification rather than a second mec
 
 * `src/core/engine_seam.{hpp,cpp}` — the pure scan, the layout constants, and the correlation
   ledger. In `stray_dlss_core`, so it builds and runs on the Linux unit lane.
-* `tests/test_engine_seam.cpp` — 12 cases, ~90 assertions: discovery, both float codegen shapes,
-  every refusal, the decoy vtable, `Image::read` bounds, the offsets as pinned constants, and the
+* `tests/test_engine_seam.cpp` — 14 cases, 103 assertions: discovery, both float codegen shapes,
+  every refusal, the movabs fallback, the decoy vtable, `Image::read` bounds, the offsets as pinned constants, and the
   ledger's claim/orphan/mismatch/retire/overflow behaviour.
 * `src/engine_seam_hook.{hpp,cpp}` — the Windows half: PE section walk, discovery logging, the
   vtable patch, the thunk, `shutdown()`. Added to the mingw `-fsyntax-only` lane, which is a real
