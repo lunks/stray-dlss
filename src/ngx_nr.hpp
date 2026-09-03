@@ -172,8 +172,8 @@ enum class Site
 	// feature 18 is a display-referred network and this signal is out of its domain (measured:
 	// neural output max luminance 0.0026, red noise on screen).
 	taa_dispatch,
-	// A post-tonemap site (REMOVED 2026-09-02 together with src/nr_hook.cpp; kept as the
-	// codec-bypass case the codec tests pin).
+	// src/nr_hook.cpp, the PRESENT STAGE: our own command list after the game's last submission
+	// of the frame ([STRAYDLSS] NgxNRHook=present).
 	// `image` is a staging copy of the back buffer: ALREADY TONEMAPPED and display-referred, in
 	// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, and left in that state on exit.
 	//
@@ -221,10 +221,13 @@ struct ApplyInputs
 	// smoothed exposure rather than walking it somewhere wrong on a stale read.
 	bool pre_exposure_ok = false;
 
-	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from output/render", which
-	// is what the TAA site does. The post-tonemap sites pass the ratio their own gate computed,
-	// because their colour rect is the BACK BUFFER's, which is not necessarily the TAA output
-	// rect the guides were sized against.
+	// Colour/guide ratio for DLSSNR.MVecScaleX/Y. <= 0 means "derive from the topology", which is
+	// what BOTH sites pass today and which reaches 1.0 — the value the user's own live A/B settled
+	// on (CLAUDE.md, 2026-09-01), overturning a code-reading argument for the ratio. The present
+	// stage's colour rect is the BACK BUFFER's, which is not necessarily the TAA output rect the
+	// guides were sized against, so its gate COMPUTES the ratio and reports it in the periodic NR
+	// STAGE line rather than sending it: the two numbers can then be compared on the box before
+	// either is changed.
 	float mvec_scale_x = 0.0f;
 	float mvec_scale_y = 0.0f;
 };

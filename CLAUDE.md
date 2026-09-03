@@ -1856,7 +1856,92 @@ OFF so a future session flipping it does so knowingly.
 
 The last four are what a live run would settle, in that order.
 
+### NR is now a PRESENT STAGE too: `[STRAYDLSS] NgxNRHook = taa | present` (phase 1, 2026-09-02)
+
+> **This supersedes "The NR hook site is ONE site again", written earlier the same day.** That
+> section is kept below verbatim, because *why the earlier sites failed* is what makes this one
+> defensible — and because the two failures it records must not be re-run.
+
+**The decision, the user's:** *"let's make the NR be a present layer and clean it up."* NR is not
+an upscaler — same resolution in, same resolution out — and it sat inside the intercepted TAA
+dispatch only because that is where we already had a hook. Everything painful about it follows
+from that one choice:
+
+* the site is **linear, pre-tonemap HDR** while the network is display-referred, which is the
+  entire reason for the HDR codec (soft clip + exact sRGB proxy, two compute passes and their two
+  shaders), for `NgxNRPaperWhiteScale`, and for `NgxNRTrackExposure` with its smoothing rate and
+  its scale-reset latch — a `DLSSNR.Reset` source driven by a continuously varying quantity, which
+  this file has already measured making an image *worse*;
+* the texture we write is `u0`, which UE 4.27 extracts as the next frame's TAA history AND hands
+  downstream as scene colour (`TemporalAA.cpp:696`, `:969`; `ScreenSpaceRayTracing.cpp:596-620`),
+  which is the feedback node `NgxNRRestoreHistory` exists to close.
+
+**None of that is needed at Present**, and the reason is one measured fact: Stray's back buffer is
+`R10G10B10A2_UNORM` and the game never calls `SetColorSpace1`, so it is **SDR display-encoded
+already** — the network's own training domain (facts §32; the colour-space half is SOFT here,
+carried from the `dlss-fg` branch). No codec, no paper white, no exposure term, no feedback path.
+
+**Why the two earlier failures do not generalise, which is the whole argument:**
+
+| earlier site | how it died | why the stage is different |
+|---|---|---|
+| `preui` | clobbered state the **game's** command list needed | the stage records on the present owner's OWN list (`src/backend_native/present_owner.hpp`), where nothing of the game's is bound — so there is nothing to clobber and nothing to restore |
+| old `present` | rode `addon_event::reshade_begin_effects`, which **never fires with an empty preset** | the stage is triggered by `icept::Sink::on_present`, which both hosts deliver unconditionally |
+
+**How it is built.** `src/nr_hook.{hpp,cpp}` is the live half (guides, gate, the `nr::apply`
+call); `src/nr_stage.{hpp,cpp}` is the NGX-free D3D12 half — one committed texture and two
+`CopyResource` calls — split out precisely so the WARP lane can judge the barriers and read the
+pixels back (`tests/warp/warp_nr_stage.inc`). The gate is pure and tested
+(`nrplan::plan_post_tonemap`, `tests/test_nr_hook_plan.cpp`). Per frame: back buffer -> our
+staging copy -> `nr::apply(Site::post_tonemap)` -> staging -> back buffer.
+
+**Four things about it that are load-bearing:**
+
+1. **The guides still come from the TAA site.** Depth, the dense motion vectors, the render extent
+   and the camera-cut OR are produced there and PUBLISHED with a sequence counter; the stage
+   consumes each capture exactly once. A frame with no TAA dispatch — a loading screen — does not
+   advance the counter, so the stage declines it as `guides-stale` with no separate test.
+2. **The stage runs AFTER `nr::on_present`, and that ordering is correctness, not tidiness.**
+   `nr::on_present` signals the NR lifetime fence on the presenting queue, but our present list is
+   only EXECUTED after the whole callback returns — so work recorded *before* the signal would be
+   reported complete while its commands had not run, and every deferred free including
+   `ReleaseFeature` would happen under an in-flight list. Recording after it tags the work with the
+   NEXT present's value. The one cosmetic consequence is one spurious `frame-gap` reset on the very
+   first stage frame, which lands on a freshly created feature that carries a reset anyway.
+3. **The back buffer's assumed state is `PRESENT` (== `COMMON` == 0), overridable with
+   `[STRAYDLSS] NgxNRStageBackBufferState`.** D3D12 *requires* it there when `Present` is called and
+   both triggers run inside that call — but "required by the API" and "true on this stack" are not
+   the same sentence, and vkd3d-proton has no debug layer to object to a wrong `StateBefore`.
+4. **`NgxNRRestoreHistory=1` is IGNORED at this site, loudly.** There is no feedback path to close
+   and nothing writes `u0` there to snapshot.
+
+**Known and accepted for phase 1: the HUD is in the image.** `DLSSNR.UICorrection` is sent (it is
+RenoDX's own default and ours); its effect is **UNCONFIRMED**. Stray's HUD is sparse, so this is
+expected to be tolerable and is a thing to LOOK at rather than argue about. The follow-up is a
+pre-UI seam — the frame's first back-buffer render-target bind — which frame generation also wants
+for its HUD-less input; **it should be built once and serve both**, and it is deliberately not
+built here.
+
+**Phase 1 SHIPS `taa` AS THE DEFAULT**, so the image is byte-identical until someone asks
+otherwise. Everything above is **UNCONFIRMED live**: no run on the box has judged it.
+
+**Phase 2 is one launch** with `NgxNRHook=present`: the user judges the image, and the `NR RESETS`
+line says whether the `codec-scale=` resets — the current leading suspect for the reported flicker
+— have gone to zero, which is the point of the whole exercise. **Phase 3, only after that
+confirms**, makes `present` the default and DELETES what the TAA site needed and this one does
+not: the codec and its two shaders, `NgxNRPaperWhiteScale` / `NgxNRColorStrength` /
+`NgxNRTransferStrength`, `NgxNRTrackExposure` with its smoothing and reset tolerance,
+`NgxNRRestoreHistory` and `nr_history_plan`, the `codec-topology` refusal, and the then-unreachable
+`no-codec` / `exposure-unknown` / `degenerate-scale` gates — with this file and the facts doc
+updated in the same commits, because several of their sections describe machinery that will no
+longer exist.
+
 ### The NR hook site is ONE site again: `taa` (the `present` / `preui` sites were REMOVED 2026-09-02)
+
+> **SUPERSEDED the same day by the section above** — the `present` site is back, as a STAGE on our
+> own present-time command list rather than as a ReShade event. `preui` stays deleted. What is
+> preserved here is the record of HOW each earlier site failed, which is the evidence the new
+> section's "does not generalise" argument rests on.
 
 This section used to describe a three-way `[STRAYDLSS] NgxNRHook` choice. **Both post-tonemap
 sites are gone from the code** (`src/nr_hook.{hpp,cpp}`, the `preui` boundary rule, the
@@ -1917,7 +2002,16 @@ that list.
 **The experiment is one launch:** write a magenta patch into the back buffer through a typed UAV on
 the present list, behind a key, and screenshot — the same `NgxPaint` separation of "can we write
 here" from "is the network right" that cracked "DLSS runs but nothing changes". If it passes, this
-outranks every difference in §9. **Not built; the user decides.**
+outranks every difference in §9.
+
+> **BUILT 2026-09-02 by the user's decision, as `[STRAYDLSS] NgxNRHook=present` — see "NR is now a
+> PRESENT STAGE too" above.** The staging path went in instead of the magenta probe, because the
+> stage's own log answers the same question more directly: a first `NR STAGE` line proves the
+> copies reached the back buffer, and the periodic `NR STAGE:` counter names the gate that refused
+> if they did not. The typed-UAV probe is reused rather than reimplemented (`nrstage::probe` calls
+> `nrp::probe_typed_uav`) and its verdict is logged once per format. **No compute dispatch of ours
+> is recorded on that list even now** — the stage is two `CopyResource` calls and NGX's own
+> evaluate — so that particular unknown is still open, and it is not on this feature's path.
 
 ### Feature 18 has its OWN temporal history, and we were invalidating it silently
 
