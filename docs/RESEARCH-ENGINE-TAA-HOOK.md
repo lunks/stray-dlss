@@ -272,7 +272,7 @@ reference in RDX/R8/R9/stack, so the two are ABI-identical. It reads, per call:
 
 **Why that rect is the whole prize.** `AddGen4MainTemporalAAPasses` sets
 `*OutSceneColorViewRect = SecondaryViewRect` where `SecondaryViewRect = TAAParameters.OutputViewRect`
-(`TemporalAA.cpp:1456`, `:1517`), and the dispatch is
+(`TemporalAA.cpp:1456`, `:1516`), and the dispatch is
 `GetGroupCount(PracticableDestRect.Size(), GTemporalAATileSizeX)` (`:958`) with
 `PracticableDestRect = DivideAndRoundUp(Inputs.OutputViewRect, Inputs.ResolutionDivisor)`
 (`:654-656`) and `ResolutionDivisor == 1` for every `Main*` config. **So the group counts the game
@@ -461,11 +461,11 @@ So the gate becomes a consequence of the identification rather than a second mec
 | `RENDERER_API`/`ENGINE_API` are empty in a monolithic target; nothing here is exported | **HARD**, `UEBuildModule.cs:545-554` |
 | `ITemporalUpscaler`'s five virtuals and their declaration order | **HARD**, `TemporalAA.h:160-180` |
 | `FDefaultTemporalUpscaler::GetDebugName` returns `TEXT("FDefaultTemporalUpscaler")` and nothing else | **HARD**, `TemporalAA.cpp:1527-1530` |
-| The two fraction accessors return exactly `0.5f` and `2.0f` | **HARD**, `TemporalAA.cpp:1567-1573` + `SceneView.h:1438-1439` |
+| The two fraction accessors return exactly `0.5f` and `2.0f` | **HARD**, `TemporalAA.cpp:1566-1573` + `SceneView.h:1438-1439` |
 | `AddPasses` is called only from `PostProcessing.cpp:559` and `:2005` | **HARD** at both sites; **SOFT** that there is no third (code search) |
 | Every look-alike calls `AddTemporalAAPass` directly | **HARD** per caller; **SOFT** that the list of six is complete |
 | `FDefaultTemporalUpscaler` is the only `ITemporalUpscaler` in the tree | **SOFT** (code search over a large fork) |
-| `*OutSceneColorViewRect == OutputViewRect`, and the dispatch is `ceil(that / 8)` for every `Main*` config | **HARD**, `TemporalAA.cpp:654-656`, `:958`, `:1456`, `:1517` |
+| `*OutSceneColorViewRect == OutputViewRect`, and the dispatch is `ceil(that / 8)` for every `Main*` config | **HARD**, `TemporalAA.cpp:654-656`, `:958`, `:1456`, `:1516` |
 | `FPassInputs`'s three pointers sit at 8 / 16 / 24 | **[derived]** — HARD declaration order, plus `sizeof(EPixelFormat) == 4` from `PixelFormat.h:12` and the MSVC x64 ABI |
 | `FIntRect` is four `int32` at 0 / 4 / 8 / 12 | **[derived]**, from the declaration; universally relied on in UE code |
 | MSVC slot order == declaration order; a virtual destructor takes one slot | **[derived]** from the MSVC ABI. This is what the 0.5/2.0 check tests |
