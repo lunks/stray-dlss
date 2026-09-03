@@ -1,0 +1,98 @@
+-- StrayDebugMenu: open the debug UI Stray itself ships.
+--
+-- The game carries its own debug widgets (found in the pak index, and DefaultGame.ini's
+-- [/Script/Hk_project.HKGameSettings] names one of them outright):
+--     HUDDebugWidgetClass=/Game/GUI/HUD/UMG_HUD_Debug.UMG_HUD_Debug_C
+--     /Game/GUI/HUD/UMG_DebugMenu.UMG_DebugMenu_C
+--     /Game/GUI/HUD/UMG_DebugButton.UMG_DebugButton_C
+--     /Game/GUI/GameMenus/UMG_DebugInput.UMG_DebugInput_C
+-- Nothing in the shipped build appears to route input to them, so this constructs one and
+-- adds it to the viewport directly.
+--
+-- Drop a widget name into stray-debug.cmd in the game dir (Binaries/Win64) — one line, e.g.
+--     UMG_DebugMenu
+--     UMG_HUD_Debug
+--     close
+-- Polls every 500 ms on the async thread; every engine call runs on the GAME thread through
+-- ExecuteInGameThread and is wrapped in pcall (the StrayFur checkpoint-reload crash lesson:
+-- touching UObjects off the game thread is what killed the game during teardown).
+
+local UEHelpers = require("UEHelpers")
+local CMD = "stray-debug.cmd"
+local LOG = "stray-debug.txt"
+
+local KNOWN = {
+    UMG_DebugMenu  = "/Game/GUI/HUD/UMG_DebugMenu.UMG_DebugMenu_C",
+    UMG_HUD_Debug  = "/Game/GUI/HUD/UMG_HUD_Debug.UMG_HUD_Debug_C",
+    UMG_DebugInput = "/Game/GUI/GameMenus/UMG_DebugInput.UMG_DebugInput_C",
+    UMG_DebugButton= "/Game/GUI/HUD/UMG_DebugButton.UMG_DebugButton_C",
+}
+
+local open = {}   -- name -> widget
+
+local function note(line)
+    print("[StrayDebugMenu] " .. line .. "\n")
+    local f = io.open(LOG, "ab")
+    if f then f:write(line .. "\n"); f:close() end
+end
+
+local function readCommand()
+    local f = io.open(CMD, "rb")
+    if not f then return nil end
+    local text = f:read("*a"); f:close()
+    local w = io.open(CMD, "wb"); if w then w:close() end
+    if not text or text == "" then return nil end
+    return (text:gsub("[\r\n]", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function closeAll()
+    for name, w in pairs(open) do
+        pcall(function() if w:IsValid() then w:RemoveFromViewport() end end)
+        note("closed " .. name)
+    end
+    open = {}
+end
+
+local function show(name)
+    local path = KNOWN[name] or name
+    local cls = StaticFindObject(path)
+    if cls == nil or not cls:IsValid() then
+        -- Not loaded yet: LoadAsset pulls it in without needing the class resident first.
+        pcall(function() cls = StaticFindObject(path) end)
+    end
+    if cls == nil or not cls:IsValid() then
+        note("NOT FOUND (not loaded?): " .. path)
+        return
+    end
+    local world = UEHelpers.GetWorld()
+    local pc = UEHelpers.GetPlayerController()
+    local lib = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    if lib == nil or not lib:IsValid() then note("UMG.WidgetBlueprintLibrary unavailable"); return end
+    local widget = lib:Create(world, cls, pc)
+    if widget == nil or not widget:IsValid() then note("Create returned nothing for " .. path); return end
+    widget:AddToViewport(1000)
+    open[name] = widget
+    note("OPENED " .. path)
+end
+
+LoopAsync(500, function()
+    local cmd = readCommand()
+    if cmd == nil or cmd == "" then return false end
+    ExecuteInGameThread(function()
+        local ok, err = pcall(function()
+            if cmd == "close" then closeAll()
+            elseif cmd == "list" then
+                for k, v in pairs(KNOWN) do
+                    local o = StaticFindObject(v)
+                    note(string.format("  %-16s %s  loaded=%s", k, v,
+                        (o ~= nil and o:IsValid()) and "yes" or "no"))
+                end
+            else show(cmd) end
+        end)
+        if not ok then note("FAILED on '" .. tostring(cmd) .. "': " .. tostring(err)) end
+    end)
+    return false
+end)
+
+note("loaded. Write a widget name into " .. CMD .. " (UMG_DebugMenu | UMG_HUD_Debug | "
+     .. "UMG_DebugInput | list | close)")
