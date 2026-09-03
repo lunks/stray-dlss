@@ -1469,8 +1469,16 @@ EventNeeds DlssApp::configure_events()
 		STRAY_LOG_INFO("Finder RT/draw events registered (PassFinder=%d GBufferFinder=%d).",
 			pass_finder_enabled ? 1 : 0, gbuffer_finder_enabled ? 1 : 0);
 	}
-		// [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which
+	// [STRAYDLSS] NgxNRStageBackBufferState, default 0 = D3D12_RESOURCE_STATE_PRESENT (which
+	// equals COMMON). D3D12 REQUIRES the back buffer to be in that state at Present and the
+	// stage runs inside it, so this is stronger than a derivation — but "required by the API"
+	// is not "true on this stack", and vkd3d has no debug layer to say otherwise, so it stays
+	// overridable.
+	{
+		int bb_state = 0;
+		bb_state = host::cfg::get_int("NgxNRStageBackBufferState", bb_state);
 		nrhook::set_back_buffer_state(bb_state < 0 ? 0u : static_cast<std::uint32_t>(bb_state));
+	}
 
 	if (pass_finder_enabled)
 		needs.pass_finder_events = true;
