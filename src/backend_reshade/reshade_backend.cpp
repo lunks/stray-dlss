@@ -72,12 +72,6 @@ bool ReshadeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, 
 	return cl != nullptr && rsb::resolve_compute_bindings(cl, out);
 }
 
-bool ReshadeBackend::resolve_graphics_srvs(const icept::CommandContext &ctx, std::vector<BoundTexture> &out)
-{
-	reshade::api::command_list *cl = list_of(ctx);
-	return cl != nullptr && rsb::resolve_graphics_srvs(cl, out);
-}
-
 void ReshadeBackend::describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out)
 {
 	if (g_device != nullptr)

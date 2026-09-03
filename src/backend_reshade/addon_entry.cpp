@@ -57,7 +57,6 @@ class DriveBackend final : public icept::Backend
 public:
 	const char *name() const override { return "native(drive)+reshade(present)"; }
 	bool resolve_compute_bindings(const icept::CommandContext &ctx, icept::DispatchBindings &out) override { return native::backend().resolve_compute_bindings(ctx, out); }
-	bool resolve_graphics_srvs(const icept::CommandContext &ctx, std::vector<BoundTexture> &out) override { return rsb::backend().resolve_graphics_srvs(ctx, out); }
 	void describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out) override { native::backend().describe_view(view, reg, out); }
 	bool describe_resource(icept::ResourceId res, icept::ResourceInfo &out) override { return native::backend().describe_resource(res, out); }
 	bool resource_from_view(icept::DescriptorId view, icept::ResourceId &out) override { return native::backend().resource_from_view(view, out); }
@@ -271,107 +270,11 @@ void on_present(
 	}
 }
 
-// ---- finder taps (pass finder + G-buffer finder) and the NR hook sites ----
-//
-// The render-target and draw events feed BOTH diagnostics and are registered when either
-// [STRAYDLSS] PassFinder=1 or [STRAYDLSS] GBufferFinder=1; the copy and execute events are
-// pass-finder-only. Conditional registration matters: every extra event ReShade dispatches
-// costs a call per operation even when the handler early-outs, and both finders are
-// diagnostics. All of the skip-capable ones return false — the finders observe, never
-// suppress.
-
-void on_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count,
-	const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
-{
-	// resource_view::handle IS the real D3D12_CPU_DESCRIPTOR_HANDLE.ptr on D3D12 (docs/RESEARCH.md
-	// §2.4); DescriptorId is that same integer, so this is a reinterpretation.
-	static_assert(sizeof(reshade::api::resource_view) == sizeof(icept::DescriptorId));
-	app::instance().on_render_targets(rsb::context_for(cmd_list), count,
-		reinterpret_cast<const icept::DescriptorId *>(rtvs), dsv.handle, /*via_render_pass=*/false);
-}
-
-bool on_begin_render_pass(reshade::api::command_list *cmd_list, uint32_t count,
-	const reshade::api::render_pass_render_target_desc *rts,
-	const reshade::api::render_pass_depth_stencil_desc *ds,
-	reshade::api::render_pass_flags flags)
-{
-	(void)flags;
-	// D3D12 allows at most 8 simultaneous render targets, so the fixed array cannot clip.
-	icept::DescriptorId views[8] = {};
-	const uint32_t n = count < 8 ? count : 8;
-	for (uint32_t i = 0; i < n; ++i)
-		views[i] = rts[i].view.handle;
-	app::instance().on_render_targets(rsb::context_for(cmd_list), n, views,
-		ds != nullptr ? ds->view.handle : 0, /*via_render_pass=*/true);
-	return false;
-}
-
-bool on_draw(reshade::api::command_list *cmd_list, uint32_t vertex_count,
-	uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
-{
-	(void)instance_count;
-	(void)first_vertex;
-	(void)first_instance;
-	app::instance().on_draw(rsb::context_for(cmd_list), vertex_count);
-	return false;
-}
-
-bool on_draw_indexed(reshade::api::command_list *cmd_list, uint32_t index_count,
-	uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
-{
-	(void)instance_count;
-	(void)first_index;
-	(void)vertex_offset;
-	(void)first_instance;
-	app::instance().on_draw(rsb::context_for(cmd_list), index_count);
-	return false;
-}
-
-bool on_copy_resource(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, reshade::api::resource dest)
-{
-	app::instance().on_copy(rsb::context_for(cmd_list), source.handle, dest.handle);
-	return false;
-}
-
-bool on_copy_texture_region(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, uint32_t source_subresource,
-	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
-	uint32_t dest_subresource, const reshade::api::subresource_box *dest_box,
-	reshade::api::filter_mode filter)
-{
-	(void)source_subresource;
-	(void)source_box;
-	(void)dest_subresource;
-	(void)dest_box;
-	(void)filter;
-	app::instance().on_copy(rsb::context_for(cmd_list), source.handle, dest.handle);
-	return false;
-}
-
-bool on_resolve_texture_region(reshade::api::command_list *cmd_list,
-	reshade::api::resource source, uint32_t source_subresource,
-	const reshade::api::subresource_box *source_box, reshade::api::resource dest,
-	uint32_t dest_subresource, uint32_t dest_x, uint32_t dest_y, uint32_t dest_z,
-	reshade::api::format format)
-{
-	(void)source_subresource;
-	(void)source_box;
-	(void)dest_subresource;
-	(void)dest_x;
-	(void)dest_y;
-	(void)dest_z;
-	(void)format;
-	app::instance().on_copy(rsb::context_for(cmd_list), source.handle, dest.handle);
-	return false;
-}
-
-void on_execute_command_list(reshade::api::command_queue *queue,
-	reshade::api::command_list *cmd_list)
-{
-	(void)queue;
-	app::instance().on_execute(rsb::context_for(cmd_list));
-}
+// The finder taps that used to live here — bind_render_targets, begin_render_pass, draw,
+// draw_indexed, copy_resource, copy_texture_region, resolve_texture_region and
+// execute_command_list — are GONE with the two heuristic pass finders they fed (the G-buffer
+// finder in f2407fe, the dataflow pass finder after it). They were ReShade-only: the native
+// host never produced one, so nothing outside this file could ever have consumed them.
 
 // Live DLSS-NR controls. Everything here is safe to change mid-frame: each value is written
 // into the NGX parameter block on EVERY evaluate, so an edit lands on the next frame with no
@@ -550,15 +453,6 @@ void draw_osd(reshade::api::effect_runtime *runtime)
 		st.taa_pipelines);
 }
 
-// ---- finder event handlers (pass finder + G-buffer finder) ----
-//
-// The render-target and draw events feed BOTH diagnostics and are registered when either
-// [STRAYDLSS] PassFinder=1 or [STRAYDLSS] GBufferFinder=1; the copy and execute events are
-// pass-finder-only. Conditional registration matters: every extra event ReShade dispatches
-// costs a call per operation even when the handler early-outs, and both finders are
-// diagnostics. All of the skip-capable ones return false — the finders observe, never
-// suppress.
-
 // Registering the pipeline events is not free: ReShade responds by routing every PSO creation
 // through ID3D12Device2::CreatePipelineState and dropping the cached-PSO blob. Under
 // vkd3d-proton that means every shader recompiles on each launch, which for a UE4 title is a
@@ -597,23 +491,6 @@ void register_events(const app::EventNeeds &needs)
 	reshade::register_event<reshade::addon_event::dispatch>(on_dispatch);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 
-	if (needs.finder_rt_events)
-		reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-			on_bind_render_targets);
-	if (needs.finder_rt_events)
-	{
-		reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
-		reshade::register_event<reshade::addon_event::draw>(on_draw);
-		reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
-	}
-	if (needs.pass_finder_events)
-	{
-		reshade::register_event<reshade::addon_event::copy_resource>(on_copy_resource);
-		reshade::register_event<reshade::addon_event::copy_texture_region>(on_copy_texture_region);
-		reshade::register_event<reshade::addon_event::resolve_texture_region>(on_resolve_texture_region);
-		reshade::register_event<reshade::addon_event::execute_command_list>(on_execute_command_list);
-	}
-
 	reshade::register_overlay(nullptr, draw_status); // settings page under our add-on entry
 	reshade::register_overlay("OSD", draw_osd);      // always-visible one-liner
 }
@@ -622,23 +499,6 @@ void unregister_events(const app::EventNeeds &needs)
 {
 	reshade::unregister_overlay("OSD", draw_osd);
 	reshade::unregister_overlay(nullptr, draw_status);
-
-	if (needs.pass_finder_events)
-	{
-		reshade::unregister_event<reshade::addon_event::execute_command_list>(on_execute_command_list);
-		reshade::unregister_event<reshade::addon_event::resolve_texture_region>(on_resolve_texture_region);
-		reshade::unregister_event<reshade::addon_event::copy_texture_region>(on_copy_texture_region);
-		reshade::unregister_event<reshade::addon_event::copy_resource>(on_copy_resource);
-	}
-	if (needs.finder_rt_events)
-	{
-		reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
-		reshade::unregister_event<reshade::addon_event::draw>(on_draw);
-		reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
-	}
-	if (needs.finder_rt_events)
-		reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-			on_bind_render_targets);
 
 	reshade::unregister_event<reshade::addon_event::present>(on_present);
 	reshade::unregister_event<reshade::addon_event::dispatch>(on_dispatch);

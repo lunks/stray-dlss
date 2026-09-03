@@ -14,7 +14,6 @@ class ReshadeBackend final : public icept::Backend
 public:
 	const char *name() const override { return "reshade"; }
 	bool resolve_compute_bindings(const icept::CommandContext &ctx, icept::DispatchBindings &out) override;
-	bool resolve_graphics_srvs(const icept::CommandContext &ctx, std::vector<BoundTexture> &out) override;
 	void describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out) override;
 	bool describe_resource(icept::ResourceId res, icept::ResourceInfo &out) override;
 	bool resource_from_view(icept::DescriptorId view, icept::ResourceId &out) override;

@@ -307,18 +307,6 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();
 }
 
-bool NativeBackend::resolve_graphics_srvs(const icept::CommandContext &, std::vector<BoundTexture> &)
-{
-	static bool said = false;
-	if (!said)
-	{
-		said = true;
-		STRAY_LOG_WARN("native backend: resolve_graphics_srvs is not implemented in this version "
-			"(the graphics root state is not shadowed); the pass finder needs the ReShade backend.");
-	}
-	return false;
-}
-
 void NativeBackend::describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out)
 {
 	shadow::ViewEntry e;

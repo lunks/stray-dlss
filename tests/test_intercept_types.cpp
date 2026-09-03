@@ -57,7 +57,6 @@ TEST_CASE("with no backend installed every query is refused, and set_backend(nul
 	{
 		const char *name() const override { return "fake"; }
 		bool resolve_compute_bindings(const icept::CommandContext &, icept::DispatchBindings &) override { return true; }
-		bool resolve_graphics_srvs(const icept::CommandContext &, std::vector<BoundTexture> &) override { return true; }
 		void describe_view(icept::DescriptorId, std::uint32_t, std::vector<BoundTexture> &) override {}
 		bool describe_resource(icept::ResourceId, icept::ResourceInfo &) override { return true; }
 		bool resource_from_view(icept::DescriptorId, icept::ResourceId &) override { return true; }

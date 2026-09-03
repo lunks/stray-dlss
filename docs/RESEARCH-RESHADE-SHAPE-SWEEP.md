@@ -845,6 +845,36 @@ it does not, because `u0` holds the expensive mechanism open regardless. What re
 §15.4 pre-registers — whether the search ever chose the wrong view on a claimed dispatch. **If that
 number is zero, there is now no second reason left to build it.**
 
+### 13.6.1 UPDATE 2026-09-03: the pass finder is DELETED, so row 7 of §13.2 is now empty
+
+`src/pass_finder.{cpp,hpp}` and `src/core/pass_walk.{cpp,hpp}` are gone (1 376 lines, plus
+`tests/test_pass_walk.cpp`). The three premises this document records were re-verified in the code
+before deleting, not taken from this document:
+
+* `[STRAYDLSS] PassFinder` defaulted **OFF** — `dlss_app.cpp`, `bool pass_finder_enabled = false;`.
+* The native backend's `resolve_graphics_srvs` was a **warn-and-return-false stub**, so the finder
+  could not run at all under the shipping host even when enabled.
+* Every entry point began with `if (!g_enabled) return;` or `if (!recording_now()) return;`, so
+  **it cost nothing measurable at runtime**. The deletion buys source, not frame time — say that
+  rather than claiming a saving this document cannot support.
+
+And the engine seam supersedes its purpose outright: the walk INFERRED which dispatch is the
+primary temporal upscale, and `ITemporalUpscaler::AddPasses` STATES it.
+
+**Two interface consequences, and the second is the one worth carrying:**
+
+1. `resolve_graphics_srvs` leaves `icept::Backend` — the finder was its only caller — which takes
+   one pure virtual off four implementers plus the test fake.
+2. **`on_render_targets`, `on_draw`, `on_copy` and `on_execute` leave `icept::Sink`.** Only the
+   ReShade host ever raised them; the native host never produced a single one. They are four
+   events, eight ReShade `register_event` calls and ~130 lines of handler that existed solely to
+   feed the two heuristic finders. **A seam event with one consumer is that consumer's interface,
+   not the seam's** — when the consumer goes, check whether the event was ever anything else.
+
+**Consequence for §13.5's first row: RTV/DSV shadowing now has NO reader on any path**, not merely
+none on the shipping path, because the differential observer resolves compute tables only. The
+gate that row proposes can therefore be an unconditional stop rather than a `PassFinder` gate.
+
 ### 13.7 Provenance ledger for this section
 
 | Claim | Status |

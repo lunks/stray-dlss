@@ -8,9 +8,9 @@ TexFormat tex_format_from_dxgi(std::uint32_t f)
 	{
 	case dxgi::kR32FloatX8X24Typeless:
 	case dxgi::kR32G8X24Typeless:     return TexFormat::r32_float_x8x24_typeless;
-	// Depth-stencil VIEW formats, seen when the pass finder describes a draw's DSV. Mapped
-	// onto the depth TexFormat so the write-set gate recognises a depth write for what it
-	// is: a pass writing one can never be replaced by DLSS. (pass_walk.hpp)
+	// Depth-stencil VIEW formats. Mapped onto the depth TexFormat so anything describing a
+	// bound DSV recognises a depth write for what it is: a pass writing one can never be
+	// replaced by DLSS.
 	case dxgi::kD32FloatS8X24Uint:
 	case dxgi::kD24UnormS8Uint:
 	case dxgi::kD32Float:

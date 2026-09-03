@@ -54,7 +54,6 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 // finder for full-screen draws only — the tonemapper's 3D colour-grading LUT SRV is the
 // dataflow walk's anchor. No root descriptors (UE4 pushes uniform buffers through those,
 // never textures) and no UAVs.
-bool resolve_graphics_srvs(reshade::api::command_list *cmd_list, std::vector<BoundTexture> &out);
 
 // Describes one bound view — liveness-checked FIRST, exactly like every other view this
 // module touches — into `out`. For callers outside this file (the pass finder's render

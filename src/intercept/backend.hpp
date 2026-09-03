@@ -20,8 +20,6 @@ public:
 	// The bindings of the compute pipeline currently bound on the list: descriptor tables
 	// walked into shader registers, root descriptors merged in (root wins where they overlap).
 	virtual bool resolve_compute_bindings(const CommandContext &ctx, DispatchBindings &out) = 0;
-	// The graphics root signature's SRVs only — the pass finder's full-screen-draw anchor.
-	virtual bool resolve_graphics_srvs(const CommandContext &ctx, std::vector<BoundTexture> &out) = 0;
 
 	// Describes one bound view into `out` — liveness-checked FIRST, like every view this
 	// project touches (CLAUDE.md §5, "Two descriptor hazards"). Appends nothing for a dead,
@@ -61,11 +59,10 @@ struct Sink
 	virtual void on_bind_pipeline(const CommandContext &ctx, std::uint64_t pso) = 0;
 	// true = suppress the game's dispatch. The only skip-capable event on our path.
 	virtual bool on_dispatch(const CommandContext &ctx, std::uint32_t x, std::uint32_t y, std::uint32_t z) = 0;
-	virtual void on_render_targets(const CommandContext &ctx, std::uint32_t count,
-	                               const DescriptorId *rtvs, DescriptorId dsv) = 0;
-	virtual void on_draw(const CommandContext &ctx, std::uint32_t vertex_or_index_count) = 0;
-	virtual void on_copy(const CommandContext &ctx, ResourceId src, ResourceId dst) = 0;
-	virtual void on_execute(const CommandContext &ctx) = 0;
+	// on_render_targets / on_draw / on_copy / on_execute used to live here. Their only
+	// consumers were the two heuristic pass finders, both now deleted, and only the ReShade
+	// host ever produced them — the native host never raised one. Nothing in this project
+	// needs a draw, a render-target bind, a copy or an ExecuteCommandLists.
 	virtual void on_swapchain(const ResourceId *back_buffers, std::uint32_t count, bool created) = 0;
 	// The host asks for the present index BEFORE it builds the PresentContext, so on_present and
 	// the host's own per-frame work agree on the number.
