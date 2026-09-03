@@ -35,6 +35,9 @@ struct NrLive
 	float local_structure = 1.0f;
 	float skin_structure = 1.33f;
 	int   preset = 1;
+	// DLSSNR.Style. 0 (our default, byte-identical to before this knob existed — the parameter
+	// was simply never written). 0/1/2 only; community-tested labels only, see draw_nr_controls.
+	int   style = 0;
 	bool  auto_mask = true;
 	bool  ui_correction = true;
 	float paper_white = 1.0f;

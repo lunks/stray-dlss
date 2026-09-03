@@ -516,6 +516,17 @@ void draw_nr_controls()
 	// 310.8 ships one weight set registered as preset 1 and falls back to it for every other
 	// value, so this is expected to change nothing — exposed to confirm that rather than assume.
 	changed |= ImGui::SliderInt("Preset", &g_nr_ui.preset, 0, 4);
+	// DLSSNR.Style — a DIFFERENT axis from Preset above. Preset selects a trained weight set
+	// (the runtime logs embedded config codenames against it); Style is a plain 0/1/2 with no
+	// weight-set switch behind it, confirmed present in the runtime by exact string search
+	// (docs/RESEARCH-DLSSNR-STYLES.md). The names below are NOT NVIDIA's — the binary carries no
+	// string for any of them, only the bare parameter name "DLSSNR.Style" — they are the labels
+	// the OptiScaler_DLSSNR fork's own menu settled on after community testing, offered here for
+	// exactly that reason: unverified beyond "the fork's authors judged it worked out this way."
+	// Changing it forces the snippet's own temporal history to reset for one frame: judge the
+	// result a second or two after moving this, never on the frame it changes.
+	static const char *const kNrStyleNames[] = { "Default (standard)", "Natural", "Cinematic" };
+	changed |= ImGui::Combo("Style", &g_nr_ui.style, kNrStyleNames, 3);
 	// GATES BOTH STRUCTURE STRENGTHS. Reference: "with it disabled the snippet forces
 	// localStructureStrength and skinStructureStrength to -1 and neither does anything."
 	changed |= ImGui::Checkbox("Auto mask (gates both structure sliders)", &g_nr_ui.auto_mask);
@@ -549,6 +560,7 @@ void draw_nr_controls()
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRSkinStructure",
 			g_nr_ui.skin_structure);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRPreset", g_nr_ui.preset);
+		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRStyle", g_nr_ui.style);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "NgxNRMVecScale", g_nr_ui.mvec_scale);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "MVConvention", g_nr_ui.mv_convention);
 		reshade::set_config_value(nullptr, "STRAYDLSS", "MVInvertX", g_nr_ui.mv_invert_x ? 1 : 0);

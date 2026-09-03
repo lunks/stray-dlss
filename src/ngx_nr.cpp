@@ -53,6 +53,7 @@ void set_dll_path(const char *) {}
 void set_topology(Topology) {}
 void set_tuning(float, float, float) {}
 void set_renodx_tuning(float, unsigned int, unsigned int, unsigned int) {}
+void set_style(unsigned int) {}
 void set_mvec_scale_override(float) {}
 bool preload() { return false; }
 void set_warmup_frames(unsigned int) {}
@@ -108,6 +109,10 @@ constexpr const char *kPreset       = "DLSSNR.Hint.Render.Preset";
 constexpr const char *kSkinStruct   = "DLSSNR.SkinStructureStrength";
 constexpr const char *kUseAutoMask  = "DLSSNR.UseAutoMask";
 constexpr const char *kUICorrection = "DLSSNR.UICorrection";
+// Confirmed present by exact string search over the 310.8.0 runtime (appears once, as a bare
+// parameter name — docs/RESEARCH-DLSSNR-STYLES.md). NOT the same axis as kPreset: preset selects
+// a different embedded weight set, Style is a small integer with no weight switch behind it.
+constexpr const char *kStyle        = "DLSSNR.Style";
 
 // Refusal indices, parallel to kNrRefusalNames.
 enum
@@ -166,6 +171,10 @@ float g_skin_structure = 1.33f;
 unsigned int g_preset = 1;
 unsigned int g_auto_mask = 1;
 unsigned int g_ui_correction = 1;
+// 0 = "Default (standard)" in the community naming (docs/RESEARCH-DLSSNR-STYLES.md). We never
+// wrote DLSSNR.Style before this knob existed, so 0 reproduces that behaviour exactly rather
+// than picking a value that merely looks neutral.
+unsigned int g_style = 0;
 float g_mvec_scale_override = 0.0f;
 // --- HDR colour codec tuning (ngx_nr.hpp documents each; math in core/nr_codec.hpp) ---
 // 1.0 is deliberately NOT copied from the reference tree's default: that default exists only
@@ -583,13 +592,16 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	g_params->Set(kPreset, g_preset);
 	g_params->Set(kUseAutoMask, g_auto_mask);
 	g_params->Set(kUICorrection, g_ui_correction);
+	// See ngx_nr.hpp's set_style comment: community-tested labels only, not names the runtime
+	// itself ships. Changing this away from 0 forces a one-frame history reset in the snippet.
+	g_params->Set(kStyle, g_style);
 
 	STRAY_LOG_WARN("NR: creating NGX feature 18 (Reserved18 / DLSSNR) %ux%u -> %ux%u, "
 		"topology=%s, intensity=%.2f localTone=%.2f localStructure=%.2f skinStructure=%.2f "
-		"preset=%u autoMask=%u uiCorrection=%u scalingRatio=%.3f...",
+		"preset=%u style=%u autoMask=%u uiCorrection=%u scalingRatio=%.3f...",
 		in_w, in_h, out_w, out_h, post ? "post-process" : "sr-shaped",
 		g_intensity, g_local_tone, g_local_structure, g_skin_structure,
-		g_preset, g_auto_mask, g_ui_correction,
+		g_preset, g_style, g_auto_mask, g_ui_correction,
 		out_w > 0 && in_w > 0 ? static_cast<double>(out_w) / static_cast<double>(in_w) : 1.0);
 
 	result = nr_create_feature(cmd, g_params, &g_feature);
@@ -957,6 +969,8 @@ void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
 	g_auto_mask = use_auto_mask;
 	g_ui_correction = ui_correction;
 }
+
+void set_style(unsigned int style) { g_style = style; }
 
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
 {
@@ -1417,6 +1431,7 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kPreset, g_preset);
 	g_params->Set(kUseAutoMask, g_auto_mask);
 	g_params->Set(kUICorrection, g_ui_correction);
+	g_params->Set(kStyle, g_style);
 
 	// One line per SITE, not one per session: `taa` and a post-tonemap mode describe genuinely
 	// different pixels, so a session that switched between them must not report only the first.
