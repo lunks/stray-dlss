@@ -138,6 +138,10 @@ set_property(TARGET StrayDualSense PROPERTY
 set_target_properties(StrayDualSense PROPERTIES OUTPUT_NAME "StrayDualSense")
 
 if(MSVC)
-    target_compile_options(StrayDualSense PRIVATE /Zi)
+    # /Z7, not /Zi — same reasoning as mods/StrayDLSS/CMakeLists.txt's twin target: sccache
+    # (now wired into dualsense.yml's plugin job) refuses to cache a /Zi compile whose /Fd is
+    # shared between objects, and CMake+Ninja gives every object of this target the same /Fd.
+    # /DEBUG below still emits the full PDB from the embedded per-object records.
+    target_compile_options(StrayDualSense PRIVATE /Z7)
     target_link_options(StrayDualSense PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()

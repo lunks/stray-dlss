@@ -32,12 +32,25 @@ jobs:
           if [ -n "$bad" ]; then echo "ReShade leaked outside src/backend_reshade/:"; echo "$bad"; exit 1; fi
           echo "clean"
 
+      # doctest is the only FetchContent dep this job pulls (CMakeLists.txt's
+      # STRAY_DLSS_BUILD_TESTS block). It is public source, pinned by GIT_TAG in that same
+      # file, so the key is the file's hash: a changed pin (or a changed URL) is a cache miss
+      # by construction, never a stale clone.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/doctest-src
+            build/_deps/doctest-subbuild
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
       - name: Configure
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DSTRAY_DLSS_BUILD_ADDON=OFF
           -DSTRAY_DLSS_BUILD_TESTS=ON
+          -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 
       - name: Build
         run: cmake --build build --parallel
@@ -49,6 +62,8 @@ jobs:
     name: Add-on (Windows, MSVC, NGX=${{ matrix.ngx }})
     runs-on: windows-latest
     needs: tests-linux
+    env:
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +80,15 @@ jobs:
         with:
           arch: x64
 
+      # Same tool and pin as dlss-plugin.yml's plugin job. sccache caches every cl.exe
+      # invocation through the GHA cache backend, content-addressed — the ON/OFF matrix legs
+      # compile different preprocessed output (STRAY_DLSS_ENABLE_NGX differs) so they land in
+      # different cache entries automatically, with no per-leg key needed. Requires the /Z7
+      # (not /Zi) debug-info format set on every target above, so /Fd is never shared between
+      # objects of one target.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       # The NGX import library is ~5 MB, so it is fetched rather than committed. The DLSS
       # SDK's redistribution terms also make fetching the cleaner posture than vendoring.
       - name: Fetch NGX import library
@@ -79,6 +103,22 @@ jobs:
           Write-Host "nvsdk_ngx_s.lib = $size bytes"
           if ($size -lt 1000000) { throw "nvsdk_ngx_s.lib looks truncated ($size bytes)" }
 
+      # Same class as tests-linux's cache: doctest is CMakeLists.txt's only FetchContent dep,
+      # public source pinned by GIT_TAG in that file. Keyed on its hash, per-OS because the
+      # subbuild directory embeds a generator-specific project.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/doctest-src
+            build/_deps/doctest-subbuild
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded turns any CMake-injected debug-format
+      # flag into /Z7 too, belt and braces alongside the per-target /Z7 already set in
+      # CMakeLists.txt. FETCHCONTENT_UPDATES_DISCONNECTED skips the per-dep update check when
+      # the FetchContent cache above restores: the pin cannot have moved without the key
+      # (CMakeLists.txt's hash) changing too.
       - name: Configure
         shell: pwsh
         run: |
@@ -86,10 +126,31 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DSTRAY_DLSS_BUILD_ADDON=ON `
             -DSTRAY_DLSS_BUILD_TESTS=ON `
-            -DSTRAY_DLSS_ENABLE_NGX=${{ matrix.ngx }}
+            -DSTRAY_DLSS_ENABLE_NGX=${{ matrix.ngx }} `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded `
+            -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 
       - name: Build
-        run: cmake --build build --parallel
+        shell: pwsh
+        run: |
+          sccache --zero-stats | Out-Null
+          cmake --build build --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      # Read this to know whether the cache did anything: "Cache hits" against "Cache misses".
+      # Zero compile requests means the launcher never engaged, which is a fault in the
+      # caching, so it fails the job rather than silently building uncached every run.
+      - name: sccache stats
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stats = & sccache --show-stats | Out-String
+          Write-Host $stats
+          $m = [regex]::Match($stats, 'Compile requests\s+(\d+)')
+          if (-not $m.Success) { throw "sccache --show-stats printed no 'Compile requests' line" }
+          if ([int]$m.Groups[1].Value -eq 0) { throw "sccache saw zero compile requests: the compiler launcher never engaged" }
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -123,6 +184,16 @@ jobs:
       # command-list wrappers -- its descriptor-heap proxies and handle conversion, the code
       # CLAUDE.md flags as having no release-build validation. That environment is otherwise
       # unreachable without the game.
+      # The installer is ~4 MB and the URL below hardcodes the version (6.8.0), so the key
+      # can just be that filename: bumping the pinned ReShade version changes the URL and
+      # therefore the key, which is a clean miss rather than a stale download.
+      - name: Cache ReShade installer
+        if: matrix.ngx == 'OFF'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/reshade-installer
+          key: reshade-installer-ReShade_Setup_6.8.0_Addon.exe-v1
+
       - name: Real ReShade lane (NGX=OFF only)
         if: matrix.ngx == 'OFF'
         shell: pwsh
@@ -130,8 +201,17 @@ jobs:
         run: |
           # The shipped installer, not a self-built ReShade: the point is to test the binary
           # the user actually runs. Its DLLs are embedded .NET resources.
-          Invoke-WebRequest -Uri "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe" `
-                            -OutFile setup.exe -UseBasicParsing
+          $cacheDir = "${{ runner.temp }}/reshade-installer"
+          $cached = Join-Path $cacheDir "ReShade_Setup_6.8.0_Addon.exe"
+          if (Test-Path $cached) {
+            Write-Host "Using cached installer: $cached"
+            Copy-Item $cached setup.exe
+          } else {
+            Invoke-WebRequest -Uri "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe" `
+                              -OutFile setup.exe -UseBasicParsing
+            New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+            Copy-Item setup.exe $cached
+          }
           python ../tools/extract_reshade.py setup.exe d3d12.dll
           if (-not (Test-Path d3d12.dll)) { throw "failed to extract ReShade64.dll" }
           Write-Host "ReShade version: $((Get-Item d3d12.dll).VersionInfo.FileVersion)"
