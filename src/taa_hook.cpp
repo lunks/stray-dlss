@@ -2078,24 +2078,58 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 										// reinterpreted as float and .w is padding. If .x is a
 										// normal float or .w is not zero, we are reading the wrong
 										// row and everything derived from it is suspect.
-										static bool s_row135_logged = false;
-										if (view_ok && !s_row135_logged)
+										// MEASURED 2026-09-03: this used to fire ONCE per session and only PRINT, which made
+										// it a diagnostic rather than a detector. Two things make that not good enough. The
+										// View CB's register is NOT invariant (b1 in one configuration, b4 in another, §2.3),
+										// so a mid-session re-selection can land on a different buffer; and the per-frame test
+										// that picks the buffer is only a PLAUSIBILITY heuristic (jitter in range, matrices
+										// that look like rotations), which a wrong-but-plausible buffer passes. Row 135 is the
+										// only STRONG check we have - y*z == 1 by construction (SceneRendering.cpp:1563-1564
+										// assigns the pair on adjacent lines from one float) - so it now runs on EVERY read.
+										// Cost: three float comparisons on bytes already memcpy'd, against a ~1.5 ms intercept.
+										// .x is int32 NumSceneColorMSAASamples reinterpreted, so it is a denormal for any small
+										// NON-ZERO count and exactly 0.0 when the count is 0. The one-shot version rejected the
+										// zero case; both are valid and a naive test would call a good buffer bad.
+										// It WARNS and keeps going rather than refusing, because one strict comparison must not
+										// cost a frame of DLSS; only a sustained run of failures degrades the exposure to
+										// UNKNOWN, a path that already exists (the codec falls back to its static scale and
+										// NR's gate counts it as exposure-unknown).
+										constexpr unsigned kRow135GraceFrames = 8;
+										static bool s_row135_seen = false;
+										static bool s_row135_last_ok = false;
+										static unsigned s_row135_bad_run = 0;
+										bool row135_ok = false;
+										if (view_ok)
 										{
-											s_row135_logged = true;
 											const auto &r = view.pre_exposure_row;
-											const bool x_denormal = r.x > 0.0f && r.x < 1e-30f;
-											STRAY_LOG_WARN("View row 135 (one read): x=%.9g y=%.6f "
-												"z=%.6f w=%.9g | y*z=%.6f (want 1.0) | x denormal=%d "
-												"(want 1, it is an int32 MSAA count) | w==0=%d "
-												"(want 1, it is padding). All three must hold or "
-												"kPreExposureRow is the wrong offset.",
-												static_cast<double>(r.x), static_cast<double>(r.y),
-												static_cast<double>(r.z), static_cast<double>(r.w),
-												static_cast<double>(r.y) * static_cast<double>(r.z),
-												x_denormal ? 1 : 0, r.w == 0.0f ? 1 : 0);
+											const bool x_ok = (r.x == 0.0f) || (r.x > 0.0f && r.x < 1e-30f);
+											const double product = static_cast<double>(r.y) * static_cast<double>(r.z);
+											const bool product_ok = product > 0.999 && product < 1.001;
+											const bool w_ok = r.w == 0.0f;
+											row135_ok = x_ok && product_ok && w_ok;
+											s_row135_bad_run = row135_ok ? 0u : s_row135_bad_run + 1u;
+											// Log the first verdict and every CHANGE of verdict, never per frame.
+											if (!s_row135_seen || row135_ok != s_row135_last_ok)
+											{
+												s_row135_seen = true;
+												s_row135_last_ok = row135_ok;
+												STRAY_LOG_WARN("View row 135 self-check %s: x=%.9g y=%.6f z=%.6f w=%.9g | "
+													"y*z=%.6f (want 1.0, exact by construction) | x denormal-or-zero=%d "
+													"(int32 MSAA count reinterpreted) | w==0=%d (padding). All three must "
+													"hold or kPreExposureRow is the wrong offset and everything derived "
+													"from it is suspect; after %u consecutive failures the exposure is "
+													"treated as unknown.",
+													row135_ok ? "PASSES" : "FAILS",
+													static_cast<double>(r.x), static_cast<double>(r.y),
+													static_cast<double>(r.z), static_cast<double>(r.w), product,
+													x_ok ? 1 : 0, w_ok ? 1 : 0, kRow135GraceFrames);
+											}
 										}
+										// A sustained self-check failure means we do not know the exposure; 0 is the
+										// codec's own "unknown" value and makes it fall back to its static scale.
 										ni.one_over_pre_exposure =
-											view_ok ? view.one_over_pre_exposure : 0.0f;
+											(view_ok && s_row135_bad_run <= kRow135GraceFrames)
+												? view.one_over_pre_exposure : 0.0f;
 										// The pair being reciprocals is what makes this free: a
 										// product that is not 1 means the read is bad, whatever
 										// the cause.
