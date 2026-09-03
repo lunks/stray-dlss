@@ -2381,3 +2381,327 @@ Name-table contents relevant to the render path:
 
 201 names total. `BLEND_Translucent` appears in neither this asset nor §34.3's.
 
+
+## 35. Stray's build configuration: it IS Shipping — the VRAM-query storm is the D3D12 Residency Manager, not STATS (2026-09-02)
+
+### Starting point
+
+A same-day measurement (`VramQueryWatch`, a vtable patch on `IDXGIAdapter3::QueryVideoMemoryInfo`)
+found the shipped `Stray-Win64-Shipping.exe` calling that API **~21 times per frame** — 167,146
+calls in one session, all from a **single return address inside the game's own executable**,
+alternating `group=0` (LOCAL) and `group=1` (NON_LOCAL), with no throttle of any kind: typical
+calls cost 0.01-0.06 ms, but calls above 5 ms run a median 14.7 ms and a max 36.5 ms, arriving in
+bursts of three every 11.46 s. HARD, inherited from that measurement.
+
+A straight read of UE 4.27.2's source finds exactly ONE call site for this API in the stock
+engine: `FD3D12CommandContextBase::UpdateMemoryStats()`
+(`D3D12CommandContext.cpp:695`), called once per frame from `RHIEndFrame()`, gated
+`#if PLATFORM_WINDOWS && STATS` and querying the **LOCAL** group only. Two predictions follow,
+and BOTH are wrong against the measured shape: if `STATS` is 0 (the Shipping default), this path
+should call the API **zero times a frame**; if `STATS` were 1, it should still only be **one
+LOCAL-only call a frame**, not 21 alternating calls. Since the source predicts at most 1/frame
+either way and the game does 21, **the user's hypothesis was that Stray is not actually a true
+Shipping build** — that `STATS` (and the rest of Development/Test instrumentation) is compiled
+in, which would also explain the mismatch away.
+
+It does not. The real explanation is a second, completely different call site the source review
+never reached, and it settles the Shipping question as a side effect.
+
+### 32.1 Method
+
+Read-only against the box (`ssh ... pct exec 113`, per this task's rules — nothing launched,
+nothing written there). `strings -n 6` (ASCII) and `strings -n 6 -e l` (UTF-16LE) were streamed
+directly over ssh into this session's own scratch directory, never written to the box's disk:
+161,499 ASCII lines and 39,645 UTF-16LE lines from `Stray-Win64-Shipping.exe` (85,043,200 bytes,
+2026-09-01). Cross-referenced against UE 4.27.2's own source — the public mirror
+`AlexMercer-MA/UnrealEngine-4.27` this project already cites elsewhere, fetched via `gh api
+search/code` (authenticated, so full-text code search works) and raw `curl` for exact file
+content — and against `docs/game-config/` (this repo's own pak-extracted inis, §2.3.1).
+
+### 32.2 The build IS Shipping — HARD, straight from the binary's own compiled content
+
+`UEngine::InitEngine` (`UnrealEngine.cpp:1774-1815`) builds a table, `EngineStats`, of every
+"stat" HUD command (`stat fps`, `stat unit`, etc.) as literal `TEXT("STAT_...")` strings passed
+to `FEngineStatFuncs` constructors — **this table is unconditional runtime code, never dead-code
+eliminated, and is completely separate from the `STATS`-gated stat SYSTEM** (§32.3). Most of its
+entries are compiled in every configuration, but several are wrapped in
+`#if !UE_BUILD_SHIPPING`:
+
+```cpp
+#if !UE_BUILD_SHIPPING
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_Version"), ...));
+#endif // !UE_BUILD_SHIPPING
+...
+#if !UE_BUILD_SHIPPING
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundMixes"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundModulators"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundModulatorsHelp"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_AudioStreaming"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundReverb"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_Sounds"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundCues"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_SoundWaves"), ...));
+#endif // !UE_BUILD_SHIPPING
+...
+#if !UE_BUILD_SHIPPING
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_UnitMax"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_UnitGraph"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_UnitTime"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_Raw"), ...));
+EngineStats.Add(FEngineStatFuncs(TEXT("STAT_ParticlePerf"), ...));
+#endif // !UE_BUILD_SHIPPING
+```
+
+Searched both encodings, case-insensitive, substring, over the whole binary:
+
+| Marker (only compiled if `!UE_BUILD_SHIPPING`) | ascii | utf16 |
+|---|---|---|
+| `STAT_Version` | 0 | 0 |
+| `STAT_SoundMixes` | 0 | 0 |
+| `STAT_SoundModulators` | 0 | 0 |
+| `STAT_SoundModulatorsHelp` | 0 | 0 |
+| `STAT_AudioStreaming` | 0 | 0 |
+| `STAT_SoundReverb` | 0 | 0 |
+| `STAT_Sounds` | 0 | 0 |
+| `STAT_SoundCues` | 0 | 0 |
+| `STAT_SoundWaves` | 0 | 0 |
+| `STAT_UnitMax` | 0 | 0 |
+| `STAT_UnitGraph` | 0 | 0 |
+| `STAT_UnitTime` | 0 | 0 |
+| `STAT_Raw` | 0 | 0 |
+| `STAT_ParticlePerf` | 0 | 0 |
+
+**Zero of fourteen.** Every one of these strings sits in executed, non-dead-strippable code
+(each is an argument to a constructor call inside a function that always runs at engine init) —
+if `UE_BUILD_SHIPPING` were 0, all fourteen would be in the binary. None are. **HARD:
+`UE_BUILD_SHIPPING=1` in this executable** — it is genuinely, not just nominally, a Shipping
+build.
+
+**The trap this closes.** The unconditional siblings of the same table — `STAT_FPS`,
+`STAT_Summary`, `STAT_Unit`, `STAT_DrawCount`, `STAT_Hitches`, `STAT_AI`, `STAT_Timecode`,
+`STAT_FrameCounter`, `STAT_ColorList`, `STAT_Levels`, `STAT_Detailed`, `STAT_NamedEvents` — ARE
+present (utf16). A search for `"STAT_"` alone, without checking WHICH stat names are
+Shipping-gated and which are not, finds hits either way and settles nothing. This is exactly
+the "too narrow a search" trap the task brief warned about: the discriminator is not whether
+`STAT_`-prefixed strings exist, but which SPECIFIC ones do.
+
+### 32.3 STATS is off too, independently — HARD
+
+`UpdateMemoryStats()` (`D3D12CommandContext.cpp:695-723`) is the one stock call site, and its
+whole body is gated:
+
+```cpp
+void FD3D12CommandContextBase::UpdateMemoryStats()
+{
+#if PLATFORM_WINDOWS && STATS
+	DXGI_QUERY_VIDEO_MEMORY_INFO LocalVideoMemoryInfo;
+	ParentAdapter->GetLocalVideoMemoryInfo(&LocalVideoMemoryInfo);
+	...
+	SET_MEMORY_STAT(STAT_D3D12UsedVideoMemory, LocalVideoMemoryInfo.CurrentUsage);
+	SET_MEMORY_STAT(STAT_D3D12AvailableVideoMemory, AvailableSpace);
+	SET_MEMORY_STAT(STAT_D3D12TotalVideoMemory, Budget);
+	...
+#endif
+}
+```
+
+`Stats.h`'s `#else //STATS` branch (the one that applies whenever `STATS` is 0) redefines every
+one of these to nothing: `#define DECLARE_MEMORY_STAT_EXTERN(...)` and
+`#define SET_MEMORY_STAT(...)` both expand to empty. So when `STATS=0` the whole function body —
+`GetLocalVideoMemoryInfo`, hence `QueryVideoMemoryInfo`, included — disappears. The four stats
+are declared with exact description text in `D3D12Stats.h:61-64`:
+
+```cpp
+DECLARE_MEMORY_STAT_EXTERN(TEXT("Used Video Memory"), STAT_D3D12UsedVideoMemory, STATGROUP_D3D12RHI, );
+DECLARE_MEMORY_STAT_EXTERN(TEXT("Available Video Memory"), STAT_D3D12AvailableVideoMemory, STATGROUP_D3D12RHI, );
+DECLARE_MEMORY_STAT_EXTERN(TEXT("Total Video Memory"), STAT_D3D12TotalVideoMemory, STATGROUP_D3D12RHI, );
+DECLARE_MEMORY_STAT_EXTERN(TEXT("Texture allocator wastage"), STAT_D3D12TextureAllocatorWastage, STATGROUP_D3D12RHI, );
+```
+
+All four searched, both encodings: **zero hits for all four, in both ascii and utf16.** If
+`STATS` were 1, these exact description strings would be embedded (the macro passes them
+straight through as `FStartupMessages` metadata) regardless of whether the stat ever fires.
+**HARD: `STATS=0`.** `UpdateMemoryStats()`'s body is dead code in this binary — it makes
+**zero** calls to `QueryVideoMemoryInfo`, ever. So the measured 167,146 calls cannot be coming
+from the path the source review examined, in either direction of the Shipping question. They
+have to come from somewhere else.
+
+### 32.4 The real source: the D3D12 Residency Manager — compiled in unconditionally on Windows, gated by neither `STATS` nor `UE_BUILD_SHIPPING`
+
+`D3D12RHI.h:53-54`:
+
+```cpp
+#if PLATFORM_WINDOWS || PLATFORM_HOLOLENS
+	#define ENABLE_RESIDENCY_MANAGEMENT				1
+```
+
+No `STATS`, no `UE_BUILD_SHIPPING` — this is a platform gate only, true in every Windows
+configuration including Shipping. `D3D12Adapter.cpp:22-29`:
+
+```cpp
+#if ENABLE_RESIDENCY_MANAGEMENT
+bool GEnableResidencyManagement = true;
+static TAutoConsoleVariable<int32> CVarResidencyManagement(
+	TEXT("D3D12.ResidencyManagement"),
+	1,
+	TEXT("Controls whether D3D12 resource residency management is active (default = on)."),
+	ECVF_ReadOnly
+);
+#endif // ENABLE_RESIDENCY_MANAGEMENT
+```
+
+and, read once right after device creation (`D3D12Adapter.cpp:443-447`):
+
+```cpp
+#if ENABLE_RESIDENCY_MANAGEMENT
+	if (!CVarResidencyManagement.GetValueOnAnyThread())
+	{
+		UE_LOG(LogD3D12RHI, Log, TEXT("D3D12 resource residency management is disabled."));
+		GEnableResidencyManagement = false;
+	}
+#endif
+```
+
+`FD3D12CommandListManager::ExecuteCommandLists` (`D3D12DirectCommandListManager.cpp:548-578`,
+both the single-list and the batch code path) routes every submission through it when the flag
+is set:
+
+```cpp
+if (GEnableResidencyManagement)
+{
+	VERIFYD3D12RESULT(GetParentDevice()->GetResidencyManager().ExecuteCommandLists(
+		D3DCommandQueue, Payload.CommandLists, Payload.ResidencySets, Payload.NumCommandLists));
+}
+else
+{
+	D3DCommandQueue->ExecuteCommandLists(Payload.NumCommandLists, Payload.CommandLists);
+}
+```
+
+`GetResidencyManager()` wraps Microsoft's own `D3DX12Residency` helper — vendored verbatim from
+`microsoft/DirectX-Graphics-Samples`, `Libraries/D3DX12Residency/d3dx12Residency.h` — and its
+`ResidencyManager::ExecuteSubset` (the function this call reaches) does this, **every single time
+it runs, unconditionally, with no cache and no throttle**:
+
+```cpp
+HRESULT ExecuteSubset(ID3D12CommandQueue* Queue, ID3D12CommandList** CommandLists, ResidencySet** ResidencySets, UINT32 Count)
+{
+	...
+	DXGI_QUERY_VIDEO_MEMORY_INFO LocalMemory;
+	GetCurrentBudget(&LocalMemory, DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+
+	DXGI_QUERY_VIDEO_MEMORY_INFO NonLocalMemory;
+	GetCurrentBudget(&NonLocalMemory, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
+	...
+}
+// GetCurrentBudget:
+void GetCurrentBudget(DXGI_QUERY_VIDEO_MEMORY_INFO* InfoOut, DXGI_MEMORY_SEGMENT_GROUP Segment)
+{
+	if (Adapter)
+	{
+		RESIDENCY_CHECK_RESULT(Adapter->QueryVideoMemoryInfo(NodeIndex, Segment, InfoOut));
+	}
+	...
+}
+```
+
+**This is an exact shape match to the measurement**: one LOCAL call and one NON_LOCAL call —
+"alternating `group=0`/`group=1`" — per invocation, with genuinely no throttle of any kind (the
+source review's other correct observation, just attributed to the wrong call site). Since this
+fires on every `ExecuteCommandLists` batch submitted to the direct queue, not once a frame, a
+frame that submits ~10-11 batches (plausible for a UE4.27 deferred frame — shadow passes, base
+pass, post-process chain, UI, each a potential flush point) produces ~20-22 calls — matching the
+measured ~21/frame. **The per-invocation LOCAL+NON_LOCAL shape and the total absence of
+throttling are HARD, read from source; the "~10-11 batches/frame" arithmetic that reproduces the
+21/frame figure is SOFT — plausible, not independently counted on this title.**
+
+**Direct confirmation the mechanism is live in Stray's own binary**, not just present in the
+stock source: the cvar's exact name and help text are both in the exe, verbatim, utf16:
+
+```
+D3D12.ResidencyManagement
+Controls whether D3D12 resource residency management is active (default = on).
+```
+
+### 32.5 A trap in the pak's own config: `BuildConfiguration=PPBC_Development`
+
+`docs/game-config/Hk_project_Config_DefaultGame.ini:234`, inside the same
+`ProjectPackagingSettings` block as `StagingDirectory=(Path="X:/Packages")`:
+
+```ini
+Build=IfProjectHasCode
+BuildConfiguration=PPBC_Development
+BuildTarget=Stray
+StagingDirectory=(Path="X:/Packages")
+```
+
+This looks, at a glance, like direct evidence the shipped build is Development. **It is not.**
+`ProjectPackagingSettings` records the editor's own "Package Project" quick-package UI state —
+whichever configuration a developer had last selected there — not a log of how the actual retail
+Steam build was produced. That build was almost certainly driven by a separate CI/build script
+that explicitly requested `Configuration=Shipping`, which is the only way Unreal Build Tool
+appends the `-Shipping` suffix to the executable name in the first place (`Stray-Win64-Shipping.exe`
+is a name UBT constructs, not one a developer types). §32.2 and §32.3 read this straight out of
+the binary's own compiled content and settle it independently of what this leftover editor
+setting says. Two lines further down, the same block also carries
+`PakFileCompressionLevel_TestShipping=5` right next to `PakFileCompressionLevel_DebugDevelopment=3`
+— evidence the packaging PIPELINE handles both configurations, which says nothing about which one
+produced this particular binary. **A grep for "Shipping" vs "Development" over the pak's ini
+alone would have been misled by exactly this line — the binary is still the only authority.**
+
+### 32.6 What this means for the stall, and the fix
+
+**There is no "stat gathering" to turn off, because `STATS` was never on.** The task's second
+question — can it be disabled at runtime, and would that stop the calls — doesn't apply to the
+path it was asked about; that path already makes zero calls. The lever that actually matters is
+`D3D12.ResidencyManagement`.
+
+**It is `ECVF_ReadOnly`**, read exactly once, immediately after `D3D12CreateDevice`
+(`D3D12Adapter.cpp:443`, quoted above) — a console command after the game is running cannot
+change it. This project has already established a route for exactly this class of cvar:
+`Engine.ini [SystemSettings]` is read before RHI init (`GSystemSettings.Initialize()` at
+`LaunchEngineLoop.cpp:2248`, versus `RHIInit()` at `:2597` — **HARD, confirmed in source, that
+the ordering is right**), and CLAUDE.md §1 records this exact mechanism working for another
+`ECVF_ReadOnly` cvar, `r.UsePreExposure`. Applying it here:
+
+```ini
+[SystemSettings]
+D3D12.ResidencyManagement=0
+```
+
+is the candidate fix. **This specific cvar accepting an ini override the same way `r.UsePreExposure`
+did is SOFT — by analogy to a working precedent in this project, not independently tested for
+`D3D12.ResidencyManagement`.**
+
+**What flipping it would stop.** With `GEnableResidencyManagement=false`,
+`FD3D12CommandListManager::ExecuteCommandLists` falls through to
+`D3DCommandQueue->ExecuteCommandLists(...)` directly at every call site quoted in §32.4 — no
+residency wrapper, no budget query, at all. Since `UpdateMemoryStats()`'s path is already dead
+(§32.3), this should collapse the measured population to near zero: the one-shot LOCAL query at
+adapter enumeration (once, at startup) and an Intel-only NON_LOCAL heuristic (irrelevant on this
+NVIDIA target) are the only calls left, both negligible.
+
+**What it costs.** The residency manager exists to page D3D12 resources under VRAM pressure;
+disabling it removes that. On this target the trade looks safe: the same session's VRAM reading
+was 16,285 of 24,564 MiB free — comfortably clear of anything the residency manager would need
+to react to. That is a snapshot, not a guarantee for every scene in the game.
+
+**Acceptance test, not run here** (this task is read-only and may not launch the game): the same
+method already established for the stall — `grep -o 'f=[0-9]* t=[0-9.]* frame [0-9.]* ms'
+stray-dlss-plugin.log`, medians of at least 15 samples, before/after — plus `VramQueryWatch`'s own
+periodic report, which should show total calls collapse from ~21/frame toward ~0.
+
+### 32.7 What is still UNCONFIRMED
+
+* Whether `Engine.ini [SystemSettings] D3D12.ResidencyManagement=0` actually takes effect here —
+  reasoned by analogy to `r.UsePreExposure` and by the confirmed init ordering, not directly
+  tested for this cvar.
+* The exact count of `ExecuteCommandLists` batches Stray submits to the direct queue per frame —
+  the "~10-11 batches -> ~21-22 calls" arithmetic that reproduces the measured rate is plausible,
+  not independently counted.
+* Whether disabling residency management has any cost beyond the currently-ample VRAM headroom —
+  a more VRAM-constrained scene, or GPU contention from another tenant on the shared box (§31.1),
+  could change the trade.
+* `STATGROUP_D3D12RHI`'s own group-description text was not independently located in source; the
+  `STATS=0` conclusion in §32.3 rests on the four member stats' exact description strings plus
+  the §32.2 `EngineStats` table, not on every possible `STATS`-only string in the engine.
