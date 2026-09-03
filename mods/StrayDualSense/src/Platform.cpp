@@ -108,16 +108,4 @@ std::wstring ModuleDir(const void* addressInsideThisModule)
     return DirOfModule(self);
 }
 
-bool AssetNameIsSafe(const std::string& s)
-{
-    if (s.empty() || s.size() > 96) return false;
-    for (const char c : s)
-    {
-        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-        if (!ok) return false;
-    }
-    return s.find("..") == std::string::npos;
-}
-
 } // namespace sds

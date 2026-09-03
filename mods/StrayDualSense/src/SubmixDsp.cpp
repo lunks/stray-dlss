@@ -46,6 +46,47 @@ float SoftClip(float x)
     return x < 0.0f ? -y : y;
 }
 
+LanePeaks InterleaveLanes(const float* coilStereo, std::size_t coilFrames, float coilGain,
+                          const float* speakerStereo, std::size_t speakerFrames,
+                          float speakerGain, std::size_t frames, std::uint32_t channels,
+                          float* out)
+{
+    LanePeaks peaks;
+    if (out == nullptr || frames == 0 || channels == 0)
+        return peaks;
+    if (coilStereo == nullptr)    coilFrames    = 0;
+    if (speakerStereo == nullptr) speakerFrames = 0;
+
+    std::memset(out, 0, frames * channels * sizeof(float));
+    for (std::size_t i = 0; i < frames; ++i)
+    {
+        float* frame = out + i * channels;
+        if (i < speakerFrames)
+        {
+            const float l = SoftClip(speakerStereo[i * 2]     * speakerGain);
+            const float r = SoftClip(speakerStereo[i * 2 + 1] * speakerGain);
+            if (kEndpointChannelFL < channels) frame[kEndpointChannelFL] = l;
+            if (kEndpointChannelFR < channels) frame[kEndpointChannelFR] = r;
+            const float a = l < 0.0f ? -l : l;
+            const float b = r < 0.0f ? -r : r;
+            if (a > peaks.speaker) peaks.speaker = a;
+            if (b > peaks.speaker) peaks.speaker = b;
+        }
+        if (i < coilFrames)
+        {
+            const float l = SoftClip(coilStereo[i * 2]     * coilGain);
+            const float r = SoftClip(coilStereo[i * 2 + 1] * coilGain);
+            if (kEndpointChannelRL < channels) frame[kEndpointChannelRL] = l;
+            if (kEndpointChannelRR < channels) frame[kEndpointChannelRR] = r;
+            const float a = l < 0.0f ? -l : l;
+            const float b = r < 0.0f ? -r : r;
+            if (a > peaks.coils) peaks.coils = a;
+            if (b > peaks.coils) peaks.coils = b;
+        }
+    }
+    return peaks;
+}
+
 void LinearResampler::Reset()
 {
     m_phase  = 0.0;

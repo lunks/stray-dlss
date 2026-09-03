@@ -1,21 +1,24 @@
-// StrayDualSense — the ring -> voice coils half of the submix spike.
+// StrayDualSense — the two rings -> the pad's one 4-channel stream.
 //
-// One thread, one IAudioClient of its own on the pad's endpoint (so it MIXES with the
-// speaker path rather than displacing it, §10), pulling stereo frames the tap left in the
-// ring and writing them to RL/RR — left channel to the left grip, right to the right, the
-// same routing the asset path uses (AudioPlayer's kCoilRoute, docs/STRAY-DUALSENSE.md §12).
+// One thread, ONE IAudioClient on the pad's endpoint, pulling stereo frames from two rings
+// the taps left behind and writing them to the endpoint's two channel pairs:
 //
-// Differences from the asset path, all deliberate:
+//   Submix_vibrationMaster  -> coil ring    -> RL/RR   (left grip, right grip)   §12
+//   Submix_controllerMaster -> speaker ring -> FL/FR   (the internal speaker)    §10/§16
 //
-//  * It is a CONTINUOUS stream, not a per-asset one. The engine mixes whenever it wants, so
-//    there is no "start" to hang a stream on; an underrun is silence, which is the right
-//    answer for a haptic.
-//  * SOFT clip, not the asset path's hard clamp. The engine's mix of several concurrent
-//    haptics has no authored headroom guarantee, and a square corner on a voice coil buzzes.
-//  * The HID waveform mode is re-asserted on the SILENT -> SIGNAL transition (rate-limited),
-//    on top of HidMode's own 2 s cadence. Without valid_flag0 = 0x00 the coils are busy
-//    emulating rumble and every sample goes nowhere (§12) — that is the single most
-//    important byte in this plugin, so it is asserted from both places.
+// The engine has already mixed, faded, looped and levelled both, and has already run the
+// speaker through its own SBFX_Boost chain, so nothing here is a level: the two gains exist
+// for the game's PadVibrationEnabled switch and for an ini A/B (SpeakerGain), and the soft
+// clip is there because a live mix of several concurrent haptics has no authored headroom
+// and a square corner on a voice coil buzzes.
+//
+// Sony's own libScePad selects what the pad DOES with these channels (scePadSetAudioOutPath,
+// Runtime::ApplySpeakerRoute); this file only puts the samples where the hardware reads them.
+//
+// The HID waveform mode is re-asserted on the coil lane's SILENT -> SIGNAL transition
+// (rate-limited), on top of HidMode's own 2 s cadence. Without valid_flag0 = 0x00 the coils
+// are busy emulating rumble and every sample goes nowhere (§12) — that is the single most
+// important byte in this plugin, so it is asserted from both places.
 //
 // Win32/COM only. No UE4SS types.
 #pragma once
@@ -43,15 +46,17 @@ public:
 
     ~SubmixSink();
 
-    // `ring` is owned by the caller and must outlive this object.
-    void Start(SubmixRing* ring, std::string endpointMatch, const Config& config,
-               BeforePlayFn beforePlay);
+    // Both rings are owned by the caller and must outlive this object. A lane whose tap is
+    // not attached yet simply reads as silence (and counts underruns) until it is.
+    void Start(SubmixRing* coilRing, SubmixRing* speakerRing, std::string endpointMatch,
+               const Config& config, BeforePlayFn beforeCoils);
     void Shutdown();
 
     // The engine's own sample rate, learned from the first tap callback. Anything other than
-    // the endpoint's rate engages the resampler rather than silently changing the pitch.
+    // the endpoint's rate engages the resamplers rather than silently changing the pitch.
     void SetSourceRate(std::uint32_t rate);
-    void SetGain(float gain);
+    void SetCoilGain(float gain);
+    void SetSpeakerGain(float gain);
 
     bool          StreamOpen() const   { return m_streamOpen.load(std::memory_order_relaxed); }
     std::uint32_t EndpointRate() const { return m_endpointRate.load(std::memory_order_relaxed); }
@@ -65,9 +70,10 @@ private:
     void WorkerMain();
     bool RunStream();      // returns false when the worker should stop entirely
 
-    SubmixRing*  m_ring = nullptr;
+    SubmixRing*  m_coilRing    = nullptr;
+    SubmixRing*  m_speakerRing = nullptr;
     std::string  m_endpointMatch;
-    BeforePlayFn m_beforePlay;
+    BeforePlayFn m_beforeCoils;
     std::uint32_t m_queueAheadMs = 40;
 
     std::thread       m_worker;
@@ -81,14 +87,19 @@ private:
     std::atomic<std::uint64_t> m_restarts{0};
     std::atomic<std::uint64_t> m_failures{0};
 
-    std::atomic<float> m_gain{1.0f};
+    std::atomic<float> m_coilGain{1.0f};
+    std::atomic<float> m_speakerGain{1.0f};
 
     mutable std::mutex m_nameMutex;
     std::string        m_endpointName;
 
-    LinearResampler    m_resampler;   // worker only
-    std::vector<float> m_pull;        // worker only
-    std::vector<float> m_out;         // worker only
+    // Worker only. One resampler per lane: it is stateful across buffers.
+    LinearResampler    m_coilResampler;
+    LinearResampler    m_speakerResampler;
+    std::vector<float> m_coilPull;
+    std::vector<float> m_speakerPull;
+    std::vector<float> m_coilOut;
+    std::vector<float> m_speakerOut;
 };
 
 } // namespace submix

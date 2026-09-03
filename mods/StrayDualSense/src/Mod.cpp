@@ -517,7 +517,8 @@ void ReadAuthoredTriggerEffectOnGameThread()
 // true, the Blueprint sets the ControllerVibration AudioComponent's sound and plays it
 // (AC.SetSound / AC.Play fired, IsPlaying()=true). It is a Blueprint variable, so it is a
 // whole-byte bool, but it is written through FBoolProperty regardless. Written from the START
-// pre-hooks, before the body evaluates its gate.
+// pre-hooks, before the body evaluates its gate - ALWAYS: there is no other way for the
+// engine to produce the streams the taps carry, so there is nothing to configure.
 //
 // THE OBJECT IS THE HOOK'S OWN CONTEXT, AND THAT IS A CORRECTION (2026-09-03).
 // It used to be `UObjectGlobals::FindFirstOf(STR("HKPlayerController"))`, which is wrong twice
@@ -542,8 +543,6 @@ int g_gateMisses = 0;
 
 void ForcePS5HapticPathOnGameThread(UObject* controller)
 {
-    if (!sds::Rt().Cfg().forcePS5HapticPath)
-        return;
     UObject* pc = controller;
     if (pc == nullptr)
     {
@@ -659,9 +658,10 @@ void CbGlyphPost(UnrealScriptFunctionCallableContext& context, void* customData)
 }
 
 // ---------------------------------------------------------------------------------------
-// The submix tap's ONE piece of UE4SS glue: resolve three objects and hand them over as raw
-// pointers. Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know
-// nothing about UE4SS and are compiled and link-tested without it.
+// The taps' ONE piece of UE4SS glue: resolve the world, the engine and the three submixes,
+// write the two UPROPERTYs the reroute needs, and hand everything over as raw pointers.
+// Everything that then happens to them is in SubmixDiscovery/SubmixTap, which know nothing
+// about UE4SS and are compiled and link-tested without it.
 //
 // ON THE GAME THREAD, ALWAYS. This is called from the top of every UFunction hook and from
 // nowhere else, for the same reason as the two reads above: on_update runs on UE4SS's own
@@ -672,6 +672,55 @@ void CbGlyphPost(UnrealScriptFunctionCallableContext& context, void* customData)
 // ---------------------------------------------------------------------------------------
 std::chrono::steady_clock::time_point g_lastSubmixAttempt{};
 int g_submixAttempts = 0;
+
+// A USoundSubmix by path. FMixerSubmix::ProcessAudio only invokes buffer listeners when the
+// owning object Casts to USoundSubmix (AudioMixerSubmix.cpp:1370) — an endpoint or soundfield
+// submix would register cleanly and then never call us, which is the exact silent null
+// result this plugin must not produce — so the resolved class is logged, once per lane.
+UObject* ResolveSubmix(const char* path, const char* lane)
+{
+    UObject* submix = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
+        nullptr, nullptr, Widen(std::string(path)));
+    if (submix == nullptr)
+        return nullptr;
+    static bool logged[2] = { false, false };
+    bool& once = logged[lane[0] == 'v' ? 0 : 1];
+    if (!once)
+    {
+        once = true;
+        const std::string full = Narrow(submix->GetFullName());
+        const bool isPlainSubmix = full.rfind("SoundSubmix ", 0) == 0;
+        SDS_LOG_INFO("submix: resolved %s '%s' -> %s%s", lane, path, full.c_str(),
+                     isPlainSubmix ? ""
+                                   : "   <- NOT a plain SoundSubmix. UE 4.27 only calls "
+                                     "buffer listeners for USoundSubmix, so this will "
+                                     "register and then never fire.");
+    }
+    return submix;
+}
+
+bool WriteOutputVolume(UObject* submix, float value, float& before)
+{
+    FProperty* prop = submix->GetPropertyByNameInChain(STR("OutputVolume"));
+    if (prop == nullptr || !prop->IsA<RC::Unreal::FFloatProperty>())
+        return false;
+    auto* fp = static_cast<RC::Unreal::FFloatProperty*>(prop);
+    before = fp->GetPropertyValueInContainer(submix);
+    fp->SetPropertyValueInContainer(submix, value);
+    return true;
+}
+
+bool WriteParentSubmix(UObject* submix, UObject* parent, UObject*& before)
+{
+    FProperty* prop = submix->GetPropertyByNameInChain(STR("ParentSubmix"));
+    if (prop == nullptr || !prop->IsA<RC::Unreal::FObjectProperty>())
+        return false;
+    auto* op   = static_cast<RC::Unreal::FObjectProperty*>(prop);
+    void* addr = reinterpret_cast<uint8_t*>(submix) + op->GetOffset_ForInternal();
+    before     = op->GetObjectPropertyValue(addr);
+    op->SetObjectPropertyValue(addr, parent);
+    return true;
+}
 
 // The scan walks tens of thousands of pointers ON THE GAME THREAD. A second between attempts is
 // right while there is a real chance of success — the engine may still be starting its audio —
@@ -705,103 +754,56 @@ void MaybeBindSubmixOnGameThread()
     UObject* world  = RC::Unreal::UObjectGlobals::FindFirstOf(STR("World"));
     UObject* engine = RC::Unreal::UObjectGlobals::FindFirstOf(STR("Engine"));
 
-    // The submix, by the exact path measured in the box's own UE4SS object dump. The literal
-    // "master" means "do not look one up" — a null submix is the engine's own shorthand for
-    // the master submix (AudioMixerDevice.cpp:2350).
-    UObject* submix = nullptr;
-    bool     submixResolved = false;
-    const std::string& path = sds::Rt().Cfg().submixPath;
-    if (path == "master")
-    {
-        submixResolved = true;
-    }
-    else
-    {
-        submix = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr,
-                                                                       Widen(path));
-        if (submix != nullptr)
-        {
-            const std::string full = Narrow(submix->GetFullName());
-            // FMixerSubmix::ProcessAudio only invokes buffer listeners when the owning object
-            // Casts to USoundSubmix (AudioMixerSubmix.cpp:1370) — an endpoint or soundfield
-            // submix would register cleanly and then never call us, which is the exact
-            // silent-null-result this spike must not produce.
-            const bool isPlainSubmix = full.rfind("SoundSubmix ", 0) == 0;
-            SDS_LOG_INFO("submix: resolved '%s' -> %s%s", path.c_str(), full.c_str(),
-                         isPlainSubmix ? ""
-                                       : "   <- NOT a plain SoundSubmix. UE 4.27 only calls "
-                                         "buffer listeners for USoundSubmix, so this will "
-                                         "register and then never fire.");
-            submixResolved = true;
-        }
-    }
+    // The two masters to tap, by the exact paths measured in the box's own UE4SS object dump,
+    // and the parent they are re-parented under.
+    const sds::Config& cfg = sds::Rt().Cfg();
+    UObject* vibration = ResolveSubmix(cfg.submixPath.c_str(), "vibration");
+    UObject* speaker   = ResolveSubmix(cfg.submixSpeakerPath.c_str(), "speaker");
 
     // THE REROUTE's UObject half (docs/STRAY-DUALSENSE.md §14): the parent's OutputVolume goes
-    // to 0 so nothing leaks into the speakers, and the master's ParentSubmix points at it.
-    // Both are plain UPROPERTY writes through reflection; the engine only acts on them when
-    // the runtime asks it to re-register the two submixes (RebuildSubmixLinks reads
-    // ParentSubmix, InitInternal reads OutputVolume). Idempotent, so it runs every attempt
-    // and logs once.
-    UObject* rerouteMaster = nullptr;
-    UObject* rerouteParent = nullptr;
-    if (sds::Rt().Cfg().submixReroute)
+    // to 0 so nothing leaks into the speakers, and each master's ParentSubmix points at it.
+    // All plain UPROPERTY writes through reflection; the engine only acts on them when the
+    // runtime asks it to re-register the submixes (RebuildSubmixLinks reads ParentSubmix,
+    // InitInternal reads OutputVolume). Idempotent, so it runs every attempt and logs once.
+    UObject* rerouteParent = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
+        nullptr, nullptr, Widen(cfg.submixRerouteParent));
     {
-        const sds::Config& cfg = sds::Rt().Cfg();
-        rerouteMaster = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, Widen(cfg.submixRerouteMaster));
-        rerouteParent = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, Widen(cfg.submixRerouteParent));
         static bool rerouteLogged = false;
-        bool ok = rerouteMaster != nullptr && rerouteParent != nullptr;
+        bool ok = rerouteParent != nullptr && vibration != nullptr && speaker != nullptr;
         if (ok)
         {
-            FProperty* volProp    = rerouteParent->GetPropertyByNameInChain(STR("OutputVolume"));
-            FProperty* parentProp = rerouteMaster->GetPropertyByNameInChain(STR("ParentSubmix"));
-            float    volBefore    = -1.0f;
-            UObject* parentBefore = nullptr;
-            if (volProp != nullptr && volProp->IsA<RC::Unreal::FFloatProperty>())
-            {
-                auto* fp = static_cast<RC::Unreal::FFloatProperty*>(volProp);
-                volBefore = fp->GetPropertyValueInContainer(rerouteParent);
-                fp->SetPropertyValueInContainer(rerouteParent, 0.0f);
-            }
-            else
-                ok = false;
-            if (parentProp != nullptr && parentProp->IsA<RC::Unreal::FObjectProperty>())
-            {
-                auto* op = static_cast<RC::Unreal::FObjectProperty*>(parentProp);
-                void* addr = reinterpret_cast<uint8_t*>(rerouteMaster) + op->GetOffset_ForInternal();
-                parentBefore = op->GetObjectPropertyValue(addr);
-                op->SetObjectPropertyValue(addr, rerouteParent);
-            }
-            else
-                ok = false;
+            float volBefore = -1.0f;
+            ok = WriteOutputVolume(rerouteParent, 0.0f, volBefore);
+            UObject* vibBefore = nullptr;
+            UObject* spkBefore = nullptr;
+            ok = WriteParentSubmix(vibration, rerouteParent, vibBefore) && ok;
+            ok = WriteParentSubmix(speaker, rerouteParent, spkBefore) && ok;
             if (!rerouteLogged)
             {
                 rerouteLogged = true;
-                SDS_LOG_INFO("submix: REROUTE UObject writes: '%s'.OutputVolume %.3f -> 0.0 "
-                             "(prop %s), '%s'.ParentSubmix %s -> %s (prop %s)%s",
+                SDS_LOG_INFO("submix: REROUTE UObject writes: '%s'.OutputVolume %.3f -> 0.0, "
+                             "'%s'.ParentSubmix %s -> %s, '%s'.ParentSubmix %s -> %s%s",
                              Narrow(rerouteParent->GetName()).c_str(),
-                             static_cast<double>(volBefore), volProp != nullptr ? "found" : "MISSING",
-                             Narrow(rerouteMaster->GetName()).c_str(),
-                             parentBefore != nullptr ? Narrow(parentBefore->GetName()).c_str() : "null",
+                             static_cast<double>(volBefore),
+                             Narrow(vibration->GetName()).c_str(),
+                             vibBefore != nullptr ? Narrow(vibBefore->GetName()).c_str() : "null",
                              Narrow(rerouteParent->GetName()).c_str(),
-                             parentProp != nullptr ? "found" : "MISSING",
-                             ok ? "" : "   <- INCOMPLETE, the reroute will NOT be submitted");
+                             Narrow(speaker->GetName()).c_str(),
+                             spkBefore != nullptr ? Narrow(spkBefore->GetName()).c_str() : "null",
+                             Narrow(rerouteParent->GetName()).c_str(),
+                             ok ? "" : "   <- INCOMPLETE (a property was MISSING), the reroute "
+                                       "will NOT be submitted");
             }
         }
         else if (!rerouteLogged)
         {
             rerouteLogged = true;
-            SDS_LOG_WARN("submix: REROUTE objects not loaded yet (master=%p parent=%p); retrying "
-                         "with the bind", static_cast<void*>(rerouteMaster),
-                         static_cast<void*>(rerouteParent));
+            SDS_LOG_WARN("submix: REROUTE objects not loaded yet (vibration=%p speaker=%p "
+                         "parent=%p); retrying with the bind", static_cast<void*>(vibration),
+                         static_cast<void*>(speaker), static_cast<void*>(rerouteParent));
         }
         if (!ok)
-        {
-            rerouteMaster = nullptr;
             rerouteParent = nullptr;
-        }
     }
 
     static bool announced = false;
@@ -809,12 +811,13 @@ void MaybeBindSubmixOnGameThread()
     {
         announced = true;
         SDS_LOG_INFO("submix: binding from the game thread. exe=%p+0x%zX world=%p engine=%p "
-                     "target='%s'", imageBase, imageSize, static_cast<void*>(world),
-                     static_cast<void*>(engine), path.c_str());
+                     "targets='%s' + '%s'", imageBase, imageSize, static_cast<void*>(world),
+                     static_cast<void*>(engine), cfg.submixPath.c_str(),
+                     cfg.submixSpeakerPath.c_str());
     }
 
-    sds::Rt().BindSubmixTap(world, engine, submix, submixResolved, rerouteMaster, rerouteParent,
-                            imageBase, imageSize);
+    sds::Rt().BindSubmixTap(world, engine, vibration, speaker, rerouteParent, imageBase,
+                            imageSize);
 }
 
 // ---------------------------------------------------------------------------------------

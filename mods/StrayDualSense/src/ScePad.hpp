@@ -7,8 +7,8 @@
 // The TRIGGER path and the SPEAKER ROUTING go through libScePad. Haptics do not:
 // scePadSetVibration reads exactly two amplitude bytes and structurally cannot carry a
 // waveform (§12, RVA 0xDC50), so the coils are driven as audio through WASAPI instead
-// (AudioPlayer) once HidMode has taken them out of motor emulation. There is no SetVibration
-// here on purpose.
+// (SubmixSink, from the engine's own rerouted submix) once HidMode has taken them out of
+// motor emulation. There is no SetVibration here on purpose.
 //
 // The speaker routing is `ApplyAudioRoute`, restoring what the retired libScePad shim did.
 // It needs no proxy DLL: the shim intercepted `scePadOpen` for its handle, and this class

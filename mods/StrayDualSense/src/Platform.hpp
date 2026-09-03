@@ -35,8 +35,4 @@ std::wstring ModuleDir(const void* addressInsideThisModule);
 // the same, and this compiles on the mingw lane where the SDK does not exist.
 bool MainModuleRange(const void*& base, size_t& size);
 
-// A UFunction argument can name anything, and a name that reaches the filesystem must not be
-// able to escape the asset directory. Refuse rather than sanitise, so a surprise is visible.
-bool AssetNameIsSafe(const std::string& name);
-
 } // namespace sds

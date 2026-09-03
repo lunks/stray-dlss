@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace sds {
@@ -32,19 +33,6 @@ bool ParseBool(const std::string& v, bool fallback)
     const std::string l = Lower(Trim(v));
     if (l == "1" || l == "true"  || l == "yes" || l == "on")  return true;
     if (l == "0" || l == "false" || l == "no"  || l == "off") return false;
-    return fallback;
-}
-
-HapticSource ParseHapticSource(const std::string& v, HapticSource fallback)
-{
-    const std::string l = Lower(Trim(v));
-    if (l == "assets"  || l == "asset")   return HapticSource::Assets;
-    if (l == "measure" || l == "measure-only" || l == "probe") return HapticSource::Measure;
-    if (l == "submix-fallback" || l == "fallback" || l == "submix_fallback")
-        return HapticSource::SubmixFallback;
-    if (l == "submix")                    return HapticSource::Submix;
-    SDS_LOG_WARN("config: HapticSource='%s' is not one of assets|measure|submix-fallback|submix; "
-                 "keeping the previous value.", v.c_str());
     return fallback;
 }
 
@@ -98,6 +86,34 @@ uint64_t FileWriteTime(const std::wstring& path)
     return u.QuadPart;
 }
 
+// Keys that existed before 0.4.0 and mean nothing now. Named rather than "unknown" so an ini
+// left over from the spike days reads as "this was retired" and not as a typo — and so a
+// value that used to CHANGE behaviour (HapticSource=assets, PadSpeakerRoute=hid) is seen to
+// be doing nothing rather than silently doing something else.
+struct RetiredKey { const char* key; const char* why; };
+const RetiredKey kRetired[] = {
+    { "hapticsource",        "there is one source, the engine's own submix through the tap; no asset path, no fallback" },
+    { "submixreroute",       "the reroute is always on - without it there is nothing to tap" },
+    { "submixreroutemaster", "the vibration master is SubmixPath" },
+    { "forceps5hapticpath",  "the DebugPS5Haptic gate is always opened from the Start hooks" },
+    { "padspeakerroute",     "the speaker route is Sony's scePadSetAudioOutPath and nothing else" },
+    { "padspeakerhidpath",   "the raw HID audio claim is gone" },
+    { "padspeakerhidvolume", "the raw HID audio claim is gone" },
+    { "padspeakerhidpreamp", "the raw HID audio claim is gone" },
+    { "hapticdir",           "no extracted assets are played" },
+    { "spkdir",              "no extracted assets are played" },
+    { "hapticloopsfile",     "the engine loops what the asset says; no loop list is read" },
+    { "spkloopsfile",        "the engine loops what the asset says; no loop list is read" },
+};
+
+const char* RetiredWhy(const std::string& key)
+{
+    for (const RetiredKey& r : kRetired)
+        if (key == r.key)
+            return r.why;
+    return nullptr;
+}
+
 } // namespace
 
 bool Config::Load(const std::wstring& path)
@@ -127,46 +143,38 @@ bool Config::Load(const std::wstring& path)
         else if (key == "haptics")                haptics                = ParseBool(val, haptics);
         else if (key == "hapticvalidflag0")       hapticValidFlag0       = ParseByte(val, hapticValidFlag0);
         else if (key == "hapticreassertseconds")  hapticReassertSeconds  = ParseFloat(val, hapticReassertSeconds);
-        else if (key == "hapticsource")           hapticSource           = ParseHapticSource(val, hapticSource);
-        else if (key == "submixwarnseconds")      submixWarnSeconds      = ParseFloat(val, submixWarnSeconds);
-        else if (key == "submixreroute")          submixReroute          = ParseBool(val, submixReroute);
-        else if (key == "submixreroutemaster")    submixRerouteMaster    = val;
+        else if (key == "speaker")                speaker                = ParseBool(val, speaker);
+        else if (key == "speakergain")            speakerGain            = std::clamp(ParseFloat(val, speakerGain), 0.0f, 8.0f);
+        else if (key == "padspeakerpath")         padSpeakerPath         = std::clamp(std::atoi(val.c_str()), 0, 4);
+        else if (key == "padspeakergain")         padSpeakerGain         = std::clamp(std::atoi(val.c_str()), 0, 255);
+        else if (key == "padspeakerreassertseconds") padSpeakerReassertSeconds = std::clamp(ParseFloat(val, padSpeakerReassertSeconds), 0.0f, 600.0f);
+        else if (key == "submixpath")             submixPath             = val;
+        else if (key == "submixspeakerpath")      submixSpeakerPath      = val;
         else if (key == "submixrerouteparent")    submixRerouteParent    = val;
         else if (key == "submixregistersoundsubmixslot") submixRegisterSoundSubmixSlot = std::clamp(std::atoi(val.c_str()), 0, 31);
-        else if (key == "forceps5hapticpath")     forcePS5HapticPath     = ParseBool(val, forcePS5HapticPath);
-        else if (key == "glyphs")                 glyphControllerType    = ParseGlyphs(val, glyphControllerType);
-        else if (key == "submixpath")             submixPath             = val;
-        else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
         else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "submixdevicesource")     submixDeviceSource     = Lower(val);
         else if (key == "submixscanbytes")        submixScanBytes        = std::clamp(std::atoi(val.c_str()), 0x800, 0x80000);
         else if (key == "submixdumpwords")        submixDumpWords        = std::clamp(std::atoi(val.c_str()), 0, 4096);
+        else if (key == "submixprobemaster")      submixProbeMaster      = ParseBool(val, submixProbeMaster);
         else if (key == "submixgain")             submixGain             = std::clamp(ParseFloat(val, submixGain), 0.0f, 8.0f);
         else if (key == "submixqueueaheadms")     submixQueueAheadMs     = std::clamp(std::atoi(val.c_str()), 5, 500);
         else if (key == "submixringms")           submixRingMs           = std::clamp(std::atoi(val.c_str()), 20, 2000);
         else if (key == "submixstatusseconds")    submixStatusSeconds    = ParseFloat(val, submixStatusSeconds);
         else if (key == "submixwatchseconds")     submixWatchSeconds     = ParseFloat(val, submixWatchSeconds);
         else if (key == "submixlivethreshold")    submixLiveThreshold    = std::clamp(ParseFloat(val, submixLiveThreshold), 0.0f, 1.0f);
+        else if (key == "submixwarnseconds")      submixWarnSeconds      = ParseFloat(val, submixWarnSeconds);
+        else if (key == "submixreroutewatchdogseconds") submixRerouteWatchdogSeconds = std::clamp(ParseFloat(val, submixRerouteWatchdogSeconds), 0.0f, 600.0f);
         else if (key == "submixstatusfile")       submixStatusFile       = val;
-        else if (key == "speaker")                speaker                = ParseBool(val, speaker);
-        else if (key == "padspeakerroute")        padSpeakerRoute        = ParsePadSpeakerRoute(val.c_str(), padSpeakerRoute);
-        else if (key == "padspeakerpath")         padSpeakerPath         = std::clamp(std::atoi(val.c_str()), 0, 4);
-        else if (key == "padspeakergain")         padSpeakerGain         = std::clamp(std::atoi(val.c_str()), 0, 255);
-        else if (key == "padspeakerreassertseconds") padSpeakerReassertSeconds = std::clamp(ParseFloat(val, padSpeakerReassertSeconds), 0.0f, 600.0f);
-        else if (key == "padspeakerhidpath")      padSpeakerHidPath      = std::clamp(std::atoi(val.c_str()), 0, 3);
-        else if (key == "padspeakerhidvolume")    padSpeakerHidVolume    = std::clamp(ParseByte(val, padSpeakerHidVolume), kPadSpeakerVolumeMin, kPadSpeakerVolumeMax);
-        else if (key == "padspeakerhidpreamp")    padSpeakerHidPreamp    = std::clamp(std::atoi(val.c_str()), 0, kPadSpeakerPreampMax);
+        else if (key == "glyphs")                 glyphControllerType    = ParseGlyphs(val, glyphControllerType);
         else if (key == "endpointmatch")          endpointMatch          = val;
-        else if (key == "hapticdir")              hapticDir              = val;
-        else if (key == "spkdir")                 spkDir                 = val;
-        else if (key == "hapticloopsfile")        hapticLoopsFile        = val;
-        else if (key == "spkloopsfile")           spkLoopsFile           = val;
         else if (key == "hookretryseconds")       hookRetrySeconds       = ParseFloat(val, hookRetrySeconds);
         else if (key == "statusseconds")          statusSeconds          = ParseFloat(val, statusSeconds);
         else if (key == "configreloadseconds")    configReloadSeconds    = ParseFloat(val, configReloadSeconds);
-        else SDS_LOG_WARN("config: ignoring unknown key '%s' (the envelope-era keys HapticGain, "
-                          "HapticLoop, SpeakerBoost, VibeDir, TriggerPosition/Strength no longer "
-                          "exist)", key.c_str());
+        else if (const char* why = RetiredWhy(key))
+            SDS_LOG_INFO("config: '%s' was retired in 0.4.0 (%s); ignored.", key.c_str(), why);
+        else
+            SDS_LOG_WARN("config: ignoring unknown key '%s'", key.c_str());
     }
     std::fclose(f);
     m_lastWriteTime = FileWriteTime(path);
@@ -186,29 +194,26 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     if (!fresh.Load(path))
         return false;
 
-    if (fresh.padUserId != padUserId || fresh.endpointMatch != endpointMatch ||
-        fresh.hapticDir != hapticDir || fresh.spkDir != spkDir ||
-        fresh.hapticLoopsFile != hapticLoopsFile || fresh.spkLoopsFile != spkLoopsFile)
+    if (fresh.padUserId != padUserId || fresh.endpointMatch != endpointMatch)
     {
-        SDS_LOG_WARN("config: PadUserId / EndpointMatch / HapticDir / SpkDir / *LoopsFile "
-                     "changed but are NOT hot-reloadable. Relaunch the game for those.");
+        SDS_LOG_WARN("config: PadUserId / EndpointMatch changed but are NOT hot-reloadable. "
+                     "Relaunch the game for those.");
     }
-    // The submix tap binds ONCE, on the game thread, into a listener the engine then holds
-    // for the session. Re-reading its shape at runtime would mean a second registration
-    // against a live audio render thread, which is exactly the kind of half-applied change
-    // this function exists to refuse.
-    if (fresh.hapticSource != hapticSource || fresh.submixPath != submixPath ||
-        fresh.submixRegisterSlot != submixRegisterSlot ||
-        fresh.submixDeviceSource != submixDeviceSource ||
-        fresh.submixProbeMaster != submixProbeMaster || fresh.submixReroute != submixReroute ||
-        fresh.submixRerouteMaster != submixRerouteMaster ||
+    // The taps bind ONCE, on the game thread, into listeners the engine then holds for the
+    // session. Re-reading their shape at runtime would mean a second registration against a
+    // live audio render thread, which is exactly the kind of half-applied change this
+    // function exists to refuse.
+    if (fresh.submixPath != submixPath || fresh.submixSpeakerPath != submixSpeakerPath ||
         fresh.submixRerouteParent != submixRerouteParent ||
-        fresh.submixRegisterSoundSubmixSlot != submixRegisterSoundSubmixSlot)
+        fresh.submixRegisterSlot != submixRegisterSlot ||
+        fresh.submixRegisterSoundSubmixSlot != submixRegisterSoundSubmixSlot ||
+        fresh.submixDeviceSource != submixDeviceSource ||
+        fresh.submixProbeMaster != submixProbeMaster)
     {
-        SDS_LOG_WARN("config: HapticSource / SubmixPath / SubmixRegisterSlot / "
-                     "SubmixDeviceSource / SubmixProbeMaster / SubmixReroute* changed but are "
-                     "NOT hot-reloadable - the listener is registered once and the engine keeps "
-                     "it. Relaunch the game.");
+        SDS_LOG_WARN("config: Submix*Path / SubmixRerouteParent / SubmixRegister*Slot / "
+                     "SubmixDeviceSource / SubmixProbeMaster changed but are NOT hot-reloadable "
+                     "- the listeners are registered once and the engine keeps them. Relaunch "
+                     "the game.");
     }
 
     // Scalars only: the strings above are read by running threads without a lock.
@@ -221,22 +226,17 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     hapticValidFlag0      = fresh.hapticValidFlag0;
     hapticReassertSeconds = fresh.hapticReassertSeconds;
     speaker               = fresh.speaker;
-    // LIVE, deliberately: Runtime re-applies the routing whenever these change, so the whole
-    // sony-versus-hid question can be A/B'd inside one session with one keypress per arm
-    // rather than one relaunch per arm.
-    padSpeakerRoute       = fresh.padSpeakerRoute;
+    speakerGain           = fresh.speakerGain;     // live: one atomic on the sink
+    // LIVE, deliberately: Runtime re-applies the routing whenever these change.
     padSpeakerPath        = fresh.padSpeakerPath;
     padSpeakerGain        = fresh.padSpeakerGain;
     padSpeakerReassertSeconds = fresh.padSpeakerReassertSeconds;
-    padSpeakerHidPath     = fresh.padSpeakerHidPath;
-    padSpeakerHidVolume   = fresh.padSpeakerHidVolume;
-    padSpeakerHidPreamp   = fresh.padSpeakerHidPreamp;
-    submixGain            = fresh.submixGain;      // live: it is one atomic on the sink
+    submixGain            = fresh.submixGain;      // live: one atomic on the sink
     submixStatusSeconds   = fresh.submixStatusSeconds;
     submixWatchSeconds    = fresh.submixWatchSeconds;
     submixLiveThreshold   = fresh.submixLiveThreshold;
     submixWarnSeconds     = fresh.submixWarnSeconds;
-    forcePS5HapticPath    = fresh.forcePS5HapticPath;   // read on the game thread per hook
+    submixRerouteWatchdogSeconds = fresh.submixRerouteWatchdogSeconds;
     glyphControllerType   = fresh.glyphControllerType;  // read on the game thread per call
     statusSeconds         = fresh.statusSeconds;
     configReloadSeconds   = fresh.configReloadSeconds;
@@ -250,34 +250,28 @@ bool Config::ReloadIfChanged(const std::wstring& path)
 void Config::LogSummary(const char* what) const
 {
     SDS_LOG_INFO("config %s: enabled=%d triggers=%d(readback=%d) haptics=%d(validFlag0=0x%02X "
-                 "reassert=%.1fs) speaker=%d endpoint='%s' padUserId=%d hapticDir='%s' "
-                 "spkDir='%s' loops='%s'/'%s'",
+                 "reassert=%.1fs) speaker=%d(gain=%.3f, sonyPath=%d(%s) sonyGain=%d "
+                 "reassert=%.1fs) endpoint='%s' padUserId=%d Glyphs=%s(%d)",
                  what, enabled ? 1 : 0, triggers ? 1 : 0, triggerReadback ? 1 : 0,
                  haptics ? 1 : 0, static_cast<unsigned>(hapticValidFlag0),
                  static_cast<double>(hapticReassertSeconds), speaker ? 1 : 0,
-                 endpointMatch.c_str(), padUserId, hapticDir.c_str(), spkDir.c_str(),
-                 hapticLoopsFile.c_str(), spkLoopsFile.c_str());
-    SDS_LOG_INFO("config %s: PadSpeakerRoute=%s sonyPath=%d(%s) sonyGain=%d | hid fallback "
-                 "path=%d(%s) volume=0x%02X preamp=%d",
-                 what, PadSpeakerRouteName(padSpeakerRoute), padSpeakerPath,
-                 SceAudioOutPathName(padSpeakerPath), padSpeakerGain, padSpeakerHidPath,
-                 PadAudioPathName(padSpeakerHidPath), static_cast<unsigned>(padSpeakerHidVolume),
-                 padSpeakerHidPreamp);
-    SDS_LOG_INFO("config %s: HapticSource=%s submixPath='%s' probeMaster=%d slot=%d "
-                 "deviceSource=%s gain=%.3f queueAhead=%dms ring=%dms scan=0x%X dump=%d "
-                 "warnEvery=%.1fs watch=%.1fs liveThreshold=%.5f",
-                 what, HapticSourceName(), submixPath.c_str(), submixProbeMaster ? 1 : 0,
-                 submixRegisterSlot, submixDeviceSource.c_str(),
-                 static_cast<double>(submixGain), submixQueueAheadMs, submixRingMs,
-                 static_cast<unsigned>(submixScanBytes), submixDumpWords,
-                 static_cast<double>(submixWarnSeconds),
+                 static_cast<double>(speakerGain), padSpeakerPath,
+                 SceAudioOutPathName(padSpeakerPath), padSpeakerGain,
+                 static_cast<double>(padSpeakerReassertSeconds), endpointMatch.c_str(),
+                 padUserId, GlyphName(), glyphControllerType);
+    SDS_LOG_INFO("config %s: submix vibration='%s' speaker='%s' parent='%s' slots=%d/%d "
+                 "deviceSource=%s scan=0x%X dump=%d probeMaster=%d gain=%.3f queueAhead=%dms "
+                 "ring=%dms status=%.1fs watch=%.1fs liveThreshold=%.5f warnEvery=%.1fs "
+                 "watchdog=%.1fs",
+                 what, submixPath.c_str(), submixSpeakerPath.c_str(),
+                 submixRerouteParent.c_str(), submixRegisterSlot, submixRegisterSoundSubmixSlot,
+                 submixDeviceSource.c_str(), static_cast<unsigned>(submixScanBytes),
+                 submixDumpWords, submixProbeMaster ? 1 : 0, static_cast<double>(submixGain),
+                 submixQueueAheadMs, submixRingMs, static_cast<double>(submixStatusSeconds),
                  static_cast<double>(submixWatchSeconds),
-                 static_cast<double>(submixLiveThreshold));
-    SDS_LOG_INFO("config %s: SubmixReroute=%d (master='%s' -> parent='%s', registerSlot=%d) "
-                 "ForcePS5HapticPath=%d Glyphs=%s(%d)",
-                 what, submixReroute ? 1 : 0, submixRerouteMaster.c_str(),
-                 submixRerouteParent.c_str(), submixRegisterSoundSubmixSlot,
-                 forcePS5HapticPath ? 1 : 0, GlyphName(), glyphControllerType);
+                 static_cast<double>(submixLiveThreshold),
+                 static_cast<double>(submixWarnSeconds),
+                 static_cast<double>(submixRerouteWatchdogSeconds));
 }
 
 const char* Config::GlyphName() const

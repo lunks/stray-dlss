@@ -1,6 +1,5 @@
 #include "SubmixSink.hpp"
 
-#include "AudioPlayer.hpp"   // kCoilRoute: the ONE definition of "left channel -> left grip"
 #include "Config.hpp"
 #include "Log.hpp"
 #include "Platform.hpp"
@@ -24,6 +23,29 @@ constexpr std::uint64_t kAssertCooldownMs = 1000;
 // something is actually about to be felt.
 constexpr float kSilenceFloor = 1.0e-4f;
 
+// Pull EXACTLY the frames the resampler will consume — it drops whatever it is handed beyond
+// that, so an approximate figure drains the ring faster than the tap fills it (see
+// LinearResampler::Process). `step` is srcRate / dstRate: 1.0 in the measured setup, where
+// the resampler is a bit-exact copy (tests/test_submix_dsp.cpp).
+std::size_t PullLane(SubmixRing* ring, LinearResampler& resampler, double step, UINT32 want,
+                     std::vector<float>& pull, std::vector<float>& out)
+{
+    const std::size_t needFrames = resampler.InputFramesFor(want, step);
+    if (pull.size() < needFrames * 2)
+        pull.assign(needFrames * 2, 0.0f);
+    if (out.size() < static_cast<std::size_t>(want) * 2)
+        out.assign(static_cast<std::size_t>(want) * 2, 0.0f);
+    if (ring == nullptr)
+    {
+        std::memset(pull.data(), 0, needFrames * 2 * sizeof(float));
+    }
+    else
+    {
+        ring->Read(pull.data(), needFrames);   // short reads are zero-filled and counted
+    }
+    return resampler.Process(pull.data(), needFrames, step, out.data(), want);
+}
+
 } // namespace
 
 SubmixSink::~SubmixSink()
@@ -31,21 +53,25 @@ SubmixSink::~SubmixSink()
     Shutdown();
 }
 
-void SubmixSink::Start(SubmixRing* ring, std::string endpointMatch, const Config& config,
-                       BeforePlayFn beforePlay)
+void SubmixSink::Start(SubmixRing* coilRing, SubmixRing* speakerRing, std::string endpointMatch,
+                       const Config& config, BeforePlayFn beforeCoils)
 {
-    m_ring          = ring;
+    m_coilRing      = coilRing;
+    m_speakerRing   = speakerRing;
     m_endpointMatch = std::move(endpointMatch);
-    m_beforePlay    = std::move(beforePlay);
+    m_beforeCoils   = std::move(beforeCoils);
     m_queueAheadMs  = static_cast<std::uint32_t>(config.submixQueueAheadMs);
-    m_gain.store(config.submixGain, std::memory_order_relaxed);
+    m_coilGain.store(config.submixGain, std::memory_order_relaxed);
+    m_speakerGain.store(config.speaker ? config.speakerGain : 0.0f, std::memory_order_relaxed);
     m_running.store(true, std::memory_order_release);
     m_worker = std::thread(&SubmixSink::WorkerMain, this);
-    SDS_LOG_INFO("submix sink: worker started; endpoint match '%s', queue-ahead %u ms, "
-                 "gain %.3f -> endpoint channels 0x%X/0x%X (RL/RR)",
+    SDS_LOG_INFO("submix sink: worker started; endpoint match '%s', queue-ahead %u ms, coil "
+                 "gain %.3f -> RL/RR (channels %u/%u), speaker gain %.3f -> FL/FR (channels "
+                 "%u/%u)",
                  m_endpointMatch.c_str(), m_queueAheadMs,
-                 static_cast<double>(config.submixGain),
-                 kCoilRoute.outputMask[0], kCoilRoute.outputMask[1]);
+                 static_cast<double>(m_coilGain.load()), kEndpointChannelRL, kEndpointChannelRR,
+                 static_cast<double>(m_speakerGain.load()), kEndpointChannelFL,
+                 kEndpointChannelFR);
 }
 
 void SubmixSink::Shutdown()
@@ -62,10 +88,16 @@ void SubmixSink::SetSourceRate(std::uint32_t rate)
         m_sourceRate.store(rate, std::memory_order_relaxed);
 }
 
-void SubmixSink::SetGain(float gain)
+void SubmixSink::SetCoilGain(float gain)
 {
     if (gain >= 0.0f && gain <= 8.0f)
-        m_gain.store(gain, std::memory_order_relaxed);
+        m_coilGain.store(gain, std::memory_order_relaxed);
+}
+
+void SubmixSink::SetSpeakerGain(float gain)
+{
+    if (gain >= 0.0f && gain <= 8.0f)
+        m_speakerGain.store(gain, std::memory_order_relaxed);
 }
 
 std::string SubmixSink::EndpointName() const
@@ -117,17 +149,16 @@ bool SubmixSink::RunStream()
     }
     m_restarts.fetch_add(1, std::memory_order_relaxed);
 
-    // Same refusal as the asset path: the coils are RL/RR = channels 2/3. On a 2-channel
-    // endpoint there are no coils to reach, and writing FL/FR instead would put the haptic
-    // waveform on the SPEAKER — audible, wrong, and hard to diagnose.
-    const uint32_t needed = kCoilRoute.outputMask[0] | kCoilRoute.outputMask[1];
-    if (stream.channels >= 32 || (needed >> stream.channels) != 0)
+    // The coils are RL/RR = channels 2/3. On a 2-channel endpoint there are no coils to reach,
+    // and writing FL/FR instead would put the haptic waveform on the SPEAKER — audible, wrong,
+    // and hard to diagnose.
+    if (stream.channels < kEndpointChannelsRequired)
     {
         m_failures.fetch_add(1, std::memory_order_relaxed);
-        SDS_LOG_ERROR("submix sink: endpoint '%s' has %u channel(s) but the coil route needs "
-                      "mask 0x%X (FL=0 FR=1 RL=2 RR=3). REFUSING - a haptic waveform on the "
-                      "speaker is worse than silence.",
-                      stream.endpointName.c_str(), stream.channels, needed);
+        SDS_LOG_ERROR("submix sink: endpoint '%s' has %u channel(s) but the pad needs %u "
+                      "(FL=0 FR=1 RL=2 RR=3). REFUSING - a haptic waveform on the speaker is "
+                      "worse than silence.",
+                      stream.endpointName.c_str(), stream.channels, kEndpointChannelsRequired);
         return false;
     }
 
@@ -156,10 +187,11 @@ bool SubmixSink::RunStream()
         return true;
     }
     m_streamOpen.store(true, std::memory_order_relaxed);
-    m_resampler.Reset();
+    m_coilResampler.Reset();
+    m_speakerResampler.Reset();
 
-    bool          wasSilent    = true;
-    std::uint64_t lastAssertMs = 0;
+    bool          coilsWereSilent = true;
+    std::uint64_t lastAssertMs    = 0;
 
     while (m_running.load(std::memory_order_acquire))
     {
@@ -182,21 +214,12 @@ bool SubmixSink::RunStream()
             continue;
         }
 
-        // EXACTLY the frames the resampler will consume — it drops whatever it is handed
-        // beyond that, so an approximate figure drains the ring faster than the tap fills it
-        // (see LinearResampler::Process). `step` is srcRate / dstRate: 1.0 in the measured
-        // setup, where the resampler is a bit-exact copy (tests/test_submix_dsp.cpp).
         const double step = static_cast<double>(m_sourceRate.load(std::memory_order_relaxed)) /
                             static_cast<double>(rate);
-        const std::size_t needFrames = m_resampler.InputFramesFor(want, step);
-        if (m_pull.size() < needFrames * 2)
-            m_pull.assign(needFrames * 2, 0.0f);
-        if (m_out.size() < static_cast<std::size_t>(want) * 2)
-            m_out.assign(static_cast<std::size_t>(want) * 2, 0.0f);
-
-        m_ring->Read(m_pull.data(), needFrames);      // short reads are zero-filled and counted
-        const std::size_t produced =
-            m_resampler.Process(m_pull.data(), needFrames, step, m_out.data(), want);
+        const std::size_t coilFrames =
+            PullLane(m_coilRing, m_coilResampler, step, want, m_coilPull, m_coilOut);
+        const std::size_t speakerFrames =
+            PullLane(m_speakerRing, m_speakerResampler, step, want, m_speakerPull, m_speakerOut);
 
         BYTE* raw = nullptr;
         if (FAILED(stream.render->GetBuffer(want, &raw)) || raw == nullptr)
@@ -205,45 +228,29 @@ bool SubmixSink::RunStream()
             SDS_LOG_ERROR("submix sink: GetBuffer(%u) failed; reopening the stream", want);
             break;
         }
-        float* dst = reinterpret_cast<float*>(raw);
 
-        const float gain = m_gain.load(std::memory_order_relaxed);
-        float peak = 0.0f;
-        for (UINT32 i = 0; i < want; ++i)
-        {
-            float l = 0.0f, r = 0.0f;
-            if (i < produced)
-            {
-                l = SoftClip(m_out[i * 2]     * gain);
-                r = SoftClip(m_out[i * 2 + 1] * gain);
-            }
-            const float a = std::max(l < 0 ? -l : l, r < 0 ? -r : r);
-            if (a > peak) peak = a;
-            for (std::uint32_t c = 0; c < channels; ++c)
-            {
-                float v = 0.0f;
-                if (kCoilRoute.outputMask[0] & (1u << c))      v = l;
-                else if (kCoilRoute.outputMask[1] & (1u << c)) v = r;
-                dst[i * channels + c] = v;
-            }
-        }
+        const LanePeaks peaks = InterleaveLanes(
+            m_coilOut.data(), coilFrames, m_coilGain.load(std::memory_order_relaxed),
+            m_speakerOut.data(), speakerFrames, m_speakerGain.load(std::memory_order_relaxed),
+            want, channels, reinterpret_cast<float*>(raw));
         stream.render->ReleaseBuffer(want, 0);
         m_framesWritten.fetch_add(want, std::memory_order_relaxed);
 
-        // Waveform mode, re-asserted on the silence -> signal edge. HidMode's own 2 s cadence
-        // covers the steady state; this covers the case where libScePad wrote its own report
-        // in the last two seconds and the very first haptic of a scratch would be swallowed.
-        const bool silent = peak < kSilenceFloor;
-        if (wasSilent && !silent && m_beforePlay)
+        // Waveform mode, re-asserted on the coil lane's silence -> signal edge. HidMode's own
+        // 2 s cadence covers the steady state; this covers the case where libScePad wrote its
+        // own report in the last two seconds and the very first haptic of a scratch would be
+        // swallowed. The speaker lane has no such mode byte, so it does not take part.
+        const bool coilsSilent = peaks.coils < kSilenceFloor;
+        if (coilsWereSilent && !coilsSilent && m_beforeCoils)
         {
             const std::uint64_t now = NowMs();
             if (now - lastAssertMs >= kAssertCooldownMs)
             {
                 lastAssertMs = now;
-                m_beforePlay();
+                m_beforeCoils();
             }
         }
-        wasSilent = silent;
+        coilsWereSilent = coilsSilent;
     }
 
     m_streamOpen.store(false, std::memory_order_relaxed);

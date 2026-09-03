@@ -5,7 +5,8 @@ name: StrayDualSense plugin
 # cheapest-first so a typo is caught in seconds rather than after a 20-minute SDK build.
 #
 #   1. tests    the pure-logic tests (asset names, trigger enum translation + param block,
-#               loop list, fade ramps), the one thing provable without hardware
+#               the submix DSP and the watch/watchdog/verdict instruments), the one thing
+#               provable without hardware
 #   2. mingw    proves the Win32 half (pad, HID mode byte, WASAPI, threads) COMPILES AND
 #               LINKS, with no SDK
 #   3. plugin   the artifact; builds RE-UE4SS from source and links against it
@@ -32,7 +33,7 @@ name: StrayDualSense plugin
 
 on:
   push:
-    branches: [ main, dualsense ]
+    branches: [ main, dualsense, dualsense-submix, dualsense-thin ]
     paths:
       - 'mods/StrayDualSense/**'
       - '.github/workflows/dualsense.yml'
@@ -118,9 +119,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/obj
-          for f in AssetName AudioPlayer CoilOwner Config HidMode Log LoopList PadAudio \
-                   Platform Runtime ScePad SubmixChoice SubmixDiscovery SubmixDsp SubmixSink \
-                   SubmixTap SubmixWatch TriggerEffect Triggers Wasapi; do
+          for f in AssetName Config HidMode Log PadAudio Platform Runtime ScePad \
+                   SubmixChoice SubmixDiscovery SubmixDsp SubmixSink SubmixTap SubmixWatch \
+                   TriggerEffect Triggers Wasapi; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
               -Isrc -c "src/$f.cpp" -o "/tmp/obj/$f.o"
@@ -149,6 +150,12 @@ jobs:
               sds::Rt().OnSetControllerSoundLevel(0.5f);
               sds::Rt().OnStopControllerSound(0.0f);
               sds::Rt().OnPadVibrationEnabled(true);
+              sds::Rt().OnHapticGate(true, true);
+              // The tap's entry point. Nulls everywhere: BindSubmixTap must refuse an
+              // unresolved submix rather than register with a null one, which the engine
+              // reads as the MASTER submix.
+              if (sds::Rt().SubmixWantsBinding())
+                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0);
               sds::Rt().Shutdown();
           }
           BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
