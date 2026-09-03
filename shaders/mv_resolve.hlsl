@@ -72,6 +72,19 @@ void main(uint3 tid : SV_DispatchThreadID)
 	const uint2 buffer_pos = uint2(ViewRectMin) + tid.xy;
 
 	// ViewportUVToScreenPos: (2u - 1, 1 - 2v). NDC, Y-up.
+	//
+	// The +0.5f is the PIXEL CENTRE, and it is deliberate. NVIDIA's own VelocityCombine.usf
+	// changed convention between integrations: the UE 4.27 plugin (DLSS-SR 3.7.0) sampled the
+	// pixel CORNER, `SvPositionToScreenPosition(float4(PixelPos.xy, 0, 1))`, while the current
+	// UE5 plugin (8.7.2) samples `PixelPos.xy + 0.5f`. A uniform half-pixel bias in the
+	// reconstructed static-geometry vectors is precisely the failure this project has already
+	// shipped once (CLAUDE.md: bad motion vectors compound through the accumulation and never
+	// look like a motion-vector bug), so the UE5 audit raised it as an open question against
+	// this line.
+	//
+	// CHECKED 2026-09-03 by reading this shader: we already sample the centre, so we already
+	// match the CURRENT plugin. Settled negative, no change — recorded here so the question is
+	// not reopened. (docs/RESEARCH-DLSS-UE5-PLUGIN.md §2.4 and recommendation #3.)
 	const float2 uv = (float2(tid.xy) + 0.5f) / RenderSize;
 	const float2 screen_pos = float2(2.0f * uv.x - 1.0f, 1.0f - 2.0f * uv.y);
 
