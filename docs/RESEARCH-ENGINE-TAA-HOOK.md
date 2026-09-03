@@ -1473,7 +1473,10 @@ against `native_backend.cpp:174-308`, it is not:
   by register (§14.4 makes colour-by-register the *intended* end state, since L1 resolves colour
   `rhi_null`) and the output UAV `u0`, which is not in `FPassInputs` at all.
   `SetComputeRootDescriptorTable` stays for the same reason, and `restore_game_compute_state` stays
-  regardless (§1.3's third consumer, legitimately D3D12-level).
+  regardless — though **it is the ROOT shadow it keeps alive, not the descriptor shadow**: it calls
+  `root::snapshot` and replays opaque table handles, resolving nothing (`native_backend.cpp:370-389`,
+  HARD). The full consumer-by-consumer audit, including why `u0` has no engine route and what the
+  shadow could stop recording, is `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §13.
 
 So the sweep's three-consumer list loses one of three, and the two expensive halves are driven by the
 two that remain. **Expected saving: well under 0.5 ms of 2.9 ms, not the write side.**

@@ -617,7 +617,7 @@ else wants it. Independent of everything above.
 **Adds ~30 lines, deletes none.** One counter for the jitter-only camera cut; one startup line when
 the observed base-pass shape contradicts the baked `r.*` premises. Both log-only.
 
-### Step 6 — the descriptor shadow (§1) ~~, and only if §3 is solved first~~
+### Step 6 — the descriptor shadow (§1) ~~, and only if §3 is solved first~~ — **SUPERSEDED BY §13: IT STAYS**
 
 ~~The 2.287 ms/frame write side. **Do not start this before the View-CB search has an answer** —
 without it the shadow cannot be gated and nothing measurable changes. If §3 stays unsolved, the
@@ -637,6 +637,12 @@ price of reading a constant buffer the engine will not hand us.~~
 > proposing to delete it should start from `u0` and colour-by-register, and should read §14.2 there
 > first — it enumerates every candidate hook point inside the window where a transient RDG texture
 > has an RHI resource, and every one of them fails.
+>
+> **§13 takes that to the end**, consumer by consumer, and adds two findings this step's premise did
+> not have: the state restore needs the **root** shadow and none of the descriptor shadow's
+> 1.694 ms, and `u0`'s identity has no engine route at all — so the expensive half is held open by a
+> single consumer that cannot be removed. It also says what *can* be stopped today (RTV/DSV
+> shadowing, whose only readers are off) and why almost nothing else can be.
 
 ---
 
@@ -667,5 +673,193 @@ price of reading a constant buffer the engine will not hand us.~~
 | The depth-histogram gameplay gate is documented but not implemented | **HARD** (absence, searched `src/`) |
 | `mods/StrayProbe` already answers "in gameplay" from the engine | **HARD**, `main.lua:104-150` |
 | A second seam for the G-buffer (e.g. `IScreenSpaceDenoiser`) | **UNCONFIRMED** — not investigated, do not assume |
-| Whether `*OutSceneColorTexture`'s RHI resource is readable at the seam | **UNCONFIRMED** — `engine-seam-l1` answers it for the inputs at the same time |
+| Whether `*OutSceneColorTexture`'s RHI resource is readable at the seam | ~~**UNCONFIRMED**~~ **ANSWERED: NO.** It is the graph-allocated post-chain scene colour, so its `ResourceRHI` is null at `AddPasses` and assigned only inside `Execute()` — the window `docs/RESEARCH-ENGINE-TAA-HOOK.md` §14.2 enumerates and finds unreachable. This is why the descriptor shadow stays; see §13.3 |
 | Line-count estimates in §11 | **[derived]** from the cited regions; not a compiler's answer |
+
+
+---
+
+## 13. Do we actually need the descriptor shadow? Every consumer, what it needs, and what would remove it (2026-09-03)
+
+**The user's question, verbatim:** *"Do we really need the descriptor shadow? What for, and how
+could we get rid of the dependency?"* — asked after §0's correction showed the perf case for the
+View-CB work was built on a wrong attribution.
+
+**The one-sentence answer, and it is narrower than this document has ever said.** Three separate
+mechanisms are being called "the shadow" and they have almost disjoint consumers: the **root shadow**
+(0.681 ms) exists for the state restore, the **resource registry** exists for liveness and GPU-VA
+lookup and is unavoidable, and the **descriptor shadow proper — the 1.694 ms that is 58% of the
+measured total — exists for exactly ONE thing: resolving the SRV/UAV table slots of the intercepted
+dispatch**, which is how we learn the output UAV `u0` and scene colour. Everything else either uses a
+different mechanism or is off on the shipping path.
+
+**Method.** Every call site of `shadow::`, `root::` and `registry::` outside their own translation
+units, read at `e4bd7f4`. Costs are the live `[perf]` line quoted in §1.2. Nothing here was run.
+
+### 13.1 The three mechanisms are not one thing
+
+| Mechanism | Fed by | Cost, from the live `[perf]` line | Read by |
+|---|---|---|---|
+| **Descriptor shadow** (`descriptor_shadow.cpp`) | 5 `Create*View` hooks (`shadow-write` **0.050 ms**, 44 views/frame) + `CopyDescriptors`/`CopyDescriptorsSimple` (`shadow-copy` **1.644 ms**, 734 calls / 4059 descriptors per frame) + `CreateDescriptorHeap` | **1.694 ms** | `gpu_to_cpu` + `lookup` in `resolve_compute_bindings`'s table walk; `describe_view` / `resource_from_view` |
+| **Root shadow** (`root_shadow.cpp`) | 9 hooks: `Reset`, `SetDescriptorHeaps`, `SetPipelineState`, `SetComputeRootSignature`, `SetComputeRootDescriptorTable`, the two `SetComputeRoot32BitConstant(s)`, and root CBV/SRV/UAV | `root-bind` **0.643 ms** (559/frame) + `heap-bind` **0.038 ms** | `root::snapshot`, called by BOTH `resolve_compute_bindings` and `restore_game_compute_state` |
+| **Resource registry** (`resource_registry.cpp`) | `CreateCommittedResource` etc. + a COM sentinel for death | not separately bucketed | liveness (`is_resource_live`, and L1's validation), `describe` (`read_buffer`'s upload-heap check), `buffer_for_va` (root CBVs → the View CB) |
+
+`resolve` (**0.539 ms**, 7.0/frame) is the per-dispatch walk itself and belongs to whoever calls it.
+
+**The load-bearing fact this table makes visible, and it corrects §1.3 a second time:
+`restore_game_compute_state` does NOT touch the descriptor shadow.** Read `native_backend.cpp:370-389`
+— it calls `root::snapshot` and replays the root signature, the table GPU handles, root
+CBV/SRV/UAV addresses, 32-bit constants, the PSO and the heaps. Table handles are opaque
+`D3D12_GPU_DESCRIPTOR_HANDLE` values replayed verbatim; nothing is resolved. **HARD**, by inspection.
+
+So the restore — which §1.3 lists as one of the three things keeping "the shadow" alive — keeps the
+**root** shadow alive and none of the 1.694 ms.
+
+### 13.2 The consumer census
+
+| # | Consumer | Where | What it needs | On the shipping path? |
+|---|---|---|---|---|
+| 1 | **SRV/UAV table walk** → `u0` output UAV, scene colour (t1/t5), the eye-adaptation SRV | `native_backend.cpp:229-282` ← `taa_hook.cpp:659` | **descriptor shadow** (heap registry for `gpu_to_cpu`, copy propagation for `lookup`) **+ root shadow** (which tables are bound) | **YES — and it is the only consumer of the 1.694 ms** |
+| 2 | **View CB search** | `taa_hook.cpp:~700` ← `constant_buffers` | **root shadow's `compute_root_cbv` only** + `registry::buffer_for_va` | YES, and cheap (§0 correction) |
+| 3 | **`restore_game_compute_state`** | `native_backend.cpp:370` ← `taa_hook.cpp:1908` | **root shadow only** | YES |
+| 4 | **L1's liveness check** on the engine's own depth/velocity | `engine_seam_hook.cpp` | **registry only** | YES |
+| 5 | `read_view_cb` / `describe_resource` | `taa_hook.cpp:346` | **registry only** | YES |
+| 6 | **The differential observer** | `dlss_app.cpp:985` | `resolve_compute_bindings` | **NO.** `diff::set_enabled(ok && native::mode() == native::Mode::observe)` (`dlss_app.cpp:817`); the shipping host is `drive` |
+| 7 | **The pass finder** (`describe_view`, `resolve_graphics_srvs`, `resolve_compute_bindings`) | `pass_finder.cpp:265, 309, 328` | descriptor shadow (RTV/DSV included) | **NO.** `[STRAYDLSS] PassFinder` defaults OFF, and the native `resolve_graphics_srvs` is **not implemented** — it logs a refusal (`native_backend.cpp:314-318`) |
+
+**Consequence: consumers 6 and 7 are the only readers of the RTV and DSV halves of the shadow, and
+both are off.** `shadowed_heap_type` (`d3d12_hooks.cpp:469-472`) accepts `CBV_SRV_UAV`, `RTV` and
+`DSV`; on the shipping path the last two are recorded and never read. That is a real, safe, available
+saving — see §13.5 — though probably a small one, because RTV/DSV heaps are never shader-visible and
+UE4 does not stream them through `CopyDescriptors` the way it does the online CBV_SRV_UAV heap
+(**[derived]**, not measured).
+
+### 13.3 What would have to be true to remove consumer 1 — the only one that matters
+
+Consumer 1 needs two identities per intercepted dispatch: **the output UAV `u0`** and **scene
+colour**. Colour is free once `u0` forces the walk, so `u0` is the whole question.
+
+**Is `u0` obtainable from the engine? The answer is no, and it is the same "no" as §14.2's, extended
+one step.** `AddPasses` writes `*OutSceneColorTexture` (`TemporalAA.cpp:1514`) after the forwarded
+call, and our thunk already has that out-parameter in hand. But it is an `FRDGTextureRef` to the
+**graph-allocated post-chain scene colour** — the same object §2.9 and `TemporalAA.cpp:696`
+(`NewHistoryTexture[0] = Outputs.SceneColor = NewHistoryTexture[0]`) identify as `u0`. Its
+`ResourceRHI` is assigned during `FRDGBuilder::Execute`'s `CollectPassResources` loop, i.e. **after**
+`AddPasses` returns and **before** `Allocator.ReleaseAll()`, which is precisely the window §14.2
+enumerates and finds unreachable: the pass-lambda virtual is a template instantiation per lambda,
+`GetRHI`/`MarkResourceAsUsed` are inline, `ExecutePass` has no self-validating constant, and
+`Execute`'s entry and exit are outside the window at both ends.
+
+**So §14.2's conclusion does cover the OUTPUT texture, not only the input** — the coordinator's
+question — because both are the same class of object reached through the same absent hook. **[derived]**
+from §14.2 being an enumeration of hook points rather than of textures; the reasoning transfers
+without a new claim.
+
+Three things would remove consumer 1, in ascending order of what they cost:
+
+| What would have to be true | Effect | Verdict |
+|---|---|---|
+| **`r.RHICmdBypass=1`** — the RHI command list executes inline, so the pass lambda's `Dispatch` reaches D3D12 on the render thread inside `Execute()`, with the allocator alive and `ResourceRHI` assigned for transients | The dispatch we intercept would arrive with `*OutSceneColorTexture` and the colour input both resolvable. **Deletes the descriptor shadow's entire 1.694 ms** | **NO.** §14.3 already refuses it: it disables the RHI thread process-wide — the engine's main rendering-throughput mechanism — to buy two texture identities. Recorded so the idea is not rediscovered as clever |
+| **Author our own RDG pass (L2)** and read all four inputs in its lambda, the way NVIDIA's plugin does | Same deletion, without the throughput cost | **NO.** §4.3: `AddPass` is a template over a shader-parameter struct with `FShaderParametersMetadata`, instantiated at engine compile time. There is no ABI to call from an injected DLL. This is not an offsets problem |
+| **A second engine seam that announces the output** | — | **Does not exist.** `ITemporalUpscaler` has five virtuals and none of them is reached after the graph executes |
+
+**Therefore: the output UAV `u0` keeps the descriptor shadow alive, and there is no engine route to
+it. Say that plainly rather than leaving it as "partly".** It is the honest end of this line of
+enquiry, and it is why §11's step 6 has been retitled.
+
+### 13.4 Could the SR path avoid the restore entirely, the way the NR stage does?
+
+**The premise is right and the answer is still no, and the blocker is GPU ordering.** Worth
+establishing rather than assuming, because if it were possible it would delete `root-bind`.
+
+The NR present stage records on `src/backend_native/present_owner.*`'s own list, where nothing of the
+game's is bound, so there is nothing to clobber and nothing to restore (§"NR is now a PRESENT STAGE
+too"). Two things make that work: the stage runs at Present, and at Present the game has already
+submitted every command list of the frame.
+
+Neither holds for SR:
+
+1. **Present is the wrong point in the frame.** DLSS SR must write `u0` before the frame's own
+   downstream consumers read it — post-processing, the tonemapper, and next frame's SSR through
+   `TemporalAAHistory.RT[0]` (§5). Running it at Present puts the upscale after all of them, and the
+   suppressed engine TAA leaves `u0` unwritten for the whole chain. The image would be wrong by an
+   entire post-process pipeline. **HARD**, from the frame graph this document already cites.
+2. **Submitting our own list mid-frame executes it too EARLY, not at the right point.** A single
+   D3D12 queue executes in *submission* order. At the moment our hook sees the TAA `Dispatch`, UE4
+   has *recorded* the depth, velocity and colour work into a list it has **not yet submitted**. An
+   `ExecuteCommandLists` of our own list at that instant would run **before** all of it — reading
+   textures the GPU has not written. Forcing a split would mean calling `Close()` on the game's list
+   and submitting it ourselves, which destroys the game's own bookkeeping and its later `Close()`.
+   **[derived]**, from D3D12's submission-order guarantee plus UE4 recording before submitting.
+
+**So the restore is structural for the SR path.** But note what §13.1 already establishes: it costs
+the **root** shadow (0.681 ms), not the descriptor shadow. It was never "the largest consumer" — the
+table walk is.
+
+### 13.5 The practical question: what can the shadow stop RECORDING?
+
+**An upper bound on the prize, from the measured line itself.** `shadow-copy` handles **4059
+descriptors per frame**, while `resolve` runs **7.0 times per frame** over the bound tables of one
+dispatch each — order 10-16 slots apiece, so **roughly 70-110 slots are ever looked up**. That is
+**on the order of 2% of what is recorded**. **[derived]** arithmetic over two numbers from one live
+`[perf]` line; the slot-per-resolve figure is the soft term.
+
+**But almost none of that 98% is skippable, and the reason is structural rather than a missing
+optimisation: a filter must decide at WRITE time, and the need is only known at READ time — a frame
+later, on another thread, keyed by a GPU handle that does not exist yet.** Working through the
+candidates, because each is the sort of thing that looks obvious for ten minutes:
+
+| Candidate filter | Verdict |
+|---|---|
+| **Skip RTV and DSV heaps** (`shadowed_heap_type`) | **AVAILABLE TODAY and safe** — their only readers (§13.2 rows 6, 7) are off by default, and the native `resolve_graphics_srvs` is unimplemented anyway. Gate it on `PassFinder`, which is the switch that would need them back. Expected win **small**: RTV/DSV heaps are never shader-visible, so UE4 does not stream them through `CopyDescriptors`. **[derived]** |
+| Skip copies whose DESTINATION is not a shader-visible heap | **BREAKS THE CHAIN.** UE4's pattern is `CreateSRV` into an offline slot, then copy offline→online; drop the offline destination and the online copy reads an unrecorded source. Any offline→offline hop makes it worse |
+| Skip by view KIND — record only SRV/UAV | Marginal, and it costs the `has_view_cb` signal the matcher still uses. The kind is only known from the source slot, so the test is not free either |
+| **Store dst→src and resolve LAZILY at lookup**, instead of propagating the value at copy time | **WRONG, and measurably so.** That is ReShade's design, and facts §16 convicted it over 137 811 slots: the source slot is recycled, so the lookup resolves to whatever lives there NOW rather than what was copied. **D3D12 copies descriptors by value and a shadow that does the same is right.** Recorded because it is exactly what a reader will propose |
+| Record only while an interception is possible (after the seam announces) | **Impossible.** The descriptors were copied during earlier passes, and the RHI thread lags graph setup by a frame — the announcement arrives after the copies |
+
+**What is worth building instead is the INSTRUMENT, not the filter.** The 2% above is derived, not
+measured. One bit per slot, set on `lookup` and counted at session end, turns "roughly 2%" into a
+number and would say whether any *structural* subset (a heap, an increment range, a kind) is
+never-read — which is the only kind of filter that can be applied at write time. **That is a small,
+safe, always-useful change and it does not wait on the box.**
+
+### 13.6 The answer, ranked
+
+1. **The descriptor shadow proper (1.694 ms) has exactly one consumer on the shipping path: the
+   SRV/UAV table walk, for the output UAV `u0` and scene colour by register.** Removing it requires
+   reading an RDG transient's `ResourceRHI` during graph execution, and §14.2 establishes there is no
+   hookable point in that window. **It stays. That is the answer to "do we really need it".**
+2. **The root shadow (0.681 ms) has two consumers**, the state restore and the table/root walk, and
+   the restore is structural for the SR path (§13.4). **It stays.**
+3. **The resource registry stays regardless** — L1's liveness validation is built on it, and it is
+   what makes the engine's own answer safe to use.
+4. **The View-CB search's dependency is the root-CBV map alone** — one of nine root hooks. Replacing
+   it with identity from the engine is a **correctness** question, not a perf one (§0's correction,
+   `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15).
+5. **Available today, no box needed:** gate RTV/DSV shadowing on `PassFinder`; add the read-bit
+   instrument so the 98% claim becomes measured.
+
+**Does this change the value of the identity work? Yes, and downward, in one direction only.** It
+removes the last trace of the argument that replacing the CB search unlocks anything architectural:
+it does not, because `u0` holds the expensive mechanism open regardless. What remains is exactly what
+§15.4 pre-registers — whether the search ever chose the wrong view on a claimed dispatch. **If that
+number is zero, there is now no second reason left to build it.**
+
+### 13.7 Provenance ledger for this section
+
+| Claim | Status |
+|---|---|
+| `restore_game_compute_state` uses `root::snapshot` only and never `shadow::` | **HARD**, `native_backend.cpp:370-389` |
+| Table handles are replayed as opaque GPU handles, so the restore resolves nothing | **HARD**, same site + `root_shadow.hpp:18-33` |
+| The SRV/UAV table walk is the only shipping-path reader of `shadow::lookup` / `gpu_to_cpu` | **HARD**, by enumeration of every `shadow::` call site outside its own TU |
+| The differential observer is off outside `NativeMode=observe` | **HARD**, `dlss_app.cpp:817` |
+| `PassFinder` defaults OFF and the native `resolve_graphics_srvs` is unimplemented | **HARD**, `dlss_app.cpp:1556-1561`, `native_backend.cpp:314-318` |
+| RTV/DSV are shadowed and unread on the shipping path | **HARD** (the filter accepts them; no live consumer) |
+| RTV/DSV `CopyDescriptors` traffic is small | **[derived]**, from those heaps never being shader-visible. Not measured |
+| `*OutSceneColorTexture` is the graph-allocated post-chain scene colour, i.e. `u0` | **HARD**, `TemporalAA.cpp:696`, `:1514`; §2.9 |
+| §14.2's "no hookable point in the Execute window" covers the output as well as the input | **[derived]** — §14.2 enumerates hook points, not textures, so it transfers |
+| Present is the wrong frame point for SR | **HARD**, from the consumers §5 already documents |
+| A mid-frame `ExecuteCommandLists` of our own list would run before the game's unsubmitted work | **[derived]**, D3D12 submission order + UE4 recording before submitting |
+| ~70-110 of 4059 descriptors per frame are ever looked up (~2%) | **[derived]** arithmetic from one live `[perf]` line; slots-per-resolve is the soft term |
+| Lazy dst→src resolution at lookup is wrong | **HARD**, facts §16 — measured over 137 811 slots |
+| Every number in §13.1 | **HARD**, quoted from the live `[perf]` line in §1.2 |
