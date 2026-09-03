@@ -936,6 +936,25 @@ those is the only one that is cheap to check, which is why it is worth running a
    queue-level counterpart. **HARD** that Streamline makes the call and we do not.
    **UNCONFIRMED** that omitting it has any consequence — no source read on either pass states
    one. Adopt as tidiness with a plausible latency-accounting benefit, not as a fix. §4.
+
+   > **PROMOTED 2026-09-03, and now verified available on our exact stack.** §7.4 finds this is
+   > **the only concrete capability Streamline has that we lack** — everything else it offers is
+   > either architectural (and comes bundled with its swapchain) or worth zero on this title. So
+   > this one call *is* the entire "hybrid" option, which raises its value considerably.
+   >
+   > And it is genuinely reachable, which was not previously checked: **DXVK-NVAPI implements
+   > it** — `src/nvapi_d3d12.cpp:1088`, `NVAPI_FUNCTION
+   > NvAPI_D3D12_NotifyOutOfBandCommandQueue(ID3D12CommandQueue*, NV_OUT_OF_BAND_CQ_TYPE)` —
+   > and it is **not a stub**: it forwards to vkd3d-proton's own
+   > `device->NotifyOutOfBandCommandQueue(...)` through the vendor interface declared in
+   > `src/interfaces/vkd3d-proton_interfaces.h`, with distinct handling for
+   > `OUT_OF_BAND_IGNORE` and `OUT_OF_BAND_RENDER_PRESENT`. **HARD**, read from
+   > `jp7677/dxvk-nvapi` @ `master`.
+   >
+   > `NV_OUT_OF_BAND_CQ_TYPE_OUT_OF_BAND_PRESENT` is the value that matches our generated-frame
+   > present. Still **UNCONFIRMED** what vkd3d-proton does with it at the driver level, and still
+   > not a fix for any observed symptom — but the "we could not use it anyway" objection is now
+   > closed.
 2. **Add a CI/runtime orthonormality check on `core::fg::camera_basis()` against a real captured
    `TranslatedWorldToView`**, not just synthetic matrices. Cheap; protects NVIDIA's own ASCD
    safety net, whose loss would be **silent**. Unchanged from the first pass and still right —
