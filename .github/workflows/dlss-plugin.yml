@@ -34,6 +34,7 @@ name: StrayDLSS plugin
 on:
   push:
     branches: [ main, dlss-ue4ss, dlss-fg ]
+    tags: [ 'v*' ]
     paths:
       - 'mods/StrayDLSS/**'
       - 'third_party/**'
@@ -504,3 +505,44 @@ jobs:
           name: stray-dlss-plugin
           path: dist/
           if-no-files-found: error
+
+  # THE PLUGIN HALF OF THE RELEASE, AND THE ONE THAT MATTERS. Until 2026-09-03 the only
+  # released artefact came from ci.yml and was the ReShade ADD-ON - a second host that is still
+  # built and tested but is not how the project runs and not what the documentation describes,
+  # so every download was a build nobody was running. An artifact does not cross workflows, so
+  # the release for each host has to be published by the workflow that built it.
+  #
+  # Both jobs attach to the SAME tag release and therefore share ONE notes file:
+  # softprops/action-gh-release resolves the body as `workflowBody || existingReleaseBody`, so
+  # two different bodies would race and the release would describe whichever host finished last.
+  #
+  # The tag trigger on this workflow is what gets us here. `paths:` above does NOT suppress it:
+  # GitHub evaluates path filters for branch pushes and pull requests only, never for a tag
+  # push, so a `v*` tag runs this whole workflow - the expensive MSVC job included - regardless
+  # of what the tag's commit touched. That is the intent (a release must build), and it does not
+  # change when the job runs for ordinary branch or PR pushes. SOFT: this is GitHub's actual
+  # behaviour by consistent report rather than by an explicit sentence in their docs, and the
+  # first real tag is what confirms it. If a tag ever produces no plugin asset, this is the
+  # first thing to check.
+  release:
+    name: Release (UE4SS plugin)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: plugin
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4 # for .github/RELEASE_NOTES.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stray-dlss-plugin
+          path: dist
+
+      - name: Package
+        run: cd dist && zip -r ../stray-dlss-plugin-${{ github.ref_name }}.zip .
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: stray-dlss-plugin-*.zip
+          body_path: .github/RELEASE_NOTES.md

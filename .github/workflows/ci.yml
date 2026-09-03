@@ -236,46 +236,31 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # THE ADD-ON HALF OF THE RELEASE. The plugin half lives in dlss-plugin.yml, because an
+  # artifact does not cross workflows and each host can only be published by the workflow that
+  # built it. Both jobs attach to the SAME tag release, so both must take their notes from the
+  # one file below: softprops/action-gh-release resolves the body as
+  # `workflowBody || existingReleaseBody`, so two jobs with two different bodies would race and
+  # the release would end up describing whichever host happened to finish last.
   release:
-    name: Release
+    name: Release (ReShade add-on)
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: build-windows
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4 # for .github/RELEASE_NOTES.md
+
       - uses: actions/download-artifact@v4
         with:
           name: stray-dlss-addon-ngx-ON
-          path: dist
+          path: dist-addon
 
       - name: Package
-        run: cd dist && zip -r ../stray-dlss-${{ github.ref_name }}.zip .
+        run: cd dist-addon && zip -r ../stray-dlss-reshade-addon-${{ github.ref_name }}.zip .
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: stray-dlss-*.zip
-          body: |
-            ## Requirements
-
-            - **ReShade 6.8.0 or newer, with add-on support.** Earlier versions crash with
-              D3D12 DLSS under vkd3d-proton; the fix landed in 6.8.0.
-            - An NVIDIA RTX GPU and a driver providing `nvngx.dll` / `_nvngx.dll` to the
-              Proton prefix.
-            - `nvngx_dlss.dll` beside the game executable. It is not redistributed here —
-              take it from https://github.com/NVIDIA/DLSS (`lib/Windows_x86_64/rel/`).
-
-            ## Install
-
-            Extract into
-            `<SteamLibrary>/steamapps/common/Stray/Hk_project/Binaries/Win64/`.
-            On Linux also install `msvcrt40` and `vcrun2022` into the prefix with
-            protontricks.
-
-            ## Reporting a problem
-
-            Attach `stray-dlss.log` and `ReShade.log` from the game directory. Launch with:
-
-            ```
-            DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%
-            ```
+          files: stray-dlss-reshade-addon-*.zip
+          body_path: .github/RELEASE_NOTES.md
