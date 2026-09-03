@@ -50,14 +50,17 @@
 > survives, but only on the narrower claim that ours is correct *for the user's configuration*
 > and that its defects are in code we can reach.
 >
-> **§7.2c settles the platform question at HARD.** Streamline's pacer drives itself from
-> `NvAPI_SetFlipConfig` (private), `GetFrameStatistics`, `WaitForVBlank` and Independent Flip —
-> DXGI presentation timing and a DWM-bypass mode, none of which gamescope provides. And DLSS-FG
-> has **two fail-closed gates with no override**: Hardware-accelerated GPU Scheduling, read
-> through **WDDM kernel thunks** that do not exist on Linux, and **Authenticode dual-signature
-> verification** of every plugin. So the honest expectation is that Streamline reports
-> *unavailable* here — a better reason than the one this project was citing, and reached by
-> reading its source rather than by mis-attributing a crash.
+> **§7.2c locates Streamline's platform gates; §7.2d corrects what they mean.** The pacer really
+> is built on `NvAPI_SetFlipConfig`, `GetFrameStatistics`, `WaitForVBlank` and Independent Flip.
+> But **§7.2c's prediction that Streamline would refuse to run here was WRONG**: Proton
+> implements HWS via an NVIDIA-authored spoof, NVIDIA's maintainer states *"Currently Proton is
+> supported"*, and DLSS-G runs under Proton in the wild. The verdict survives on **measured**
+> grounds instead — DXVK's presentation-timing APIs are approximate, and
+> **[vkd3d-proton#2325], "DLSS FG causes stuttering and breaks VRR", has been open since
+> 2025-02-01** in exactly the 165 Hz VRR + gamescope configuration the user runs.
+> **§7.2d also retires the OptiScaler mystery**: "DLSSG as FG Output" is documented **unsupported
+> by OptiScaler's own maintainers**, which is a third and more parsimonious explanation of the
+> six-launch death than either ReShade or the fullscreen transition.
 
 We deliberately do not use Streamline. `src/ngx_fg.cpp` drives NGX feature 11
 (`NVSDK_NGX_Feature_FrameGeneration`) directly through the NGX core; `src/backend_native/present_owner.*`
@@ -841,7 +844,12 @@ swapchain, three back buffers, no device resets. That is exactly the configurati
 runs, which is why it has never bitten. It is not a general implementation and should not be
 described as one.
 
-### 7.2c RESOLVED 2026-09-03 — the platform gates, located in Streamline's own source
+### 7.2c PARTLY SUPERSEDED — the platform gates, located in Streamline's own source
+
+> **Read §7.2d immediately after this section.** The source reading below is accurate and worth
+> keeping; **its headline conclusion — that HWS is the likeliest blocker — is WRONG**, because
+> Proton implements HWS. The section is preserved because locating the gates is useful and
+> because the error is instructive.
 
 §7.2 offered two possibilities for the pacer and §7.6 left HWS as **UNCONFIRMED**. Both are now
 answered from `NVIDIA-RTX/Streamline` @ **v2.12.0** (`e8aaa6eaac`), plus string/import analysis of
@@ -943,6 +951,111 @@ the **global** timer resolution to 0.5 ms via `NtSetTimerResolution`
 (`slPreferredTimerRes = 5000UL`), which is a system-wide side effect worth knowing about under
 Wine.
 
+
+### 7.2d CORRECTION 2026-09-03, hours later — §7.2c's headline prediction is WRONG
+
+**§7.2c predicted that Streamline would most likely refuse to run here on the HWS gate. That
+prediction does not survive the ecosystem evidence, and it should not have been made with the
+confidence it was.** The source reading behind it is accurate — the gate exists, it is a WDDM
+kernel-thunk query, it fails closed, no flag bypasses it. What was wrong was the unstated
+assumption that **Wine does not implement those thunks.** It does.
+
+**Wine/Proton implements Hardware-accelerated GPU Scheduling. HARD.**
+
+* Proton exposes it as a compat option, `nohardwarescheduling`, and as
+  `WINE_DISABLE_HARDWARE_SCHEDULING=1` — i.e. HWS is **on by default** and there is a switch to
+  turn it *off*.
+* The Wine HWS patch was authored by **Liam Middlebrook of NVIDIA**, the same engineer behind
+  vkd3d-proton's `DXVKInteropDevice1` and its `VK_NV_optical_flow` queue — both commits dated
+  2024-06-23, the latter's message reading *"Needed for implementation of nvofapi64 DLL D3D12
+  functionality in dxvk-nvapi."*
+* dxvk-nvapi **v0.8.0**'s release notes state the chain outright: the `nvofapi64` pass-through
+  for *"DLSS3 / Frame Generation"* **"requires VKD3D-Proton 2.14 and a Wine implementation with
+  support for hardware scheduling (HAGS)."**
+* It shipped in **Proton 9.0-4, 2024-12-11**.
+* **Important qualifier:** the HWS implementation is a spoof that lives **only in Proton's Wine
+  fork** — upstream Wine does not implement it, and there is no spoofing anywhere in
+  vkd3d-proton, DXVK or dxvk-nvapi. Our target runs GE-Proton, which is Proton-derived, so it
+  should carry it; that is **UNCONFIRMED** for this specific build and is one thing the §7.6 run
+  would establish for free.
+
+**So the enabling stack for Streamline DLSS-G under Proton was built deliberately, largely by
+NVIDIA, and our own Proton 11.0-2 / vkd3d-proton master / dxvk-nvapi 0.9.2 is exactly the
+supported configuration.**
+
+**And NVIDIA says so.** On the official repo, [NVIDIA-RTX/Streamline#105 "Linux support"], the
+maintainer `jake-nv` wrote on 2026-04-09: **"Currently Proton is supported."** **SOFT** — a
+maintainer comment on an issue, not documentation — but it reverses NVIDIA's earlier posture and
+is corroborated by the code above.
+
+**Two more §7.2c claims that need softening:**
+
+* **`NvAPI_SetFlipConfig` is not simply absent.** dxvk-nvapi **v0.9.2** — our exact version —
+  ships a `SET_FLIP_CONFIG_V2` implementation, its release note reading: *"Implement several
+  NVAPI entrypoints needed for **limited/incomplete support for Dynamic Multi Frame
+  Generation.** This requires updated DLSS snippets and Streamline."* **HARD.** What
+  "limited/incomplete" excludes is not enumerated anywhere, so the pacer's inputs are **partial,
+  not missing** — a materially weaker claim than §7.2c made.
+  **But partial is the operative word, and it still favours §7.2's conclusion.** DXVK provides
+  the `IDXGISwapChain4` façade and vkd3d-proton the presenter backend, so every interface
+  Streamline hooks exists — yet **`GetFrameStatistics` and `WaitForVBlank` are approximate and
+  log warnings**, and on the kernel-thunk side `D3DKMTWaitForVerticalBlankEvent`,
+  `GetPresentHistory`, `Present` and `GetDeviceState` are **absent from `gdi32`'s export table
+  entirely** (`GetProcAddress` returns NULL), with `QueryStatistics` a stub returning
+  `STATUS_SUCCESS` and writing nothing. **HARD.** So a pacer built on presentation timing runs
+  here on approximations — which is exactly the shape of the open VRR/stutter bug below.
+* **Authenticode verification evidently passes**, since Streamline DLSS-G demonstrably runs
+  under Proton in the wild (below). §7.2c was right that it is a fail-closed gate and wrong to
+  imply it is an obstacle.
+
+**The strongest correction of all: the OptiScaler dead end was neither ReShade nor Streamline.**
+OptiScaler's own wiki lists **"DLSSG as FG Output"** among options that *"aren't supported and
+may be implemented down the line."* A `framegen/dlssg/DLSSG_Dx12.cpp` exists on master but is not
+a shipped feature. **HARD.** `CLAUDE.md` already recorded that no published build would accept
+`FGOutput=dlssg` and that it *"exists only on master"* — what is new is that it is **unfinished
+upstream, by upstream's own account**, not merely unreleased.
+
+**So the six-launch death now has THREE candidate explanations, not two**: ReShade's ext-vtable
+patch (§7.0), the fullscreen transition (§7.0), and **an OptiScaler code path its own maintainers
+document as unsupported**. The third is the most parsimonious, and it further weakens any claim
+against Streamline itself — which is the direction §7.0 was already pointing, now with a better
+reason.
+
+**What actually works on Linux today, and it is the mirror image of what we tried.** DLSSG via
+**Streamline as FG *input*** with **FSR-FG/XeFG as output** is reported working — OptiScaler
+issue #1100, 2026-08-16, Alan Wake 2 on Arch + GE-Proton 11.5: *"Frame Generation set to 'DLSSG
+via Streamline' — works correctly and stably, including through loading screens and cutscene
+transitions."* The failing arm in that same report was *"DLSSG via NvNGX"* → black-screen hang.
+**SOFT** (a user report), but it is the only positive datapoint anyone has.
+
+#### Does the verdict change? No — and one piece of evidence now supports §7.2 better than my own reasoning did
+
+**Keep ours still stands, but the load-bearing argument shifts from structure to measurement.**
+
+* **§7.2's pacer conclusion survives, on better evidence than the argument I gave it.**
+  [vkd3d-proton#2325], **open since 2025-02-01**: *"DLSS Frame Generation causes stuttering and
+  breaks VRR"* — five titles, RTX 4070 Super; Cyberpunk 2077 retained VRR but showed a double
+  image. And vkd3d-proton `c8c8ab50` (2026-04-09) fixed *"DLSS Frame Generation causing Reflex
+  desync and game freezes"*, where DLSS-G presenting interpolated frames without new latency
+  markers made Streamline conclude `eDLSSGStatusFailReflexNotDetectedAtRuntime` and freeze the
+  game — *"particularly when switching workspaces on Wayland compositors."* **HARD.** We have
+  that fix, but the pattern is the point: **frame pacing for Streamline DLSS-G under
+  Proton/Wayland is a known, open, actively-worked problem in someone else's tree.** Our own
+  pacer, whatever its defects (§7.2b), produces a measured 6.0-6.2 ms cadence on this exact
+  panel today.
+* **The cost/benefit is unchanged.** Everything in §7.3-§7.5 stands: ~3,100 lines and 803 test
+  lines deleted, everything re-measured, gains worth ~zero on a single-viewport UE 4.27 title on
+  Ada.
+
+**But my reasoning was wrong twice in one section, and the pattern is worth naming.** §7.2c
+argued from *structure* — "this is a WDDM concept, Linux has no WDDM, therefore it cannot work" —
+without checking whether the compatibility layer implements it. That is the same error class as
+§7.0's original sin (concluding from a confounded measurement) and as §5.4's flipped feasibility
+claim ("cannot render off-screen from outside" — we already do). **Three times in this document a
+confident structural argument has been overturned by looking at what actually exists.** The rule
+this earns: *when the argument is "platform X cannot do Y", go and check whether someone has
+already made it do Y — especially when the vendor has an incentive to.*
+
 ### 7.3 What replacing it would actually cost
 
 **Deleted or reduced to a shim** (exact line counts, tree at `3224c46`):
@@ -1016,83 +1129,66 @@ schedule and present it differently.
 5. **Independence from Reflex's real behaviour on this stack** (7.1).
 6. **The user's stated constraint** would have to be revisited — which is their call, not ours.
 
-### 7.6 The decisive experiment — still worth running, but expect a different answer
+### 7.6 REDESIGNED 2026-09-03 — the experiments, cheapest first
 
-**One launch settles the question that 7.0 opened**, and the reason it is cheap is that the
-configuration already existed once:
+> **The original §7.6 proposed re-running the OptiScaler + Streamline configuration with
+> `LoadReshade=false`. That experiment is now largely pointless and is withdrawn as the headline
+> recommendation.** §7.2d establishes that OptiScaler's own maintainers document **"DLSSG as FG
+> Output" as unsupported** — so the original six launches were driving an unfinished upstream
+> code path, and re-running it without ReShade would most likely reproduce the death for that
+> reason and teach us nothing about Streamline. The confound the first draft was proud of
+> removing was not the only one, and probably not the important one.
 
-> **Re-run the OptiScaler + Streamline frame-generation configuration with `LoadReshade=false`,
-> under the current UE4SS-loaded plugin, and see whether it passes FG frame ~40.**
+Three experiments, in ascending cost. **Only the first is recommended now.**
 
-The original experiment set `LoadReshade=true` **only because ReShade was how this project
-loaded at the time** (`CLAUDE.md`: *"Install OptiScaler AS `dxgi.dll`, copy ReShade's DLL to
-`ReShade64.dll`, set `LoadReshade=true`"*). That is no longer true — we load through UE4SS, and
-`mods/StrayDLSS/README.md:33` documents Config A (no ReShade) as supported. **So the confound
-can be removed by changing one line of OptiScaler's ini.**
+**A. `NVPRESENT_ENABLE_SMOOTH_MOTION=1` — one environment variable, zero integration.**
+NVIDIA's Linux driver exposes driver-level frame generation that is, in NVIDIA's own words,
+*"transparent to the game engine and gets applied automatically"* (driver installation guide,
+gaming section; driver README). No Streamline, no NGX feature, no swapchain proxy, nothing to
+hook. **SOFT** that it works under gamescope specifically — that is exactly what the run would
+establish.
 
-* **If it survives past frame 40 and into gameplay** → Streamline works on this stack without
-  ReShade, §5.3's hypothesis is confirmed, and the "keep ours" decision rests purely on 7.2 and
-  7.5 rather than on any doubt about viability. It would also mean the ReShade ext-vtable bug is
-  more dangerous than currently documented.
-* **If it dies at the same frame** → the fullscreen-transition confound (7.0) is the live
-  explanation, Streamline's swapchain path really is unusable here, and the question closes for
-  good.
+Worth trying **before** any further Streamline investigation, with two caveats stated up front:
+NVIDIA warns that *"Native DLSS Frame Generation and Smooth Motion are competing technologies
+and should not be used together"*, so it must be tested with our own FG **off**; and if it works
+it is a different product from ours — no guide control, no validation gate, no per-reason
+refusals, and no way to reason about what it does on a camera cut. **It would not replace our
+implementation so much as make the question moot for a user who just wants more frames.** That
+is a legitimate outcome and the user should get to choose it.
 
-Either outcome is worth having, and **the negative result is the more valuable one** because it
-would finally convict or acquit a suspect this project has been quoting a verdict on without a
-trial.
+**B. Streamline as FG *input*, FSR-FG/XeFG as output, through OptiScaler.** This is the mirror
+image of what was tried, and the only configuration with a positive Linux report (§7.2d,
+OptiScaler #1100 — Alan Wake 2, GE-Proton 11.5, *"works correctly and stably"*). It would tell us
+whether Streamline's DLSS-G **input** path functions on this box without requiring its present
+path to work. Moderate cost, genuine information, **but it does not test what §7 is about** —
+it routes around the swapchain question rather than answering it.
 
-**Two knobs to set that the original experiment almost certainly did not**, both first-party
-from `sl_core_types.h:508-542` (**HARD**):
+**C. Native Streamline DLSS-G, via `eUseManualHooking`.** The real test, and now clearly
+possible: the host loads `sl.interposer.dll` explicitly and keeps its own hooks, routing a
+mandatory list (`CreateSwapChain*`, `Present`, `Present1`, `GetBuffer`, `ResizeBuffers`,
+`ResizeBuffers1`, `GetCurrentBackBufferIndex`, `SetFullscreenState`, `CreateCommandQueue`)
+through SL's proxies (`docs/ProgrammingGuideManualHooking.md`, **HARD**). No OptiScaler, no
+`dxgi.dll` substitution. **This is real integration work, not a config flip**, and §7.7 says not
+to do it. Recorded so that if it is ever wanted, the shape is known.
 
-* **`PreferenceFlags::eUseDXGIFactoryProxy`** — *"If specified SL will create DXGI factory proxy
-  rather than modifying the v-table for the base interface. This can help with 3rd party
-  overlays which are NOT integrated with the host application but rather operate via
-  injection."* **Streamline has a flag for exactly our scenario, and the default is the
-  v-table modification** — i.e. the original run had Streamline patching a v-table while
-  ReShade patched another. Worth setting on any retry.
-* **`PreferenceFlags::eBypassOSVersionCheck`** — *"Do not check OS version… VARIOUS WIN APIs
-  INCLUDING BUT NOT LIMITED TO `IsWindowsXXX`, `GetVersionX`, `rtlGetVersion` ARE KNOWN FOR
-  RETURNING INCORRECT RESULTS."* Directly relevant under Wine.
+**If any of these runs, what to look for**, in order — this list is the durable part of the
+original §7.6 and survives its redesign:
 
-**The caveat, now RESOLVED and promoted to a prediction.** §7.2c locates the HWS gate exactly:
-`sl.common` queries it through the **WDDM kernel thunks** `D3DKMTEnumAdapters2` +
-`D3DKMTQueryAdapterInfo(KMTQAITYPE_WDDM_2_7_CAPS)` and reads `HwSchEnabled`; `sl.cpp:792-801`
-then returns `Result::eErrorOSDisabledHWS` when a feature requires it, and **no preference flag
-bypasses it** (`eBypassOSVersionCheck` covers the OS version only). Enumeration failure is
-indistinguishable from HWS being off. **HARD.** Our own direct-NGX path reaches 2.00× without
-HWS, which proves the gate is *not* in the snippet — it is in Streamline.
+| Log line | Means |
+|---|---|
+| `eErrorOSDisabledHWS`, `requires GPU hardware scheduling`, `Adapter enumeration has failed` | The Proton HWS spoof is absent from this GE-Proton build (§7.2d). Structural, nothing to do with our code |
+| `Streamline will not load unsecured modules` | Authenticode verification failed under Wine |
+| `eDLSSGStatusFailReflexNotDetectedAtRuntime` | The Reflex presentID desync class — vkd3d-proton `c8c8ab50` fixed one instance of this; our build has the fix |
+| `eFailGetCurrentBackBufferIndexNotCalled` | The §7.1 back-buffer contract |
+| `eFailHDRFormatNotSupported` | Stray presents `R10G10B10A2`, which should be fine, but SL rejects FP16/scRGB |
 
-**So the most likely outcome of the experiment is now a specific, named refusal that has nothing
-to do with ReShade or fullscreen**, and the run should be read accordingly:
+**Set before any run:** clear the default OTA flags (`eAllowOTA | eLoadDownloadedPlugins`, on by
+default) so nothing tries `wininet` or spawns `nvngx_update.exe`.
 
-* Look first for `eErrorOSDisabledHWS`, `requires GPU hardware scheduling to be enabled in the
-  OS`, or `Adapter enumeration has failed` in `sl.log`. If any appears, **Streamline is
-  unavailable on this platform for a structural reason** and the ReShade question becomes moot
-  — the experiment still succeeded, it just answered a different question.
-* Look also for `Streamline will not load unsecured modules` — SL verifies an **Authenticode
-  dual signature** on every plugin before `LoadLibraryW` (§7.2c), another fail-closed gate that
-  depends on Wine's `wintrust`/`crypt32`.
-* Only if it gets past both is the ReShade-versus-fullscreen question actually under test.
-
-**Clear these before running**, both **HARD** from `sl_core_types.h:569`: OTA is **on by
-default** (`eAllowOTA | eLoadDownloadedPlugins`) and will try `wininet` plus `CreateProcessW` on
-`nvngx_update.exe`.
-
-**And one option the first draft did not know existed: manual hooking.** `eUseManualHooking`
-plus `slGetNativeInterface`/`slUpgradeInterface` is a fully documented integration mode
-(`docs/ProgrammingGuideManualHooking.md`) in which the host loads `sl.interposer.dll`
-**explicitly** and keeps its own hooks, routing a mandatory list through SL's proxies —
-`CreateSwapChain*`, `Present`, `Present1`, `GetBuffer`, `ResizeBuffers`, `ResizeBuffers1`,
-`GetCurrentBackBufferIndex`, `SetFullscreenState`, `CreateCommandQueue`. **HARD.** So Streamline
-does **not** have to be installed as `dxgi.dll` at all, and the experiment does not have to go
-through OptiScaler. That does not change the verdict — the mandatory list still hands SL the
-swapchain, and the pacer still comes with it — but it means "the interposer must own the DLL
-chain" was never true, and a future attempt has a cleaner integration shape available.
-
-**This experiment is not a prerequisite for the verdict below** — it is worth running for the
-knowledge, and because a wrong belief in this project's own documentation is worth correcting
-even when the conclusion survives.
+**And a standing hazard to weigh against all three:** [vkd3d-proton#2325] — *"DLSS Frame
+Generation causes stuttering and breaks VRR"* — has been **open since 2025-02-01** across five
+titles. The user runs a 165 Hz VRR panel through gamescope. Any Streamline-based FG path is
+walking into a known-unfixed bug in precisely our display configuration.
 
 ### 7.7 Verdict: KEEP OURS, and adopt the pieces — but for the right reasons
 
@@ -1119,13 +1215,20 @@ does that we do not.**
    in code we own; here we would be handing pacing to a closed component whose *inputs* are
    missing, with a failure mode that is visible to the user and unfixable by us.
 
-   **1b. And Streamline may simply refuse to run.** Two fail-closed gates with no override
-   (7.2c): **HWS**, read through WDDM kernel thunks that do not exist on Linux, with no bypass
-   flag and enumeration-failure indistinguishable from "disabled"; and **Authenticode
-   dual-signature verification** of every plugin before load. Either returns *unavailable*
-   rather than degrading. **This is now the most likely outcome of the 7.6 experiment** — and
-   note it is a *stronger* reason than the one this project was wrongly citing, arrived at by
-   reading rather than by mis-attributing a crash.
+   **1b. RETRACTED — see §7.2d.** This slot previously read *"Streamline may simply refuse to
+   run"* on the HWS and Authenticode gates. **Proton implements HWS** (an NVIDIA-authored spoof,
+   shipped since Proton 9.0-4), NVIDIA's own maintainer states *"Currently Proton is
+   supported"*, and Streamline DLSS-G demonstrably runs under Proton in the wild. **That
+   argument is withdrawn.**
+
+   **What replaces it is better, because it is measured rather than deduced.**
+   [vkd3d-proton#2325], *"DLSS Frame Generation causes stuttering and breaks VRR"*, has been
+   **open since 2025-02-01** across five titles — and the user runs a 165 Hz VRR panel through
+   gamescope. Meanwhile DXVK's `GetFrameStatistics` and `WaitForVBlank` are **approximate and
+   log warnings**, and `D3DKMTWaitForVerticalBlankEvent` / `GetPresentHistory` / `GetDeviceState`
+   are absent from `gdi32` entirely. So Streamline's pacer would run on approximations, into a
+   known-unfixed bug, in exactly our display configuration — while ours produces a measured
+   6.0-6.2 ms cadence on that panel today.
 2. **We would be replacing a measured system with an unmeasured one**, and the measured one
    already hits the theoretical maximum (2.00× steady state; the 1.91× headline is startup and
    reload frames that are legitimately not generatable).
@@ -1213,26 +1316,22 @@ looked at your own code is not an argument.
    `eOnlyValidNow` (the stricter mode) with a TODO noting `eValidUntilPresent` would be more
    efficient. We chose the same trade-off independently, for a reason the guide states. §1, §2.
 
-### Run this — it is one launch and it settles a standing question
+### Try this first — one environment variable
 
-0. **Re-run the OptiScaler + Streamline FG configuration with `LoadReshade=false`.** The
-   original six-launch experiment set it to `true` only because ReShade was then our loader;
-   we now load through UE4SS and Config A (no ReShade) is supported. **One ini line removes the
-   confound.** Set `PreferenceFlags::eUseDXGIFactoryProxy` (Streamline's own flag for
-   injection-based third parties — the default is v-table modification) and
-   `eBypassOSVersionCheck` while you are there; both are **HARD** from `sl_core_types.h:508-542`.
-   Either outcome is worth having: it convicts or acquits a suspect this project has been
-   quoting a verdict on without a trial. **It does not change the §7.7 verdict either way** —
-   it changes what we are allowed to say. §7.6.
-   **Revised expectation (§7.2c):** the likeliest outcome is now that Streamline reports
-   *unavailable* before frame generation is ever reached, on the **HWS** gate (WDDM kernel
-   thunks, no bypass flag) or on **Authenticode plugin-signature verification** — both
-   fail-closed. Read `sl.log` for `eErrorOSDisabledHWS`, `requires GPU hardware scheduling`,
-   `Adapter enumeration has failed`, or `Streamline will not load unsecured modules` **before**
-   concluding anything about ReShade or the fullscreen transition. Clear the default OTA flags
-   (`eAllowOTA | eLoadDownloadedPlugins`) first. Note also that `sl.interposer.dll` need not be
-   installed as `dxgi.dll` at all — `eUseManualHooking` is a documented mode — so OptiScaler is
-   a convenience here, not a requirement.
+0. **`NVPRESENT_ENABLE_SMOOTH_MOTION=1`, with our own FG off.** NVIDIA's Linux driver does
+   frame generation at the driver level, *"transparent to the game engine"*, with no Streamline,
+   no NGX feature, no swapchain proxy and nothing to hook. **SOFT** that it works under
+   gamescope — that is what the run establishes. If it works it does not replace our
+   implementation (no guide control, no validation gate, no per-reason refusals) but it **may
+   moot the whole question for a user who simply wants more frames**, and they should get to
+   choose that. NVIDIA warns it must not be combined with native DLSS-FG. §7.6-A.
+
+   > **This replaces the previous item 0**, which proposed re-running OptiScaler with
+   > `LoadReshade=false`. **Withdrawn**: §7.2d found OptiScaler documents *"DLSSG as FG Output"*
+   > as **unsupported by its own maintainers**, so those six launches were driving an unfinished
+   > upstream path and re-running them would most likely reproduce the death for that reason and
+   > teach us nothing about Streamline. The confound the first draft removed was real but was
+   > probably not the important one.
 
 ### Fix these regardless of the Streamline question — found while writing §7.2b
 
