@@ -608,8 +608,10 @@ Config and saves live in the **Proton prefix**:
 > gates.** Levels 0-2 keep the heuristic in charge; a level-3 session with no live seam runs the
 > heuristic only if `EngineSeamFallback=1` and says so at ERROR level. The whole verdict is
 > readable from the main menu — the seam fires on frame 0 — and the periodic `[seam]` line's
-> `unclaimed` must stay 0 (`lookalikesRefused` is expected to grow: that is the two passes above
-> being told no, every frame). Nothing below is deleted yet; under level 3 it is bypassed.
+> `unclaimed` must stay 0 (`preSkipped` is expected to grow: that is the two passes above being
+> turned away every frame — since 2026-09-04 BEFORE the descriptor resolve, by the ledger's own
+> group counts (`seam::pre_gate_decide`), so `lookalikesRefused` now counts only the ones that
+> got as far as a claim). Nothing below is deleted yet; under level 3 it is bypassed.
 >
 > **AND LEVEL 3 EXPOSED THE OTHER HALF (2026-09-03, facts §36.6-36.8).** Identity was solved and
 > the frames still flipped: `unclaimed` ~ NR `guides-stale` ~ NR `frame-gap` resets at every
