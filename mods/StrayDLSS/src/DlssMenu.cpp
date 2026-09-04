@@ -100,6 +100,20 @@ struct Args
 		return false;
 	}
 
+	bool set_u8(const wchar_t *name, std::uint8_t value)
+	{
+		for (FProperty *p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None))
+		{
+			if (p == nullptr || !p->HasAnyPropertyFlags(CPF_Parm))
+				continue;
+			if (p->GetName() != name)
+				continue;
+			std::memcpy(buf.data() + p->GetOffset_Internal(), &value, sizeof(value));
+			return true;
+		}
+		return false;
+	}
+
 	void *ret_ptr() const
 	{
 		for (FProperty *p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None))
@@ -139,6 +153,24 @@ void Root(UObject *o)
 			static_cast<void *>(o));
 }
 
+// UWidgetBlueprintLibrary::Create resolves its world through GetWorldFromContextObject, so a
+// null context returns null before any widget exists (measured 2026-09-04: "Create returned
+// null"). The Lua version passed the player's world; a live PlayerController is the standard
+// world-context object and there is one from the main menu onward. Skip the CDO - FindAllOf
+// returns it too and it has no world.
+UObject *world_context()
+{
+	std::vector<UObject *> pcs;
+	UObjectGlobals::FindAllOf(STR("PlayerController"), pcs);
+	for (UObject *o : pcs)
+		if (o != nullptr && !o->HasAnyFlags(RF_ClassDefaultObject))
+			return o;
+	UObject *gi = UObjectGlobals::FindFirstOf(STR("GameInstance"));
+	if (gi != nullptr && !gi->HasAnyFlags(RF_ClassDefaultObject))
+		return gi;
+	return nullptr;
+}
+
 void console(const std::wstring &cmd)
 {
 	UFunction *fn = find_fn(STR("/Script/Engine.KismetSystemLibrary:ExecuteConsoleCommand"));
@@ -150,7 +182,7 @@ void console(const std::wstring &cmd)
 		return;
 	}
 	Args a(fn);
-	a.set_ptr(STR("WorldContextObject"), nullptr);
+	a.set_ptr(STR("WorldContextObject"), world_context());
 	// Command is an FString; write it as a struct-sized copy is unsafe, so use the property.
 	for (FProperty *p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None))
 	{
@@ -181,6 +213,16 @@ void set_text()
 {
 	if (g_widget == nullptr)
 		return;
+	// BP_HKTextBlock_C is a UserWidget wrapping one UTextBlock in a member named Text. From Lua
+	// it was row.Text:SetText(); assigning row.Text directly wrote an FText struct over the
+	// widget pointer, which is the same mistake this offset-based path cannot make.
+	UObject **inner = g_widget->GetValuePtrByPropertyName<UObject *>(STR("Text"));
+	if (inner == nullptr || *inner == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: BP_HKTextBlock_C has no Text member (ptr=%p)",
+			static_cast<void *>(inner));
+		return;
+	}
 	UFunction *fn = find_fn(STR("/Script/UMG.TextBlock:SetText"));
 	if (fn == nullptr)
 		return;
@@ -193,7 +235,7 @@ void set_text()
 			*dst = FText(menu_text().c_str());
 		}
 	}
-	g_widget->ProcessEvent(fn, a.buf.data());
+	(*inner)->ProcessEvent(fn, a.buf.data());
 }
 
 } // namespace
@@ -230,32 +272,41 @@ void OnToggle()
 	if (g_widget == nullptr)
 	{
 		// One widget, not a hierarchy: the fewer objects we own, the fewer there are to be
-		// collected. A TextBlock is multi-line, so the whole menu fits in one.
-		UClass *cls = UObjectGlobals::StaticFindObject<UClass *>(
-			nullptr, nullptr, STR("/Script/UMG.TextBlock"));
+		// collected. It must be a UUserWidget child - UE 4.27 UserWidget.cpp:2021 refuses any
+		// other class ("CreateWidget can only be used on UUserWidget children") and the first
+		// build asked for a plain TextBlock and got null. BP_HKTextBlock_C is the game's own
+		// text row: a UserWidget wrapping one TextBlock, in the game's font.
+		const wchar_t *kClass = STR("/Game/GUI/Widgets/BP_HKTextBlock.BP_HKTextBlock_C");
+		UClass *cls = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr, kClass);
 		UFunction *create = find_fn(STR("/Script/UMG.WidgetBlueprintLibrary:Create"));
 		UObject *cdo = UObjectGlobals::StaticFindObject<UObject *>(
 			nullptr, nullptr, STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
-		if (cls == nullptr || create == nullptr || cdo == nullptr)
+		UObject *ctx = world_context();
+		if (cls == nullptr || create == nullptr || cdo == nullptr || ctx == nullptr)
 		{
-			STRAY_LOG_ERROR("dlss-menu: TextBlock class or Create not resident; menu off for "
-				"this session.");
+			STRAY_LOG_ERROR("dlss-menu: cannot create: class=%p create=%p cdo=%p world=%p "
+				"(class is %S); menu off for this session.",
+				static_cast<void *>(cls), static_cast<void *>(create), static_cast<void *>(cdo),
+				static_cast<void *>(ctx), kClass);
 			g_failed = true;
 			return;
 		}
 		Args a(create);
+		a.set_ptr(STR("WorldContextObject"), ctx);
 		a.set_ptr(STR("WidgetType"), cls);
+		a.set_ptr(STR("OwningPlayer"), nullptr);
 		cdo->ProcessEvent(create, a.buf.data());
 		g_widget = static_cast<UObject *>(a.ret_ptr());
 		if (g_widget == nullptr)
 		{
-			STRAY_LOG_ERROR("dlss-menu: Create returned null; menu off for this session.");
+			STRAY_LOG_ERROR("dlss-menu: Create returned null (world ctx %S); menu off for this "
+				"session.", ctx->GetFullName().c_str());
 			g_failed = true;
 			return;
 		}
 		Root(g_widget);   // before anything can tick
-		STRAY_LOG_WARN("dlss-menu: widget created at %p, rootSet=%d",
-			static_cast<void *>(g_widget), g_widget->IsRootSet() ? 1 : 0);
+		STRAY_LOG_WARN("dlss-menu: widget created: %S rootSet=%d",
+			g_widget->GetFullName().c_str(), g_widget->IsRootSet() ? 1 : 0);
 	}
 
 	UFunction *add = find_fn(STR("/Script/UMG.UserWidget:AddToViewport"));
@@ -264,6 +315,13 @@ void OnToggle()
 		Args a(add);
 		a.set_i32(STR("ZOrder"), 1000);
 		g_widget->ProcessEvent(add, a.buf.data());
+	}
+	UFunction *vis = find_fn(STR("/Script/UMG.Widget:SetVisibility"));
+	if (vis != nullptr)
+	{
+		Args a(vis);
+		a.set_u8(STR("InVisibility"), 0);   // ESlateVisibility::Visible
+		g_widget->ProcessEvent(vis, a.buf.data());
 	}
 	set_text();
 	g_open = true;
