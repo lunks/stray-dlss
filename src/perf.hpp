@@ -67,7 +67,18 @@ enum Bucket
 	kShadowCopy,       // CopyDescriptors(Simple) hooks: shadow::note_copy per descriptor
 	kHeapBind,         // SetDescriptorHeaps hook: root::on_set_heaps + shadow::note_heap_bound (GetDesc)
 	kRootBind,         // SetComputeRoot* / SetPipelineState / Reset hooks: the root shadow (one global mutex)
-	kResolve,          // NativeBackend::resolve_compute_bindings (the per-dispatch table walk)
+	kResolve,          // NativeBackend::resolve_compute_bindings (the per-dispatch table walk); CONTAINS the four below
+	// THE RESOLVE'S OWN PARTS. `resolve` was the one native-hook bucket with a candidate fix
+	// attached before it had an attribution: the root-signature layout is deep-copied under a
+	// mutex and every bound table is re-walked on every call, for a layout that cannot change
+	// for an immutable ID3D12RootSignature* (docs/RESEARCH-RESHADE-SHAPE-SWEEP.md 13). Whether
+	// that is where the time goes - or whether it is the per-slot registry lookups, or the
+	// snapshot copy - is what these say. Nested inside kResolve; the report prints them as its
+	// breakdown and does not add them to the hooks total.
+	kResolveState,     // root::snapshot (the ListState copy) + hooks::layout_for (the RootLayout deep copy)
+	kResolveWalk,      // core::walk_table per bound table + finding the heap the table lives in (GetDesc)
+	kResolveSlots,     // per slot: shadow::gpu_to_cpu + shadow::lookup (registry describe/generation, mutexed)
+	kResolveRootCbv,   // per root CBV: registry::buffer_for_va (mutexed)
 	kBucketCount,
 };
 
@@ -86,6 +97,8 @@ enum Counter
 	kCntHeapBinds,     // SetDescriptorHeaps calls
 	kCntRootBinds,     // SetComputeRoot* + SetPipelineState + Reset hook bodies
 	kCntResolves,      // resolve_compute_bindings calls
+	kCntResolveTables, // bound table parameters walked by those calls
+	kCntResolveSlots,  // descriptor slots looked up by those calls (the "~70-110 a frame" that was arithmetic)
 	kCounterCount,
 };
 void count(Counter c, std::uint64_t n = 1);
