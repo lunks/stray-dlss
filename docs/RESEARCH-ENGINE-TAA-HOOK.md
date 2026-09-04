@@ -2116,3 +2116,293 @@ and on a fresh feature, consumed by the next evaluate, and counted as `forcedRes
 | The stale rows below the rect reach no display | **[derived]** from every downstream pass using the view rect |
 | The bottom-edge convergence cost | **[derived], not seen.** This is what the user's eyes settle |
 | All 22 measured slide rects pass the gate | **HARD in CI** |
+
+---
+
+## 20. The render-target pool names every G-buffer, and the name is a live argument (2026-09-04)
+
+**The brief:** `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5, rank 5. Ray Reconstruction has been
+dark since §13 deleted the ~3 970-line heuristic G-buffer finder, and the replan's whole point is
+that the replacement must not be another shape classifier. It is not. **UE 4.27 hands every
+pooled render target's debug name to `FRenderTargetPool::FindFreeElement` as a live
+`const TCHAR*` argument, and uses it unconditionally in a Shipping build.**
+
+Built as `[STRAYDLSS] PoolNames`: `src/core/pool_locator.{hpp,cpp}` (pure, CI-tested),
+`src/pool_name_hook.{hpp,cpp}` (live), `tests/test_pool_locator.cpp`. **Nothing here has run
+against the game.**
+
+### 20.1 What was wrong with our own refusal, and it is one sentence
+
+`docs/RESEARCH-U0-IDENTITY.md` §4.1 refused this route because *"no D3D12 object carries an
+engine name"* in Shipping — `RHIBindDebugLabelName` is inside `#if !(UE_BUILD_SHIPPING ||
+UE_BUILD_TEST)` and `NAME_OBJECTS` is 0. **Both quotes are correct and neither is the question.**
+
+```cpp
+// RenderTargetPool.h:268-274 @ 4.27/306a7e9
+bool FindFreeElement(FRHICommandList& RHICmdList, const FPooledRenderTargetDesc& Desc,
+                     TRefCountPtr<IPooledRenderTarget>& Out, const TCHAR* InDebugName,
+                     ERenderTargetTransience TransienceHint = ERenderTargetTransience::Transient,
+                     bool bDeferTextureAllocation = false);
+
+// RenderTargetPool.cpp:415 @ 4.27/306a7e9 — OUTSIDE any #if
+CreateInfo.DebugName = InDebugName;
+```
+
+**HARD.** We asked what is *stored*; the answer is in what is *passed*. `praydog/UEVR` reads it
+exactly this way in production across hundreds of shipping UE titles
+(`src/mods/vr/RenderTargetPoolHook.cpp`), which is the field confirmation that this is a
+mechanism rather than an idea. §4.1 and §4.2 are corrected in place.
+
+### 20.2 The locator: anchor on the CALLERS, not on the function
+
+§4.2's other refusal was *"no self-validating constant, no shipping-surviving string anchor"* —
+looking for a literal **inside** `FindFreeElementForRDG`. UEVR does not look inside. It scans for
+a caller's argument literal (`L"SceneDepthZ"`), resolves the displacement reference that loads it,
+and decodes forward to the first `CALL`.
+
+4.27's `SceneRenderTargets.cpp` alone has **25 such call sites**, each with a distinct literal,
+spread over **six distinct enclosing functions** (**HARD**, read from the file):
+
+| Enclosing function | Literals it passes | Line |
+|---|---|---|
+| `AllocGBufferTargets` | `GBufferA`…`GBufferE`, `SceneDepthAux`, `GBufferVelocity` | 1125-1172 |
+| `AllocateCommonDepthTargets` | `SceneDepthZ` — UEVR's own anchor | 1543 |
+| `AllocateDeferredShadingPathRenderTargets` | `SmallDepthZ`, `ScreenSpaceAO`, `DirectionalOcclusion`, `LightAccumulation`, `GBufferVelocity` | 1601-1722 |
+| `AllocateReflectionTargets` | `ReflectionColorScratchCubemap0/1`, `DiffuseIrradianceScratchCubemap0/1`, `SkySHIrradianceMap` | 1444-1459 |
+| `AllocateDebugViewModeTargets` | `QuadOverdrawBuffer` | 1496 |
+| `AllocateAnisotropyTarget` | `GBufferF` | 1741 |
+
+`SceneColorDeferred` is **not** an anchor: `AllocSceneColor` passes
+`GetSceneColorTargetName(CurrentShadingPath)`, which RETURNS the literal out of a table
+(`:315-324`), so the only reference to it lives inside that accessor. It is still recorded at the
+hook; it just cannot help find the function.
+
+**We do not decode instructions, and the reason is the honest one: a partial x86-64 length
+decoder that lands mid-instruction would produce a plausible wrong answer.** Instead every
+`E8 rel32` in a bounded window after each name `lea` is a candidate, and three filters do the
+work a decoder would have done less safely:
+
+1. **The target must be a `RUNTIME_FUNCTION::BeginAddress`** in the exe's own `.pdata` — the
+   table `u0::function_start` already reads for the RHI-context seed
+   (`RESEARCH-U0-IDENTITY.md` §10.4). A stray `0xE8` inside another instruction's operand yields
+   an effectively random target, and a random address landing exactly on a function start is a
+   ~1e-5 event; a real call target is one by construction.
+2. **Ranking is on DISTINCT ENCLOSING FUNCTIONS**, derived from the same `.pdata` rather than
+   from our source reading. That is what refuses the obvious false positive: `AllocGBufferTargets`
+   alone holds seven name literals, so anything it calls is reached by seven names and only ever
+   one group. Pinned by a test.
+3. **The bar is ≥ 3 groups and ≥ 4 names, the runner-up must be beaten OUTRIGHT on groups, and a
+   tie is `ambiguous` — a refusal, never a pick** (unless the internal-call fact below settles
+   it). This is the equivalent of the seam's three
+   constants (§4.1): a candidate must be reached from several independent places in the engine's
+   own code before anything is installed.
+
+A fourth check runs when the image allows it, and it is also the **only** thing permitted to
+break a tie. `FindFreeElement`'s last act is `FindFreeElementInternal`
+(`RenderTargetPool.cpp:703`), and that function contains the `UE_LOG` format string
+`%d MB, NewRT %s %s` (`:403`). When that literal survives, the internal is nameable from its own
+xref, and **when the two front-runners are TIED on groups and exactly one of them calls it, that
+one is the function** (`resolved_by_internal`, reported on the scan line). That is a fact from the
+engine's source, not a preference — with no internal, or with both calling it, or with neither,
+the ranking stands and a tie is still refused. **It is deliberately not allowed to overrule a
+candidate the ranking already separated**: that would let one mis-attributed `internal_fn` promote
+a one-group candidate over a six-group one, a bigger hole than the tie it closes. Where the
+ranking decided, the internal call is REPORTED and nothing more — and it reading "does NOT call
+it" against a clear winner is exactly the sort of thing a human should see rather than a rule
+should act on. It matters because the realistic
+ambiguity in this binary is not a random address: it is some *other* helper genuinely called
+from four of the six allocators, and no amount of proximity heuristics would separate that
+honestly. **The scan searches for the literal and reports either way**,
+which SETTLES the residual `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.5 flags rather than
+assuming it — its presence means `USE_LOGGING_IN_SHIPPING`, names the internal outright, and gives
+a fourth independent confirmation of the winner (our target must call it); its absence closes that
+route and costs this one nothing, because **every RR guide goes through the OUTER
+`FindFreeElement`, not through `FindFreeElementForRDG`.** That was going to be a grep of the exe
+on the box; it is now a log line.
+
+### 20.3 The name → resource mapping, and how a wrong one is refused
+
+At the hook, after forwarding:
+
+```
+Out (TRefCountPtr<IPooledRenderTarget>&)
+  -> *(IPooledRenderTarget**)Out
+  -> +8  RenderTargetItem.TargetableTexture       (FRHITexture*)
+  -> +16 RenderTargetItem.ShaderResourceTexture
+  -> vtable slot 7, FRHITexture::GetNativeResource -> ID3D12Resource*
+```
+
+`IPooledRenderTarget` has one vptr — a virtual destructor plus eight virtuals, no virtual bases —
+and exactly one data member, `FSceneRenderTargetItem RenderTargetItem`, whose first two members
+are `FTextureRHIRef TargetableTexture` and `ShaderResourceTexture` (`RendererInterface.h:428-465`,
+`:477-525`). **HARD from the header**, and corroborated in the field by UEVR's own field-tested
+`IPooledRenderTarget` layout. Slot 7 is HARD on this exe already: it is what L1 calls for depth
+and velocity every frame (§14.1 — this IS `GetNativeResource`, spelled as an index, because the
+accessor is a virtual we cannot name).
+
+**Forwarding FIRST is not a detail.** `FindFreeElement` has a keep-current early return
+(`:660-672`) that never reaches the internal and leaves `Out` already holding the element, and an
+allocate path that assigns `Out` at `:719`. Reading after the call is the only thing that works on
+both — and the early return is the steady state, which is why the map refreshes every frame the
+target is re-requested rather than going stale.
+
+**Refusals, every one named and counted** (`pool::RecordStatus`): the argument did not read as a
+wide string at all (`name-unreadable` — this is the runtime validator that a hook on the wrong
+function fails); a plausible name we have no `Target` for (`unknown-name`, census only); `Out`
+null (`out-null` — expected for `SceneDepthZ`, which is asked for with
+`bDeferTextureAllocation`); the chain unreadable; the `GetNativeResource` slot not in code; and
+the one that matters — **`not-registered`: the resolved `ID3D12Resource*` is not one our own
+registry calls live.** A wrong offset yields that, never a plausible lie.
+
+**One expected transient, so it is not read as a fault:** a target the engine allocated before our
+D3D12 creation hooks were armed is unknown to the registry, so its first records read
+`not-registered`. It self-heals — the keep-current path re-requests the same name every frame, and
+the registry registers a resource either at creation or at the first view created over it, which a
+G-buffer gets every frame. **A `not-registered` rate that does not fall to zero is the finding**;
+a handful at session start is the hooks coming up. Guards are L1's
+verbatim (§12.5): `VirtualQuery` before every read, SEH around the read and the one engine call,
+a fault latching the whole mechanism off for the session at ERROR with the address and both
+`[derived]` constants by name.
+
+### 20.4 What level 2 asserts, and why these four pairs
+
+Nothing is gated on any of it; the map has no consumer. These are oracles beside oracles.
+
+| Pair | Prediction | Where the other answer comes from |
+|---|---|---|
+| `SceneDepthZ` vs L1's `FPassInputs.SceneDepthTexture` | **equal** | `ITemporalUpscaler::AddPasses`, resolved on the render thread (§12.9) |
+| `GBufferVelocity` vs L1's `FPassInputs.SceneVelocityTexture` | **equal** | the same |
+| every scene-buffer-extent name vs `View` row 132 `BufferSizeAndInvSize` | **equal** | the engine's own `CachedViewUniformShaderParameters` (§19) |
+| `SceneColorDeferred` vs the TAA pass's `t1` | **none — an OBSERVATION** | the descriptor walk's bind stream at claim |
+
+The first three are **engine-sourced answers from different mechanisms**, so agreement is strong
+evidence and disagreement is a finding — most likely that several views per frame allocate the
+same names and the map is holding the wrong one, which is the failure mode the replan flags. The
+fourth has **no prediction attached** deliberately: whether the post-chain colour TAA reads is the
+same allocation `AllocSceneColor` made is exactly the sort of thing this project should measure
+rather than reason about, and `pool::AssertVerdict::absent` is a first-class outcome so a frame
+where one side has nothing can never be counted as a disagreement.
+
+### 20.5 The ladder, and the escalation stated plainly
+
+| Level | Name | What changes |
+|---|---|---|
+| 0 | off | nothing mapped, nothing scanned |
+| **1** | **discover** (DEFAULT) | scan, log the verdict, the runner-up, the entry bytes and the `NewRT` residual. **Installs nothing; cannot change a pixel.** |
+| 2 | observe | additionally installs the forwarding recorder, resolves each known name, and asserts §20.4. Image byte-identical. |
+| 3 | supply | **DECLARED, NOT BUILT.** Feeding RR is a separate decision; asking logs at ERROR and runs 2. |
+
+**Level 2 writes an inline trampoline into the GAME'S OWN CODE.** This project has patched
+vtables — `ext_unhook`, the seam, `u0hook` — and never engine code, and a wrong target is a crash
+rather than a wrong number. That is why the default is 1, why `pool::kDefaultLevel` is pinned by a
+test (the discipline `tests/test_nr_history_plan.cpp` applies to `NgxNRRestoreHistory`), and why
+three things stand in the way: the static bar refuses to name a target it cannot warrant; the
+install is refused outright when the bar is not met, so the level DEGRADES to 1 and says so; and
+**the trampoline is MinHook's, supplied by the plugin HOST rather than linked into
+`stray_dlss_native`**, so a host that does not own MinHook (the ReShade add-on) can never install
+one and says `no-installer` instead. MinHook additionally validates the prologue itself and
+returns `MH_ERROR_UNSUPPORTED_FUNCTION` rather than corrupting a function it cannot relocate.
+
+`shutdown()` removes the trampoline before the DLL can be unloaded. A detour into a module that is
+gone is the address-0 crash this project already paid for once
+(`docs/RESEARCH-UE4SS-MIGRATION.md`).
+
+### 20.6 What one launch prints
+
+Level 1, at `[STRAYDLSS] PoolNames=1`, in the main menu, before the game has to reach gameplay:
+
+```
+[STRAYDLSS] PoolNames=1 (discover): locating FRenderTargetPool::FindFreeElement by
+    caller-literal agreement, the way praydog/UEVR does. Level 1 SCANS AND LOGS ONLY ...
+POOL NAMES: scan of N sections - literals found 19/20, names referenced 18, lea sites 41,
+    distinct call targets 6. VERDICT: ok.
+POOL NAMES: best candidate 0x14xxxxxxx - reached from 6 DISTINCT enclosing functions
+    (.pdata-derived, bar is 3) and 17 distinct name literals (bar 4), 24 lea sites, nearest
+    call 23 bytes after the name load. Names: GBufferA GBufferB ... Runner-up 0x14yyyyyyy
+    with 1 groups / 7 names. Entry bytes: 48 89 5C 24 08 ...
+POOL NAMES: the string "%d MB, NewRT %s %s" is NOT in this image, so ... (or IS, at 0x...)
+```
+
+The readings that decide the next step, in order:
+
+* **`VERDICT: ok` with `groups >= 3`** — the function is found and the bar is cleared. Level 2 is
+  then one ini key on the SAME build.
+* **`ambiguous`** — two candidates tied on distinct enclosing functions, and the internal-call
+  tiebreak could not settle it (no `NewRT` literal, or both call it). Terminal for the session and
+  the finding of the launch; both addresses, their group/name counts and their nearest-call
+  distances are printed, which is what a follow-up would need.
+* **`insufficient`** with a best candidate and its group/name counts — how close it came, and
+  which bar it missed.
+* **`no_candidates` with `refs_found` non-zero** — the literals and their references are there and
+  no call in any window lands on a `.pdata` function start. That is what **LTCG inlining
+  `FindFreeElement` into its callers** would look like, and it would close the route.
+* **`literals found 0/20`** — the name literals are not in this image at all, which would mean the
+  engine version or the cook differs from what this table was read from.
+* **The `NewRT` line, either way** — it settles the `FindFreeElementForRDG` residual for the
+  record, with no grep of the exe.
+
+At level 2 the `[pool]` line adds the map and the assertions:
+
+```
+[pool] mode=observe discovered=1 hooked=1 target=0x... groups=6 names=17 calls=NNNN
+    census=NN(+0) unknown=NN faults=0 off=0 | ok=... notRegistered=0 rhiNull=... outNull=...
+    nameBad=0 | assert: depth A/0/B velocity A/0/B extent A/0/B colour ?/?/? (agree/disagree/absent)
+    | GBufferA=ok(1920x1080,fmt24) GBufferB=ok(...) ... SceneDepthZ=ok(...)
+```
+
+`nameBad=0` is the one that says the hook is on the right function. `notRegistered=0` says the
+`+8`/slot-7 walk is right. `depth`/`velocity` `disagree=0` says two independent engine routes
+name the same textures. And **`GBufferA`…`GBufferE` reading `ok` with the scene-buffer extent is
+the whole point** — that is Ray Reconstruction's guide set, named by the engine.
+
+**Gameplay, not the menu.** The menu has no shadow, capture or planar-reflection view to allocate
+a competing `GBufferA`, and facts §36.21 records a sibling counter going 0 → 171 across that
+boundary. This file has been caught by the menu/load trap four times; level 2's assertions mean
+nothing until they have run in The Slums.
+
+### 20.7 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| `FindFreeElement`'s signature, with `Out` as an explicit `TRefCountPtr&` and `InDebugName` as the 4th argument (so no hidden-return ABI shift) | **HARD** — `RenderTargetPool.h:268-274` @ 4.27/306a7e9, read 2026-09-04 |
+| `CreateInfo.DebugName = InDebugName` is outside any `#if` | **HARD** — `RenderTargetPool.cpp:415` |
+| The keep-current path early-returns `true` with `Out` already set, without reaching the internal | **HARD** — `RenderTargetPool.cpp:660-672`; it is why the map refreshes per frame |
+| `FindFreeElement` calls `FindFreeElementInternal` as its last act | **HARD** — `RenderTargetPool.cpp:703` |
+| The 20 literals, their enclosing functions and their line numbers | **HARD** — `SceneRenderTargets.cpp` @ 4.27/306a7e9, read 2026-09-04 |
+| `SceneColorDeferred` is returned by `GetSceneColorTargetName`, not passed at the call site | **HARD** — `SceneRenderTargets.cpp:315-324`, `:1005` |
+| `IPooledRenderTarget` is one vptr + `RenderTargetItem`, whose first two members are `TargetableTexture` and `ShaderResourceTexture` ⇒ `+8` / `+16` | **HARD from the header** (`RendererInterface.h:428-465`, `:477-525`); corroborated by UEVR's field-tested layout across many UE builds |
+| `FRHITexture::GetNativeResource` is vtable slot 7 on this exe | **HARD** — L1 calls it every frame (facts §36.13) |
+| `%d MB, NewRT %s %s` is inside `FindFreeElementInternal` | **HARD** that the literal is there (`:403`); **UNCONFIRMED** whether it survives in Stray's exe — which is what the scan reports |
+| UEVR hooks this function, keys pooled RTs by the name argument, and ships it as a public plugin API | **HARD** — `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.1, read from the repository |
+| MSVC emits `lea reg,[rip+disp32]` as `48/4C 8D <modrm 05-form> <disp32>` and a direct call as `E8 rel32` | **HARD** — the x86-64 encoding |
+| A random 32-bit displacement read as a `rel32` almost never lands on a `RUNTIME_FUNCTION::BeginAddress` | **[derived]** arithmetic (~1e-5 per candidate against ~200k functions); the cross-anchor agreement is what it is paired with |
+| The scan finding one unambiguous target on `Stray-Win64-Shipping.exe` | **UNCONFIRMED.** Nothing has run |
+| That `FindFreeElement` survives this build's LTCG rather than being inlined | **UNCONFIRMED**, and `no_candidates` with `refs_found` non-zero is what it would look like |
+| The `+8` walk yielding a resource our registry knows, on this exe | **UNCONFIRMED.** `not-registered` is what a wrong constant produces |
+| That level 2's trampoline is survivable in this process | **UNCONFIRMED.** This is the project's first inline hook into engine code |
+
+### 20.8 Windows-portability, stated per prediction
+
+The brief's constraint is that nothing may depend on vkd3d, DXVK or Wine even though the box runs
+on them. Nothing here does. Per prediction, so a reader can check rather than take the sentence:
+
+| What | Depends on |
+|---|---|
+| The UTF-16 literal scan and the `lea reg,[rip+d]` decode | the PE section table and MSVC's x86-64 encodings — the game's own image, on any host |
+| The `.pdata` function-start filter | the PE exception directory, which every x64 image carries and a Shipping build cannot strip |
+| The enclosing-function grouping | the same `.pdata` |
+| The `%d MB, NewRT %s %s` residual check | a UTF-16 literal in the game's own `.rdata` |
+| `IPooledRenderTarget +8 / +16` | the engine's own object layout |
+| `FRHITexture::GetNativeResource` slot 7 | the engine's vtable — already HARD on this exe from L1 |
+| The registry liveness and extent check | our own `ID3D12Device` creation hooks over a real `ID3D12Resource*` |
+| The trampoline | MinHook, x86-64 |
+
+The one thing the box's configuration touches at all is the guarded reader: `VirtualQuery` is a
+Win32 call and `__try`/`__except` is MSVC-only, so the mingw fast lane compiles the read without
+SEH and relies on the `VirtualQuery` guard alone — which is exactly what L1 does and why the fault
+counter names the build it is reading (§12.5). Neither is a translation-layer dependency.
+
+**And the one prediction that is NOT portable across a game patch, said plainly:** the target
+address. It is discovered per binary, every launch, and refused on ambiguity — never cached, never
+pinned. A recook that moves the function costs a rescan, which is the rule §11.8 of the replan
+asks for.

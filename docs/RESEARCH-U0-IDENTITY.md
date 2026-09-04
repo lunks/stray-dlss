@@ -32,6 +32,15 @@
 > every resource before executing any pass (§1.3's step 5/6 are two phases, not interleaved).
 > The text of §0-§9 is left as written, because the reasoning error — enumerating producers and
 > forgetting the consumer — is the instructive part.
+>
+> **AND SO IS §4.1/§4.2's, corrected in place the same day.** Naming a pooled render target from
+> outside the engine is not only possible, it is a shipping mechanism: the debug name is a live
+> `const TCHAR*` ARGUMENT to `FRenderTargetPool::FindFreeElement`, used unconditionally in
+> Shipping, and `praydog/UEVR` hooks it across hundreds of UE titles. §4.1 asked what is STORED
+> when the question was what is PASSED; §4.2 looked for an anchor inside the function when the
+> anchor is in its 25 callers. Built as `[STRAYDLSS] PoolNames`
+> (`docs/RESEARCH-ENGINE-TAA-HOOK.md` §20), and what it buys is not `u0` — it is **Ray
+> Reconstruction's entire G-buffer guide set**, `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5.
 
 **There is no engine route to `u0`'s identity for the frame in which we need it. The descriptor
 shadow stays.** §13.3's transfer holds — but not for the reason it gives, and the correct reason
@@ -328,6 +337,33 @@ awake when we need the answer.**
 
 ### 4.1 Naming the pool element — dead in Shipping, twice
 
+> **CORRECTED 2026-09-04, AND THE ROUTE IS BUILT.** The heading and the two `#if` quotes below
+> are right about *D3D12 objects* and wrong about the engine. **The name is a LIVE FUNCTION
+> ARGUMENT.** `FRenderTargetPool::FindFreeElement` takes `const TCHAR* InDebugName`
+> (`RenderTargetPool.h:268-274`) and `FindFreeElementInternal` uses it unconditionally —
+> `CreateInfo.DebugName = InDebugName` at `RenderTargetPool.cpp:415`, outside any `#if`. A hook
+> on that function is handed the name on every call, in a Shipping build, and
+> **`praydog/UEVR` ships exactly this across hundreds of shipping UE titles**
+> (`src/mods/vr/RenderTargetPoolHook.cpp`). The reasoning error is worth naming because it is
+> the same one §10 records for the whole document: *"no D3D12 object carries a name"* was read
+> as *"the engine cannot tell us which texture this is"*, and that does not follow — it asks
+> what is stored, when the question is what is passed.
+>
+> The paragraph's second half — *"even had it survived, it would have been a candidate SET,
+> not an identity: the pool matches on `GetTypeHash(Desc)` and `IsFree()` only, never on the
+> name"* — is **true and irrelevant to the route**. We do not ask the pool to FIND an element by
+> name; we watch the engine ASK for one by name and record what it got back. Reuse across names
+> is invisible to that, because the name is the caller's word for what the element is being used
+> as this frame.
+>
+> Built as `[STRAYDLSS] PoolNames` (`src/core/pool_locator.hpp`, `src/pool_name_hook.hpp`);
+> the design and the ladder are `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20, and the prize is
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5 — **DLSS Ray Reconstruction's entire guide set**,
+> without rebuilding the ~3 970-line heuristic G-buffer finder. Also corrected here by
+> `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.4: `u0`'s pool name is `TEXT("TemporalAA")`, not
+> `TEXT("TemporalAAHistory")`.
+
+
 `FindFreeElementForRDG` carries the engine's own debug name (`TEXT("TemporalAAHistory")`,
 `kTAAOutputNames`) all the way down, so "let the resource registry recognise `u0` by the name the
 engine gave it" is an obvious idea. Both places it could surface are compiled out:
@@ -353,6 +389,38 @@ matches on `GetTypeHash(Desc)` and `IsFree()` only (`RenderTargetPool.cpp:360-39
 name, so an element first created for one texture is freely reused for another.
 
 ### 4.2 Hooking `FRenderTargetPool::FindFreeElementForRDG` — no self-validating constant
+
+> **CORRECTED 2026-09-04. BOTH HALVES ARE WRONG, and the second one is the transferable
+> mistake.**
+>
+> **"No shipping-surviving string anchor"** — the section looks for a literal INSIDE the
+> function. UEVR anchors on a **CALLER's** argument literal, resolves the `lea reg,[rip+d]` that
+> loads it, and decodes forward to the CALL (`shared/sdk/FRenderTargetPool.cpp` @ `0587a46`).
+> 4.27's `SceneRenderTargets.cpp` alone has **25 such call sites**, each with a distinct literal,
+> spread over **six distinct enclosing functions** (`AllocGBufferTargets`,
+> `AllocateCommonDepthTargets`, `AllocateDeferredShadingPathRenderTargets`,
+> `AllocateReflectionTargets`, `AllocateDebugViewModeTargets`, `AllocateAnisotropyTarget`).
+> **The anchor is not in the function, it is in its callers** — and a route refused for lacking
+> something it never needed is the shape to watch for.
+>
+> **"No self-validating constant"** — the `InDebugName` argument IS one, and a *stronger* one
+> than the `ITemporalUpscaler` scan's `0.5` / `2.0` pair, because that pair is checked once at
+> install while this is checked on **every call**: a hook on the wrong function is handed a
+> `const TCHAR*` that does not read as a wide string and never equals a name we know. The static
+> side gets its own bar in the same spirit — agreement across **≥ 3 distinct enclosing
+> functions** (derived from the exe's own `.pdata`, not from a source reading) and **≥ 4 distinct
+> name literals** on one address that is a `RUNTIME_FUNCTION::BeginAddress`, with the runner-up
+> beaten outright and a tie refused. `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20.
+>
+> **What STANDS: `FindFreeElement` and `FindFreeElementForRDG` are different functions**
+> (`RenderTargetPool.cpp:623` and `:320`), and `u0` goes through the latter. **That residual is
+> not this route's problem** — every RR guide (`GBufferA-E`, `SceneDepthZ`, `GBufferVelocity`,
+> `SceneColorDeferred`) is allocated through the OUTER `FindFreeElement`, which is what the scan
+> finds. The falsifiable test this section named — is `%d MB, NewRT %s %s` still in the exe? — is
+> now RUN AT STARTUP and reported either way, so the RDG half is settled by a log line rather
+> than by a grep, and it costs nothing. The refusal to install on a guess (§9's rule) also
+> stands, and is why level 1 installs nothing at all.
+
 
 This is the *right* site in principle: it runs on the render thread inside `Execute()`, in the
 exact window, and it returns the `FPooledRenderTarget*` with the name in hand. But it is a

@@ -11,6 +11,7 @@
 #include "intercept/backend.hpp"
 #include "log.hpp"
 #include "ngx_nr.hpp"
+#include "pool_name_hook.hpp"
 
 #include <MinHook.h>
 
@@ -325,6 +326,32 @@ HRESULT WINAPI hook_create_device(IUnknown *adapter, D3D_FEATURE_LEVEL fl, REFII
 	return hr;
 }
 
+// The trampoline installer handed to src/pool_name_hook.cpp. MinHook validates the target's
+// prologue itself (hde64) and returns MH_ERROR_UNSUPPORTED_FUNCTION rather than corrupting a
+// function it cannot relocate, which is one more reason a wrong target refuses instead of
+// crashing.
+bool pool_install_hook(void *target, void *replacement, void **original)
+{
+	if (target == nullptr || replacement == nullptr || original == nullptr)
+		return false;
+	if (MH_CreateHook(target, replacement, original) != MH_OK)
+		return false;
+	if (MH_EnableHook(target) != MH_OK)
+	{
+		MH_RemoveHook(target);
+		return false;
+	}
+	return true;
+}
+
+bool pool_remove_hook(void *target)
+{
+	if (target == nullptr)
+		return false;
+	MH_DisableHook(target);
+	return MH_RemoveHook(target) == MH_OK;
+}
+
 bool install_device_hook()
 {
 	if (g_hook_installed.load())
@@ -349,6 +376,13 @@ bool install_device_hook()
 			return false;
 		}
 		g_minhook_up.store(true);
+		// THE ONLY TRAMPOLINE INSTALLER IN THE PROCESS, and it is registered here rather than
+		// linked into stray_dlss_native on purpose. That library is shared with the ReShade
+		// add-on host, which does not own MinHook; a mechanism that needs to patch engine CODE
+		// must therefore ask its host for a patcher and be told "no" cleanly. Today the only
+		// caller is the render-target pool's name hook ([STRAYDLSS] PoolNames >= 2), which
+		// installs nothing unless its own static scan cleared the agreement bar first.
+		poolhook::set_installer(&pool_install_hook, &pool_remove_hook);
 	}
 	void *target = reinterpret_cast<void *>(::GetProcAddress(d3d12, "D3D12CreateDevice"));
 	if (target == nullptr)

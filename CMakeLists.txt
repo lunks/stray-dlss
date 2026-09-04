@@ -79,6 +79,8 @@ add_library(stray_dlss_core STATIC
     src/core/view_cached.hpp
     src/core/u0_rhi_uav.cpp
     src/core/u0_rhi_uav.hpp
+    src/core/pool_locator.cpp
+    src/core/pool_locator.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -233,6 +235,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/view_params_hook.hpp
         src/u0_rhi_hook.cpp
         src/u0_rhi_hook.hpp
+        src/pool_name_hook.cpp
+        src/pool_name_hook.hpp
         src/perf.cpp
         src/perf.hpp
         src/nr_hook.cpp
@@ -474,6 +478,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_engine_seam.cpp
         tests/test_view_cached.cpp
         tests/test_u0_rhi_uav.cpp
+        tests/test_pool_locator.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp

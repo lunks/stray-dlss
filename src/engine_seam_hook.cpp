@@ -3,6 +3,7 @@
 #include "core/engine_seam.hpp"
 #include "intercept/backend.hpp"
 #include "log.hpp"
+#include "pool_name_hook.hpp"
 #include "view_params_hook.hpp"
 
 #include <windows.h>
@@ -239,6 +240,25 @@ void add_passes_thunk(const void *self, void *graph_builder, const void *view,
 	// forwarded call because the engine's output rect is one of its predictions, and before the
 	// ledger files the announcement because the announcement is what carries it.
 	vphook::scan_at_announce(view, a, a.depth_res);
+
+	// ADJACENT ON PURPOSE, and for the same reason: this is the frame's one point where the
+	// engine's OWN answers for depth, velocity and the scene-buffer extent are all in hand, on
+	// the thread that owns them. The render-target pool's name map answers for the same three
+	// textures by a completely different route (a hook on FRenderTargetPool::FindFreeElement,
+	// src/pool_name_hook.hpp), so this is where the two are compared. Inert unless
+	// [STRAYDLSS] PoolNames reached level 2; nothing here is gated on the verdict.
+	{
+		std::uint32_t buffer_w = 0;
+		std::uint32_t buffer_h = 0;
+		if (a.view_carried && a.view.buffer_size_and_inv_size.x > 0.0f &&
+			a.view.buffer_size_and_inv_size.y > 0.0f)
+		{
+			buffer_w = static_cast<std::uint32_t>(a.view.buffer_size_and_inv_size.x);
+			buffer_h = static_cast<std::uint32_t>(a.view.buffer_size_and_inv_size.y);
+		}
+		poolhook::note_engine_frame(a.depth_res, a.velocity_res, a.colour_res,
+			buffer_w, buffer_h, a.frame);
+	}
 
 	bool log_first = false;
 	{
