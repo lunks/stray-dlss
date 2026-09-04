@@ -166,4 +166,21 @@ void nov_rotation_rows(const Matrix4 &translated_world_to_view, float out[3][3])
 // Member name for a view_matrix_block index (0-6), for the diagnostics line.
 const char *view_matrix_block_name(int index);
 
+// WE PASS NO SUBRECT BASE TO NGX. Every evaluate hands colour, depth, motion vectors and output
+// as whole textures with an implicit origin of (0,0), which is correct only while UE4's view rect
+// starts at the buffer top-left. §5's rule for this field is "read it, do not assume it", so it
+// was read: (0,0) in all 41 observations across 8 sessions on the box (facts §40).
+//
+// The plumbing is therefore deliberately NOT built. It would be untested code for a case that has
+// never occurred here, and the obvious version of it is wrong anyway: the motion-vector texture
+// NGX receives is OURS, written from 0, so it must not carry the engine's view-rect offset even
+// when colour and depth would. Getting that split wrong offsets the guides against each other,
+// which is worse than the uniform offset it was meant to fix.
+//
+// What is built instead is the loud failure the prime directives ask for.
+inline bool view_rect_min_is_origin(const ViewParams &p)
+{
+	return p.view_rect_min.x == 0.0f && p.view_rect_min.y == 0.0f;
+}
+
 } // namespace stray_dlss::ue4

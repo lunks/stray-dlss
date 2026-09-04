@@ -454,6 +454,17 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 			static_cast<unsigned long long>(b.view_cb.offset));
 		STRAY_LOG_INFO("    ViewRectMin        = %.1f %.1f",
 			view.view_rect_min.x, view.view_rect_min.y);
+		// The one case that silently offsets every NGX guide: we pass no subrect base, so a
+		// non-origin view rect means colour, depth and output are all taken from the wrong
+		// place with no error anywhere. See ue4::view_rect_min_is_origin for why the bases are
+		// not plumbed instead.
+		if (!ue4::view_rect_min_is_origin(view))
+			STRAY_LOG_WARN("    ViewRectMin IS NOT THE ORIGIN (%.1f %.1f). We pass NO subrect "
+				"base to NGX, so every guide is being taken from (0,0) while the engine's view "
+				"rect starts elsewhere. This had never been observed on this title - 41/41 "
+				"reads were (0,0) across 8 sessions, facts §40 - and it is observed NOW.",
+				static_cast<double>(view.view_rect_min.x),
+				static_cast<double>(view.view_rect_min.y));
 		STRAY_LOG_INFO("    ViewSizeAndInvSize = %.1f %.1f %.6f %.6f",
 			view.view_size_and_inv_size.x, view.view_size_and_inv_size.y,
 			view.view_size_and_inv_size.z, view.view_size_and_inv_size.w);

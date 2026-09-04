@@ -537,3 +537,26 @@ TEST_CASE("the two bounds are COMPLEMENTARY - which is why the small impostor re
 		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
 	}
 }
+
+// ViewRectMin has been (0,0) in every read on the target - 41 of 41 across 8 sessions, facts
+// §40 - which is WHY no subrect base is passed to NGX, and why this predicate exists as a
+// tripwire rather than as the condition on a code path. If it ever fires, every guide is being
+// sampled from the wrong place and nothing else in the stack reports anything.
+TEST_CASE("view_rect_min_is_origin is the tripwire for the unplumbed NGX subrect base")
+{
+	ue4::ViewParams p{};
+	CHECK(ue4::view_rect_min_is_origin(p));            // the observed case
+
+	p.view_rect_min.x = 0.0f; p.view_rect_min.y = 0.0f;
+	CHECK(ue4::view_rect_min_is_origin(p));
+
+	// Either axis alone is enough to offset every guide.
+	p.view_rect_min.x = 1.0f; p.view_rect_min.y = 0.0f;
+	CHECK_FALSE(ue4::view_rect_min_is_origin(p));
+
+	p.view_rect_min.x = 0.0f; p.view_rect_min.y = 1.0f;
+	CHECK_FALSE(ue4::view_rect_min_is_origin(p));
+
+	p.view_rect_min.x = 64.0f; p.view_rect_min.y = 41.0f;
+	CHECK_FALSE(ue4::view_rect_min_is_origin(p));
+}
