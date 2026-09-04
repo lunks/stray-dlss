@@ -158,6 +158,12 @@ enum class SeamRefusal : std::uint8_t
 	view_unreadable,// claimed, but no bound constant buffer decoded as a plausible View
 	dead_inputs,    // claimed, but depth/velocity not live AND the engine inputs did not resolve
 	role_unresolved,// claimed, live, but colour or output could not be identified
+	// Claimed, but the render rect we read is not a shape DLSS can upscale to the engine's
+	// announced output rect (`primary_view_shape_ok`). The engine's word covers the DISPATCH
+	// and the OUTPUT rect; the render rect still comes from the slot-order View CB search, so
+	// this counts how often that search hands us another view's size. It was 37 spurious
+	// feature creations per session before it was a refusal at all.
+	bad_render_rect,
 	mv_failed,      // claimed, the motion-vector resolve did not record
 	create_failed,  // claimed, NGX ensure_feature failed
 	eval_failed,    // claimed, EvaluateFeature returned failure

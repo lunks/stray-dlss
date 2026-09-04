@@ -429,3 +429,116 @@ TEST_CASE("the ratios this project actually runs still pass the aspect and scale
 		CHECK(match_taa_dispatch(sig, rr[0], rr[1]).verdict != MatchVerdict::no_match);
 	}
 }
+
+// ---------------------------------------------------------------------------------------
+// primary_view_shape_ok — the gate that was skipped under the engine's own announcement,
+// and the 37-of-62 spurious DLSS feature creations that skip produced (2026-09-03).
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("every ratio this project runs is a legal primary-view shape")
+{
+	CHECK(primary_view_shape_ok(1920, 1080, 3840, 2160)); // 50%, the shipped configuration
+	CHECK(primary_view_shape_ok(2688, 1512, 3840, 2160)); // 70%
+	CHECK(primary_view_shape_ok(3840, 2160, 3840, 2160)); // DLAA
+	// Dynamic resolution: the engine announced 3840x2073 in the measured session.
+	CHECK(primary_view_shape_ok(1920, 1037, 3840, 2073));
+	CHECK(primary_view_shape_ok(1920, 1070, 3840, 2140));
+	CHECK(primary_view_shape_ok(1920, 1068, 3840, 2135));
+}
+
+TEST_CASE("the render rects measured creating bogus DLSS features are all refused")
+{
+	// Verbatim from the live log's `DLSS feature created:` lines, every one of them
+	// announced by the engine as an upscale to 3840x2160.
+	CHECK_FALSE(primary_view_shape_ok(64, 34, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(64, 41, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(64, 52, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(128, 109, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(128, 126, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(256, 240, 3840, 2160));
+	CHECK_FALSE(primary_view_shape_ok(1024, 1024, 3840, 2160));
+	// A portrait view — a shadow cascade or a scene capture, never the primary view.
+	CHECK_FALSE(primary_view_shape_ok(1064, 2128, 3840, 2160));
+}
+
+TEST_CASE("a missing measurement is not a shape verdict")
+{
+	// The caller has its own refusal for "no rect"; this predicate must not invent one.
+	CHECK(primary_view_shape_ok(0, 0, 3840, 2160));
+	CHECK(primary_view_shape_ok(1920, 1080, 0, 0));
+}
+
+TEST_CASE("each bound of primary_view_shape_ok fires on its own")
+{
+	// Right aspect, below the engine's 0.5 minimum fraction: 0.499 fails, 0.5 passes.
+	CHECK_FALSE(primary_view_shape_ok(1916, 1078, 3840, 2160));
+	CHECK(primary_view_shape_ok(1920, 1080, 3840, 2160));
+	// Right fraction, wrong aspect: a 4:3 render rect against a 16:9 output.
+	CHECK_FALSE(primary_view_shape_ok(2880, 2160, 3840, 2160));
+}
+
+// ---------------------------------------------------------------------------------------
+// colour_input_acceptable — the shape discipline every other DLSS input already had.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("the real scene colour is accepted, at the render rect and above it")
+{
+	const BoundTexture exact{ 1, 0x2000, TexFormat::r16g16b16a16_float, 1920, 1080 };
+	CHECK(colour_input_acceptable(exact, 1920, 1080, TexFormat::r16g16b16a16_float));
+	// Under dynamic resolution the view rect is SMALLER than the scene-buffer allocation,
+	// so equality would refuse the real scene colour (CLAUDE.md §2.5).
+	CHECK(colour_input_acceptable(exact, 1920, 1037, TexFormat::r16g16b16a16_float));
+	// The menu's scene colour is R11G11B10_FLOAT, and its output UAV is too.
+	const BoundTexture menu{ 1, 0x2000, TexFormat::r11g11b10_float, 1920, 1080 };
+	CHECK(colour_input_acceptable(menu, 1920, 1080, TexFormat::r11g11b10_float));
+	// With no output format known the format pairing is skipped, not failed.
+	CHECK(colour_input_acceptable(menu, 1920, 1080, TexFormat::unknown));
+}
+
+TEST_CASE("a streamed material texture can never be InputSceneColor")
+{
+	// Stray's carpets, measured from the pak's own uasset name tables: BC3_TYPELESS /
+	// BC1_TYPELESS / BC5_UNORM at 1024^2 and 2048^2, 7 mips always resident. Every BC
+	// format lands on TexFormat::unknown, so the format test alone refuses them — even
+	// though a 2048^2 albedo passes "live, 2D, at least the render rect" trivially.
+	const BoundTexture carpet_2k{ 1, 0x9000, TexFormat::unknown, 2048, 2048 };
+	CHECK_FALSE(colour_input_acceptable(carpet_2k, 1920, 1080, TexFormat::r16g16b16a16_float));
+	const BoundTexture carpet_1k{ 1, 0x9000, TexFormat::unknown, 1024, 1024 };
+	CHECK_FALSE(colour_input_acceptable(carpet_1k, 1920, 1080, TexFormat::r16g16b16a16_float));
+	// A UI or G-buffer target in a non-HDR format is refused for the same reason.
+	const BoundTexture bgra{ 1, 0x9000, TexFormat::b8g8r8a8_unorm, 3840, 2160 };
+	CHECK_FALSE(colour_input_acceptable(bgra, 1920, 1080, TexFormat::r16g16b16a16_float));
+}
+
+TEST_CASE("the shapes NGX itself rejects are refused before it sees them")
+{
+	// A buffer: the caller records 0x0 for one.
+	CHECK_FALSE(colour_input_acceptable(
+		BoundTexture{ 1, 0x2000, TexFormat::r16g16b16a16_float, 0, 0 }, 1920, 1080,
+		TexFormat::r16g16b16a16_float));
+	// The 1x1 BlackDummy UE4 substitutes on a camera cut.
+	CHECK_FALSE(colour_input_acceptable(
+		BoundTexture{ 1, 0x2000, TexFormat::r16g16b16a16_float, 1, 1 }, 1920, 1080,
+		TexFormat::r16g16b16a16_float));
+	// Smaller than the subrect DLSS is told to read.
+	CHECK_FALSE(colour_input_acceptable(
+		BoundTexture{ 1, 0x2000, TexFormat::r16g16b16a16_float, 1280, 720 }, 1920, 1080,
+		TexFormat::r16g16b16a16_float));
+	// Nothing bound.
+	CHECK_FALSE(colour_input_acceptable(
+		BoundTexture{ 1, 0, TexFormat::r16g16b16a16_float, 1920, 1080 }, 1920, 1080,
+		TexFormat::r16g16b16a16_float));
+	// A 3D texture is not a Tex2D. `is_3d` is the last member, so set it explicitly.
+	BoundTexture lut{ 1, 0x2000, TexFormat::r16g16b16a16_float, 1920, 1080 };
+	lut.is_3d = true;
+	CHECK_FALSE(colour_input_acceptable(lut, 1920, 1080, TexFormat::r16g16b16a16_float));
+}
+
+TEST_CASE("a same-size buffer of another kind is refused by the output pairing")
+{
+	// The pairing test is what separates a same-size buffer of another kind from the
+	// scene colour; it is not a substitute for the colour-versus-history decision, which
+	// needs last frame's u0 and is made by the caller.
+	const BoundTexture other{ 1, 0x4000, TexFormat::r11g11b10_float, 1920, 1080 };
+	CHECK_FALSE(colour_input_acceptable(other, 1920, 1080, TexFormat::r16g16b16a16_float));
+}

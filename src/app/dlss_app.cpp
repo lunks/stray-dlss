@@ -13,6 +13,7 @@
 #include "core/fnv1a.hpp"
 #include "core/taa_hashes.hpp"
 #include "core/exposure_plan.hpp"
+#include "core/feature_recreate.hpp"
 #include "ext_unhook.hpp"
 #include "exposure_texture.hpp"
 #include "host/config.hpp"
@@ -36,6 +37,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cstdlib>
 #include <iterator>
 #include <mutex>
@@ -712,6 +714,16 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		STRAY_LOG_INFO("DLSS will replace pass 0x%016llx ([STRAYDLSS] NgxPassHash).",
 			static_cast<unsigned long long>(ngx_pass_value));
 
+	// [STRAYDLSS] NgxRecreateStableFrames. How many consecutive frames a DIFFERING render/output
+	// rect must be asked for before the DLSS feature is torn down and rebuilt for it. Measured
+	// 2026-09-03: a scripted scene transition animates the view rect (3840x2160 down to
+	// 3840x2073 and back, aspect 1.778 -> 1.85 — cinematic bars) in runs of 6-10 steps, and
+	// chasing each step destroyed DLSS's temporal accumulation and paid a full CreateFeature.
+	// 0 restores that behaviour for an A/B. (src/core/feature_recreate.hpp)
+	ngx::set_recreate_stable_frames(static_cast<unsigned int>(std::max(0,
+		host::cfg::get_int("NgxRecreateStableFrames",
+			static_cast<int>(core::kDefaultRecreateStableFrames)))));
+
 	const int ngx_preset = host::cfg::get_int("NgxPreset", 0);
 	if (ngx_preset != 0)
 	{
@@ -1087,24 +1099,55 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		std::uint64_t r135_ok = 0;
 		std::uint64_t r135_bad = 0;
 		std::uint64_t wrong_view = 0;
-		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view);
+		std::uint64_t suspect_small = 0;
+		std::uint64_t amb_claimed = 0;
+		std::uint64_t amb_other = 0;
+		taa_hook::view_row135_counters(r135_ok, r135_bad, wrong_view, suspect_small,
+			amb_claimed, amb_other);
 		// What the search costs: one describe_resource + one 2448-byte read per candidate tried.
 		// This is the ONLY work that replacing the search with identity from the engine retires,
 		// so it bounds that saving from above (report §15.4).
 		const std::uint64_t cb_reads = taa_hook::view_cb_read_count();
-		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0)
+		if (r135_ok != 0 || r135_bad != 0 || wrong_view != 0 || suspect_small != 0 ||
+			amb_claimed != 0)
 			STRAY_LOG_INFO("[view] %s: row135 self-check ok=%llu bad=%llu | wrongView=%llu "
-				"(candidates that were A View buffer but not THIS view - the search skipped "
-				"them; each was an unclaimed frame before facts 36.18) | cbReads=%llu (what the "
-				"search costs: one describe+2448B read each)%s", when,
+				"(candidates that were A View buffer but not THIS view - too LARGE for the "
+				"dispatch; the search skipped them) | tooSmall=%llu (the same skip for a "
+				"candidate BELOW the engine's own 0.5 minimum fraction - a shadow or capture "
+				"view. Each one is the fix for the full-screen-texture bug firing: before it "
+				"was gated these WON the search and DLSS was created at rects like 64x41 -> "
+				"3840x2160, report §16) | ambClaimed=%llu ambOther=%llu (a claimed dispatch "
+				"where a SECOND legal-shaped View survived and disagreed on ClipToPrevClip / "
+				"jitter / CameraCut - i.e. DLSS SR took a guess. 0 means the search's answer "
+				"was forced) | cbReads=%llu (what the search costs: one describe+2448B read "
+				"each)%s", when,
 				static_cast<unsigned long long>(r135_ok),
 				static_cast<unsigned long long>(r135_bad),
 				static_cast<unsigned long long>(wrong_view),
+				static_cast<unsigned long long>(suspect_small),
+				static_cast<unsigned long long>(amb_claimed),
+				static_cast<unsigned long long>(amb_other),
 				static_cast<unsigned long long>(cb_reads),
 				r135_bad > r135_ok
 					? "  <- THE CB SEARCH IS PICKING THE WRONG BUFFER; jitter, ClipToPrevClip "
 					  "and CameraCut are all suspect"
 					: "");
+
+		// And the DLSS feature's own churn. Every re-creation destroys the temporal
+		// accumulation (the user's "pop") and pays a full CreateFeature (the hitch), so a
+		// session that needs one feature must show one creation. `restarts` climbing while
+		// `waits` climbs and nothing is created is an ANIMATING rect being correctly refused.
+		unsigned long long rc_waits = 0;
+		unsigned long long rc_restarts = 0;
+		ngx::recreate_counters(rc_waits, rc_restarts);
+		if (rc_waits != 0 || rc_restarts != 0)
+			STRAY_LOG_INFO("[recreate] %s: deferred=%llu restarts=%llu ([STRAYDLSS] "
+				"NgxRecreateStableFrames=%d). Each deferral is one frame of the engine's own "
+				"TAA instead of a DLSS feature rebuilt for a rect that is still moving; a high "
+				"restarts count is a scripted scene transition animating the view rect, which "
+				"used to create 6-10 features per transition.", when, rc_waits, rc_restarts,
+				host::cfg::get_int("NgxRecreateStableFrames",
+					static_cast<int>(core::kDefaultRecreateStableFrames)));
 	}
 
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
@@ -1137,6 +1180,17 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			std::fprintf(f, "taa_pipelines=%u\n", g_state.taa_pipelines_seen.load());
 			std::fprintf(f, "dispatches=%u\n", g_state.dispatches_seen.load());
 			std::fprintf(f, "vkd3d=%d\n", g_state.is_vkd3d ? 1 : 0);
+			{
+				// The DLSS feature's own churn (src/core/feature_recreate.hpp). One session
+				// that stays at one resolution must show one creation; deferrals rising with
+				// restarts and no creation is a scripted transition's animating view rect
+				// being correctly refused instead of chased.
+				unsigned long long rc_waits = 0;
+				unsigned long long rc_restarts = 0;
+				ngx::recreate_counters(rc_waits, rc_restarts);
+				std::fprintf(f, "dlss_recreate_deferred=%llu\n", rc_waits);
+				std::fprintf(f, "dlss_recreate_restarts=%llu\n", rc_restarts);
+			}
 			{
 				// The engine upscaler seam ([STRAYDLSS] EngineSeam). `orphans` is the number
 				// the whole thing exists for: dispatches the behavioural matcher called the

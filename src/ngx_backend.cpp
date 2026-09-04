@@ -1,6 +1,7 @@
 #include "ngx_backend.hpp"
 
 #include "core/dlss_quality.hpp"
+#include "core/feature_recreate.hpp"
 #include "ext_unhook.hpp"
 
 #include "log.hpp"
@@ -40,6 +41,12 @@ void shutdown(ID3D12Device *) { g_status = Status{}; }
 bool ensure_feature(ID3D12GraphicsCommandList *, const FeatureDesc &) { return false; }
 bool evaluate(ID3D12GraphicsCommandList *, const EvaluateInputs &) { return false; }
 void set_preset(int) {}
+void set_recreate_stable_frames(unsigned int) {}
+void recreate_counters(unsigned long long &waits, unsigned long long &restarts)
+{
+	waits = 0;
+	restarts = 0;
+}
 void release_feature() {}
 const char *last_error() { return "<ngx disabled>"; }
 
@@ -104,6 +111,13 @@ NVSDK_NGX_Handle *g_feature = nullptr;
 NVSDK_NGX_Parameter *g_feature_params = nullptr;
 FeatureDesc g_feature_desc;
 char g_last_error[256] = "";
+
+// THE RE-CREATION DEBOUNCE (src/core/feature_recreate.hpp). A feature is torn down only for a
+// rect that has SETTLED, because a scripted scene transition animates the view rect every few
+// frames and chasing it created six to ten features per transition — each one a lost temporal
+// history and a full CreateFeature stall. Pure decision, unit-tested; this is only its state.
+core::RecreateState g_recreate_state;
+unsigned int g_recreate_stable_frames = core::kDefaultRecreateStableFrames;
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
 exposure::Mode g_exposure_mode = exposure::Mode::automatic;
@@ -479,6 +493,9 @@ void release_feature()
 		g_feature_params = nullptr;
 	}
 	g_feature_desc = FeatureDesc{};
+	// No feature means nothing to protect, so the next request creates immediately.
+	g_recreate_state.pending = core::FeatureRect{};
+	g_recreate_state.pending_count = 0;
 }
 
 namespace {
@@ -819,20 +836,50 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	ext_unhook::repair();
 	if (!g_status.initialised || !g_status.super_sampling_available || cmd == nullptr)
 		return false;
-	if (desc.render_width == 0 || desc.output_width == 0)
+	if (desc.render_width == 0 || desc.render_height == 0 ||
+		desc.output_width == 0 || desc.output_height == 0)
 		return false;
 
 	// The NgxRR=1 probe rides the SR ensure path: same command list, same real dimensions,
 	// ext hook just repaired. One attempt per session; SR proceeds regardless.
 	maybe_probe_rr(cmd, desc);
 
-	const bool same = g_feature != nullptr &&
-		g_feature_desc.render_width == desc.render_width &&
-		g_feature_desc.render_height == desc.render_height &&
-		g_feature_desc.output_width == desc.output_width &&
-		g_feature_desc.output_height == desc.output_height;
-	if (same)
-		return true;
+	const core::FeatureRect want{ desc.render_width, desc.render_height,
+		desc.output_width, desc.output_height };
+	const core::FeatureRect live{ g_feature_desc.render_width, g_feature_desc.render_height,
+		g_feature_desc.output_width, g_feature_desc.output_height };
+	const core::RecreateAction action = core::plan_recreate(g_recreate_state,
+		g_feature != nullptr, live, want, g_recreate_stable_frames);
+	if (action == core::RecreateAction::keep)
+		return g_feature != nullptr;
+	if (action == core::RecreateAction::wait)
+	{
+		// DECLINED, and the frame renders with the engine's own TAA. This is the correct
+		// failure: the alternative is a feature built for a rect that has already moved on.
+		// Logged sparsely because a transition produces one of these per frame for ~0.5 s.
+		if (g_recreate_state.waits <= 3 || (g_recreate_state.waits % 600) == 0)
+		{
+			std::snprintf(g_last_error, sizeof(g_last_error),
+				"ensure_feature: rect %ux%u -> %ux%u has not settled (%u/%u frames)",
+				desc.render_width, desc.render_height, desc.output_width, desc.output_height,
+				g_recreate_state.pending_count, g_recreate_stable_frames);
+			STRAY_LOG_INFO("DLSS recreate DEFERRED: asked for %ux%u -> %ux%u while the live "
+				"feature is %ux%u -> %ux%u, and that request has only stood for %u of %u "
+				"frames. The engine's own TAA renders this frame. A scripted scene transition "
+				"animates the view rect every few frames, and chasing it destroyed DLSS's "
+				"temporal history six to ten times per transition; waiting for the rect to "
+				"settle keeps the ORIGINAL feature alive across the whole animation. "
+				"waits=%llu restarts=%llu ([STRAYDLSS] NgxRecreateStableFrames=0 restores the "
+				"old behaviour). Logged 3 times, then every 600.",
+				desc.render_width, desc.render_height, desc.output_width, desc.output_height,
+				g_feature_desc.render_width, g_feature_desc.render_height,
+				g_feature_desc.output_width, g_feature_desc.output_height,
+				g_recreate_state.pending_count, g_recreate_stable_frames,
+				static_cast<unsigned long long>(g_recreate_state.waits),
+				static_cast<unsigned long long>(g_recreate_state.restarts));
+		}
+		return false;
+	}
 
 	release_feature();
 
@@ -1033,6 +1080,21 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	release_keep_alive(/*all=*/false);
 	release_probe_feature(/*force=*/false);
 	return true;
+}
+
+void set_recreate_stable_frames(unsigned int frames)
+{
+	g_recreate_stable_frames = frames;
+	if (frames == 0)
+		STRAY_LOG_WARN("NgxRecreateStableFrames=0: a DLSS feature will be recreated on the "
+			"FIRST frame that asks for a different rect, which is the pre-2026-09-03 behaviour "
+			"and is what produced 6-10 creations per scripted scene transition.");
+}
+
+void recreate_counters(unsigned long long &waits, unsigned long long &restarts)
+{
+	waits = static_cast<unsigned long long>(g_recreate_state.waits);
+	restarts = static_cast<unsigned long long>(g_recreate_state.restarts);
 }
 
 void shutdown(ID3D12Device *device)

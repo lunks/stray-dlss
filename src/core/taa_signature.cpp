@@ -106,6 +106,62 @@ bool is_hdr_colour(TexFormat f)
 	return f == TexFormat::r16g16b16a16_float || f == TexFormat::r11g11b10_float;
 }
 
+bool primary_view_shape_ok(std::uint32_t render_w, std::uint32_t render_h,
+                           std::uint32_t out_w, std::uint32_t out_h)
+{
+	// Nothing to judge. The caller has its own "did we read a rect at all" refusal; inventing a
+	// shape verdict here would turn a missing measurement into a rejection.
+	if (render_w == 0 || render_h == 0 || out_w == 0 || out_h == 0)
+		return true;
+
+	// The engine's own floor, both axes. 64 against 3840 is 0.017; 1024 against 3840 is 0.27.
+	if (static_cast<double>(render_w) < static_cast<double>(out_w) * kMinUpsampleFraction ||
+		static_cast<double>(render_h) < static_cast<double>(out_h) * kMinUpsampleFraction)
+		return false;
+
+	// A real primary-view upscale preserves the aspect ratio. A square render rect against a
+	// 16:9 output is not the main view, whoever announced the dispatch.
+	const double in_aspect = static_cast<double>(render_w) / static_cast<double>(render_h);
+	const double out_aspect = static_cast<double>(out_w) / static_cast<double>(out_h);
+	if (in_aspect > out_aspect * (1.0 + kAspectTolerance) ||
+		in_aspect < out_aspect * (1.0 - kAspectTolerance))
+		return false;
+
+	// Implied by the fraction test at 0.5 / 3.5, and kept because the two bounds come from
+	// different authorities — one is UE4's, one is DLSS's. If either constant is ever revised
+	// the other still holds its own end.
+	return static_cast<double>(out_w) / static_cast<double>(render_w) <= kMaxUpscaleFactor;
+}
+
+bool colour_input_acceptable(const BoundTexture &t, std::uint32_t render_w,
+                             std::uint32_t render_h, TexFormat output_format)
+{
+	if (t.resource == 0)
+		return false;
+	// A buffer, or the 1x1 GSystemTextures::BlackDummy UE4 substitutes on a camera cut. The
+	// caller records width/height as 0 for a buffer, so this excludes both.
+	if (t.width == 0 || t.height == 0)
+		return false;
+	// A 3D texture is not a Tex2D, and NGX says so out loud.
+	if (t.is_3d)
+		return false;
+	// THE TEST A STREAMED MATERIAL TEXTURE FAILS. Stray's carpets cook to BC3_TYPELESS /
+	// BC1_TYPELESS / BC5_UNORM (measured 2026-09-03 from the pak's own uasset name tables:
+	// Content/Data/Props/Carpet and Content/Data/Textures/Tile/Carpet, 1024^2 and 2048^2, 7
+	// mips always resident), and every BC format lands on TexFormat::unknown here.
+	if (!is_hdr_colour(t.format))
+		return false;
+	// TAA reads and writes the same buffer kind, so when the output UAV's format is known the
+	// colour input must share it — that separates the menu's R11G11B10 scene colour from
+	// gameplay's RGBA16 when both happen to be bound.
+	if (output_format != TexFormat::unknown && t.format != output_format)
+		return false;
+	// AT LEAST the render subrect, never equal to it: UE4 allocates the scene buffer at the
+	// scene-buffer extent rather than the view size (CLAUDE.md §2.5), and under dynamic
+	// resolution the view rect is strictly smaller than the allocation.
+	return t.width >= render_w && t.height >= render_h;
+}
+
 MatchResult match_taa_dispatch(const DispatchSignature &sig,
                                std::uint32_t view_width,
                                std::uint32_t view_height)

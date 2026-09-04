@@ -699,12 +699,12 @@ TEST_CASE("every refusal reason has a distinct, stable name for the [seam] line"
 {
 	// The names are read by eye out of a pasted log, so a duplicate or an empty one costs a
 	// round trip. Also pins that `none` reads as success rather than as a refusal.
-	const SeamRefusal all[] = { SeamRefusal::none, SeamRefusal::view_unreadable,
-		SeamRefusal::dead_inputs, SeamRefusal::role_unresolved, SeamRefusal::mv_failed,
-		SeamRefusal::create_failed, SeamRefusal::eval_failed };
+	// Iterate the ENUM rather than a hand-written list: a reason added without a name would
+	// otherwise pass here and print "?" in a pasted log, which is the one place it matters.
 	std::set<std::string> seen;
-	for (SeamRefusal r : all)
+	for (std::size_t i = 0; i < static_cast<std::size_t>(SeamRefusal::count); ++i)
 	{
+		const SeamRefusal r = static_cast<SeamRefusal>(i);
 		const char *n = seam_refusal_name(r);
 		REQUIRE(n != nullptr);
 		CHECK(std::strlen(n) > 0);

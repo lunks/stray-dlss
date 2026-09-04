@@ -109,7 +109,20 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // `wrong_view` counts candidates that decoded as A View buffer but described a DIFFERENT view
 // than the dispatch - the search skipping past them instead of stopping. Non-zero is the fix for
 // facts §36.18 working; each one is a frame that used to lose DLSS SR entirely.
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view);
+// `suspect_small` is the SAME skip for the opposite failure and it IS gated now (facts §36.20,
+// report §16.5): a candidate below the engine's own kMinTAAUpsampleResolutionFraction of the
+// dispatch is an impostor too SMALL for `view_fits_dispatch` to catch, and it used to WIN the
+// search from a lower root parameter - which created DLSS features at 64x41 -> 3840x2160 and put
+// a magnified corner of the frame on screen. Each count is now the search rejecting one and
+// continuing to the real view, not a frame we got wrong.
+// amb_claimed / amb_other count dispatches where a SECOND surviving View would have given
+// DIFFERENT ClipToPrevClip / jitter / CameraCut - i.e. the slot-order search was guessing rather
+// than having its answer forced. Split by whether the ENGINE claimed the dispatch, because
+// look-alikes outnumber real upscales here and an undifferentiated count cannot answer the only
+// question that matters: was DLSS SR itself ever fed a view we had to guess at?
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
+                          std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
+                          std::uint64_t &amb_other);
 
 // WHAT THE VIEW-CB SEARCH ITSELF COSTS: every bound root CBV it TRIED, one describe_resource and
 // one 2448-byte buffer read each. Divided by the dispatch count it is candidates-per-dispatch,

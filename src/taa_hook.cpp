@@ -63,6 +63,23 @@ std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
 // which colour-by-register and the u0 output still require, so this number bounds the saving from
 // above and is expected to be small against `shadow-copy`.
 std::atomic<std::uint64_t> g_view_cb_reads{ 0 };
+// THE OTHER HALF OF THE WRONG-VIEW BUG, AND IT IS NOW GATED (report §16.5, facts §36.20).
+// `view_fits_dispatch` bounds a candidate only from ABOVE, so an impostor whose rect is too
+// SMALL — a shadow, planar-reflection, cubemap-face or scene-capture view — passed plausibility,
+// row 135 and the fit bound alike, and one sitting on a lower root parameter won the search.
+// It counted 162 in the measured session and gated nothing; the consequence was 37 of 62 DLSS
+// features created at rects like 64x41 -> 3840x2160, i.e. the top-left corner of the frame
+// magnified over the whole screen. This counter now means "a candidate REJECTED for being below
+// the engine's own kMinTAAUpsampleResolutionFraction, so the search kept looking" — each one is
+// the fix firing, not a frame we got wrong.
+std::atomic<std::uint64_t> g_view_suspect_small{ 0 };
+// More than one plausible View survived the filter on one dispatch, so the pick was a choice.
+// SPLIT BY WHETHER THE ENGINE CLAIMED THE DISPATCH. A session offers ~10 000 look-alikes beside
+// ~9 000 real upscales, so an undifferentiated count is diluted by an order of magnitude and
+// cannot answer the actual question: was DLSS SR ITSELF ever fed the wrong view?
+std::atomic<std::uint64_t> g_view_amb_claimed{ 0 };
+std::atomic<std::uint64_t> g_view_amb_other{ 0 };
+std::atomic<std::uint32_t> g_view_amb_logged{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -172,6 +189,8 @@ std::unordered_map<std::uint64_t, bool> g_candidate_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_disagreement_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_hash_assert_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_rect_assert_logged;
+// One WARN per pass when register t1 holds something that cannot be InputSceneColor.
+std::unordered_map<std::uint64_t, bool> g_colour_reg_rejected_logged;
 bool g_seam_first_engine_claim_logged = false;
 
 // Why a structurally matched TAA pass never reached DLSS.
@@ -703,12 +722,31 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
+	// THE LOOP RUNS TO THE END even after a winner is accepted, and for two different reasons.
+	// The first is a GATE: a candidate too large for the dispatch (facts §36.18) or below the
+	// engine's own 0.5 minimum fraction (§36.21) is skipped and the search CONTINUES, so the
+	// real view on a higher root parameter is found. The second is a MEASUREMENT of what is
+	// left: `distinct_rival` counts a survivor that would hand DLSS DIFFERENT motion, which is
+	// the only kind of ambiguity a slot-order search can get wrong.
+	// It is NOT "how many candidates survived".
+	// Two root parameters can point at one suballocation, or hold byte-identical copies of the
+	// same view - neither is a choice the search can get wrong. Only a survivor that would hand
+	// DLSS DIFFERENT ClipToPrevClip / jitter / CameraCut is ambiguity.
+	bool distinct_rival = false;
+	char cand_list[192];
+	int cand_off = 0;
+	cand_list[0] = '\0';
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
 		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
+		if (cand_off >= 0 && cand_off < static_cast<int>(sizeof(cand_list)) - 1)
+			cand_off += std::snprintf(cand_list + cand_off, sizeof(cand_list) - cand_off,
+				" b%u=%.0fx%.0f", cb.first,
+				static_cast<double>(candidate.view_size_and_inv_size.x),
+				static_cast<double>(candidate.view_size_and_inv_size.y));
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
 		// establish that a buffer IS a View uniform buffer; a shadow, cubemap-face or
 		// scene-capture view satisfies both. The search runs in slot order, so a wrong-but-
@@ -720,7 +758,37 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// be larger than the dispatch covers cannot be this one.
 		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			// Gated on !view_ok so this keeps the meaning it had when the loop still broke at
+			// the winner: candidates on LATER root parameters could never have won under either
+			// selection rule, and counting them would make this incomparable with the 19 870
+			// recorded in facts §36.19.
+			if (!view_ok)
+				g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		// AND KEEP LOOKING IF IT IS TOO SMALL, which is the other half of the same test and
+		// used to be measured without being acted on (facts §36.20, report §16.5).
+		// `view_fits_dispatch` above bounds a candidate only from ABOVE; a shadow, planar-
+		// reflection, cubemap-face or scene-capture view is SMALLER than the dispatch and
+		// passed plausibility, row 135 and that bound alike, so one on a lower root parameter
+		// still won the search. UE 4.27 will not ask for a temporal upscale from below
+		// `kMinTAAUpsampleResolutionFraction` = 0.5 of the output rect on either axis, and the
+		// dispatch covers the output rect - so a candidate under that floor is not this
+		// dispatch's view. SKIPPING it rather than refusing the frame is the point: the real
+		// view usually sits on a HIGHER root parameter, so the search now finds it and DLSS
+		// runs correctly instead of declining. `primary_view_shape_ok` at the create site is
+		// the backstop for when it does not.
+		if (!ue4::view_fraction_plausible(candidate, x * 8u, y * 8u))
+		{
+			if (!view_ok)
+				g_view_suspect_small.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (view_ok)
+		{
+			// Keep scanning ONLY to judge ambiguity; the pick is unchanged (first accepted).
+			if (ue4::views_differ_temporally(view, candidate))
+				distinct_rival = true;
 			continue;
 		}
 		view = candidate;
@@ -728,7 +796,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
-		break;
 	}
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
@@ -812,6 +879,35 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
+
+		// THE QUIET-RESIDUE VERDICT, and it is only meaningful on a CLAIMED dispatch. The
+		// question is not "was any dispatch's View ambiguous" - look-alikes outnumber real
+		// upscales here - it is "was DLSS SR itself ever handed a view it had to guess at".
+		// `distinct_rival` means a second surviving candidate would have given different
+		// ClipToPrevClip / jitter / CameraCut, i.e. the slot-order search was guessing.
+		if (view_ok && distinct_rival)
+		{
+			const bool claimed = (seam_gate == seam::Gate::engine);
+			if (claimed)
+				g_view_amb_claimed.fetch_add(1, std::memory_order_relaxed);
+			else
+				g_view_amb_other.fetch_add(1, std::memory_order_relaxed);
+			if (claimed && g_view_amb_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+				STRAY_LOG_WARN("VIEW CB AMBIGUITY ON A CLAIMED DISPATCH: %ux%u groups (covers "
+					"%ux%u px). More than one View survived plausibility + row135 + "
+					"fits-dispatch + the 0.5 minimum fraction, AND they disagree on "
+					"ClipToPrevClip / jitter / CameraCut - so the slot-order search GUESSED, "
+					"and DLSS SR took the guess. We used b%u = %.0fx%.0f (fraction %.3f of the "
+					"dispatch). All plausible candidates:%s. The too-SMALL impostors are gated "
+					"out now (facts §36.20), so anything left here is a rival of a legal shape "
+					"and would need the View CB by IDENTITY to settle (report §15.2). Logged 8 "
+					"times.",
+					x, y, x * 8u, y * 8u, b.view_cb_register,
+					static_cast<double>(view.view_size_and_inv_size.x),
+					static_cast<double>(view.view_size_and_inv_size.y),
+					x != 0 ? static_cast<double>(view.view_size_and_inv_size.x) / (x * 8.0) : 0.0,
+					cand_list);
+		}
 		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
 		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
 		// no RHI resource at AddPasses time has one now. Each is validated against our own
@@ -1359,13 +1455,70 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							m.verdict == MatchVerdict::hash_and_structural ||
 							seam_gate == seam::Gate::engine;
 
+						// THE COLOUR INPUT IS SHAPE-CHECKED LIKE EVERY OTHER DLSS INPUT.
+						//
+						// Until 2026-09-03 it was not, and it is the only one that was not:
+						// depth, stencil and velocity are format-matched in match_taa_dispatch,
+						// the output UAV must be an HDR float colour target, depth and velocity
+						// additionally come from the engine's own FPassInputs (L1) — while the
+						// register pick took whatever was live at t1, with no format, no extent
+						// and no dimensionality test, and handed it to NGX as pInColor.
+						//
+						// It cannot be cross-checked against the engine either, and that is
+						// structural rather than incidental: FPassInputs.SceneColorTexture is
+						// the post-chain scene colour, whose ResourceRHI is assigned inside
+						// FRDGBuilder::Execute(), so it resolves `rhi_null` at announce BY
+						// DESIGN. The live log reads `l1: resolved=0 partial=103402` — depth and
+						// velocity on every claim, colour on none — so the L1 disagreement
+						// assertion below has never once executed for colour, and
+						// docs/RESEARCH-ENGINE-TAA-HOOK.md §14.4's "nothing has ever suggested
+						// colour was misidentified" is an artifact of never having looked.
+						//
+						// So assert what the shader itself requires of InputSceneColor, and
+						// REFUSE rather than evaluate when t1 does not meet it. Refusing costs
+						// one frame of the engine's own TAA; not refusing puts an arbitrary
+						// texture through the upscaler and into u0.
 						std::uint64_t reg_colour = 0;
+						const BoundTexture *reg_colour_tex = nullptr;
+						bool reg_colour_rejected = false;
 						if (trust_registers)
 						{
 							for (const auto &t : b.srvs)
 							{
-								if (t.slot == kSceneColourReg && icept::backend()->is_resource_live(t.resource))
+								if (t.slot != kSceneColourReg ||
+									!icept::backend()->is_resource_live(t.resource))
+									continue;
+								reg_colour_tex = &t;
+								if (colour_input_acceptable(t, render_w, render_h,
+										out_tex != nullptr ? out_tex->format : TexFormat::unknown))
 									reg_colour = t.resource;
+								else
+									reg_colour_rejected = true;
+							}
+							if (reg_colour_rejected && reg_colour == 0)
+							{
+								bool first = false;
+								{
+									std::lock_guard<std::mutex> lock(g_mutex);
+									first = !g_colour_reg_rejected_logged[hash];
+									g_colour_reg_rejected_logged[hash] = true;
+								}
+								if (first)
+									STRAY_LOG_WARN("COLOUR INPUT REFUSED on pass 0x%016llx: "
+										"register t%u holds %p (%ux%u fmt=%d) which is not "
+										"InputSceneColor — it must be a 2D HDR float colour "
+										"texture (the output UAV is fmt=%d) of at least the "
+										"render rect %ux%u. DLSS SR does not run on this "
+										"dispatch; the engine's own TAA does. If this fires "
+										"steadily, read the render rect first: it comes from "
+										"the View CB slot-order search, and a wrong one makes "
+										"every colour candidate fail. Once per pass.",
+										static_cast<unsigned long long>(hash), kSceneColourReg,
+										reinterpret_cast<void *>(reg_colour_tex->resource),
+										reg_colour_tex->width, reg_colour_tex->height,
+										static_cast<int>(reg_colour_tex->format),
+										out_tex != nullptr ? static_cast<int>(out_tex->format) : -1,
+										render_w, render_h);
 							}
 							if (!g_ngx_registers_logged)
 							{
@@ -1505,26 +1658,34 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						// descriptor's render size comes from the View CB's view rect (see the
 						// comment above). Gating the matcher left this path untouched — the
 						// bogus creates continued with zero rejections logged.
-						// Under the engine's gate the shape test is moot: a cubemap face or
-						// a reflection capture never reaches ITemporalUpscaler::AddPasses.
-						bool shape_ok = true;
-						if (seam_gate != seam::Gate::engine &&
-							fd.render_width > 0 && fd.render_height > 0 &&
-							fd.output_width > 0 && fd.output_height > 0)
-						{
-							const double in_aspect = static_cast<double>(fd.render_width) /
-								static_cast<double>(fd.render_height);
-							const double out_aspect = static_cast<double>(fd.output_width) /
-								static_cast<double>(fd.output_height);
-							// 4% absorbs UE4's 8-pixel tile quantisation at every ratio we run;
-							// a genuine mismatch (5.8:1 against 1.78:1) is out by 225%.
-							if (in_aspect > out_aspect * 1.04 || in_aspect < out_aspect * 0.96)
-								shape_ok = false;
-							// Ultra Performance is 3x linear; 3.5 leaves room for a future mode.
-							if (static_cast<double>(fd.output_width) /
-								static_cast<double>(fd.render_width) > 3.5)
-								shape_ok = false;
-						}
+						// THE SHAPE TEST RUNS UNDER THE ENGINE'S GATE TOO, and it was wrong
+						// not to. (CORRECTED 2026-09-03; the skip was added by f947ee4, the
+						// commit that made EngineSeam=3 the default, reasoning "a cubemap
+						// face or a reflection capture never reaches
+						// ITemporalUpscaler::AddPasses".)
+						//
+						// That reasoning covers ONE of the test's two operands. `fd.output_*`
+						// is the engine's own announced OutputViewRect and is trustworthy.
+						// `fd.render_*` is `View.ViewSizeAndInvSize` out of a constant buffer
+						// we located by SEARCHING every bound CB in slot order and keeping the
+						// first plausible hit — nothing the engine announced. A shadow,
+						// planar-reflection or scene-capture view IS a real View uniform
+						// buffer, so it passes plausibility, the row-135 self-check and
+						// `view_fits_dispatch` (which bounds the view only from ABOVE), and one
+						// on a lower root parameter wins the search.
+						//
+						// MEASURED on the box, one 114,000-frame session: 37 of 62 DLSS
+						// features were created at render rects that cannot be the primary view
+						// — 64x34 through 64x52, 128x109, 128x126, 256x240, 1024x1024 — every
+						// one of them upscaling to the announced 3840x2160. DLSS was then told
+						// InRenderSubrectDimensions of 64x41 against the real 1920x1080 scene
+						// colour, so it read the TOP-LEFT CORNER of the frame and magnified it
+						// ~60x over the whole screen. Refusing costs one frame of the engine's
+						// own TAA (`suppress_engine_dispatch` is only set on a successful
+						// evaluate); not refusing puts an unrelated part of the world on the
+						// display. Prime directive 2.
+						const bool shape_ok = primary_view_shape_ok(
+							fd.render_width, fd.render_height, fd.output_width, fd.output_height);
 
 						const bool dims_ok = shape_ok &&
 							fd.output_width >= fd.render_width &&
@@ -1549,7 +1710,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						const bool roles_ok =
 							dims_ok && colour != nullptr && output != nullptr;
 						const bool feature_ok = roles_ok && ngx::ensure_feature(native, fd);
-						if (seam_gate == seam::Gate::engine && !roles_ok)
+						// A shape refusal and a role refusal are different fixes, so they are
+						// different counters: the first says the View CB search handed us
+						// another view's size, the second that a binding could not be named.
+						if (seam_gate == seam::Gate::engine && !shape_ok)
+							seamhook::note_outcome(seam::SeamRefusal::bad_render_rect);
+						else if (seam_gate == seam::Gate::engine && !roles_ok)
 							seamhook::note_outcome(seam::SeamRefusal::role_unresolved);
 						else if (seam_gate == seam::Gate::engine && !feature_ok)
 							seamhook::note_outcome(seam::SeamRefusal::create_failed);
@@ -1972,11 +2138,16 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
 }
 
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view)
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
+                          std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
+                          std::uint64_t &amb_other)
 {
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
+	suspect_small = g_view_suspect_small.load(std::memory_order_relaxed);
+	amb_claimed = g_view_amb_claimed.load(std::memory_order_relaxed);
+	amb_other = g_view_amb_other.load(std::memory_order_relaxed);
 }
 
 std::uint64_t view_cb_read_count()

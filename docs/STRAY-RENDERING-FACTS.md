@@ -3412,3 +3412,182 @@ loudly** — that is the 1.2%. A wrong view whose rect was *smaller* passed the 
 another view's jitter, `ClipToPrevClip` and `CameraCut` **silently**. How often that happened on
 the real TAA dispatch specifically is not measured here, but it is the same class of error as the
 wrong velocity (§36.13.1) and it is now impossible by construction.
+
+### 36.20 The quiet residue is REAL: 0.33% of claimed dispatches take a GUESSED View (2026-09-03)
+
+DLL `645c16de…` (`e3e0763`), menu, no injected input. The instrument is investigation-only —
+nothing is gated on it and the pick is unchanged.
+
+```
+[view] frame 10800: row135 ok=20398 bad=0 | wrongView=19939 | suspectSmall=0
+                    ambClaimed=36 ambOther=4
+[seam] frame 9000:  announced=9003 claimed=9003 unclaimed=0 orphans=0
+```
+
+* **`suspectSmall=0`.** No accepted View is below the engine's own
+  `kMinTAAUpsampleResolutionFraction`. The "impostor too small to catch" shape does **not**
+  occur — that hypothesis is refuted.
+
+  > **RETRACTED THE SAME DAY, AND THE RETRACTION IS THE LESSON (§36.21).** This session was
+  > **the menu, with no injected input**, and the menu has no shadow-casting world, no planar
+  > reflections and no scene captures to offer. In **gameplay** the same build reads
+  > **`suspectSmall=171`**, and the consequence reached the screen: 26 DLSS features created at
+  > rects like `64x41 -> 3840x2160`, i.e. the top-left corner of the frame magnified over the
+  > whole display. **A counter that reads 0 where the phenomenon cannot occur is not a
+  > refutation** — it is the §2.4 menu/load trap in a new place, and this file has now paid for
+  > that shape three times (menu depth, the NR luminance diagnostic, and here).
+* **`ambClaimed=36` of ~10 800 claimed dispatches (~0.33%).** On those, a second surviving View
+  would have given **different `ClipToPrevClip` / jitter / `CameraCut`**, so the slot-order search
+  guessed and DLSS SR took the guess. `ambOther=4`: essentially none on look-alikes, which is why
+  splitting the counter mattered — undifferentiated it would have read 40 and meant nothing.
+
+#### And the WARN names the shape, which is not what anyone predicted
+
+```
+VIEW CB AMBIGUITY ON A CLAIMED DISPATCH: 480x270 groups (covers 3840x2160 px). ... We used
+b3 = 1920x1080 (fraction 0.500 of the dispatch, engine minimum 0.5 -> OK).
+All plausible candidates: b3=1920x1080 b4=1920x1080.
+```
+
+**Both candidates are 1920x1080 — the real render rect — and both pass every structural test.**
+They are not a shadow or capture view; they are two buffers describing the *same view shape* that
+**disagree on the motion fields**. The overwhelmingly likely reading is that one is **STALE**: UE4
+sub-allocates the View uniform buffer from a constant ring (§2.6), and a previous frame's copy can
+still be bound on a lower root parameter. **We take the lower register, so we take the stale one.**
+
+That is precisely the error class this file keeps warning about: a wrong `ClipToPrevClip` and
+jitter do not cost one frame, they **compound through the accumulation** and read as instability
+on small bright high-contrast content — menu light shafts being the ideal case.
+
+#### Why no structural test can fix this, and what can
+
+Every discriminator we have is structural — extent, plausibility, row 135, the fraction bound —
+and **all of them are satisfied by both candidates**, because both really are the same view's
+uniform buffer. There is nothing left to measure the difference *with*.
+
+**So the answer is identity, not shape** — the same move that retired the TAA-pass heuristic and
+the G-buffer finder. `ITemporalUpscaler::AddPasses` hands us the `const FViewInfo&`; its
+`ViewUniformBuffer` resolved to a D3D12 resource and offset, matched against the bound CBV, names
+the buffer outright and makes "which of these two" unanswerable-by-search into a fact.
+**This measurement is what justifies that work** (report §14.4 had demoted it to a performance
+change on the strength of §36.14's clean row-135 record; §36.18 already narrowed that reading, and
+this narrows it further).
+
+#### Scale, stated honestly
+
+0.33% is **a quarter** of the loud 1.2% that turned out to be the whole visible flicker, and it is
+one event per ~300 frames (~0.18/s at 53 fps) against the loud one's ~0.64/s. So it is real, it is
+the right shape to produce the symptom, and it is **not established that it accounts for all the
+residual flicker** — only that it exists and is worth removing.
+
+#### What the elimination arms could NOT settle
+
+Four arms (baseline / `NgxNR=0` / `NgxFG=0` / both off), n=8 screenshots each, median
+frame-to-frame difference over a crop of the light shafts:
+
+| arm | median |
+|---|---|
+| baseline, long-running session | 2712 |
+| **baseline, fresh launch** | **1421** |
+| `NgxNR=0` | 3169 |
+| `NgxFG=0` | 1605 |
+| both off | 1443 |
+
+**The same configuration measured 2712 and 1421**, so the within-config spread exceeds every
+between-arm difference. **This instrument cannot separate the arms** and no attribution should be
+read out of it — the menu's own animation (drifting motes, pulsing shafts) dominates, and the
+capture rate (~2 s) is far below the phenomenon. Recorded as a **clean negative on the method**,
+because the tempting misreading — "FG off halves it" — is exactly the single-draw error this file
+has already paid for twice.
+
+**NR is separately ruled out on its own counters**, which are not subject to that noise:
+`guides-stale=0` and 4 resets total across a 27 600-frame session.
+
+
+---
+
+## 36.21 The wrong View reaches the SCREEN in gameplay, and it costs 59% of all DLSS feature creations (2026-09-03)
+
+**The user, playing:** *"some textures are popping up on the whole screen when we walk around… at
+Antvillage you see a carpet pattern full screen"*, and separately *"during some script scene
+transitions, the NR kinda pops up/slows down as if there was something off."* **Two reports, and
+the same log answers both.**
+
+Read **read-only, while the user was playing**, from the live `stray-dlss-plugin.log`
+(`EngineSeam=3`, frame 258 600):
+
+```
+[view] frame 258600: row135 ok=515927 bad=0 | wrongView=517135
+                     suspectSmall=171 ambClaimed=344 ambOther=14
+[seam] frame 258600: announced=257803 claimed=241391 unclaimed=16412 orphans=58
+                     claimedButNoSR: all zero | evaluated=241270
+                     l1: resolved=0 partial=241391 fellBack=0 stale=0 faults=0 off=0
+```
+
+**`suspectSmall=171`, against the `0` §36.20 measured in the menu.** The shape §36.20 called
+refuted is the shape that was on screen.
+
+### 36.21.1 Every DLSS feature creation in the session, classified
+
+88 `DLSS feature created:` lines. The classification is arithmetic, not judgement — a rect fails
+`primary_view_shape_ok` (UE 4.27's own `kMinTAAUpsampleResolutionFraction = 0.5` on both axes, a
+4% aspect tolerance, a 3.5x scale ceiling) or it does not:
+
+| group | count | what it is |
+|---|---|---|
+| **A** | **26** | `64x34` … `64x59`, `128x109`, `128x126`, `256x240`, `512x512`, `1016x1016`, `1024x1024` — all `-> 3840x2160`. **Impossible.** A 60x upscale is not a thing DLSS does |
+| **B** | **31** | `1920x1037 -> 3840x2073` … `1920x1074 -> 3840x2148`, twenty-two distinct pairs. **Real**, and see below |
+| **C** | **31** | `1920x1080 -> 3840x2160`, the primary view |
+
+**The creation SEQUENCE is what makes this decisive**, and it is one string:
+
+```
+CBBBBBBBCACBBBBBBBBCACACACACACACACACACACACACACACACACACACACACACACACBBBBBBCBBBBBBBBBBCACAC
+```
+
+* **Every A is a LONE excursion** — 26 of them, each `…C A C…`. So each A costs a second creation
+  when the real view comes back: **26 + 26 = 52 of 88 creations, 59%, are the wrong-View bug**,
+  and gating `view_fraction_plausible` removes all of them.
+* **Every B is part of a RUN**: four runs of **7, 8, 6 and 10** consecutive creations. Those are
+  the scripted scene transitions.
+
+### 36.21.2 Group B is a cinematic-bar animation, and it is genuine
+
+The aspect goes **1.778 -> 1.85** and back while the render rect tracks the output rect at exactly
+0.5, so both operands move together: this is the engine really running the upscale into a
+shrinking view rect, not a wrong buffer. It passes `primary_view_shape_ok` and should.
+
+**A subrect cannot absorb it.** `NVSDK_NGX_D3D12_DLSS_Eval_Params` carries
+`InRenderSubrectDimensions` (dimensions) and `InOutputSubrectBase` (a base COORDINATE), and the
+target extent is fixed at `CreateFeature` by `InTargetWidth/Height` — `nvsdk_ngx_helpers.h:377-398`,
+**HARD**. Dynamic resolution works through the render subrect precisely because the output rect
+does not move; here it does. So CLAUDE.md §2.1's rule stands and the recreate is required.
+
+**The fix is therefore not to recreate faster but to stop chasing.** `core::plan_recreate`
+debounces RE-creation until a differing rect has been asked for `NgxRecreateStableFrames`
+(default 8) frames running, declining meanwhile so the engine's own TAA renders those frames.
+Replayed against the sequence above that is **zero creations per transition**, and the primary
+feature is never released — so DLSS's accumulated history survives the whole cinematic and there
+is no pop at the end of it either.
+
+### 36.21.3 What each defect's fix leaves behind
+
+| | before | after |
+|---|---|---|
+| creations from the wrong View (A + the C it forces) | 52 | **0** |
+| creations from the bar animation (B + the C it forces) | 35 | **0** |
+| genuine creations | 1 | **1** |
+
+**Read from one launch:** `[view] tooSmall=` counting up with **no** impossible rect in any
+`DLSS feature created:` line is Defect 1 fixed; `[recreate] deferred= restarts=` counting up
+across a scripted transition with **no** creation in it is Defect 2 fixed. `badRenderRect` on the
+`[seam]` line must stay at or near 0 — it is the backstop, and a rising rate means the search is
+still losing.
+
+### 36.21.4 Method note
+
+The measurement cost two `grep`s against a log file on a machine someone was playing on. The
+creation histogram alone would have shown group A; **only the ordered sequence showed that each
+one costs a second creation**, which is what turned "37 of 62 look wrong" into "59% of all
+creations are this bug". When a counter is a total, ask for the order before estimating what
+removing it buys.

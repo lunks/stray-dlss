@@ -379,3 +379,161 @@ TEST_CASE("view_fits_dispatch separates THIS view from A view")
 		CHECK(ue4::view_fits_dispatch(p, 0, 0));
 	}
 }
+
+TEST_CASE("view_fraction_plausible is the OTHER half - it catches an impostor that is too SMALL")
+{
+	// view_fits_dispatch catches a rect LARGER than the dispatch (the loud 1.2%, facts §36.18).
+	// A rect that is SMALLER passes it silently and would hand DLSS another view's jitter,
+	// ClipToPrevClip and CameraCut. The floor is the engine's OWN declared minimum,
+	// FSceneViewScreenPercentageConfig::kMinTAAUpsampleResolutionFraction == 0.5 - the same
+	// constant seam::discover already validates the ITemporalUpscaler vtable against.
+	ue4::ViewParams p{};
+
+	SUBCASE("the shipped 50% screen percentage sits exactly ON the floor and passes")
+	{
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("70%, the other configuration this project runs, passes")
+	{
+		p.view_size_and_inv_size = { 2688.0f, 1512.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("DLAA passes")
+	{
+		p.view_size_and_inv_size = { 3840.0f, 2160.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("a shadow-sized view is nowhere near the line")
+	{
+		p.view_size_and_inv_size = { 512.0f, 512.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1024.0f, 1024.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("the quantisation slack is 8px, not a licence to drift")
+	{
+		// group count * 8 rounds the real output rect up by at most 7 per axis, so the floor is
+		// loosened by 8 - enough for DivideAndRoundUp and nothing like enough for a wrong view.
+		p.view_size_and_inv_size = { 1912.0f, 1072.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1700.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+	SUBCASE("no extent, or nothing to compare against")
+	{
+		p.view_size_and_inv_size = { 0.0f, 0.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+		p.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK(ue4::view_fraction_plausible(p, 0, 0));
+	}
+}
+
+TEST_CASE("views_differ_temporally: duplicates are not ambiguity, different motion is")
+{
+	// An ambiguity counter that counts SURVIVING candidates is inflated by events where no view
+	// was ever at stake - two root parameters pointing at one suballocation, or two copies of
+	// the same view's uniform buffer. Only a candidate that would hand DLSS DIFFERENT motion is
+	// a choice the search can get wrong.
+	ue4::ViewParams a{};
+	a.temporal_aa_params = { 8.0f, 8.0f, 0.25f, -0.125f };
+	a.camera_cut = 0.0f;
+	for (int i = 0; i < 16; ++i)
+		a.clip_to_prev_clip.m[i] = static_cast<float>(i) * 0.5f;
+
+	SUBCASE("a byte-identical copy is NOT ambiguity")
+	{
+		ue4::ViewParams b = a;
+		CHECK_FALSE(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("a different view rect alone is NOT ambiguity - it reaches no temporal consumer")
+	{
+		// The rect matters for the matcher, but DLSS integrates motion, not extents. Two
+		// buffers agreeing on ClipToPrevClip/jitter/CameraCut give the same reprojection.
+		ue4::ViewParams b = a;
+		b.view_size_and_inv_size = { 1920.0f, 1080.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("any ClipToPrevClip element differing IS ambiguity")
+	{
+		for (int i = 0; i < 16; ++i)
+		{
+			ue4::ViewParams b = a;
+			b.clip_to_prev_clip.m[i] += 1.0f;
+			CHECK(ue4::views_differ_temporally(a, b));
+		}
+	}
+	SUBCASE("jitter differing IS ambiguity")
+	{
+		ue4::ViewParams b = a;
+		b.temporal_aa_params.z = 0.30f;
+		CHECK(ue4::views_differ_temporally(a, b));
+		ue4::ViewParams c = a;
+		c.temporal_aa_params.w = 0.0f;
+		CHECK(ue4::views_differ_temporally(a, c));
+	}
+	SUBCASE("CameraCut differing IS ambiguity")
+	{
+		ue4::ViewParams b = a;
+		b.camera_cut = 1.0f;
+		CHECK(ue4::views_differ_temporally(a, b));
+	}
+	SUBCASE("it is symmetric")
+	{
+		ue4::ViewParams b = a;
+		b.camera_cut = 1.0f;
+		CHECK(ue4::views_differ_temporally(a, b) == ue4::views_differ_temporally(b, a));
+	}
+}
+
+TEST_CASE("the two bounds are COMPLEMENTARY - which is why the small impostor reached the screen")
+{
+	// The search now rejects a candidate that fails EITHER bound and keeps looking. This pins
+	// why both are needed: the shadow/capture views that created DLSS features at 64x41 ->
+	// 3840x2160 (report §16) all PASS view_fits_dispatch, because it only bounds from above.
+	// Every rect here is one the live log actually named on a dispatch covering 3840x2160.
+	const struct { float w, h; } impostors[] = {
+		{ 64.0f, 34.0f }, { 64.0f, 41.0f }, { 64.0f, 52.0f }, { 128.0f, 109.0f },
+		{ 128.0f, 126.0f }, { 256.0f, 240.0f }, { 1024.0f, 1024.0f },
+	};
+	for (const auto &r : impostors)
+	{
+		ue4::ViewParams p{};
+		p.view_size_and_inv_size = { r.w, r.h, 0.0f, 0.0f };
+		CHECK(ue4::view_fits_dispatch(p, 3840, 2160));          // the old filter lets it through
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160)); // the new one does not
+	}
+
+	SUBCASE("and the real views pass BOTH, so gating costs no legitimate frame")
+	{
+		// Each render rect against the dispatch that ACTUALLY covered it - group count * 8 over
+		// that frame's own output rect. The dynamic-resolution rows are the point: under it the
+		// output rect shrinks WITH the render rect, so the pair stays at ~0.5 and the 8px
+		// quantisation slack is what absorbs the rounding. (Pairing 1920x1064 with a full
+		// 3840x2160 dispatch would fail, and correctly so - that combination never occurs.)
+		const struct { float w, h; std::uint32_t cw, ch; } real[] = {
+			{ 1920.0f, 1080.0f, 3840, 2160 },  // 50% screen percentage, what the game ships
+			{ 2688.0f, 1512.0f, 3840, 2160 },  // 70%
+			{ 3840.0f, 2160.0f, 3840, 2160 },  // DLAA
+			{ 1920.0f, 1070.0f, 3840, 2144 },  // dynamic res, 3840x2140 output, from the log
+			{ 1920.0f, 1064.0f, 3840, 2128 },  // dynamic res, 3840x2127 output
+			{ 1920.0f, 1066.0f, 3840, 2136 },  // dynamic res, 3840x2132 output
+		};
+		for (const auto &r : real)
+		{
+			ue4::ViewParams p{};
+			p.view_size_and_inv_size = { r.w, r.h, 0.0f, 0.0f };
+			CHECK(ue4::view_fits_dispatch(p, r.cw, r.ch));
+			CHECK(ue4::view_fraction_plausible(p, r.cw, r.ch));
+		}
+	}
+
+	SUBCASE("a portrait impostor fails the fraction test on its NARROW axis")
+	{
+		// 1064x2128 against 3840x2160: the height alone would pass, the width cannot. Both
+		// axes are tested for exactly this shape.
+		ue4::ViewParams p{};
+		p.view_size_and_inv_size = { 1064.0f, 2128.0f, 0.0f, 0.0f };
+		CHECK_FALSE(ue4::view_fraction_plausible(p, 3840, 2160));
+	}
+}
