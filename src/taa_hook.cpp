@@ -16,6 +16,7 @@
 #include "log.hpp"
 #include "input_dump.hpp"
 #include "mv_mask.hpp"
+#include "gbuffer_resolve.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_fg.hpp"
 #include "ngx_backend.hpp"
@@ -242,6 +243,208 @@ const char *const kGateReasonText[kGateReasonCount] = {
 	"refused on every dispatch by configuration (see the ENGINE SEAM MODE line at startup)",
 };
 std::unordered_map<std::uint64_t, std::uint32_t> g_gate_logged; // hash -> reason bitmask
+
+// --- DLSS Ray Reconstruction (taa_hook.hpp) -----------------------------------------------
+//
+// [STRAYDLSS] NgxRR: 0 off, 1 probe (ngx_backend does that at feature creation), 2 evaluate.
+std::atomic<int> g_ngx_rr_mode{ 0 };
+std::atomic<std::uint32_t> g_rr_evaluates{ 0 };
+std::atomic<std::uint32_t> g_rr_fallbacks{ 0 };
+std::atomic<std::uint32_t> g_rr_reasons[kRrReasonCount] = {};
+// One first-occurrence WARN per reason, with the specifics the counter cannot carry. The
+// counters give the RATE, this gives the STORY, and conflating the two has cost this project a
+// round trip before (CLAUDE.md §2.3, the seam's per-reason counters).
+bool g_rr_reason_logged[kRrReasonCount] = {};
+bool g_rr_logged_once = false;
+
+// The evaluate-side reasons, i.e. everything that is not the guide set's own verdict. Indices
+// continue where rrguides::Refusal stops.
+enum RrEvalReason : std::size_t
+{
+	kRrRowsImplausible = kRrGuideReasonCount + 0, // View row 12-15's rotation failed its check
+	kRrResolveNotReady = kRrGuideReasonCount + 1, // gbr::initialise refused (device/alloc)
+	kRrResolveFailed   = kRrGuideReasonCount + 2, // gbr::record refused
+	kRrCreateFailed    = kRrGuideReasonCount + 3, // ngx::ensure_feature_rr refused
+	kRrEvaluateFailed  = kRrGuideReasonCount + 4, // ngx::evaluate_rr returned false
+};
+
+void note_rr_reason(std::size_t index, const char *detail)
+{
+	if (index >= kRrReasonCount)
+		return;
+	g_rr_reasons[index].fetch_add(1, std::memory_order_relaxed);
+	if (g_rr_reason_logged[index])
+		return;
+	g_rr_reason_logged[index] = true;
+	STRAY_LOG_WARN("DLSS RR fell back to SR, reason \"%s\" (first occurrence): %s. SR carries "
+		"this frame, so the image is the SR image and nothing is lost - but a reason whose "
+		"counter never stops growing on the [rr] line is a configuration problem, not noise.",
+		rr_reason_name(index), detail != nullptr ? detail : "");
+}
+
+// THE RAY-RECONSTRUCTION EVALUATE, and the whole of its guide sourcing.
+//
+// Called only when [STRAYDLSS] NgxRR == 2, from the one place in the frame where colour, depth,
+// the dense motion vectors and the View are all known-good and known-fresh. Returns true when
+// RR carried the frame; false means SR carries it and a NAMED reason has been counted.
+//
+// IDENTITY AND LIFETIME, spelled out because the project has been bitten by conflating them
+// twice (CLAUDE.md §2.3):
+//   * IDENTITY of the three inputs is the ENGINE'S OWN, read off FindFreeElement's debug-name
+//     argument. It is warranted permanently and needs no re-checking.
+//   * LIFETIME is warranted by nothing the engine told us. poolhook::guide_set re-asks OUR
+//     resource registry at THIS call, rrguides::judge refuses the frame if any member is not
+//     live, and gbr::record then AddRefs all three for as long as the GPU could be reading them.
+//     Nothing caches a pointer across a frame boundary.
+//
+// WHERE THIS RECORDS, and it is the one thing a live run must judge. NVIDIA's own UE plugin
+// resolves the G-buffer at exactly this point - AddGBufferResolvePass runs at the upscale point,
+// DLSSUpscaler.cpp:578-589 (HARD, docs/RESEARCH-RR-GBUFFER.md §2.4) - and UE 4.27 holds the
+// G-buffer refcount from before the base pass to after AddPostProcessingPasses (§1.1), so the
+// pool cannot hand these elements to anything else while the frame is being rendered.
+// AGAINST THAT: a 2026-08-31 measurement of the OLD, heuristically-identified resources found
+// their CONTENT already recycled at this same point (~95% of every guide decoded as unlit). That
+// was a measurement of resources whose identity was a guess, so it does not transfer - but it is
+// not refuted either, and it is the single thing a first run has to look at. The instrument is
+// the guide dump below: one look at straydlss_rr_diffuse_*.bin says whether the albedo is the
+// scene or is mid-grey everywhere.
+bool try_evaluate_rr(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+                     const ngx::FeatureDesc &fd, const ngx::EvaluateInputs &ei,
+                     const ue4::ViewParams &view, std::uint64_t eval_no)
+{
+	rrguides::Set set;
+	poolhook::guide_set(set);
+
+	rrguides::Expect expect;
+	expect.frame_now = g_present_frame.load(std::memory_order_relaxed);
+	expect.buffer_width = static_cast<std::uint32_t>(view.buffer_size_and_inv_size.x);
+	expect.buffer_height = static_cast<std::uint32_t>(view.buffer_size_and_inv_size.y);
+	expect.render_width = ei.render_width;
+	expect.render_height = ei.render_height;
+	expect.supplying = poolhook::supplying();
+	expect.hooked = poolhook::hooked();
+
+	const rrguides::Refusal verdict = rrguides::judge(set, expect);
+	if (verdict != rrguides::Refusal::none)
+	{
+		char detail[256];
+		std::snprintf(detail, sizeof(detail),
+			"A=%#llx(%ux%u fmt%u seen%d ok%d live%d ep%llu) B=%#llx(fmt%u) C=%#llx(fmt%u) "
+			"expect %ux%u buffer, %ux%u render, supplying=%d hooked=%d",
+			static_cast<unsigned long long>(set.a.resource), set.a.width, set.a.height,
+			set.a.dxgi_format, set.a.seen ? 1 : 0, set.a.status_ok ? 1 : 0, set.a.live ? 1 : 0,
+			static_cast<unsigned long long>(set.a.epoch),
+			static_cast<unsigned long long>(set.b.resource), set.b.dxgi_format,
+			static_cast<unsigned long long>(set.c.resource), set.c.dxgi_format,
+			expect.buffer_width, expect.buffer_height, expect.render_width,
+			expect.render_height, expect.supplying ? 1 : 0, expect.hooked ? 1 : 0);
+		note_rr_reason(static_cast<std::size_t>(verdict), detail);
+		return false;
+	}
+
+	// The NoV geometry. A wrong rotation biases specular albedo everywhere and silently, so the
+	// row block is gated rather than trusted: rows 12-15 are mirror-verified but were never
+	// among the MEASURED anchors of CLAUDE.md §2.6.
+	if (!ue4::world_to_view_rotation_plausible(view.translated_world_to_view))
+	{
+		note_rr_reason(kRrRowsImplausible,
+			"View rows 12-15 (TranslatedWorldToView) do not read as a rigid rotation, so NoV - "
+			"and with it the whole specular-albedo guide - would be wrong in a way nothing "
+			"downstream can notice");
+		return false;
+	}
+
+	if (!gbr::initialise(device, ei.render_width, ei.render_height))
+	{
+		note_rr_reason(kRrResolveNotReady, gbr::last_error());
+		return false;
+	}
+
+	gbr::ResolveInputs gi;
+	gi.gbuffer_a = set.a.resource;
+	gi.gbuffer_b = set.b.resource;
+	gi.gbuffer_c = set.c.resource;
+	gi.render_width = ei.render_width;
+	gi.render_height = ei.render_height;
+	gi.view_rect_min[0] = view.view_rect_min.x;
+	gi.view_rect_min[1] = view.view_rect_min.y;
+	// Matrix4::m is a FLAT float[16] with m[r*4+c] == M[r][c] (view_params.hpp), so the two
+	// projection scale terms are m[0] and m[5], not m[0][0] and m[1][1].
+	gi.proj00 = view.view_to_clip_no_aa.m[0];
+	gi.proj11 = view.view_to_clip_no_aa.m[5];
+	ue4::nov_rotation_rows(view.translated_world_to_view, gi.world_to_view);
+
+	if (!gbr::record(cmd, gi, /*dispatch_mode=*/2))
+	{
+		note_rr_reason(kRrResolveFailed, gbr::last_error());
+		return false;
+	}
+
+	// The guides are UAV-written; NGX reads them as shader resources.
+	gbr::transition_outputs(cmd, /*to_shader_resource=*/true);
+
+	bool ok = false;
+	if (!ngx::ensure_feature_rr(cmd, fd))
+	{
+		note_rr_reason(kRrCreateFailed, ngx::last_error());
+	}
+	else
+	{
+		ngx::EvaluateInputsRR rr;
+		rr.base = ei;
+		rr.diffuse_albedo = gbr::diffuse_albedo();
+		rr.specular_albedo = gbr::specular_albedo();
+		rr.normals_roughness = gbr::normals_roughness();
+		rr.roughness = gbr::roughness();
+		// Row-major, straight across (ngx_backend.hpp: NGX's expected convention is
+		// undocumented and only the specular-MV path we do not feed consumes them).
+		std::memcpy(rr.world_to_view, view.translated_world_to_view.m, sizeof(rr.world_to_view));
+		std::memcpy(rr.view_to_clip, view.view_to_clip_no_aa.m, sizeof(rr.view_to_clip));
+		rr.have_matrices = true;
+		rr.frame_time_delta_ms = view.delta_time * 1000.0f;
+
+		if (input_dump::wants(eval_no))
+		{
+			// The four guides, as NGX receives them. This is the ONLY instrument that
+			// distinguishes "RR ran on good guides and did not help" from "RR ran on mid-grey" -
+			// the exact ambiguity that made the 2026-08-31 content-recycling finding cost a
+			// whole round trip. They are in NON_PIXEL_SHADER_RESOURCE at this point.
+			input_dump::capture(device, cmd, rr.diffuse_albedo,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "rr_diffuse", eval_no);
+			input_dump::capture(device, cmd, rr.specular_albedo,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "rr_specular", eval_no);
+			input_dump::capture(device, cmd, rr.normals_roughness,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "rr_normals", eval_no);
+			input_dump::capture(device, cmd, rr.roughness,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "rr_roughness", eval_no);
+		}
+
+		ok = ngx::evaluate_rr(cmd, rr);
+		if (!ok)
+			note_rr_reason(kRrEvaluateFailed, ngx::last_error());
+	}
+
+	// Back to UAV for the next frame's resolve, whether or not the evaluate ran: the state we
+	// claimed is the state the resource is in, and leaving it wrong desynchronises OUR own
+	// tracking for every later frame.
+	gbr::transition_outputs(cmd, /*to_shader_resource=*/false);
+
+	if (ok && !g_rr_logged_once)
+	{
+		g_rr_logged_once = true;
+		STRAY_LOG_INFO("DLSS RR evaluate OK: %ux%u -> %ux%u, guides from the ENGINE'S OWN names "
+			"- GBufferA=%#llx B=%#llx C=%#llx, all three from allocation cycle %llu at %ux%u. "
+			"This is the first frame Ray Reconstruction has ever carried in this project; "
+			"whether the IMAGE is right is a separate question and is for the user's eyes.",
+			ei.render_width, ei.render_height, fd.output_width, fd.output_height,
+			static_cast<unsigned long long>(set.a.resource),
+			static_cast<unsigned long long>(set.b.resource),
+			static_cast<unsigned long long>(set.c.resource),
+			static_cast<unsigned long long>(set.a.epoch), set.a.width, set.a.height);
+	}
+	return ok;
+}
+
 
 bool g_dry_run_all_logged = false;
 bool g_dry_run_mode2_logged = false;
@@ -525,6 +728,35 @@ bool owns_temporal_history(std::uint64_t hash)
 const Diagnostics &diagnostics() { return g_diag; }
 
 void set_ngx_evaluate(bool enabled) { g_ngx_evaluate = enabled; }
+
+void set_ngx_rr(int mode) { g_ngx_rr_mode.store(mode, std::memory_order_relaxed); }
+
+void rr_counters(std::uint32_t &evaluates, std::uint32_t &fallbacks)
+{
+	evaluates = g_rr_evaluates.load(std::memory_order_relaxed);
+	fallbacks = g_rr_fallbacks.load(std::memory_order_relaxed);
+}
+
+void rr_reason_counters(std::uint32_t out[kRrReasonCount])
+{
+	for (std::size_t i = 0; i < kRrReasonCount; ++i)
+		out[i] = g_rr_reasons[i].load(std::memory_order_relaxed);
+}
+
+const char *rr_reason_name(std::size_t index)
+{
+	if (index < kRrGuideReasonCount)
+		return rrguides::refusal_name(static_cast<rrguides::Refusal>(index));
+	switch (index)
+	{
+	case kRrGuideReasonCount + 0: return "rowsImplausible";
+	case kRrGuideReasonCount + 1: return "resolveNotReady";
+	case kRrGuideReasonCount + 2: return "resolveFailed";
+	case kRrGuideReasonCount + 3: return "createFailed";
+	case kRrGuideReasonCount + 4: return "evaluateFailed";
+	default: return "?";
+	}
+}
 void set_stage_file(bool enabled) { g_stage_file_enabled = enabled; }
 void set_ngx_dry_run(int mode) { g_ngx_dry_run = mode; }
 void set_dry_run_hashes(const std::uint64_t *hashes, std::size_t count)
@@ -2135,12 +2367,30 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							}
 							else
 							{
-								// DLSS SR. Ray Reconstruction used to get first refusal here
-								// and SR was its per-frame fallback, which is why this used to
-								// be wrapped in `if (!ok)`. RR's guide source was the heuristic
-								// G-buffer finder, deleted 2026-09-03 (report §13), so SR is
-								// the only evaluate on this path until RR is rewired to the
-								// engine's own named G-buffer textures.
+								// RAY RECONSTRUCTION GETS FIRST REFUSAL, SR IS THE PER-FRAME
+								// FALLBACK. RR replaces SR rather than adding to it: it does
+								// the upscaling too (docs/RESEARCH-RR-GBUFFER.md §2.6, "when
+								// DLSS-RR is enabled it effectively overrides DLSS-SR
+								// execution"). A frame RR cannot carry is carried by SR with a
+								// counted, named reason - never dropped, never guessed at.
+								bool rr_ok = false;
+								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)
+								{
+									perf::Scope perf_rr(perf::kNgxRr);
+									rr_ok = try_evaluate_rr(native_device, native, fd, ei, view,
+										eval_no);
+									if (rr_ok)
+									{
+										g_rr_evaluates.fetch_add(1, std::memory_order_relaxed);
+										perf::stall_note_evaluate();
+									}
+									else
+									{
+										g_rr_fallbacks.fetch_add(1, std::memory_order_relaxed);
+									}
+								}
+								ok = rr_ok;
+								if (!rr_ok)
 								{
 									perf::Scope perf_sr(perf::kNgxSr);
 									ok = ngx::evaluate(native, ei);

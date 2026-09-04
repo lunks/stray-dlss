@@ -80,6 +80,10 @@ add_library(stray_dlss_core STATIC
     src/core/u0_rhi_uav.hpp
     src/core/pool_locator.cpp
     src/core/pool_locator.hpp
+    src/core/rr_guides.cpp
+    src/core/rr_guides.hpp
+    src/core/envbrdf.cpp
+    src/core/envbrdf.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -221,6 +225,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/input_dump.hpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp
+        src/gbuffer_resolve.cpp
+        src/gbuffer_resolve.hpp
         src/mv_mask.cpp
         src/mv_mask.hpp
         src/d3d12_restore.cpp
@@ -294,6 +300,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
                    main cs_5_0 g_nr_mask_dxbc)
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
+                   main cs_5_0 g_gbuffer_resolve_dxbc)
 endif()
 
 # ---------------------------------------------------------------------------------------
@@ -392,6 +400,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_view_cached.cpp
         tests/test_u0_rhi_uav.cpp
         tests/test_pool_locator.cpp
+        tests/test_rr_guides.cpp
+        tests/test_envbrdf.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp

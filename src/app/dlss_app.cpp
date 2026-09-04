@@ -15,6 +15,7 @@
 #include "core/exposure_plan.hpp"
 #include "core/feature_recreate.hpp"
 #include "exposure_texture.hpp"
+#include "gbuffer_resolve.hpp"
 #include "host/config.hpp"
 #include "input_dump.hpp"
 #include "intercept/backend.hpp"
@@ -301,6 +302,12 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		// Before ngx::shutdown, which is where the caller has already made the GPU idle.
 		// Our owned exposure texture belongs to this device and must not outlive it.
 		exposure_texture::release();
+		// The RR guide resolve owns four textures, a descriptor heap, an upload ring and a PSO,
+		// all created against THIS device. gbr::initialise re-creates on a device change, but
+		// waiting for that would leave them alive across the teardown; here the caller has
+		// already made the GPU idle, which is the only moment it is safe to free work the GPU
+		// may have been reading (CLAUDE.md §5, the NR lifetime rule in its simplest form).
+		gbr::shutdown();
 		if (g_state.ngx_attempted.load(std::memory_order_relaxed))
 			ngx::shutdown(g_state.native_device);
 		g_state.native_device = nullptr;
@@ -451,8 +458,10 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// 1 locates the function by caller-literal agreement (>= 3 distinct enclosing functions and
 	// >= 4 distinct name literals on one .pdata function start) and INSTALLS NOTHING; 2 also
 	// installs a FORWARDING recorder into the game's code and ASSERTS each name's resource
-	// against L1's FPassInputs depth/velocity and View row 132's extent; 3 (feeding RR) is
-	// declared, not built. src/pool_name_hook.hpp, docs/RESEARCH-ENGINE-AWARE-REPLAN.md §5.
+	// against L1's FPassInputs depth/velocity and View row 132's extent; 3 SUPPLIES those names
+	// to Ray Reconstruction (poolhook::guide_set + src/core/rr_guides.hpp), which by itself
+	// still changes no pixel - NgxRR=2 is what consumes them.
+	// src/pool_name_hook.hpp, docs/RESEARCH-ENGINE-AWARE-REPLAN.md §5.
 	poolhook::configure(host::cfg::get_int("PoolNames", pool::kDefaultLevel));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
@@ -541,30 +550,60 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			graphics_heaps ? 1 : 0, graphics_heaps ? "RECORDED" : "not recorded");
 	}
 
-	// [STRAYDLSS] NgxRR. RAY RECONSTRUCTION IS NOT WIRED UNDER THIS HOST, and this refuses
-	// LOUDLY rather than doing nothing. Its guide source was the heuristic G-buffer finder —
-	// GBufferA-E identified by descriptor SHAPE — which was deleted 2026-09-03 along with the
-	// resolve pass that fed it (docs/RESEARCH-ENGINE-TAA-HOOK.md §13). That was the same class
-	// of guessing the engine seam replaced for the TAA pass, and nothing on the SR, NR or FG
-	// path referenced it.
+	// [STRAYDLSS] NgxRR: 0 off (default, SR unchanged), 1 = PROBE DLSSD's existence on this
+	// stack (one CreateFeature attempt at the first SR feature creation, released; SR keeps
+	// running), 2 = evaluate Ray Reconstruction in place of SR with a per-frame SR fallback.
 	//
-	// THE NGX SIDE IS INTACT AND UNTOUCHED: ngx::ensure_feature_rr / evaluate_rr /
-	// release_feature_rr all take raw ID3D12Resource*, so what RR needs to come back is a GUIDE
-	// SOURCE — and the intended one is the engine's own named RDG G-buffer textures, reachable
-	// from the `const FViewInfo&` that ITemporalUpscaler::AddPasses already hands us. Identity
-	// from the engine, exactly as L1 does for depth and velocity.
+	// ITS GUIDE SOURCE IS THE ENGINE'S OWN NAME, since 2026-09-04. The previous one was the
+	// heuristic finder that identified GBufferA-E by descriptor SHAPE and was deleted
+	// 2026-09-03 (docs/RESEARCH-ENGINE-TAA-HOOK.md §13); the replacement reads
+	// FRenderTargetPool::FindFreeElement's own `const TCHAR* InDebugName` argument
+	// ([STRAYDLSS] PoolNames=3, above) and resolves the four guides with NVIDIA's UE-plugin
+	// recipe (src/gbuffer_resolve.hpp). Do not rebuild the finder.
+	//
+	// MODE 2 REQUIRES PoolNames=3, and does NOT force it on. PoolNames >= 2 installs an inline
+	// trampoline into the game's own code; turning that on as a side effect of an unrelated key
+	// is exactly the escalation "nothing is installed on a guess" exists to prevent. A mismatch
+	// is named here and, if it survives to a frame, counted as `notSupplying` on the [rr] line.
+	//
+	// AND GUIDES ARE NOT THE ONLY OPEN QUESTION: whether RR has a denoising job in this title at
+	// all is UNSETTLED, because r.RayTracing=False, r.SSGI.Enable=0 and Stray's own shipped
+	// r.SSR.Temporal=1 may leave no noisy signal for it to denoise. RR running is not RR being
+	// worth running - docs/RESEARCH-RR-REFLECTION-DENOISE.md.
 	const int ngx_rr = host::cfg::get_int("NgxRR", 0);
-	if (ngx_rr != 0)
-		STRAY_LOG_ERROR("[STRAYDLSS] NgxRR=%d IS REFUSED: DLSS Ray Reconstruction has no guide "
-			"source under this host. The heuristic G-buffer finder and its resolve pass were "
-			"deleted on 2026-09-03; the NGX side (ensure_feature_rr / evaluate_rr) is intact and "
-			"waiting for guides taken from the engine's own named G-buffer textures via the "
-			"FViewInfo that AddPasses hands us. DLSS SR runs this session, unaffected. Set NgxRR=0 "
-			"to make that the deliberate configuration and silence this line. AND NOTE: guides are "
-			"not the only open question - whether RR has a denoising job in this title at all is "
-			"UNSETTLED, because r.RayTracing=False, r.SSGI.Enable=0 and Stray's own shipped "
-			"r.SSR.Temporal=1 may leave no noisy signal for it to denoise. Read "
-			"docs/RESEARCH-RR-REFLECTION-DENOISE.md before building a guide source for it.", ngx_rr);
+	const int pool_level_for_rr = host::cfg::get_int("PoolNames", pool::kDefaultLevel);
+	ngx::set_rr_mode(ngx_rr);
+	taa_hook::set_ngx_rr(ngx_rr);
+	if (ngx_rr == 1)
+	{
+		STRAY_LOG_WARN("[STRAYDLSS] NgxRR=1 (PROBE): one DLSSD create attempt runs at the first "
+			"SR feature creation and logs every result code by name. It answers \"does Ray "
+			"Reconstruction exist on this stack under vkd3d-proton\" and nothing else - no "
+			"guides are read and no frame changes. Needs EnableNGX=1 and NgxEvaluate=1, and "
+			"nvngx_dlssd.dll staged next to the game executable.");
+	}
+	else if (ngx_rr == 2)
+	{
+		STRAY_LOG_WARN("[STRAYDLSS] NgxRR=2 (FULL): Ray Reconstruction replaces the SR evaluate "
+			"on every frame whose ENGINE-NAMED GBufferA/B/C set passes rrguides::judge; SR "
+			"carries every other frame with a counted, named reason. Grep for 'DLSS RR' and the "
+			"'[rr]' line. NOTHING ABOUT THIS HAS EVER RUN AGAINST THE GAME - read the refusal "
+			"counters before reading the image, and read the guide dumps (NgxDumpInputs=1, "
+			"straydlss_rr_diffuse_*.bin) before believing either.");
+		if (pool_level_for_rr < static_cast<int>(pool::Level::supply))
+			STRAY_LOG_ERROR("[STRAYDLSS] NgxRR=2 needs PoolNames=3 and this session has "
+				"PoolNames=%d, so RR has no guide source and EVERY frame will fall back to SR "
+				"with reason \"notSupplying\". Set PoolNames=3 deliberately - it is not turned "
+				"on for you, because it patches the game's own code.", pool_level_for_rr);
+	}
+	else if (ngx_rr != 0)
+	{
+		STRAY_LOG_ERROR("[STRAYDLSS] NgxRR=%d is not a mode this build has. 0=off, 1=probe, "
+			"2=full. NgxRR=3 used to mean RR plus suppression of the screen-space-denoiser "
+			"family (RR-1); that suppression was deleted with the heuristic finder on "
+			"2026-09-03 and has NOT come back, so 3 is refused rather than quietly run as 2. "
+			"DLSS SR runs this session, unaffected.", ngx_rr);
+	}
 
 	// [STRAYDLSS] NgxExposure = auto (default) | texture | owned.
 	//
@@ -1285,6 +1324,10 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// Drives DryRunAlternate's phase and logs each transition, so a screenshot's timestamp
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
+	// The pool recorder's frame stamp. It runs on the render thread inside the engine's own
+	// allocation, so it has no frame number of its own; without this every name record looks
+	// equally fresh forever and rrguides::judge could never bound a pointer's age.
+	poolhook::note_frame(frame);
 	input_dump::on_present();
 	// Drains any completed MV census readback and emits the MV CENSUS line. Fence-free and
 	// paced in presents, the same conservative latency input_dump uses; a no-op with MvStats=0.
@@ -1362,6 +1405,24 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				char poolline[2048] = {};
 				if (poolhook::format_report(poolline, sizeof(poolline)) > 0)
 					std::fprintf(f, "%s\n", poolline);
+			}
+			{
+				// Ray Reconstruction, one key per refusal reason. Written whenever RR has been
+				// ASKED about a frame, so an NgxRR=0 session carries none of these keys and a
+				// non-zero one carries every reason including the zeroes - automation must be
+				// able to tell "this reason never fired" from "this reason is not reported".
+				std::uint32_t rr_ok = 0, rr_fallback = 0;
+				taa_hook::rr_counters(rr_ok, rr_fallback);
+				if (rr_ok + rr_fallback > 0)
+				{
+					std::fprintf(f, "rr_evaluates=%u\n", rr_ok);
+					std::fprintf(f, "rr_fallbacks=%u\n", rr_fallback);
+					std::uint32_t reasons[taa_hook::kRrReasonCount] = {};
+					taa_hook::rr_reason_counters(reasons);
+					for (std::size_t i = 0; i < taa_hook::kRrReasonCount; ++i)
+						std::fprintf(f, "rr_refused_%s=%u\n", taa_hook::rr_reason_name(i),
+							reasons[i]);
+				}
 			}
 			{
 				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame
@@ -1618,6 +1679,35 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		taa_hook::resolve_counters(attempts, skipped);
 		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,
 			skipped, attempts ? (100.0 * skipped / attempts) : 0.0);
+
+		// RAY RECONSTRUCTION. Printed only once RR has been ASKED about a frame, so an NgxRR=0
+		// session carries no line at all — but once it is on, the totals and EVERY refusal
+		// reason go out together. Totals without reasons cost this project a whole round trip
+		// on the SR path (CLAUDE.md §2.3) and the same mistake is not worth repeating: a frame
+		// that fell back because the guide set was stale and a frame that fell back because
+		// DLSSD refused to create are different fixes.
+		std::uint32_t rr_ok = 0, rr_fallback = 0;
+		taa_hook::rr_counters(rr_ok, rr_fallback);
+		if (rr_ok + rr_fallback > 0)
+		{
+			char line[512];
+			int off = std::snprintf(line, sizeof(line),
+				"[%s] [rr] evaluates=%u fallbacks=%u (%.1f%% RR) | refusals:", when, rr_ok,
+				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
+			std::uint32_t reasons[taa_hook::kRrReasonCount] = {};
+			taa_hook::rr_reason_counters(reasons);
+			for (std::size_t i = 0; i < taa_hook::kRrReasonCount && off > 0 &&
+				off < static_cast<int>(sizeof(line)); ++i)
+			{
+				if (reasons[i] == 0)
+					continue;
+				off += std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off),
+					" %s=%u", taa_hook::rr_reason_name(i), reasons[i]);
+			}
+			if (rr_fallback == 0 && off > 0 && off < static_cast<int>(sizeof(line)))
+				std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off), " none");
+			STRAY_LOG_INFO("%s", line);
+		}
 
 		if (nr::enabled())
 		{
