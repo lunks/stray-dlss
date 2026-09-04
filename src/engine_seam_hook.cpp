@@ -90,6 +90,10 @@ bool g_l1_thread_change_logged = false;
 // reason is the fix and a rate alone is not. The count keeps going in the [seam] line.
 constexpr int kNearMissLogLimit = 8;
 int g_near_miss_logged = 0;
+// Dispatches the pre-resolve gate turned away before any descriptor was looked up: an
+// announcement was pending and none expected these group counts (seam::pre_gate_decide). What
+// `lookalikesRefused` used to count after a full resolve, now counted without one.
+std::atomic<std::uint64_t> g_pre_skipped{ 0 };
 // A read or a call that the guards let through and the CPU refused. Non-zero means an offset
 // or a vtable slot in seam::kRdgResourceRhiOffset / kRhiGetNativeResourceSlot is wrong on this
 // executable, and L1 disables itself for the session rather than roll the dice again.
@@ -750,6 +754,24 @@ void note_present(std::uint64_t frame)
 	g_ledger.begin_frame(frame);
 }
 
+seam::PreGate pre_gate(std::uint32_t group_x, std::uint32_t group_y)
+{
+	seam::PreGateInputs in;
+	in.hooked = g_hooked.load(std::memory_order_acquire);
+	if (!in.hooked)
+		return seam::PreGate::run; // the cheap answer first: no seam, nothing to consult
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		in.mode = g_mode;
+		in.pending = g_ledger.pending() != 0;
+		in.expects = in.pending && g_ledger.expects(group_x, group_y);
+	}
+	const seam::PreGate verdict = seam::pre_gate_decide(in);
+	if (verdict == seam::PreGate::skip)
+		g_pre_skipped.fetch_add(1, std::memory_order_relaxed);
+	return verdict;
+}
+
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 {
 	Verdict v;
@@ -883,7 +905,7 @@ int format_report(char *buffer, std::size_t size)
 	// frames that published no guides, which is what NR reports as guides-stale / frame-gap.
 	return std::snprintf(buffer, size,
 		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
-		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu "
+		"lookalikesRefused=%llu preSkipped=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu "
 		"nearMiss=%llu | claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu "
 		"%s=%llu | "
 		"evaluated=%llu | "
@@ -894,6 +916,7 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(c.unclaimed),
 		static_cast<unsigned long long>(c.orphans),
 		static_cast<unsigned long long>(c.rect_mismatch),
+		static_cast<unsigned long long>(g_pre_skipped.load(std::memory_order_relaxed)),
 		static_cast<unsigned long long>(c.overflow),
 		static_cast<unsigned long long>(g_unreadable.load(std::memory_order_relaxed)),
 		"noDispatch", static_cast<unsigned long long>(c.unclaimed),
@@ -1085,12 +1108,13 @@ void log_report(const char *when)
 	char line[768] = {};
 	format_report(line, sizeof(line));
 	// `unclaimed` is the number that must stay at zero: an announced primary upscale we never
-	// intercepted is a frame that ran the engine's TAA. `lookalikesRefused` is EXPECTED to
-	// grow (the SSD passes ask every frame and are told no); `orphans` counts candidates in
+	// intercepted is a frame that ran the engine's TAA. `preSkipped` is EXPECTED to grow (the
+	// SSD passes ask every frame and are turned away before the resolve; `lookalikesRefused`
+	// now counts only the ones that got as far as a claim); `orphans` counts candidates in
 	// frames where the engine announced nothing at all.
 	STRAY_LOG_INFO("[seam] %s: %s%s", when != nullptr ? when : "", line,
 		m == seam::Mode::authoritative
-			? "  (unclaimed must stay 0; lookalikesRefused is expected to grow)" : "");
+			? "  (unclaimed must stay 0; preSkipped is expected to grow)" : "");
 }
 
 void shutdown()

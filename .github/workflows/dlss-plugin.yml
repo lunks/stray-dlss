@@ -33,7 +33,7 @@ name: StrayDLSS plugin
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket ]
+    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced ]
     tags: [ 'v*' ]
     paths:
       - 'mods/StrayDLSS/**'

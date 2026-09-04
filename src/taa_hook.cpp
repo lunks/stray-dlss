@@ -301,6 +301,7 @@ struct HashStats
 {
 	std::uint64_t resolved = 0;
 	std::uint64_t failed = 0;
+	std::uint64_t skipped = 0; // turned away by the pre-resolve gate (seamhook::pre_gate)
 	std::uint32_t gx = 0;
 	std::uint32_t gy = 0;
 	std::uint32_t srvs = 0;
@@ -562,15 +563,16 @@ void dump_summary()
 	g_summary_dumped = true;
 
 	STRAY_LOG_INFO("======== PER-SHADER DISPATCH CENSUS ========");
-	STRAY_LOG_INFO("  %-18s %-11s %5s %5s %8s %8s  %s",
-		"hash", "dispatch", "srv", "uav", "resolved", "failed", "verdict");
+	STRAY_LOG_INFO("  %-18s %-11s %5s %5s %8s %8s %8s  %s",
+		"hash", "dispatch", "srv", "uav", "resolved", "failed", "skipped", "verdict");
 	for (const auto &e : g_stats)
 	{
-		STRAY_LOG_INFO("  0x%016llx %4ux%-6u %5u %5u %8llu %8llu  %s",
+		STRAY_LOG_INFO("  0x%016llx %4ux%-6u %5u %5u %8llu %8llu %8llu  %s",
 			static_cast<unsigned long long>(e.first), e.second.gx, e.second.gy,
 			e.second.srvs, e.second.uavs,
 			static_cast<unsigned long long>(e.second.resolved),
 			static_cast<unsigned long long>(e.second.failed),
+			static_cast<unsigned long long>(e.second.skipped),
 			verdict_name(e.second.verdict));
 	}
 	STRAY_LOG_INFO("===========================================");
@@ -616,6 +618,10 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	perf::Scope perf_dispatch(perf::kDispatchPath);
 
 	std::uint64_t hash = 0;
+	// Every once-per-hash report for this hash is in the log: the first sighting and the first
+	// steady (non-cut) frame - or the first sighting alone for a hash the matcher EXCLUDES by
+	// identity, which never gets a steady report because `want_steady` refuses `excluded`.
+	bool reports_done = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		++g_diag.large_dispatches;
@@ -669,6 +675,11 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// anything downstream depends on seeing the pass.
 		const bool dry_running = g_dry_run_hash_count != 0 || g_ngx_dry_run != 0 ||
 			g_ngx_pass_override != 0 || g_ngx_evaluate;
+		{
+			const std::uint32_t reports = g_report_count[hash];
+			reports_done = reports >= 2 ||
+				(reports >= 1 && g_stats[hash].verdict == MatchVerdict::excluded);
+		}
 		if (!dry_running && g_report_count[hash] >= 2 && !is_known_taa_hash(hash))
 		{
 			// Still track the output resource each frame: the history round-trip (this
@@ -676,6 +687,29 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			// colour SRV is the history. (CLAUDE.md §2.3)
 			return false;
 		}
+	}
+
+	// THE PRE-RESOLVE SKIP. The throttle just above never fires in a real session - `dry_running`
+	// includes g_ngx_evaluate, which every session that runs DLSS sets - because the pin and the
+	// round-trip proof needed to see every dispatch. Under [STRAYDLSS] EngineSeam=3 they decide
+	// nothing: the ledger already knows which group counts a pending announcement expects, and a
+	// dispatch that fits none of them cannot be claimed whatever the resolve finds. Ask it here,
+	// with the group counts alone, BEFORE the table walk over the descriptor shadow, the View-CB
+	// search (a 2448-byte read per bound root CBV) and the structural matcher - which is where
+	// the 7 resolves a frame of the `resolve 0.539ms (7.0)` line went, six of them to be told
+	// `not-announced`. Every counter keeps its meaning (seam::pre_gate_decide says how), and the
+	// once-per-hash diagnostics still see each pass first: a hash is only skipped after both of
+	// its DISPATCH REPORTs are in the log (one, for a hash the matcher excludes by identity -
+	// the two SSD passes, which are exactly the look-alikes that ask every frame). The
+	// bisection instruments need the full path
+	// for every dispatch and turn this off outright: a named dry-run hash, a dry-run mode, or an
+	// explicitly named pass.
+	if (reports_done && g_dry_run_hash_count == 0 && g_ngx_dry_run == 0 && g_ngx_pass_override == 0 &&
+		seamhook::pre_gate(x, y) == seam::PreGate::skip)
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		++g_stats[hash].skipped;
+		return false;
 	}
 
 	// The RR guide-resolve trigger ([STRAYDLSS] GBufferResolveAt=ssd): the first SSD

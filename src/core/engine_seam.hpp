@@ -208,6 +208,34 @@ struct GateInputs
 // loudly by the caller) or a refusal (fallback disallowed). Never a silent downgrade.
 Gate decide(const GateInputs &in);
 
+// THE PRE-RESOLVE GATE. Asked BEFORE the descriptor resolve, for every size-gated dispatch,
+// with only what the ledger already knows. Under the authoritative gate a dispatch whose group
+// counts fit NO pending announcement cannot be claimed whatever the resolve finds - the
+// resolve (the table walk over the descriptor shadow), the View-CB search (a 2448-byte read per
+// bound root CBV) and the structural matcher would all run only to be told `not-announced`.
+// Measured: ~7 size-gated dispatches a frame reach the resolve and ONE of them is the primary
+// upscale (the `resolve 0.539ms (7.0)` line, docs/RESEARCH-RESHADE-SHAPE-SWEEP.md 1.2; the
+// two known look-alikes ask every frame, facts 36.3).
+//
+// `skip` is allowed on exactly one combination, and each clause protects a counter:
+//   * authoritative AND hooked - below that the heuristic gates and must see every dispatch;
+//   * at least one announcement PENDING - so an ORPHAN (a candidate arriving with nothing
+//     announced, the wrong-pass class) still runs the full path and is still counted;
+//   * NONE of the pending announcements expects these group counts - so a NEAR MISS (the real
+//     pass, refused by the matcher) still runs the full path and is still counted.
+// Everything else runs. `claim`, `unclaimed`, `orphans` and `nearMiss` therefore keep their
+// exact meaning; only `lookalikesRefused` shrinks, and what it no longer counts is counted as
+// `preSkipped` by the caller.
+enum class PreGate : std::uint8_t { run, skip };
+struct PreGateInputs
+{
+	Mode mode = Mode::off;
+	bool hooked = false;
+	bool pending = false; // Ledger::pending() != 0
+	bool expects = false; // Ledger::expects(group_x, group_y)
+};
+PreGate pre_gate_decide(const PreGateInputs &in);
+
 // ---------------------------------------------------------------------------------------
 // The module image
 // ---------------------------------------------------------------------------------------
@@ -472,6 +500,9 @@ public:
 	// the matcher REFUSED, so that "the real pass arrived and a gate rejected it" and "no
 	// dispatch ever came" stop being the same number. Counts a near miss when true.
 	bool note_unmatched(std::uint32_t group_x, std::uint32_t group_y);
+	// The same question with NO side effect: consumes nothing, counts nothing. This is what the
+	// pre-resolve gate asks (pre_gate_decide) before any descriptor is looked up.
+	bool expects(std::uint32_t group_x, std::uint32_t group_y) const;
 
 private:
 	void retire_stale();

@@ -639,7 +639,7 @@ const Announcement *Ledger::claim(std::uint32_t group_x, std::uint32_t group_y)
 	return nullptr;
 }
 
-bool Ledger::note_unmatched(std::uint32_t group_x, std::uint32_t group_y)
+bool Ledger::expects(std::uint32_t group_x, std::uint32_t group_y) const
 {
 	for (std::size_t i = 0; i < m_count; ++i)
 	{
@@ -647,12 +647,26 @@ bool Ledger::note_unmatched(std::uint32_t group_x, std::uint32_t group_y)
 		if (a.consumed)
 			continue;
 		if (expected_groups(a.out_width) == group_x && expected_groups(a.out_height) == group_y)
-		{
-			++m_counters.near_misses;
 			return true;
-		}
 	}
 	return false;
+}
+
+bool Ledger::note_unmatched(std::uint32_t group_x, std::uint32_t group_y)
+{
+	if (!expects(group_x, group_y))
+		return false;
+	++m_counters.near_misses;
+	return true;
+}
+
+PreGate pre_gate_decide(const PreGateInputs &in)
+{
+	if (in.mode != Mode::authoritative || !in.hooked)
+		return PreGate::run;
+	if (!in.pending || in.expects)
+		return PreGate::run;
+	return PreGate::skip;
 }
 
 std::size_t Ledger::pending() const

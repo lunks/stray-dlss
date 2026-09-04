@@ -47,6 +47,14 @@ bool hooked();
 // The gate for one candidate dispatch, from the live mode/hook state and `announced`.
 seam::Gate gate(bool announced);
 
+// THE PRE-RESOLVE GATE (seam::pre_gate_decide). Asked BEFORE the descriptor resolve with the
+// dispatch's group counts alone; `skip` means no pending announcement can be claimed by them,
+// so the resolve, the View-CB search and the matcher would run only to be refused. Counted as
+// `preSkipped` on the [seam] line. `run` in every mode below authoritative, whenever nothing is
+// pending (an orphan must still be counted) and whenever a pending announcement expects
+// exactly these counts (a near miss must still be counted).
+seam::PreGate pre_gate(std::uint32_t group_x, std::uint32_t group_y);
+
 // Frame boundary for the ledger. Called from taa_hook::note_present.
 void note_present(std::uint64_t frame);
 

@@ -1033,4 +1033,77 @@ TEST_CASE("note_unmatched separates 'we refused the real pass' from 'no dispatch
 		CHECK(led.claim(gx, gy) != nullptr);
 		CHECK(led.counters().claimed == 1);
 	}
+	SUBCASE("expects() is the same question with NO side effect at all")
+	{
+		// The pre-resolve gate asks this for every size-gated dispatch, so it must count
+		// nothing: a near miss is only a near miss once the matcher has actually refused.
+		CHECK(led.expects(gx, gy));
+		CHECK_FALSE(led.expects(120, 68));
+		CHECK(led.counters().near_misses == 0);
+		CHECK(led.pending() == 1);
+		REQUIRE(led.claim(gx, gy) != nullptr);
+		CHECK_FALSE(led.expects(gx, gy)); // consumed: nothing pending expects it any more
+		CHECK(led.counters().near_misses == 0);
+	}
+}
+
+TEST_CASE("the pre-resolve gate skips only what no pending announcement could ever claim")
+{
+	// Every clause protects a counter: below authoritative the heuristic must see every
+	// dispatch; with nothing pending an ORPHAN must still reach claim() and be counted; with
+	// a pending announcement that expects these counts a NEAR MISS must still reach the
+	// matcher and be counted. The one remaining combination - something pending, none of it
+	// fitting - is the six-of-seven resolves a frame that were run only to be refused.
+	PreGateInputs in;
+	for (Mode m : { Mode::off, Mode::discover, Mode::observe })
+	{
+		in.mode = m;
+		in.hooked = true;
+		in.pending = true;
+		in.expects = false;
+		CHECK(pre_gate_decide(in) == PreGate::run);
+	}
+	in.mode = Mode::authoritative;
+	in.hooked = false;
+	CHECK(pre_gate_decide(in) == PreGate::run); // no seam: the fallback heuristic needs every dispatch
+	in.hooked = true;
+	in.pending = false;
+	in.expects = false;
+	CHECK(pre_gate_decide(in) == PreGate::run); // nothing pending: an orphan stays countable
+	in.pending = true;
+	in.expects = true;
+	CHECK(pre_gate_decide(in) == PreGate::run); // fits: the real pass, or a same-shape look-alike
+	in.expects = false;
+	CHECK(pre_gate_decide(in) == PreGate::skip);
+
+	// Against the ledger itself, the measured session shape (facts 36.3): one 4K announcement,
+	// the two look-alikes at 240x135 and 120x68 asking first, then the real 480x270 dispatch.
+	Ledger led;
+	led.begin_frame(1);
+	Announcement a;
+	a.out_width = 3840;
+	a.out_height = 2160;
+	a.frame = 1;
+	led.announce(a);
+	const auto ask = [&](std::uint32_t gx, std::uint32_t gy) {
+		PreGateInputs q;
+		q.mode = Mode::authoritative;
+		q.hooked = true;
+		q.pending = led.pending() != 0;
+		q.expects = q.pending && led.expects(gx, gy);
+		return pre_gate_decide(q);
+	};
+	CHECK(ask(240, 135) == PreGate::skip);
+	CHECK(ask(120, 68) == PreGate::skip);
+	CHECK(ask(480, 270) == PreGate::run);
+	// Skipping consumed nothing: the real pass still claims, exactly once.
+	CHECK(led.claim(480, 270) != nullptr);
+	CHECK(led.counters().claimed == 1);
+	CHECK(led.counters().rect_mismatch == 0);
+	CHECK(led.counters().orphans == 0);
+	// With the announcement consumed nothing is pending, so a late look-alike RUNS and is an
+	// orphan at claim() - exactly as before this gate existed.
+	CHECK(ask(240, 135) == PreGate::run);
+	CHECK(led.claim(240, 135) == nullptr);
+	CHECK(led.counters().orphans == 1);
 }
