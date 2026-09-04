@@ -57,7 +57,6 @@ class DriveBackend final : public icept::Backend
 public:
 	const char *name() const override { return "native(drive)+reshade(present)"; }
 	bool resolve_compute_bindings(const icept::CommandContext &ctx, icept::DispatchBindings &out) override { return native::backend().resolve_compute_bindings(ctx, out); }
-	void describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out) override { native::backend().describe_view(view, reg, out); }
 	bool describe_resource(icept::ResourceId res, icept::ResourceInfo &out) override { return native::backend().describe_resource(res, out); }
 	bool resource_from_view(icept::DescriptorId view, icept::ResourceId &out) override { return native::backend().resource_from_view(view, out); }
 	bool read_buffer(const icept::BufferRange &range, std::uint64_t bytes, void *out) override { return native::backend().read_buffer(range, bytes, out); }

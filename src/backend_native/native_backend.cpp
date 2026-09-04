@@ -307,16 +307,6 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 	return !out.srvs.empty() || !out.uavs.empty() || !out.constant_buffers.empty();
 }
 
-void NativeBackend::describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out)
-{
-	shadow::ViewEntry e;
-	if (!shadow::lookup(view, e) || e.resource == 0 || e.dead)
-		return;
-	if (!registry::is_live(e.resource))
-		return;
-	out.push_back(to_bound(reg, view, e));
-}
-
 bool NativeBackend::describe_resource(icept::ResourceId res, icept::ResourceInfo &out)
 {
 	return registry::describe(res, out);

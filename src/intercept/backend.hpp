@@ -21,10 +21,6 @@ public:
 	// walked into shader registers, root descriptors merged in (root wins where they overlap).
 	virtual bool resolve_compute_bindings(const CommandContext &ctx, DispatchBindings &out) = 0;
 
-	// Describes one bound view into `out` — liveness-checked FIRST, like every view this
-	// project touches (CLAUDE.md §5, "Two descriptor hazards"). Appends nothing for a dead,
-	// unknown or null view.
-	virtual void describe_view(DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out) = 0;
 	// False unless the resource is KNOWN LIVE.
 	virtual bool describe_resource(ResourceId res, ResourceInfo &out) = 0;
 	// False if the view is unknown or its resource is dead.
