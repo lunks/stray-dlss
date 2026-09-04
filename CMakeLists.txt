@@ -136,11 +136,7 @@ endif()
 
 # ---------------------------------------------------------------------------------------
 # Vendored third-party headers, all version-pinned. See docs/RESEARCH.md for why each pin
-# matters — a drift in any of the three silently breaks loading rather than the build.
-
-if(WIN32)
-    endif()
-endif()
+# matters — a drift silently breaks loading rather than the build.
 
 add_library(ngx_sdk INTERFACE)
 target_include_directories(ngx_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/include)
