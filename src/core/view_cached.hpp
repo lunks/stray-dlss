@@ -112,8 +112,10 @@ constexpr std::size_t kScanWindowBytes = 32768;
 //
 // THE BUDGET IS THE WHOLE WINDOW, and it has to be, because the claim this scan makes is
 // "EXACTLY ONE offset survived" - a claim about the entire window, which a scan that stopped
-// three quarters of the way through cannot make. MEASURED 2026-09-04 on the box (facts §36.22)
-// at the old budget of 2048:
+// short of the end cannot make. That matters precisely because the latch REFUSES on two
+// survivors rather than picking one: a second survivor hiding in the unjudged tail is the one
+// reading that would change what we do, and it is the one a truncated scan cannot see.
+// MEASURED 2026-09-04 on the box (facts §36.22) at the old budget of 2048:
 //
 //     candidates by stage: qwords=3973 pointer-shaped=2049 probed=2048 readable=1986
 //       plausible=1 row135=1 fitsRect=1 aboveMinFraction=1 bufferSize=1 survivors=1
