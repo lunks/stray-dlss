@@ -3320,6 +3320,18 @@ cast) and `NgxNRTransferStrength` (0 is an EXACT bit-for-bit bypass, so it is th
 
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
+**TWO HOSTS, ONE INIT PATH: a config key can be advertised and inert (found 2026-09-04).**
+`shader_dump::initialise()` had exactly one caller — `src/backend_reshade/addon_entry.cpp`'s
+`DLL_PROCESS_ATTACH`. The **UE4SS plugin, which is the shipping host, has no such entry**, so
+`[STRAYDLSS] DumpShaders` did nothing there while `mods/StrayDLSS/StrayDLSS.ini` advertised it.
+Worse, `DlssApp::configure_events()` already read `shader_dump::enabled()` — it had always
+assumed an initialise that never ran on that path. **When a subsystem has per-host setup, the
+add-on's entry point is the one that is easy to remember and the plugin's is the one that
+ships**; put the call somewhere BOTH hosts reach (`configure_events`) and make it idempotent.
+Fixed, and the audit was run: `grep -rn "void initialise" src/**/*.hpp` finds **exactly one**
+such entry point in the tree, so `shader_dump` was the only instance and there is no second one
+waiting. Re-run that grep whenever a subsystem grows a host-time setup call.
+
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
 order, each step decisive where the previous was blind:
 

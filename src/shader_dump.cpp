@@ -18,6 +18,11 @@ constexpr const char *kConfigSection = "STRAYDLSS";
 constexpr const char *kOutputDir = "stray-dlss-shaders";
 
 std::mutex g_mutex;
+// Idempotence, and it is load-bearing rather than tidy. Two hosts reach this: the ReShade
+// add-on calls initialise() from DLL_PROCESS_ATTACH, and the UE4SS plugin has no such entry, so
+// the call was added to DlssApp::configure_events() — which the add-on ALSO reaches, a few lines
+// later. Without this flag that second call reopens the manifest and leaks the first FILE*.
+bool g_initialised = false;
 bool g_enabled = false;
 std::unordered_set<std::uint64_t> g_dumped;
 std::unordered_map<std::uint64_t, std::uint32_t> g_dispatch_counts;
@@ -28,6 +33,10 @@ std::FILE *g_manifest = nullptr;
 void initialise()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
+
+	if (g_initialised)
+		return;
+	g_initialised = true;
 
 	g_enabled = host::cfg::get_bool("DumpShaders", false);
 

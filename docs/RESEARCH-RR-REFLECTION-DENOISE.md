@@ -276,8 +276,19 @@ finding in opposite directions:
 
 ## 4. The one launch
 
-**No build required. Nothing in this branch has to ship first.** The launch answers §0.1 and
-§1.3 together and is decisive in both directions.
+The launch answers §0.1 and §1.3 together and is decisive in both directions. **It needs this
+branch's build**, for one reason found while writing the recipe:
+
+> **`DumpShaders` WAS DEAD UNDER THE PLUGIN HOST, silently.** `shader_dump::initialise()` was
+> called only from `src/backend_reshade/addon_entry.cpp`'s `DLL_PROCESS_ATTACH`; the UE4SS
+> plugin — the shipping configuration — has no such entry, so `g_enabled` stayed false and the
+> key `mods/StrayDLSS/StrayDLSS.ini:25` advertises did nothing. `DlssApp::configure_events()`
+> had *always* assumed otherwise: its `needs.pipeline_events = hash_shaders ||
+> shader_dump::enabled()` consulted a value nothing had ever set. Fixed on this branch —
+> `initialise()` is now idempotent and called from `configure_events()` (both hosts), and
+> `finish()` from `DlssApp::shutdown()` so the manifest is closed under the plugin host too.
+> **The instrument the whole verdict rests on had to be repaired before it could be used**,
+> which is its own small argument for measuring rather than reasoning.
 
 ### 4.1 What to set
 
@@ -361,4 +372,5 @@ command.
 | At the TAA dispatch, G-buffer CONTENT is recycled | **SOFT, and now doubted** — measured 2026-08-31 through the heuristic identification we deleted for unreliability; contradicted by RR-GBUFFER §1.1's refcount lifetime (HARD) |
 | `pool-name-hook` carries no commits, is level 1, has observed nothing, and level 3 is refused | **HARD** — read from the author's worktree 2026-09-04; a moving target, not a contract |
 | `DumpShaders=1` writes a dispatched-shader census usable with `--find-hash` | **HARD** — `src/shader_dump.cpp`, `src/app/dlss_app.cpp:1040-1058`, `tools/shaderlib_extract.py:398` |
+| Before this branch, `DumpShaders` was inert under the UE4SS plugin host | **HARD** — `shader_dump::initialise()` had exactly one caller, `src/backend_reshade/addon_entry.cpp:550`, and `g_enabled` defaults false. Fixed here; **the fix itself is UNCONFIRMED live** until the launch produces a manifest |
 | The 3.4× shimmer gap does not describe reflections under tonight's configuration | **[derived]** from the two HARD rows about `FSSDTemporalAccumulationCS` and `r.SSGI.Enable=0`; §4 measures it |
