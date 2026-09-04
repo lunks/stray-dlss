@@ -297,6 +297,16 @@ void note_rr_reason(std::size_t index, const char *detail)
 //     live, and gbr::record then AddRefs all three for as long as the GPU could be reading them.
 //     Nothing caches a pointer across a frame boundary.
 //
+// THE WINDOW THAT REMAINS, stated rather than papered over. The liveness check and the AddRef
+// are microseconds apart on THIS thread, but FindFreeElement runs on the render thread while
+// this dispatch is recorded on the RHI thread (facts §36.10), so in principle the pool could
+// release an element in between and the AddRef would touch freed memory. Two things make that
+// not worth a new mechanism: the scene renderer holds GBufferRefCount = 1 across the whole of
+// FDeferredShadingSceneRenderer::Render (RESEARCH-RR-GBUFFER.md §1.1, HARD-via-mirror), so the
+// pool cannot hand these three elements anywhere while the frame is in flight; and this is
+// exactly the discipline mv_resolve has used for depth and velocity for months. If it ever does
+// bite, it bites as a fault inside gbr::record, not as a wrong image.
+//
 // WHERE THIS RECORDS, and it is the one thing a live run must judge. NVIDIA's own UE plugin
 // resolves the G-buffer at exactly this point - AddGBufferResolvePass runs at the upscale point,
 // DLSSUpscaler.cpp:578-589 (HARD, docs/RESEARCH-RR-GBUFFER.md §2.4) - and UE 4.27 holds the
