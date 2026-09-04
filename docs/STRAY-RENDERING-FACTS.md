@@ -2763,3 +2763,49 @@ alternating A/B against screenshots, in gameplay.
 * **`tools/stray-box.sh --status` read the owner FILE rather than the lock**, so a shell killed
   without running its EXIT trap left the box reporting BUSY forever while it was free. Now fixed
   to ask `flock -n` and to clear a stale label when it finds one.
+
+## §49 RT reflections cost a THIRD of the frame rate, even with skinned meshes excluded (2026-09-04)
+
+§45's cost experiment, run. Same session pair, same recorded scenario, 3 x (reload + traverse):
+
+```
+rt-baseline-1   47.2 fps   slowest bucket 41.6   worst 46.3 ms   2445MHz@85
+rt-baseline-2   46.4              41.6                28.0        2535MHz@87
+rt-baseline-3   46.5              41.6                26.6        2445MHz@88
+
+rt-reflections-1  31.2            26.3                38.4        2760MHz@83
+rt-reflections-2  30.4            22.6                40.3        2760MHz@77
+rt-reflections-3  30.4            25.9                38.6        2760MHz@78
+```
+
+**Median 46.5 -> 30.4 fps: a 35% loss**, and the slowest 0.25 s bucket falls 41.6 -> 25.9. The
+config was §45's verified block, including `r.RayTracing.Geometry.SkeletalMeshes=0` and the
+`SamplesPerPixel=1` that the pass needs in order to run at all.
+
+**This is real GPU work, not throttling** — the RT arm ran at a HIGHER clock and a LOWER
+temperature than the baseline (2760MHz@77-83 against 2445-2535MHz@85-88). The baseline was the
+thermally limited one; the RT arm simply had more to do.
+
+**The escape hatch worked and was not enough.** Full RT previously cost ~2.9x (§5, 32.4 against
+95.4 fps in a comparable scene); excluding skinned meshes brings the penalty to ~1.5x. So the
+per-frame acceleration-structure rebuild really was much of the old cost, and removing the
+skinned half really does halve it — the remaining cost is static-geometry AS plus the trace
+itself, and it is still a third of the frame rate.
+
+**Two side observations, both consistent with the AS explanation:** loading to gameplay was
+markedly slower under RT, and the plugin logged a 101.78 ms frame (6.2x median) during the load.
+
+**Verdict: RT reflections are too expensive here, so RR-as-reflection-denoiser stays blocked on
+cost rather than on quality.** Nothing was learned about how the reflections LOOK, deliberately —
+§45 put cost first precisely so a negative would cost no image work. The `pInBiasCurrentColorMask`
+route (§48, now known to be accepted by the runtime) remains the cheap lever for the same
+problem: it marks the pixels whose history should not be believed, at no per-frame ray cost.
+
+**Confound, stated rather than buried:** host load1 was 2.16 for the baseline and 3.43 for the RT
+arm. Both are far inside the bench's own `load1/nproc < 0.5` guard (0.07 and 0.11), and a 35% gap
+with a mechanism, a clock/temperature inversion and 3/3 consistency in each arm is not a load
+artefact — but the arms were not run under identical conditions and a repeat on a quiet host
+would be cleaner.
+
+The live ini was restored from `Engine.ini.bak-before-rt` afterwards: `r.RayTracing=False`,
+SSGI off, GTAO on, `r.TemporalAASamples=8`.
