@@ -1,9 +1,13 @@
 # DLSS Ray Reconstruction as Stray's reflection denoiser: the verdict, the design, and the one launch
 
-Research spike, 2026-09-04, branch `rr-reflection-denoise`. **No code was built and nothing has
-run.** The brief was *"bring DLSS Ray Reconstruction back as the denoiser for screen-space
-reflections"*, with an explicit licence to answer "the noise it would denoise is already gone" if
-that is what the evidence says.
+Research spike, 2026-09-04, branch `rr-reflection-denoise`. The brief was *"bring DLSS Ray
+Reconstruction back as the denoiser for screen-space reflections"*, with an explicit licence to
+answer "the noise it would denoise is already gone" if that is what the evidence says.
+
+**No RR machinery was built and nothing has run on the box.** What this branch ships is the
+verdict below, the corrections it forces in three other documents, `tools/dispatch_census.py`,
+and one repair without which §4's launch would have produced nothing (`DumpShaders` was inert
+under the shipping host — §4's opening note).
 
 Provenance labels follow CLAUDE.md §0.5. UE citations are 4.27.2 via the mirror
 `AlexMercer-MA/UnrealEngine-4.27`, quoted second-hand here through
@@ -304,7 +308,7 @@ content this branch is about. Take the census **before** issuing any console com
 ### 4.2 What to read, offline
 
 ```
-python3 tools/name-dispatched-shaders.py stray-dlss-shaders/manifest.txt \
+python3 tools/dispatch_census.py stray-dlss-shaders/manifest.txt \
     --cache /tmp/shaderlib/Engine_GlobalShaderCache-PCD3D_SM5.bin
 ```
 
@@ -349,8 +353,8 @@ Pre-registered readings:
 
 It does not enable `PoolNames`, `NgxRR`, or anything that changes a pixel. Prime directive 2 cuts
 both ways: a feature that cannot work must say so, and a feature whose *premise* is unmeasured
-must be measured before it is built. This spike's entire cost is one ini key and one offline
-command.
+must be measured before it is built. This spike's entire cost is one ini key, one gameplay
+session, and one offline command.
 
 ---
 
