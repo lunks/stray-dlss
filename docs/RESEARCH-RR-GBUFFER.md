@@ -20,6 +20,17 @@ live game demonstrably deviates from stock.
 
 ---
 
+> **SUPERSEDED IN PART, 2026-09-04, on the question this document exists to serve.** The
+> *guide-sourcing* research below stands and is still the recipe to follow if RR is ever wired
+> (§2.3-§2.4 especially — NVIDIA's own `EnvBRDFApproxRTG` and the 4.27 G-buffer decode). What has
+> changed is **whether RR has a job at all**: the heuristic finder of §4 was deleted 2026-09-03,
+> and the noise RR would denoise has since been configured out of the game
+> (`r.RayTracing=False`, `r.SSGI.Enable=0`, and Stray's own shipped `r.SSR.Temporal=1` putting a
+> dedicated temporal filter on SSR before the composite). Read
+> **`docs/RESEARCH-RR-REFLECTION-DENOISE.md`** before acting on anything here; §5's "cheap and
+> diagnosable staged plan" now has a cheaper stage 0 in front of it — one launch with
+> `DumpShaders=1` that says which passes are even in the frame.
+
 ## 0. Verdict up front
 
 1. **The G-buffers are NOT released after lighting.** In 4.27 they live from before the

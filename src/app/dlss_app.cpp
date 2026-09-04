@@ -490,7 +490,11 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			"deleted on 2026-09-03; the NGX side (ensure_feature_rr / evaluate_rr) is intact and "
 			"waiting for guides taken from the engine's own named G-buffer textures via the "
 			"FViewInfo that AddPasses hands us. DLSS SR runs this session, unaffected. Set NgxRR=0 "
-			"to make that the deliberate configuration and silence this line.", ngx_rr);
+			"to make that the deliberate configuration and silence this line. AND NOTE: guides are "
+			"not the only open question - whether RR has a denoising job in this title at all is "
+			"UNSETTLED, because r.RayTracing=False, r.SSGI.Enable=0 and Stray's own shipped "
+			"r.SSR.Temporal=1 may leave no noisy signal for it to denoise. Read "
+			"docs/RESEARCH-RR-REFLECTION-DENOISE.md before building a guide source for it.", ngx_rr);
 
 	// [STRAYDLSS] NgxExposure = auto (default) | texture | owned.
 	//

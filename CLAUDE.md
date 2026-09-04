@@ -1697,6 +1697,51 @@ absorb the screen-space denoiser's job; SSR/SSGI noise shimmers straight through
 "suppress the denoiser and let SR handle it" is dead, and DLSS Ray Reconstruction is the only
 candidate for replacing UE's denoiser — with a quantified 3.4x stability gap as its target.
 
+> **BOUNDED 2026-09-04, and the 3.4x is NOT a reflections number.** Two things narrow it, both
+> from `docs/RESEARCH-RR1-DENOISER-CONFIG.md` §1/§3/§4 reading UE 4.27.2:
+> `FSSDTemporalAccumulationCS` in this title is the **ScreenSpaceDiffuseIndirect (SSGI)**
+> denoiser — reflections and AO do not route through it here — and the configuration it was
+> measured in is gone (`r.RayTracing=False`, and the live ini now carries `r.SSGI.Enable=0`).
+> So this number describes a subsystem that may no longer be in the frame at all. **Nobody has
+> measured what actually dispatches under the current configuration**, and `DumpShaders=1` plus
+> `tools/dispatch_census.py` answers it in one launch and one offline command. Do not quote the
+> 3.4x as RR's target for reflections until that census exists —
+> `docs/RESEARCH-RR-REFLECTION-DENOISE.md` §1.2, §4.
+
+### Stray SHIPS `r.SSR.Temporal=1`, so the SSR reaching our hook is already denoised (2026-09-04)
+
+`docs/game-config/Hk_project_Config_DefaultEngine.ini:63`, inside
+`[/Script/Engine.RendererSettings]`, is the game's own cooked setting — extracted from the pak,
+not a user override:
+
+```ini
+r.SSR.Temporal=1.0
+```
+
+Under TAA that makes `IsSSRTemporalPassRequired` true, so `bTemporalFilter` is true and SSR runs
+through `AddTemporalAAPass` with `ETAAPassConfig::ScreenSpaceReflections` — **a full temporal
+accumulation over the SSR buffer, before the composite into scene colour**. Stray also ships
+`r.SSR.HalfResSceneColor=1` (`Hk_project_Config_Windows_WindowsEngine.ini:12`), so that pass runs
+at 960x540 = **120x68 groups**, which is exactly one of the two TAA look-alikes the engine seam
+caught on the box (`0x42af595f8ff91038`, RESEARCH-ENGINE-TAA-HOOK §10.2). Arithmetic, not a name;
+`tools/dispatch_census.py --cache` names it.
+
+**This retires `docs/RESEARCH-RR1-DENOISER-CONFIG.md` §3's conclusion**, which reasoned from the
+stock default `r.SSR.Temporal=0` and concluded raw SSR already reaches our hook so "reflections
+need no change for RR-1". That doc stated the condition — *"conditional on Stray not overriding
+`r.SSR.Temporal`"* — and Stray overrides it. **The consequences are the interesting part:**
+
+* **There is no raw reflection noise at our hook to denoise.** "RR as the SSR denoiser" cannot
+  mean "denoise what arrives"; it can only mean turning the engine's own filter OFF and
+  substituting a network for it.
+* **The half-res trace, not the denoiser, is the reflection-quality lever here.**
+  `r.SSR.HalfResSceneColor=0` and `r.SSR.Quality` are resolution and sample-count deficits, which
+  no denoiser fixes.
+* **The general trap, and it has now cost two documents:** a shipped `[/Script/Engine.RendererSettings]`
+  value silently beats every "engine default is N" argument. `docs/game-config/` holds the game's
+  own inis — **grep them before reasoning from a stock default**, and when a conclusion has to be
+  written as conditional, that condition is the thing to check first, not last.
+
 ### r.RayTracing=True is the single biggest problem in this game — 3x the frame rate AND the noise (measured 2026-08-31)
 
 **Setting `r.RayTracing=False` in `Engine.ini [SystemSettings]` nearly TRIPLED the frame rate and

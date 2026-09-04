@@ -64,6 +64,21 @@ frame. Consequences:
 
 ## 3. Reflections (SSR) — already composite RAW in Stray, no cvar needed
 
+> **RETRACTED 2026-09-04. The conclusion of this section is WRONG, and its own stated condition
+> is why.** It ends *"[HARD, conditional on Stray not overriding `r.SSR.Temporal` /
+> `r.SSR.ExperimentalDenoiser`.]"* — and **Stray overrides `r.SSR.Temporal`**:
+> `docs/game-config/Hk_project_Config_DefaultEngine.ini:63` ships `r.SSR.Temporal=1.0` in
+> `[/Script/Engine.RendererSettings]`, extracted from the game's own pak. So
+> `IsSSRTemporalPassRequired` is **true**, `bTemporalFilter` is **true**, and SSR goes through
+> `ETAAPassConfig::ScreenSpaceReflections` — a full temporal accumulation before the composite.
+> **RR does not already receive raw SSR; it receives denoised SSR.** Everything below the
+> retraction line is correct source-reading with one false premise at the top.
+>
+> The lesson, recorded because it is cheap and this file paid for it: a conclusion written as
+> conditional makes its own falsifier explicit, and `docs/game-config/` — the game's own cooked
+> inis — is one grep away. **Check the condition when you write it, not when someone else finds
+> it.** Full consequences in `docs/RESEARCH-RR-REFLECTION-DENOISE.md` §1.1.
+
 `ilr.cpp:768-772`:
 ```cpp
 bDenoise       = DenoiserMode != 0 && CVarDenoiseSSR.GetValueOnRenderThread();  // r.SSR.ExperimentalDenoiser, default 0
