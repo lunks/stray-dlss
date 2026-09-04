@@ -32,6 +32,25 @@ labelled as such every time, because a derived offset that is wrong dereferences
 
 ## 0. The ranked table
 
+> ### RE-RANKED 2026-09-04 — see `docs/RESEARCH-ENGINE-AWARE-REPLAN.md`
+>
+> This table and §13 were written while the project reasoned like a graphics-API interposer. It is
+> an **engine-aware injector** (a UE4SS C++ plugin with the engine's objects in hand), and
+> `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` found that the one project sharing that vantage point,
+> `praydog/UEVR`, does no descriptor tracking at all. Re-ranked by **machinery removed** rather than
+> measured cost, the table below is overturned in four rows:
+>
+> | Row | This document said | Now |
+> |---|---|---|
+> | 1 (descriptor shadow) | "Shrink, do not delete"; §13: "it stays — `u0` has no engine route" | **Delete.** The engine's own bind stream (`IRHIComputeContext::RHISetShaderTexture` / `RHISetUAVParameter` / …, with register indices, `RHIContext.h:184-215`) is the shadow's write side done by the engine; `u0` has three routes. ~1 450 lines and 1.694 ms. Replan §1 |
+> | 3 (View CB search) | "no cheap engine route" (§3.2); the §15 two-offset design | **Replace** with `FViewInfo::CachedViewUniformShaderParameters` (`SceneRendering.h:1047`) — the CPU struct the bound buffer is created from, self-validated by row 135 and byte-equality with today's read. Replan §2 |
+> | 8 (G-buffer finder) | "no cheap route" (§8.2) | **The render-target pool's live name argument** — `GBufferA-E`, `SceneDepthZ`, `GBufferVelocity` are allocated by name through the exact function UEVR hooks. Replan §5 |
+> | 9 (cvars) | "assert, do not fetch"; "UE4SS offers no help" | Writing is HARD (`ProcessConsoleExec`); reading is one `patternsleuth` symbol away (SOFT). Replan §8 |
+>
+> Rows 2, 4, 5, 6, 7, 10 stand. §13.4 (no SR at Present) and §13.5 (no lazy resolution) stand.
+> **The root shadow and the restore are the only ReShade-shaped machinery that survives** the replan
+> — ~600 lines and 0.681 ms, not ~2 000 and 2.9 ms.
+
 Ranked by **measured cost or bug risk**, biggest first. "After item 2" means: assuming the
 `engine-seam-l1` work lands and colour/depth/velocity identity comes from `FPassInputs`.
 
@@ -150,7 +169,8 @@ alive on the shipping path:**
 1. **The View constant buffer.** `taa_hook.cpp:1273-1285` iterates `b.constant_buffers` — which the
    native backend fills from the root-CBV addresses via `registry::buffer_for_va`
    (`native_backend.cpp:289-305`) — and keeps the first that parses as a plausible `View`. Without
-   the shadow there is no list to iterate. ~~This is §3, and it is the load-bearing one.~~
+   the shadow there is no list to iterate. *(2026-09-04: and with
+   `FViewInfo::CachedViewUniformShaderParameters` there is no list to need — replan §2.)* ~~This is §3, and it is the load-bearing one.~~
    **CORRECTED 2026-09-03 (see the correction under §0's table): it is the LIGHTEST of the three.**
    It needs the **root** shadow's `compute_root_cbv` map and the registry's GPU-VA lookup, and
    nothing else — one of nine root hooks. It does **not** need `CopyDescriptors` tracking, which is
@@ -276,6 +296,14 @@ And even with the offset, a `TUniformBufferRef` is an `FRHIUniformBuffer*`, from
 upload allocation is another undocumented hop.
 
 **There is no cheap engine route to the View CB, and that is a real finding rather than a gap.**
+
+> **SUPERSEDED 2026-09-04.** There is one, and it is not the `ViewUniformBuffer` chain above.
+> `FViewInfo::CachedViewUniformShaderParameters` (`SceneRendering.h:1047`) is a `TUniquePtr` to the
+> CPU struct from which `ViewUniformBuffer` is created (`SceneRendering.cpp:1859-1869`) and which
+> TAA binds (`TemporalAA.cpp:767`) — the same 2448 bytes `read_view_cb` maps out of the upload
+> ring, at rest in the object `AddPasses` hands us. One offset, discovered by scanning `FViewInfo`
+> for a pointer whose pointee passes `view_params_plausible` + row 135 + rect equality with L1's
+> extents, then proven by byte-equality with today's read. `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §2.
 
 ### 3.3 Recommendation
 
@@ -501,6 +529,15 @@ that path.
 investigated here and should not be assumed; the brief's rule against speculating about
 Renderer-private structure applies.
 
+> **SUPERSEDED 2026-09-04.** No second seam is needed. In 4.27 every G-buffer target is allocated
+> by **name** through the outer `FRenderTargetPool::FindFreeElement` — `TEXT("GBufferA")` …
+> `TEXT("GBufferE")` at `SceneRenderTargets.cpp:1125-1153`, `TEXT("GBufferVelocity")` at `:1172`,
+> `TEXT("SceneDepthZ")` at `:1543` — and that function is exactly the one `praydog/UEVR` locates
+> (via the `L"SceneDepthZ"` literal, forward-decoded to the CALL) and hooks in shipping UE titles,
+> keying `IPooledRenderTarget*` by the name argument. `FSceneRenderTargets`'s public members
+> (`SceneRenderTargets.h:459-476`) are the independent oracle. ~150 lines instead of ~1 900.
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5 and `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.
+
 ### 8.3 Recommendation
 
 **KEEP as-is.** It is off by default (`GBufferFinder=0`, `NgxRR=0` in `StrayDLSS.ini:29, 36`), and
@@ -542,6 +579,13 @@ frame it already sees — the base-pass MRT count, the scene-colour format, the 
 Where a comment says "Stray ships X", the code should say so out loud when what it observes
 contradicts it. **A cvar-singleton scan is a whole seam's worth of risk for a premise a format
 check already tests.**
+
+> **CORRECTED 2026-09-04.** "UE4SS offers no help" is wrong on both halves.
+> `docs/RESEARCH-UE4SS-MIGRATION.md:587` already records that cvars can be **written** from a mod
+> (`UObject::ProcessConsoleExec`, HARD), so a premise can be set for an A/B rather than asserted;
+> and UE4SS's scanner locates `ConsoleManagerSingleton` by AOB (SOFT, DeepWiki over the repo; C++
+> exposure UNCONFIRMED), so the singleton scan this paragraph calls "a whole seam's worth of risk"
+> has already been done by the loader we run inside. `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §8.
 
 ---
 
@@ -829,6 +873,15 @@ safe, always-useful change and it does not wait on the box.**
    SRV/UAV table walk, for the output UAV `u0` and scene colour by register.** Removing it requires
    reading an RDG transient's `ResourceRHI` during graph execution, and §14.2 establishes there is no
    hookable point in that window. **It stays. That is the answer to "do we really need it".**
+
+   > **OVERTURNED 2026-09-04.** Both premises fell. §14.2's window *does* contain hookable points
+   > (`ISceneViewExtension::PostRenderViewFamily_RenderThread` runs as an RDG pass,
+   > `SceneRendering.cpp:3181-3200`), and — the larger point — the table walk reconstructs a mapping
+   > the engine hands its RHI context **by register** on every pass (`RHISetShaderTexture`,
+   > `RHISetShaderResourceViewParameter`, `RHISetUAVParameter`, `ShaderParameterStruct.h:198-283`).
+   > Five of TAA's six inputs arrive there as bare `FRHITexture*`. **It goes**, with `heap_math`,
+   > the copy hooks and `va_map`. `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §1;
+   > `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §3-§4.
 2. **The root shadow (0.681 ms) has two consumers**, the state restore and the table/root walk, and
    the restore is structural for the SR path (§13.4). **It stays.**
 3. **The resource registry stays regardless** — L1's liveness validation is built on it, and it is
