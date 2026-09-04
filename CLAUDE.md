@@ -32,12 +32,14 @@ Depth lives in two companion documents, both of which are load-bearing:
   this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
 * **`docs/RESEARCH-ENGINE-TAA-HOOK.md`** — how UE 4.27 itself says which dispatch is the TAA pass,
   and what that retires from §2.3. Read it before touching the identification path.
-* **`docs/RESEARCH-U0-IDENTITY.md`** — **the `u0` question is CLOSED: there is no engine route to
-  the TAA output UAV's identity**, verified against Epic's own `EpicGames/UnrealEngine` @ `4.27`
-  rather than inferred. Seven mechanisms, each refused for its own reason. Read it before
-  proposing to delete the descriptor shadow, and before assuming `u0` is a "graph-allocated
-  transient" — in 4.27 RDG has no transient allocator and every texture is a pooled render
-  target, so the blocker is a *schedule*, not a lifetime.
+* **`docs/RESEARCH-U0-IDENTITY.md`** — its §0 verdict, *"there is no engine route to the TAA
+  output UAV's identity"*, is **CORRECTED by its own §10 (2026-09-04)**: the seven mechanisms it
+  refused were all ways of reading RDG's state, and the RHI is the consumer RDG hands the binding
+  to — `IRHIComputeContext::RHISetUAVParameter(shader, 0, uav)` fires on the RHI thread
+  immediately before the D3D12 dispatch we intercept, with the register as an argument. Built as
+  `[STRAYDLSS] U0Hook` (§2.9, §5); measured in facts §37. Read §0-§9 for why the enumeration
+  looked complete, and still read it before assuming `u0` is a "graph-allocated transient" — in
+  4.27 every RDG texture is a pooled render target.
 
 ---
 
@@ -1270,6 +1272,29 @@ The same resource can also appear as this frame's **scene-colour input**; the tw
 distinguishable **only by which register it turns up on**. Track by register, never by identity
 alone.
 
+> **THE ENGINE NAMES `u0` — AND EVERY OTHER REGISTER OF THE PASS — ON THE RHI THREAD, AND WE
+> NOW LISTEN (2026-09-04, `[STRAYDLSS] U0Hook`, branch `u0-rhi-uav`).** `RESEARCH-U0-IDENTITY.md`
+> §10: `FTAAStandaloneCS` is `SHADER_USE_PARAMETER_STRUCT` (`TemporalAA.cpp:149`), so its pass
+> lambda binds every parameter through `IRHIComputeContext` virtuals with the register as an
+> argument (`ShaderParameterStruct.h:185-283` — `RHISetShaderTexture` for t0/t1/t2/t3/t5,
+> `RHISetShaderResourceViewParameter` for t4, `RHISetUAVParameter(shader, 0, uav)` for `u0` at
+> `:157`, `RHISetShaderUniformBuffer` for the View CB's `b` slot), on the RHI thread, right
+> before `FD3D12CommandContext::RHIDispatchComputeShader` issues the `Dispatch` our hook already
+> intercepts (`D3D12Commands.cpp:120`). The `FRDGTexture` being freed by then is irrelevant.
+>
+> **How it is found without a name literal:** our Dispatch hook's own return address, resolved
+> through the exe's `.pdata` to the start of `RHIDispatchComputeShader`, is `IRHIComputeContext`
+> slot 3; the read-only qword holding it names the vtable, and the candidate must have 38 code
+> slots and six predicted empty-body slots beginning with `ret`. **The UAV slot is measured, not
+> counted** — MSVC reverses adjacent overloads, so both 16 and 17 are hooked with a five-argument
+> forwarding thunk and classified by the objects they are handed. **The resource hop needs no
+> D3D12RHI layout:** the `FRHIUnorderedAccessView*` is scanned for a CPU descriptor handle our
+> own `CreateUnorderedAccessView` hook recorded, two bookkeepers agreeing on one 64-bit value;
+> `t0..t5` resolve through `FRHITexture::GetNativeResource` (slot 7, HARD since L1). Level 2
+> ASSERTS all of it against the descriptor walk (`[u0]` line: `assert:`, `regs:`, `viewReg:`
+> disagree must stay 0); level 3 (the walk and the View-CB search replaced) is declared, not built.
+> Windows-portable throughout: PE, the game's `.rdata`, opaque handle keys, real device hooks.
+
 ### 2.10 Stability observations
 
 Environment facts, independent of any add-on — useful when triaging so we do not chase our own tail:
@@ -1539,6 +1564,13 @@ will not. Three separate mechanisms get called "the shadow" and their consumers 
   to have no hookable point. The two things that would work are `r.RHICmdBypass=1` (disables the RHI
   thread process-wide) and authoring our own RDG pass (§4.3: a template over shader-parameter
   metadata, no ABI). **Both refused.**
+  > **WRONG, 2026-09-04.** The enumeration was of RDG's publication points; the RHI context the
+  > pass lambda binds through is a virtual interface with the register as an argument, and it is
+  > hooked (`[STRAYDLSS] U0Hook`, §2.9, `RESEARCH-U0-IDENTITY.md` §10). The shadow's expensive
+  > half keeps its one reader for now — level 2 is an ORACLE beside the walk, not a replacement —
+  > but its job is no longer irreducible: every answer the walk gives for the TAA pass now has
+  > an engine-sourced twin, counted on the `[u0]` line. Deleting the walk is level 3, a separate
+  > decision after the assertion has run clean across GAMEPLAY (facts §37).
 * **And the SR path cannot move to our own command list the way the NR stage did.** Present is the
   wrong point in the frame (post, tonemap and next frame's SSR all read `u0` before it), and a
   mid-frame `ExecuteCommandLists` of our own list would run BEFORE the game's still-unsubmitted

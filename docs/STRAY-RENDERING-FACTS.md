@@ -3673,3 +3673,193 @@ here — after which an announcement costs one guarded qword and one guarded 244
 * **Whether it changes the image is not settled by any counter.** Removing a stale
   `ClipToPrevClip` and jitter from ~0.3-0.7% of frames is §5's compounding-error class; it is for
   the user's eyes, not for a log line.
+
+## 37. The engine names `u0` — and every register of the TAA pass — on the RHI thread (2026-09-04)
+
+`[STRAYDLSS] U0Hook` (`src/core/u0_rhi_uav.hpp`, `src/u0_rhi_hook.cpp`, branch `u0-rhi-uav`).
+The route, the discovery and the refusals are `docs/RESEARCH-U0-IDENTITY.md` §10; this section is
+what the box measured. Log lines are verbatim. Config A (no ReShade), `EngineSeam=3`,
+`EngineSeamInputs=1`, `U0Hook=2`, launched `--no-drive` into the main menu with no injected input —
+the menu runs the TAA pass, so every counter below is readable there.
+
+### 37.1 What the design predicted, so the measurement can be checked against it
+
+| Prediction | Kind |
+|---|---|
+| Our `Dispatch` hook's return address resolves through `.pdata` to ONE function start, eight dispatches running | seed |
+| Exactly one read-only qword equals that start; 24 bytes before it is a vtable whose 38 slots are all code | vtable |
+| Slots 5, 10, 11, 12, 13, 25 begin with `C3` (`RHISetAsyncComputeBudget`, the four `UAVOverlap`, `RHIInvalidateCachedState` — empty bodies) | REQUIRED |
+| Slots 28, 32, 33, 37 begin with `C3`; slot 36 with `33 C0 C3` (`return nullptr`) | reported |
+| Exactly one of slots 16/17 is handed objects holding a UAV CPU handle; the other fires rarely or never (the `InitialCount` overload) | measured, not counted |
+| The UAV handle sits at +40 in the object (`FRHIUnorderedAccessView` 24 bytes, `FD3D12View` vptr, `TD3D12ViewDescriptorHandle{Parent, Handle}`) | [derived] |
+| `u0` from the bind == `u0` from the descriptor walk, on every engine-announced dispatch | THE assertion |
+| `t0..t5` from the bind == the walk's SRVs at the same registers | the widened assertion |
+| The bracket binds exactly ONE uniform buffer and its register == the View-CB search's choice | the View register |
+| `(*OutSceneColorTexture)->Name` reads `L"TemporalAA"` at the seam | RDG layout self-check |
+
+### 37.2 Measured — the vtable is RIGHT, and one prediction's ENCODING was wrong (2026-09-04)
+
+**RUN at level 1 on the box, Config A, `--no-drive`, main menu, 3 600 frames.** Artifact md5
+`f21bb04c0b35e9dbee51fe4b6b66a97d` (CI run `33842689249`). Discovery **REFUSED**, verbatim:
+
+```
+U0 HOOK MODE: discover ([STRAYDLSS] U0Hook=1). Waiting for 8 agreeing Dispatch return addresses
+  to seed the FD3D12CommandContext vtable search (module base 0x6ffff7190000, 8 sections,
+  .pdata entries=242902).
+U0 HOOK: FD3D12CommandContext vtable NOT FOUND - a slot predicted to be an empty body is not one
+  (seed=0x6ffff88b2830 from 8 agreeing Dispatch return addresses, qwordHits=1 survivors=0
+  failedSlot=5, 10.2 ms).
+```
+
+**Every prediction of §37.1 held except one, and the one that failed was a BYTE, not a layout.**
+A static scan of `Stray-Win64-Shipping.exe` itself (`ImageBase 0x140000000`, seed RVA `0x1722830`,
+the single 8-aligned `.rdata` qword holding it at RVA `0x3cb6c08`, candidate vtable `0x3cb6bf0`)
+dumps all 38 slots:
+
+| Slot | Predicted | Measured first bytes | |
+|---|---|---|---|
+| 3 | the seed | `48 89 5c 24 10 48 89 6c` @ `.text 0x1722830` | **seed held** |
+| 5, 10, 11, 12, 13, 25 | `C3` (REQUIRED) | **`c2 00 00`, all six at ONE address `0x830de0`** | **encoding wrong, ICF folded** |
+| 28, 32, 37 | `C3` (reported) | `c2 00 00`, same address | same |
+| 33 | `C3` (reported) | `48 8b c2 41 b8 04 00 00` — real code | **reported prediction did NOT hold** |
+| 36 | `33 C0 C3` (reported) | **`33 c0 c3`** | **held, and it is the proof** |
+| 0-37 | all code in module | all 38 in `.text` | **held** |
+| 16, 17 | two distinct adjacent overloads | `0x1727620` / `0x17275a0`, distinct, reverse address order | **consistent** |
+
+**Four independent things say the vtable is the right one**: `qwordHits=1` (exactly one read-only
+qword equals the seed — §37.1's vtable prediction, unqualified); 38/38 slots inside `.text`;
+**slot 36 carrying `33 C0 C3` at exactly the predicted index**, a distinctive 3-byte pattern that
+no misalignment survives; and six ret-shaped slots landing on precisely the six predicted indices.
+
+**So the refusal was ours.** MSVC emitted this class's empty bodies as **`ret 0` — `C2 00 00`** —
+rather than `C3`, and `expectation_holds` tested `C3` alone. `Expect::ret` now accepts either
+encoding **and nothing else** (`C2 08 00`, a real stack-popping return, is still refused; pinned
+in `tests/test_u0_rhi_uav.cpp`). Slot 33 is `RHIBuildAccelerationStructure(FRHIRayTracingGeometry*)`
+with a real body — expected, since Stray ships `r.RayTracing=True` so D3D12's RT path is compiled
+in — and it was never a gate, exactly as §10.4 intended.
+
+**The lesson is the one this project keeps re-earning in a new place.** The prediction *"this
+virtual has an empty body"* was correct about the engine and wrong about the compiler; a
+refusal message naming the failing slot turned a dead end into a one-line fix, where a silent
+`survivors=0` would have read as "the route does not exist on this exe". **Predict the semantics,
+but never assume one encoding of them** — and keep the failing slot in the refusal.
+
+**The self-check in the same session passed independently**: `[seam] frame 3600: ... u0name:
+ok=3603 bad=0 unreadable=0`, so `FRDGResource::Name` at +8 reads `L"TemporalAA"` on every one of
+3 603 announcements — §37.1's RDG-layout prediction, **HARD**.
+
+### 37.3 Level 2: the route WORKS, `u0` and `t0..t5` agree 100%, and the View register does not
+
+**RUN on the box with the corrected predicate** (md5 `3f3d1ed5869ea22469c33aa4cb5f3d96`, CI run
+`33844879113`, both workflows green), Config A, `EngineSeam=3`, `EngineSeamInputs=1`, `U0Hook=2`,
+`--no-drive`, **main menu only, no injected input**, 8 400 frames, **zero ERROR lines, no crash**.
+
+Discovery now succeeds and every §37.1 prediction is settled:
+
+```
+U0 HOOK FOUND: FD3D12CommandContext vtable at 0x6ffffb606bf0 (10.2 ms). ... Predictions held at
+  slots: 3 5 10 11 12 13 25 28 32 36 37; not held (reported, never gated): 33.
+  ICF: 6 of the 6 empty bodies share one address. qwordHits=1 survivors=1.
+U0 HOOK INSTALLED: 7 of 7 slots ... now point at forwarding thunks
+U0 HOOK: the UAV object's CPU descriptor handle sits at +40, latched after 3 agreeing scans.
+  [derived] expectation was +40 ... - MATCHES.
+U0 HOOK: vtable slot 17 classified as uav after 16 objects (uav=8 srv=0 none=0 ambiguous=8)
+```
+
+**The `+40` [derived] offset is now HARD**, and so is the slot: MSVC put the 3-argument
+`RHISetUAVParameter` at **17**, not 16 — slot 16 was never called once (`16=0/unknown`), which is
+why the design measured the pair instead of counting it. The SRV handle also latched at `+40`.
+
+**Counters at frame 6600** (`[u0]` line), and the split is the whole result:
+
+| Group | Result |
+|---|---|
+| `assert:` (`u0`) | **`agree=6603 disagree=0`**, and every refusal reason zero — `noBind=0 unresolved=0 notLive=0 walkAbsent=0 descMismatch=0 extentNe=0 shaderMismatch=0 hookOff=0` |
+| `regs:` (`t0..t5`) | **`agree=39618 disagree=0 disagreeMask=0`**, `engineAbsent=13206`, `walkAbsent=0`, `unresolved=0` |
+| `viewReg:` | **`agree=0 disagree=6603`**, `noneBound=0 multipleBound=0 walkAbsent=0` |
+| health | `faults=0 off=0 latchedReads=347994 misses=0 nativeRefused=0 seedForeign=0` |
+
+`39618 = 6603 x 6` and `13206 = 6603 x 2`: **all six bound registers agree on every claim**, and the
+two absent ones are `t6`/`t7`, which this shader does not use. So `u0` and the §2.3 register map are
+now confirmed **twice, by two independent routes, on 100% of announced dispatches** — the engine's
+own bind stream and the descriptor walk name the same `ID3D12Resource*` every time.
+
+#### The View register disagrees on EVERY frame, and this instrument cannot say why
+
+```
+U0 HOOK REGISTERS ... | View at b-mask 0x2 (1 uniform buffers bound), walk chose b4 (valid=1): DISAGREE
+U0 HOOK ASSERTION: ... the engine bound its one uniform buffer (ViewUniformBuffer) at b-mask 0x2
+  and the View-CB search chose b4.
+```
+
+The engine binds **exactly one** uniform buffer (`noneBound=0`, `multipleBound=0` on 6 603 claims)
+at index **1** — which agrees with the shader's own `dcl_constantbuffer cb1[145]` (§2.3) and with
+§2.6's "the View uniform buffer at register `b1`". The walk chose **b4** (and `b3` in the 44
+ambiguous frames). 6 603 of 6 603.
+
+**But the assertion compares REGISTER NUMBERS, not buffers** (`u0::judge_view_register` is
+`reg == walk_reg`; the `FRHIUniformBuffer*` is never resolved to a resource). So a 100%
+disagreement is consistent with **two different readings and this run cannot separate them**:
+
+1. **The search is on another view's buffer** — the §36.18 class, at 100% instead of 1.2%. The
+   session's own `[view]` line is suggestive: `ambClaimed=44` frames where a second legal-shaped
+   View survived and *disagreed on `ClipToPrevClip` / jitter / `CameraCut`*, with the log itself
+   saying such a frame "would need the View CB by IDENTITY to settle".
+2. **The two numbering conventions differ** — the walk enumerates bound descriptor-TABLE slots
+   while the engine's index is the shader register, and §2.3 already records that "UE4 binds
+   tables wider than any one shader's declarations". Under this reading b3/b4 are table slots the
+   shader never reads and nothing is wrong.
+
+**Reading 2 has the stronger evidence today, and it is not ours.** The `view-cb-cached-params`
+work latched `FViewInfo+5768` and its byte-assertion agreed with the search's buffer on **589 of
+593** claims (the four being stale ring copies). If the search were reading another view's buffer,
+that comparison would disagree, not agree. Against that, `row135 self-check ok=15562 bad=0` proves
+only that the chosen buffer is **a** View — §2.6's own rule: *a self-validating check tells you
+what KIND of thing you have, never WHICH one.*
+
+**The next step is one line of code, not another launch: compare the BUFFER.** The thunk holds the
+`FRHIUniformBuffer*` and the walk holds an `ID3D12Resource*` plus the offset it read (`View CB at
+b4, offset 4921600`); matching those settles reading 1 against reading 2 outright. **Do not act on
+the register-number disagreement until that is done** — and note it is the same trap this file
+records twice already: an assertion that compares the wrong quantity fails loudly and truthfully
+while saying nothing about the thing you care about.
+
+#### What deleting the descriptor table walk still needs
+
+The `u0` and `t0..t5` halves are as clean as they can be **in the menu**, and the menu is **not
+sufficient** to authorise the deletion:
+
+* **Sufficient in the menu:** discovery, the vtable, the slot classification, both `+40` latches,
+  and the fact that the route produces an answer at all — the seam fires on frame 0 and the menu
+  runs the TAA pass (8 403 announcements, `unclaimed=0`).
+* **Gameplay REQUIRED:** every failure mode the walk is being replaced *for* lives where shadow,
+  capture and planar-reflection views exist, and the menu has none — `tooSmall=0` here, and §36.21
+  already records a menu `suspectSmall=0` being a non-refutation of exactly this. The walk's own
+  `wrongView=14829` skips and the 44 ambiguous claims say the population of rival views is what
+  matters, and gameplay is where it is largest.
+* **Also required before deletion:** the buffer-identity comparison above, since level 3 replaces
+  the View-CB search with the engine's answer and this run has *not* established which of the two
+  is right; and a decision about `t4`, whose engine side comes from the SRV handle cross-match
+  rather than `GetNativeResource`.
+
+The lines that settle each prediction, in the order they appear in `stray-dlss-plugin.log`:
+
+| Line | Settles |
+|---|---|
+| `U0 HOOK MODE: observe` | the module mapped and `.pdata` was found (`.pdata entries=`) |
+| `U0 HOOK FOUND: FD3D12CommandContext vtable at ...` / `U0 HOOK: ... NOT FOUND - <reason>` | the seed, the vtable, the six REQUIRED `ret` slots; `Predictions held at slots:` / `not held` lists the reported ones; `ICF:` says whether the empty bodies folded |
+| `U0 HOOK slots: ...` | the six probed addresses, for the record |
+| `U0 HOOK INSTALLED: 7 of 7 slots` | the thunks went in |
+| `U0 HOOK: vtable slot 16/17 classified as uav/silent ...` | which overload MSVC put where |
+| `U0 HOOK: the UAV object's CPU descriptor handle sits at +N` | the [derived] +40 |
+| `U0 HOOK: first UAVIndex==0 bind resolved - slot N ...` | the cross-match fired |
+| `U0 HOOK AGREES: ... the SAME resource` / `U0 HOOK ASSERTION: ... THEY DIFFER` | THE assertion |
+| `U0 HOOK REGISTERS on pass ...` | t0..t5 and the View register, engine vs walk, one bracket |
+| `ENGINE SEAM: the engine's output texture ... carries FRDGResource::Name L"TemporalAA"` | the RDG layout self-check |
+| `[u0] frame N: ...` every 600 frames | `assert: agree= disagree= noBind=`, `regs: ... disagreeMask=`, `viewReg: ...`, `faults= off=` |
+| `[seam] frame N: ... u0name: ok= bad= unreadable=` | the self-check's rate |
+
+Success is `disagree=0` in all three groups with `agree` tracking the seam's `claimed`, `noBind=0`,
+`faults=0 off=0`, and `u0name: bad=0`. `noBind` non-zero means the UAV slot is not 16 or 17 on this
+exe; `unresolved` non-zero means the cross-match did not find the handle (read the scan counters);
+`seed foreign=` non-zero means the return address was not the game's (Config B).

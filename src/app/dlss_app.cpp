@@ -32,6 +32,7 @@
 #include "taa_hook.hpp"
 #include "engine_seam_hook.hpp"
 #include "view_params_hook.hpp"
+#include "u0_rhi_hook.hpp"
 
 #include <d3d12.h>
 
@@ -283,6 +284,9 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		// this device and this DLL. Restore it before anything else: a slot pointing into an
 		// unloaded module is an address-0 crash on the next frame (facts §14).
 		seamhook::shutdown();
+		// The same rule for the RHI-context slots the u0 route patched: they live in the game's
+		// .rdata and must point back at the engine before this DLL can go.
+		u0hook::shutdown();
 		// The present stage records onto a command list of its own and hands work to nr::,
 		// so it must be torn down before nr:: is.
 		nrhook::shutdown();
@@ -370,6 +374,16 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// pinned by a test, so moving the rung is deliberate. src/view_params_hook.hpp,
 	// docs/RESEARCH-ENGINE-AWARE-REPLAN.md §2, docs/RESEARCH-ENGINE-TAA-HOOK.md §19.
 	vphook::configure(host::cfg::get_int("EngineSeamViewParams", viewcached::kDefaultLevel));
+
+	// [STRAYDLSS] U0Hook, default 1 (discover). The engine's OWN route to the TAA output UAV
+	// `u0`: UE 4.27 binds it through IRHIComputeContext::RHISetUAVParameter on the RHI thread,
+	// between RDG assigning the resource and the D3D12 Dispatch we intercept — the middle of
+	// the window docs/RESEARCH-U0-IDENTITY.md checked only at both ends. 1 finds and validates
+	// the FD3D12CommandContext vtable from our Dispatch hook's return address and installs
+	// nothing; 2 installs forwarding thunks and ASSERTS the RHI-bound u0 against the descriptor
+	// walk's on every engine-announced dispatch (the walk stays authoritative). Level 3 is
+	// declared, not implemented. src/u0_rhi_hook.hpp, src/core/u0_rhi_uav.hpp.
+	u0hook::configure(host::cfg::get_int("U0Hook", 1));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
@@ -1127,6 +1141,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		seamhook::log_report(when);
 		// The View from the engine's own struct: latch state, and the search judged against it.
 		vphook::log_report(when);
+		// The u0 route's own line: vtable verdict, per-slot roles, the handle latch, and the
+		// assertion counters (`disagree` must stay 0; `noBind` means the slot is wrong).
+		u0hook::log_report(when);
 		// Beside it, the ONE number that says whether the View constant buffer we are reading
 		// every frame is the right one. It is located by SEARCH and `view_params_plausible` is
 		// a shape test the wrong buffer can satisfy; row 135 validates itself from one read
@@ -1270,13 +1287,20 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				// 640 to match seamhook::log_report's own buffer: the line grew the
 				// per-reason refusal breakdown and the l1: group, and a truncated status
 				// line is a counter silently missing from automation.
-				char seam[768] = {};
+				char seam[1024] = {};
 				if (seamhook::format_report(seam, sizeof(seam)) > 0)
 					std::fprintf(f, "%s\n", seam);
 				// And the View-from-the-struct latch beside it (src/view_params_hook.hpp).
 				char vp[512] = {};
 				if (vphook::format_report(vp, sizeof(vp)) > 0)
 					std::fprintf(f, "%s\n", vp);
+			}
+			{
+				// The u0 route ([STRAYDLSS] U0Hook): the assertion counters and the discovery
+				// verdict, so automation can read `disagree=` without the log.
+				char u0line[1024] = {};
+				if (u0hook::format_report(u0line, sizeof(u0line)) > 0)
+					std::fprintf(f, "%s\n", u0line);
 			}
 			{
 				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame

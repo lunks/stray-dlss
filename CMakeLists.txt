@@ -77,6 +77,8 @@ add_library(stray_dlss_core STATIC
     src/core/engine_seam.hpp
     src/core/view_cached.cpp
     src/core/view_cached.hpp
+    src/core/u0_rhi_uav.cpp
+    src/core/u0_rhi_uav.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -229,6 +231,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/engine_seam_hook.hpp
         src/view_params_hook.cpp
         src/view_params_hook.hpp
+        src/u0_rhi_hook.cpp
+        src/u0_rhi_hook.hpp
         src/perf.cpp
         src/perf.hpp
         src/nr_hook.cpp
@@ -420,7 +424,10 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/backend_native/fg_throttle.cpp
         src/backend_native/vram_query_watch.cpp
         src/backend_native/vtable_patch.cpp
-        src/app/diff_observer.cpp)
+        src/app/diff_observer.cpp
+        # The Dispatch hook feeds the u0 RHI-context discovery its seed (src/u0_rhi_hook.hpp);
+        # unconfigured in the harness, so it maps and scans nothing, but it must link.
+        src/u0_rhi_hook.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)
@@ -466,6 +473,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_taa_signature.cpp
         tests/test_engine_seam.cpp
         tests/test_view_cached.cpp
+        tests/test_u0_rhi_uav.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp

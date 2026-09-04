@@ -115,6 +115,15 @@ constexpr std::uint32_t kTaaTileSize = 8;
 // lambda; we read it from inside AddPasses because we cannot author a pass (report §14).
 constexpr std::size_t kRdgResourceRhiOffset = 16;
 
+// FRDGResource::Name — `const TCHAR* const Name` at +8, UNCONDITIONAL in Shipping (it is not
+// under RDG_ENABLE_DEBUG; RenderGraphResources.h:61 @ 4.27). Read at the seam from the OUTPUT
+// texture the engine hands back in *OutSceneColorTexture, it must be the pool name
+// TemporalAA.cpp:554-562 gives every Main* config: L"TemporalAA". One guarded pointer read
+// that validates the RDG layout L1 relies on (`Name` is the qword BEFORE `ResourceRHI`), for
+// free, on every announcement. docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md §2.4.
+constexpr std::size_t kRdgResourceNameOffset = 8;
+constexpr char kTaaOutputName[] = "TemporalAA";
+
 // FRHITexture's vtable slot for GetNativeResource in a Shipping build (ENABLE_RHI_VALIDATION=0,
 // so one vptr). FRHIResource declares one virtual (its dtor); FRHITexture then declares
 // GetTexture2D, GetTexture2DArray, GetTexture3D, GetTextureCube, GetTextureReference,
