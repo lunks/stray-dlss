@@ -25,6 +25,7 @@
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Mod/CppUserModBase.hpp>
+#include <Input/KeyDef.hpp>
 #include <UE4SSProgram.hpp>
 
 #include <imgui.h>
@@ -32,6 +33,7 @@
 #include <string>
 
 #include "Host.hpp"
+#include "DlssMenu.hpp"
 #include "MenuScan.hpp"
 #include "Platform.hpp"
 #include "TweakUi.hpp"
@@ -88,7 +90,6 @@ class StrayDlssMod : public RC::CppUserModBase
         stray_dlss::plugin::Stop();
     }
 
-    auto on_unreal_init() -> void override {}
 
     // Fired when UE4SS's debug GUI initialises (i.e. when someone first opens it). Without the
     // macro the mod's own imgui translation unit has a NULL context and a different allocator,
@@ -97,6 +98,17 @@ class StrayDlssMod : public RC::CppUserModBase
     {
         UE4SS_ENABLE_IMGUI()
         Say(STR("[StrayDLSS] imgui context adopted; the StrayDLSS tab is live"));
+    }
+
+    // The in-game DLSS menu's key bindings. register_keydown_event is CppUserModBase's own
+    // (CppUserModBase.hpp:213), so this needs no Lua mod and no polling.
+    auto on_unreal_init() -> void override
+    {
+        stray_dlss_menu::Init();
+        register_keydown_event(RC::Input::Key::F10, []() { stray_dlss_menu::OnToggle(); });
+        register_keydown_event(RC::Input::Key::LEFT_ARROW, []() { stray_dlss_menu::OnLeft(); });
+        register_keydown_event(RC::Input::Key::RIGHT_ARROW, []() { stray_dlss_menu::OnRight(); });
+        Say(STR("[StrayDLSS] DLSS menu bound to F10 / LEFT / RIGHT"));
     }
 
     // NOT the game thread: UE4SS's own event-loop jthread, ~200 Hz.
