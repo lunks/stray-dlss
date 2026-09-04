@@ -4,6 +4,7 @@
 // TAA still runs and nothing about the image changes.
 #pragma once
 
+#include "core/rr_guides.hpp"
 #include "core/taa_signature.hpp"
 #include "core/view_params.hpp"
 
@@ -58,22 +59,40 @@ void set_ngx_evaluate(bool enabled);
 // (stray-dlss-stage.txt, taa_hook.cpp's mark()) — six file writes per dispatch, so it is a
 // crash-naming tool to switch on deliberately, never something to leave running.
 void set_stage_file(bool enabled);
-// DLSS RAY RECONSTRUCTION IS NOT WIRED UNDER THIS HOST. The heuristic G-buffer finder and
-// the guide-resolve pass that fed it were deleted 2026-09-03 (docs/RESEARCH-ENGINE-TAA-HOOK.md
-// §13): they identified GBufferA-E by descriptor SHAPE, which is the same class of guessing the
-// engine seam replaced for the TAA pass, and nothing on the SR, NR or FG path referenced them.
-// The NGX side survives byte-identical in src/ngx_backend.{hpp,cpp} — `ensure_feature_rr`,
-// `evaluate_rr`, `release_feature_rr` all take raw ID3D12Resource* and never named the finder.
-// What RR needs to come back is a GUIDE SOURCE, and the intended one is the named RDG G-buffer
-// textures reachable from the `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already
-// hands us — identity from the engine, exactly as L1 does for depth and velocity.
-// `[STRAYDLSS] NgxRR` is refused loudly at startup (src/app/dlss_app.cpp) rather than silently
-// doing nothing.
-// AND BEFORE BUILDING THAT GUIDE SOURCE: docs/RESEARCH-RR-REFLECTION-DENOISE.md argues RR may
+// DLSS RAY RECONSTRUCTION, [STRAYDLSS] NgxRR: 0 off (default), 1 = probe DLSSD's existence on
+// this stack, 2 = evaluate RR in place of SR with a per-frame SR fallback.
+//
+// ITS GUIDE SOURCE IS THE ENGINE'S OWN NAME, and that is the whole of what changed on
+// 2026-09-04. The heuristic finder that used to identify GBufferA-E by descriptor SHAPE was
+// deleted 2026-09-03 (docs/RESEARCH-ENGINE-TAA-HOOK.md §13) and must not come back; the
+// replacement is FRenderTargetPool::FindFreeElement's own `const TCHAR* InDebugName` argument,
+// read by the forwarding recorder (src/pool_name_hook.hpp, [STRAYDLSS] PoolNames=3) and turned
+// into the four RR guides by src/gbuffer_resolve.hpp using NVIDIA's own UE-plugin recipe.
+//
+// EVERY REFUSAL IS COUNTED AND NAMED (rr_reason_counters below, the [rr] line). A frame that
+// falls back to SR because the guide set was not usable must never be indistinguishable from a
+// frame RR was not asked about — that rule has already cost this project one round trip on the
+// SR path and it applies verbatim here.
+//
+// AND THE PRIOR QUESTION IS STILL OPEN: docs/RESEARCH-RR-REFLECTION-DENOISE.md argues RR may
 // have no denoising job left in this title (r.RayTracing=False, r.SSGI.Enable=0, and Stray's own
 // shipped r.SSR.Temporal=1 already running a temporal filter over SSR before the composite), and
 // that reflections are the content RR is least equipped for because our motion vectors describe
-// the surface, not the reflected geometry. One launch with DumpShaders=1 settles it (§4).
+// the surface, not the reflected geometry. One launch with DumpShaders=1 settles it (§4). RR
+// running is not RR being worth running.
+void set_ngx_rr(int mode);
+
+// RR telemetry. `evaluates` counts frames Ray Reconstruction carried; `fallbacks` counts frames
+// it was asked for and SR carried instead. Their sum is the number of frames RR was ASKED about,
+// which is the denominator every rate here should be read against.
+void rr_counters(std::uint32_t &evaluates, std::uint32_t &fallbacks);
+
+// Why the fallbacks happened. The first rrguides::kRefusalCount entries are the guide-set
+// verdict (rrguides::refusal_name); the rest are the evaluate-side reasons below.
+constexpr std::size_t kRrGuideReasonCount = rrguides::kRefusalCount;
+constexpr std::size_t kRrReasonCount = kRrGuideReasonCount + 5;
+const char *rr_reason_name(std::size_t index);
+void rr_reason_counters(std::uint32_t out[kRrReasonCount]);
 
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the

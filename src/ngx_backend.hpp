@@ -13,6 +13,9 @@
 
 #include "core/exposure_plan.hpp"
 
+#include <cstddef>
+#include <cstdint>
+
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12GraphicsCommandList;
@@ -250,6 +253,25 @@ const char *last_error();
 // feature creation uses, releasing the throwaway feature once the GPU has certainly
 // executed its creation work. SR keeps running throughout.
 
+// WHY THE PROBE DID OR DID NOT RUN. Every value here is set on exactly one code path and the
+// enum has no "unknown" that means "we did not look": a probe whose whole job is to report an
+// outcome must never be able to report nothing (CLAUDE.md §0.2). This exists because a box run
+// on 2026-09-04 armed NgxRR=1, created an SR feature, and produced no probe line of any kind -
+// and `maybe_probe_rr` had FOUR silent early returns, none of which a log could tell apart from
+// "the probe never got a chance to run".
+enum class RRProbeState : unsigned char
+{
+	not_armed = 0,        // NgxRR != 1 — the probe is switched off and that is not a failure
+	awaiting_feature,     // armed, and ensure_feature has never been reached
+	declined_no_cmd,      // ensure_feature was reached with a null command list
+	declined_dims,        // ...with a zero render or output extent
+	alloc_failed,         // AllocateParameters refused
+	create_ok,            // NGX_D3D12_CREATE_DLSSD_EXT succeeded
+	create_failed,        // ...refused, and probe_create_result names it
+	count
+};
+const char *rr_probe_state_text(RRProbeState s);
+
 struct RRStatus
 {
 	bool available = false;             // SuperSamplingDenoising.Available
@@ -260,7 +282,21 @@ struct RRStatus
 	bool probed = false;                // the create probe has run (either way)
 	bool probe_create_ok = false;
 	unsigned int probe_create_result = 0;
+
+	// THE SILENCE-PROOFING. `state` is the single value that answers "what happened to the
+	// probe", and it starts at `not_armed` rather than at an "unknown" — set_rr_mode moves it
+	// to `awaiting_feature` the moment the probe is armed, so a session where nothing else ever
+	// happens still reports the truth rather than the default.
+	RRProbeState state = RRProbeState::not_armed;
+	std::uint64_t ensure_feature_calls = 0;  // how many times the probe's hook point was reached
+	bool initialise_ran = false;             // ngx::initialise reached its capability query
 };
+
+// One line naming the probe's state, its result by name, and — when it has not run — the count
+// of times its hook point was reached. Written to the periodic log AND to
+// stray-dlss-status.txt, on two independent channels, because this diagnostic has already been
+// lost once. Returns the number of characters written.
+int format_rr_probe_report(char *buffer, std::size_t size);
 
 void set_rr_mode(int mode); // 0 off, 1 probe, 2 full — set once at init, like set_preset
 int rr_mode();

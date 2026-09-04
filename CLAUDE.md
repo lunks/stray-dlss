@@ -1864,9 +1864,89 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 > installs a forwarding recorder into the game's own code — **this project's first inline hook
 > into ENGINE code**, gated on ≥ 3 distinct enclosing functions and ≥ 4 distinct name literals
 > agreeing on one `.pdata` function start, with the trampoline supplied by the plugin HOST so the
-> ReShade host physically cannot install one. Level 3 (feeding RR) is declared, not built.
+> ReShade host physically cannot install one.
 > `src/core/pool_locator.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20,
-> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5. **Nothing has run against the game.**
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5.
+>
+> **LEVEL 1 RAN ON THE BOX AND PASSED (2026-09-04).** `literals found 19/20, names referenced 18,
+> lea sites 21, distinct call targets 21. VERDICT: ok`, best candidate reached from **5 distinct
+> enclosing functions** (bar 3) and **18 distinct name literals** (bar 4), naming `GBufferA`
+> through `GBufferF`, `SceneDepthZ`, `GBufferVelocity` and the rest. The scan cost **313 ms,
+> once**, on the device-creation thread. It also settled the §2.5 residual of
+> `RESEARCH-U0-EXTERNAL-PRIOR-ART.md`: `"%d MB, NewRT %s %s"` is **absent** from this image, so
+> the build strips `UE_LOG` in Shipping, there is no in-function anchor for
+> `FindFreeElementInternal`, and route 1 is closed — which costs this route nothing, because
+> every RR guide goes through the OUTER `FindFreeElement`. **HARD.** Level 2 has NOT run.
+>
+> **LEVEL 2 AND LEVEL 3 RAN ON THE BOX, 2026-09-04 (facts §56), and the inline engine hook
+> HOLDS.** 6600 frames, zero ERRORs: `ok=72636 notRegistered=0 nameBad=0 faults=0`, the name
+> argument reading back as a wide string on every call, and the map AGREEING with the two routes
+> that already answer for the same textures (`depth 6603/0`, `velocity 6603/0`, `extent 52824/0`).
+> `IPooledRenderTarget::RenderTargetItem.TargetableTexture` at **+8** and
+> `GetNativeResource` at **slot 7** are therefore **HARD on this executable**. The RR guide set
+> came back complete and in exactly the formats the recipe assumes — GBufferA `R10G10B10A2_UNORM`
+> (so the plain `N*0.5+0.5` encoding, not octahedral), B and C `B8G8R8A8_TYPELESS`, all three at
+> 1920x1080. **`rrguides::judge` accepts that set as written.** One measured surprise:
+> `SceneColorDeferred` disagrees with the TAA pass's `t1` on **every** frame (0 agree / 6603
+> disagree) — a pair shipped with no prediction attached, so it is a finding rather than a fault,
+> and it is consistent with L1 resolving colour as `rhi_null`.
+>
+> **LEVEL 3 (SUPPLY) AND `NgxRR=2` ARE BUILT, 2026-09-04, and the EVALUATE has not run.**
+> `poolhook::guide_set` hands the RR path the GBufferA/B/C triple; `src/core/rr_guides.hpp`
+> decides whether it may be used, with thirteen named refusals; `src/gbuffer_resolve.hpp` and
+> `shaders/gbuffer_resolve.hlsl` — restored from the deletion, because the FINDER was what was
+> wrong with them, not the recipe — emit the four guides with NVIDIA's own UE-plugin arithmetic;
+> `taa_hook::try_evaluate_rr` gets first refusal at the SR evaluate site with SR as the per-frame
+> fallback. `[STRAYDLSS] NgxRR=2` **requires `PoolNames=3` and does not force it on**: level 2+
+> patches the game's own code, and an escalation as a side effect of an unrelated key is exactly
+> what "nothing is installed on a guess" forbids. `NgxRR=3` (RR-1 denoiser suppression) is
+> **refused by name** — it went with the finder and has not come back.
+>
+> **THE ONE THING A RUN MUST JUDGE, and it is not the plumbing.** A 2026-08-31 measurement of the
+> OLD, heuristically-identified G-buffers found their **CONTENT already recycled at this same
+> hook point** — GBufferA near-black, `ShadingModelID` decoding 0, the unlit fallback covering
+> ~95% of every guide — which is why the deleted code recorded at the first SSD dispatch instead.
+> Two things now argue the other way: NVIDIA's own UE plugin resolves the G-buffer at **exactly**
+> the upscale point (`AddGBufferResolvePass`, `DLSSUpscaler.cpp:578-589`, HARD), and UE 4.27
+> holds `GBufferRefCount = 1` from before the base pass until **after** `AddPostProcessingPasses`
+> (`RESEARCH-RR-GBUFFER.md` §1.1, HARD-via-mirror), so the pool cannot hand those elements
+> elsewhere mid-frame. The old finding was made on resources whose identity was a GUESS, so it
+> does not transfer — **and it is not refuted either.** It is also moot now in one respect: the
+> SSD trigger the old code used no longer exists in the frame (`r.SSGI.Enable=0`).
+>
+> **The instrument is the guide dump, and it needs no new theory.** `NgxDumpInputs=1` now writes
+> `straydlss_rr_{diffuse,specular,normals,roughness}_*.bin` beside the colour/depth/MV dumps, and
+> `tools/rawdump2png.py` grows `rgba16f_normal`, `rgba8` and `r16f`. **`rgba16f_normal` prints the
+> DEGENERATE fraction** — the share of pixels whose decoded normal had no length, i.e. the
+> `+Z` fallback a cleared or recycled GBufferA produces. A high number is the 2026-08-31 finding
+> reproducing under a correct identity; a low one says the guides are real. Nothing else in the
+> pipeline can tell those apart, and this project has already paid a round trip for not being
+> able to. **Set `NgxDumpAt` past the loading screen** (§5).
+>
+> **AND THE PROBE MUST NEVER BE SILENT (fixed 2026-09-04, facts §56).** A box run armed
+> `NgxRR=1`, created an SR feature — the probe's own precondition — and produced no probe output
+> of any kind, which reads identically to "DLSSD does not exist on this stack". `maybe_probe_rr`
+> had four bare `return`s and `ensure_feature` two more upstream: six silent exits, none
+> distinguishable in a log. Now `RRProbeState` has seven values and no "unknown", it is armed in
+> `set_rr_mode` rather than in the probe (so *never armed* and *armed but never reached* are
+> different readings), every declining path logs an ERROR naming itself, and `[rrprobe]` prints
+> every 600 frames whatever happened — with `rr_probe_*` in `stray-dlss-status.txt` as a second
+> channel. **The sharpening of §0.2 this earned: a gate that is CORRECT to be silent about and a
+> gate that is BROKEN and silent look the same from outside.** The `[rr]` line's absence under
+> `NgxRR=1` is by design — the probe never evaluates — so the absence itself is now printed as
+> `[rr] NOT ASKED`, naming why. `guideReads=0` under `NgxRR=1` is correct for the same reason.
+>
+> **Read `[rr]` before the image.** `evaluates`, `fallbacks` and every refusal by name, in the
+> log and in `stray-dlss-status.txt`. `notSupplying` means `PoolNames` is not 3; `epochSplit`
+> means the three records did not come from one allocation cycle; `notLive` means our own
+> registry called a named resource dead between the engine allocating it and us reading it;
+> `formatA` means GBufferA is not the RGB10A2 family our `N*2-1` decode assumes (the
+> high-precision paths are OCTAHEDRAL and would decode into plausible, wrong normals).
+>
+> **AND RR RUNNING IS NOT RR BEING WORTH RUNNING.** `docs/RESEARCH-RR-REFLECTION-DENOISE.md`
+> argues this title may have no noisy signal left for it — `r.RayTracing=False`,
+> `r.SSGI.Enable=0`, and Stray's own shipped `r.SSR.Temporal=1` already running a temporal filter
+> over SSR before the composite. That question is upstream of this one and is still open.
 
 > **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
 > so RR is not independently usable here" and treated it as concluded. **That was never

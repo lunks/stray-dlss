@@ -56,11 +56,28 @@ FindFreeElementFn g_original = nullptr;
 
 Record g_records[pool::kNameCount]{};
 
+// THE ALLOCATION CYCLE. FRenderTargetPool::FindFreeElement is called once per name, so a
+// "set" of three records is assembled from three separate engine calls and could straddle two
+// frames. `g_epoch` is bumped when GBufferA is written — AllocGBufferTargets acquires A first
+// (SceneRenderTargets.cpp:1099-1176, HARD-via-mirror) — and stamped on every record, so
+// rrguides::judge can demand that A, B and C carry ONE epoch. It is deliberately not derived
+// from the frame counter: relying on the ORDER would make a licensee reordering silently
+// produce a mixed set, while an epoch that does not line up produces a named refusal.
+std::uint64_t g_epoch = 0;
+// The present counter, so a record carries the frame it was written in (poolhook::note_frame).
+std::uint64_t g_frame = 0;
+
 // Counters. Everything is under g_mutex; the thunk fires on the order of tens of times a frame
 // and the lock is never held across an engine call.
 std::uint64_t g_calls = 0;                 // every call the engine made through us
 std::uint64_t g_status_counts[static_cast<std::size_t>(pool::RecordStatus::count)] = {};
 std::uint64_t g_names_unknown = 0;         // plausible wide strings we have no Target for
+// Level 3: how many guide-record reads the RR path made, and how many came back with our own
+// registry calling the resource dead. A non-zero second number is the pooled element having
+// been released between the engine naming it and us reading it, which is the one thing this
+// mechanism cannot warrant and must therefore count.
+std::uint64_t g_guide_reads = 0;
+std::uint64_t g_guide_dead_reads = 0;
 std::uint64_t g_faults = 0;
 std::uint64_t g_fault_va = 0;
 bool g_disabled = false;                   // a fault latched the resolve off for the session
@@ -473,7 +490,11 @@ bool hk_find_free_element(void *self, void *cmd_list, const void *desc, void **o
 	}
 
 	Record &rec = g_records[static_cast<std::size_t>(index)];
+	if (static_cast<pool::Target>(index) == pool::Target::gbuffer_a)
+		++g_epoch;
 	rec.seen = true;
+	rec.epoch = g_epoch;
+	rec.frame = g_frame;
 	++rec.calls;
 
 	const std::uint64_t out_va = reinterpret_cast<std::uint64_t>(out);
@@ -738,12 +759,12 @@ void configure(int level)
 	if (requested == pool::Level::supply && !g_asked_supply)
 	{
 		g_asked_supply = true;
-		g_level = pool::Level::observe;
-		STRAY_LOG_ERROR("[STRAYDLSS] PoolNames=3 (supply) is DECLARED, NOT IMPLEMENTED, and is "
-			"being run as 2 (observe). Feeding DLSS Ray Reconstruction the G-buffer this map "
-			"names is a separate decision after level 2 has run clean in GAMEPLAY - the menu "
-			"has no shadow, capture or planar-reflection view to disagree, and this project "
-			"has been caught by that four times.");
+		STRAY_LOG_WARN("[STRAYDLSS] PoolNames=3 (SUPPLY): the GBufferA/B/C records become "
+			"readable by the Ray Reconstruction path. This level by itself still changes no "
+			"pixel - the recorder only forwards, and NgxRR is what consumes the map. What it "
+			"DOES do is put a set of engine-named resources in front of a compute pass, so "
+			"read the [rr] line's refusal counters and not just its totals: a guide set that "
+			"never passes must never look like a guide set that was never asked for.");
 	}
 	if (g_level == pool::Level::off)
 	{
@@ -756,8 +777,11 @@ void configure(int level)
 		level, pool::level_name(g_level),
 		g_level == pool::Level::discover
 			? "Level 1 SCANS AND LOGS ONLY - nothing is patched, and it cannot change a pixel."
-			: "Level 2 additionally installs a FORWARDING recorder into the game's own code, "
-			  "gated on the scan clearing its agreement bar.");
+			: g_level == pool::Level::observe
+			? "Level 2 additionally installs a FORWARDING recorder into the game's own code, "
+			  "gated on the scan clearing its agreement bar."
+			: "Level 3 installs that same recorder and additionally lets the RR path READ the "
+			  "GBufferA/B/C records it fills.");
 	run_discovery();
 	if (g_level >= pool::Level::observe)
 		install();
@@ -791,6 +815,54 @@ bool record(pool::Target t, Record &out)
 		return false;
 	out = g_records[i];
 	return true;
+}
+
+void note_frame(std::uint64_t frame)
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	g_frame = frame;
+}
+
+bool supplying()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	return g_level == pool::Level::supply && g_hooked;
+}
+
+void guide_set(rrguides::Set &out)
+{
+	out = rrguides::Set{};
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (g_level != pool::Level::supply)
+		return;
+	const pool::Target names[3] = {
+		pool::Target::gbuffer_a, pool::Target::gbuffer_b, pool::Target::gbuffer_c };
+	rrguides::Record *slots[3] = { &out.a, &out.b, &out.c };
+	for (int i = 0; i < 3; ++i)
+	{
+		const Record &rec = g_records[static_cast<std::size_t>(names[i])];
+		rrguides::Record &g = *slots[i];
+		g.seen = rec.seen;
+		g.status_ok = rec.seen && rec.status == pool::RecordStatus::ok;
+		g.epoch = rec.epoch;
+		g.frame = rec.frame;
+		// The SHADER-RESOURCE texture is the one to hand a resolve pass: for a non-MSAA pooled
+		// target it is the same object as the targetable one (pool_locator.hpp), and where they
+		// differ it is the resolved copy that later passes sample.
+		g.resource = rec.shader_resource != 0 ? rec.shader_resource : rec.targetable;
+		g.width = rec.width;
+		g.height = rec.height;
+		g.dxgi_format = rec.dxgi_format;
+		// LIVENESS, RE-CHECKED HERE AND NOWHERE ELSE. The record's own status was decided when
+		// the engine allocated the target; between then and now the pool can have released the
+		// element and D3D12 can have handed the address to a different resource. Our registry
+		// keeps a set of LIVE resources (never of dead ones) for exactly that reason —
+		// CLAUDE.md §5, hazard 2.
+		g.live = g.resource != 0 && resource_is_live(g.resource);
+		++g_guide_reads;
+		if (!g.live)
+			++g_guide_dead_reads;
+	}
 }
 
 void note_engine_frame(std::uint64_t depth_res, std::uint64_t velocity_res,
@@ -839,11 +911,13 @@ void note_engine_frame(std::uint64_t depth_res, std::uint64_t velocity_res,
 		judge(g_assert_extent, v, what, r.width, buffer_width, true, &g_extent_logged[i]);
 	}
 
-	for (Record &r : g_records)
-	{
-		if (r.seen)
-			r.frame = frame;
-	}
+	// The frame stamp used to be applied here, to EVERY seen record. It is not, any more, and
+	// the difference is the whole freshness bound: stamping a record at the TAA hook says "we
+	// looked at it this frame", not "the engine re-affirmed it this frame", and the second is
+	// the only one that bounds how long ago the pool last handed us this element. The stamp
+	// belongs in the thunk (poolhook::note_frame supplies the number); this function keeps only
+	// the assertions it was built for.
+	(void)frame;
 }
 
 void note_taa_colour(std::uint64_t colour_res)
@@ -872,7 +946,7 @@ int format_report(char *buffer, std::size_t size)
 	}
 	int at = std::snprintf(buffer, size,
 		"[pool] mode=%s discovered=%d hooked=%d target=%#llx groups=%u names=%u calls=%llu "
-		"census=%zu(+%llu) unknown=%llu faults=%llu off=%d | ok=%llu notRegistered=%llu rhiNull=%llu "
+		"census=%zu(+%llu) unknown=%llu faults=%llu off=%d guideReads=%llu guideDead=%llu | ok=%llu notRegistered=%llu rhiNull=%llu "
 		"outNull=%llu nameBad=%llu | assert: depth %llu/%llu/%llu velocity %llu/%llu/%llu "
 		"extent %llu/%llu/%llu colour %llu/%llu/%llu (agree/disagree/absent) |",
 		pool::level_name(g_level), g_discovered ? 1 : 0, g_hooked ? 1 : 0,
@@ -881,6 +955,8 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(g_census_overflow),
 		static_cast<unsigned long long>(g_names_unknown),
 		static_cast<unsigned long long>(g_faults), g_disabled ? 1 : 0,
+		static_cast<unsigned long long>(g_guide_reads),
+		static_cast<unsigned long long>(g_guide_dead_reads),
 		static_cast<unsigned long long>(g_status_counts[static_cast<std::size_t>(pool::RecordStatus::ok)]),
 		static_cast<unsigned long long>(g_status_counts[static_cast<std::size_t>(pool::RecordStatus::not_registered)]),
 		static_cast<unsigned long long>(g_status_counts[static_cast<std::size_t>(pool::RecordStatus::rhi_null)]),

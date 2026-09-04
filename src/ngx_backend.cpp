@@ -55,6 +55,17 @@ const char *last_error() { return "<ngx disabled>"; }
 namespace { RRStatus g_rr_status; }
 void set_rr_mode(int) {}
 int rr_mode() { return 0; }
+const char *rr_probe_state_text(RRProbeState) { return "ngx-disabled"; }
+int format_rr_probe_report(char *buffer, std::size_t size)
+{
+	if (buffer == nullptr || size == 0)
+		return 0;
+	// Even here it says something rather than nothing: a build with NGX compiled out is a
+	// perfectly good explanation for an absent probe, and it is one a log should carry.
+	return std::snprintf(buffer, size,
+		"[rrprobe] state=ngx-disabled - this binary was built with STRAY_DLSS_ENABLE_NGX=0, so "
+		"there is no NGX in it at all and no probe can run.");
+}
 void set_exposure_mode(exposure::Mode) {}
 exposure::Mode exposure_mode() { return exposure::Mode::automatic; }
 void set_exposure_value_multiplier(float) {}
@@ -462,6 +473,7 @@ Status initialise(ID3D12Device *device)
 			NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, &rr_init);
 		g_rr_status.feature_init_result = rr_init;
 
+		g_rr_status.initialise_ran = true;
 		STRAY_LOG_INFO("DLSS RR (DLSSD) available=%d needs_updated_driver=%d min_driver=%u.%u "
 			"feature_init=0x%08x (%s)  [NgxRR=%d]",
 			g_rr_status.available ? 1 : 0, g_rr_status.needs_updated_driver ? 1 : 0,
@@ -533,16 +545,51 @@ void release_probe_feature(bool force)
 // outcome — the log lines it emits are the whole product of a probe run.
 void maybe_probe_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 {
-	if (g_rr_mode != 1 || g_rr_status.probed || cmd == nullptr)
+	// EVERY PATH OUT OF THIS FUNCTION LOGS OR IS COUNTED. Until 2026-09-04 all four were bare
+	// `return`s, and a box session that armed NgxRR=1 and created an SR feature produced no
+	// probe output of any kind - indistinguishable from "the hook point never ran" and from
+	// "DLSSD does not exist". A diagnostic whose entire job is to report an outcome must never
+	// have a silent path (CLAUDE.md §0.2).
+	if (g_rr_mode != 1)
+		return;   // not armed; set_rr_mode already said so and said it once
+	if (g_rr_status.probed)
+		return;   // ran already; its outcome is latched in g_rr_status and reported every 600
+	if (cmd == nullptr)
+	{
+		if (g_rr_status.state != RRProbeState::declined_no_cmd)
+		{
+			g_rr_status.state = RRProbeState::declined_no_cmd;
+			STRAY_LOG_ERROR("RR PROBE DECLINED: ngx::ensure_feature reached the probe with a "
+				"NULL command list, which cannot happen through the SR path (it rejects a null "
+				"list before this point). Something is calling ensure_feature directly. The "
+				"probe stays armed and will fire at the next call that has one.");
+		}
 		return;
+	}
 	if (desc.render_width == 0 || desc.output_width == 0)
+	{
+		if (g_rr_status.state != RRProbeState::declined_dims)
+		{
+			g_rr_status.state = RRProbeState::declined_dims;
+			STRAY_LOG_ERROR("RR PROBE DECLINED: the feature description carries a zero extent "
+				"(%ux%u -> %ux%u), so there is nothing to create a DLSSD feature for. The probe "
+				"stays armed. This is a real finding about the SR path, not about RR.",
+				desc.render_width, desc.render_height, desc.output_width, desc.output_height);
+		}
 		return;
+	}
 	g_rr_status.probed = true;
+	STRAY_LOG_WARN("RR PROBE FIRING at ensure_feature call #%llu, %ux%u -> %ux%u. Every exit "
+		"from here logs; if this line has no successor the process died inside "
+		"NGX_D3D12_CREATE_DLSSD_EXT, which is itself the answer.",
+		static_cast<unsigned long long>(g_rr_status.ensure_feature_calls),
+		desc.render_width, desc.render_height, desc.output_width, desc.output_height);
 
 	NVSDK_NGX_Result result = NVSDK_NGX_D3D12_AllocateParameters(&g_probe_params);
 	if (NVSDK_NGX_FAILED(result) || g_probe_params == nullptr)
 	{
 		g_rr_status.probe_create_result = static_cast<unsigned int>(result);
+		g_rr_status.state = RRProbeState::alloc_failed;
 		STRAY_LOG_ERROR("RR PROBE: AllocateParameters failed: 0x%08x (%s)",
 			static_cast<unsigned int>(result),
 			result_name(static_cast<unsigned int>(result)));
@@ -578,6 +625,8 @@ void maybe_probe_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	g_rr_status.probe_create_ok = NVSDK_NGX_SUCCEED(result) && g_probe_feature != nullptr;
 	g_probe_eval_frame = g_eval_frame;
 
+	g_rr_status.state = g_rr_status.probe_create_ok ? RRProbeState::create_ok
+	                                               : RRProbeState::create_failed;
 	if (g_rr_status.probe_create_ok)
 	{
 		STRAY_LOG_WARN("RR PROBE: CreateFeature SUCCEEDED (0x%08x %s). DLSSD exists on this "
@@ -605,12 +654,98 @@ void maybe_probe_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 } // namespace
 
+const char *rr_probe_state_text(RRProbeState state)
+{
+	switch (state)
+	{
+	case RRProbeState::not_armed: return "not-armed";
+	case RRProbeState::awaiting_feature: return "awaiting-feature";
+	case RRProbeState::declined_no_cmd: return "declined-no-cmd";
+	case RRProbeState::declined_dims: return "declined-dims";
+	case RRProbeState::alloc_failed: return "alloc-failed";
+	case RRProbeState::create_ok: return "create-OK";
+	case RRProbeState::create_failed: return "create-FAILED";
+	default: return "?";
+	}
+}
+
+int format_rr_probe_report(char *buffer, std::size_t size)
+{
+	if (buffer == nullptr || size == 0)
+		return 0;
+	// The SECOND channel, and that is the point. This same text goes to the periodic log and to
+	// stray-dlss-status.txt, so an answer cannot be lost to one of them. It prints whenever
+	// NgxRR is non-zero, whatever happened - including "nothing happened", which is the case
+	// that cost the round trip.
+	const char *why = "";
+	switch (g_rr_status.state)
+	{
+	case RRProbeState::not_armed:
+		why = " - NgxRR is not 1, so no probe was ever armed. This is the correct reading for "
+		      "NgxRR=0 and for NgxRR=2 (full RR does not probe; it creates the real feature).";
+		break;
+	case RRProbeState::awaiting_feature:
+		why = g_rr_status.ensure_feature_calls == 0
+			? " - ARMED AND NEVER FIRED: ngx::ensure_feature has not been reached ONCE. The probe "
+			  "rides SR feature creation, so this means no DLSS SR feature was created either. "
+			  "Check EnableNGX, NgxEvaluate, and whether the TAA seam ever claimed a dispatch; "
+			  "the fault is upstream of Ray Reconstruction entirely."
+			: " - ARMED, and ensure_feature WAS reached (see ensureCalls) but returned before the "
+			  "probe. That is ensure_feature's own precondition: read ngxInit and srAvail on this "
+			  "line - a 0 in either names it exactly.";
+		break;
+	case RRProbeState::declined_no_cmd:
+	case RRProbeState::declined_dims:
+		why = " - the hook point was reached and the probe declined; the ERROR above names it.";
+		break;
+	case RRProbeState::alloc_failed:
+		why = " - NGX would not allocate a parameter block for DLSSD.";
+		break;
+	case RRProbeState::create_ok:
+		why = " - DLSSD EXISTS on this stack. NgxRR=2 with PoolNames=3 is the next step.";
+		break;
+	case RRProbeState::create_failed:
+		why = " - DLSSD did not create; the ERROR above names the result and the usual causes "
+		      "(nvngx_dlssd.dll not staged beside the executable, or driver < 535).";
+		break;
+	default:
+		break;
+	}
+	return std::snprintf(buffer, size,
+		"[rrprobe] mode=%d state=%s ngxInit=%d srAvail=%d rrAvail=%d ensureCalls=%llu "
+		"result=0x%08x (%s)%s",
+		g_rr_mode, rr_probe_state_text(g_rr_status.state),
+		g_rr_status.initialise_ran ? 1 : 0, g_status.super_sampling_available ? 1 : 0,
+		g_rr_status.available ? 1 : 0,
+		static_cast<unsigned long long>(g_rr_status.ensure_feature_calls),
+		g_rr_status.probe_create_result, result_name(g_rr_status.probe_create_result), why);
+}
+
 void set_rr_mode(int mode)
 {
 	if (mode >= 0 && mode <= 2)
 		g_rr_mode = mode;
 	else
+	{
 		STRAY_LOG_WARN("NgxRR %d invalid (0 off, 1 probe, 2 full); keeping %d.", mode, g_rr_mode);
+		return;
+	}
+	// ARM THE STATE HERE, not at the probe. `not_armed` and "armed but the hook point was never
+	// reached" are different findings and the whole cost of the 2026-09-04 round trip was that
+	// they looked identical - as did both of them and "the probe ran and said nothing".
+	if (g_rr_mode == 1 && !g_rr_status.probed)
+	{
+		g_rr_status.state = RRProbeState::awaiting_feature;
+		STRAY_LOG_WARN("RR PROBE ARMED (NgxRR=1). It fires at the FIRST ngx::ensure_feature "
+			"call - i.e. the first DLSS SR feature creation - and logs its outcome whatever "
+			"that outcome is, including \"the hook point was never reached\". Read the "
+			"[rrprobe] line in the periodic report and rr_probe_* in stray-dlss-status.txt; "
+			"neither can be absent while NgxRR is non-zero.");
+	}
+	else if (g_rr_mode != 1)
+	{
+		g_rr_status.state = RRProbeState::not_armed;
+	}
 }
 
 int rr_mode() { return g_rr_mode; }
@@ -834,6 +969,13 @@ bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 {
+	// COUNTED AT THE TRUE ENTRY, above this function's own preconditions, because the probe
+	// rides this call and "ensure_feature was never called" and "it was called and refused
+	// before reaching the probe" are different findings with different fixes. The [rrprobe]
+	// line reports this count beside `ngxInit` and `srAvail`, which together name which.
+	if (g_rr_mode == 1 && !g_rr_status.probed)
+		++g_rr_status.ensure_feature_calls;
+
 	// CreateFeature builds NGX's cubin descriptor objects; undo ReShade's ext-vtable patch
 	if (!g_status.initialised || !g_status.super_sampling_available || cmd == nullptr)
 		return false;

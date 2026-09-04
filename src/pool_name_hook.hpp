@@ -16,9 +16,10 @@
 //       ID3D12Resource*, and ASSERT it against the routes that already answer for the same
 //       textures — L1's FPassInputs depth and velocity, and the extent the View CB's row 132
 //       reports. Nothing consumes the map; the image is byte-identical.
-//   3 — SUPPLY (RR's guides) is DECLARED, NOT IMPLEMENTED. Wiring Ray Reconstruction is a
-//       separate decision after level 2 has run clean in GAMEPLAY. A request for 3 logs at
-//       ERROR and runs 2.
+//   3 — SUPPLY: everything level 2 does, and the GBufferA/B/C records become READABLE by the
+//       RR path (guide_set below). Nothing else changes: the recorder still only forwards, and
+//       a frame whose set does not pass rrguides::judge is REFUSED by name rather than
+//       substituted. Level 3 alone changes no pixel — [STRAYDLSS] NgxRR is what consumes it.
 //
 // THE ESCALATION, STATED PLAINLY. Level 2 writes an inline trampoline into the GAME'S CODE.
 // wrong target is a crash rather than a wrong number. Three things stand between here and that:
@@ -38,6 +39,7 @@
 #pragma once
 
 #include "core/pool_locator.hpp"
+#include "core/rr_guides.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -78,10 +80,32 @@ struct Record
 	std::uint32_t height = 0;
 	std::uint32_t dxgi_format = 0;
 	std::uint64_t frame = 0;         // the frame the record was last written
+	std::uint64_t epoch = 0;         // the allocation cycle that wrote it (bumped at GBufferA)
 	std::uint64_t calls = 0;         // how many times the engine has asked for this name
 };
 // A snapshot of one name's record. False when the name has never been seen.
 bool record(pool::Target t, Record &out);
+
+// THE FRAME STAMP. Called once per present so a record carries the frame it was written in and
+// rrguides::judge can bound its age. Without it every record looks equally fresh forever, which
+// is how a pointer the engine stopped re-affirming becomes a silent wrong input.
+void note_frame(std::uint64_t frame);
+
+// True when [STRAYDLSS] PoolNames == 3 AND the recorder is installed, i.e. when guide_set can
+// return anything at all. Read by the RR path so a refusal names the LEVEL rather than a
+// downstream symptom of it.
+bool supplying();
+
+// LEVEL 3. The GBufferA/B/C triple, as of the engine's own most recent allocation of each,
+// snapshotted under the recorder's lock and with LIVENESS re-checked against our resource
+// registry AT THIS CALL — never inherited from the record. Everything the caller needs to judge
+// the set is in the returned struct; nothing here decides anything (rrguides::judge does).
+//
+// IDENTITY vs LIFETIME, restated where it is consumed: `resource` is warranted by the engine
+// passing us the name, and stays warranted forever; `live` is warranted only for as long as
+// this call's answer is acted on, which is why the caller must AddRef before the GPU can read
+// it (gbr::record does) and must not cache the pointer across a frame.
+void guide_set(rrguides::Set &out);
 
 // THE LEVEL-2 ASSERTION. Called from the engine seam's AddPasses thunk, on the render thread,
 // with what the OTHER engine routes resolved for the same frame: L1's FPassInputs depth and

@@ -6,6 +6,11 @@ Usage: rawdump2png.py <file.bin> <width> <height> <fmt> [out.png]
        r32f         depth dumps           (straydlss_depth_*.bin)
        rgba16unorm  the ENGINE'S OWN sparse velocity (straydlss_velocity_raw_*.bin)
        rg16f        our resolved dense motion vectors (straydlss_mv_*.bin)
+       rgba16f_normal  the RR normal+roughness guide (straydlss_rr_normals_*.bin) — prints the
+                    DEGENERATE fraction, which is the one number that says whether the
+                    engine-named G-buffer still had CONTENT when we read it
+       rgba8        the RR albedo guides (straydlss_rr_diffuse_*.bin / _rr_specular_*.bin)
+       r16f         the standalone RR roughness guide (straydlss_rr_roughness_*.bin)
 
 Width, height, format and row pitch are all in the `input_dump: captured ...` log line beside
 each capture — read them off it rather than guessing.
@@ -92,6 +97,51 @@ def main():
             f"(white = decoded object motion, black = our resolve reconstructed camera motion "
             f"from depth)"
         )
+    elif fmt == "rgba16f_normal":
+        # THE RR NORMAL+ROUGHNESS GUIDE (straydlss_rr_normals_*.bin): xyz is a SIGNED world-space
+        # unit normal and w is linear roughness, so the plain rgba16f path — which scales by a
+        # percentile and clips — would render every negative component as black and tell you
+        # nothing. Shown as N*0.5+0.5, which is how a normal buffer is read by eye.
+        #
+        # THE NUMBER TO LOOK AT IS THE DEGENERATE FRACTION. gbuffer_resolve.hlsl falls back to
+        # +Z whenever the decoded normal has no length, which is what a CLEARED or RECYCLED
+        # GBufferA produces — and a 2026-08-31 measurement of the old heuristically-identified
+        # G-buffers found exactly that at the TAA hook, ~95% of the frame. A high number here
+        # says the pool named the right resource and its CONTENT was already gone; a low one
+        # says the guides are real. Nothing else in the pipeline can distinguish those.
+        img = rows_of(raw, w, h, 8).view(np.float16).reshape(h, w, 4).astype(np.float32)
+        n = img[:, :, :3]
+        rough = img[:, :, 3]
+        length = np.sqrt((n * n).sum(axis=2))
+        degenerate = np.isclose(n[:, :, 0], 0.0) & np.isclose(n[:, :, 1], 0.0) & (n[:, :, 2] > 0.99)
+        rgb = np.clip(n * 0.5 + 0.5, 0.0, 1.0)
+        Image.fromarray((rgb * 255).astype(np.uint8), "RGB").save(out)
+        print(
+            f"{out}: |N| mean={float(np.nanmean(length)):.4f} (want 1.0) "
+            f"DEGENERATE (+Z fallback) {100.0 * float(degenerate.mean()):.2f}% of pixels; "
+            f"roughness min={float(np.nanmin(rough)):.4f} max={float(np.nanmax(rough)):.4f} "
+            f"mean={float(np.nanmean(rough)):.4f}"
+        )
+    elif fmt == "rgba8":
+        # The RR albedo guides (straydlss_rr_diffuse_*.bin, straydlss_rr_specular_*.bin), LINEAR
+        # RGBA8_UNORM. gbuffer_resolve.hlsl floors both at 0.05 and writes a flat 0.5 for
+        # unlit/sky pixels, so a picture that is uniformly mid-grey is the shader saying it saw
+        # no shading model — the same finding the normal dump's degenerate fraction reports.
+        img = rows_of(raw, w, h, 4).reshape(h, w, 4).astype(np.float32) / 255.0
+        rgb = np.clip(img[:, :, :3], 0.0, 1.0) ** (1 / 2.2)
+        flat = np.isclose(img[:, :, :3], 0.5, atol=2.0 / 255.0).all(axis=2)
+        Image.fromarray((rgb * 255).astype(np.uint8), "RGB").save(out)
+        print(
+            f"{out}: mean linear RGB = ({float(img[:, :, 0].mean()):.4f}, "
+            f"{float(img[:, :, 1].mean()):.4f}, {float(img[:, :, 2].mean()):.4f}); "
+            f"FLAT 0.5 (sky/unlit default) on {100.0 * float(flat.mean()):.2f}% of pixels"
+        )
+    elif fmt == "r16f":
+        img = rows_of(raw, w, h, 2).view(np.float16).reshape(h, w).astype(np.float32)
+        lo, hi = float(np.nanmin(img)), float(np.nanmax(img))
+        norm = (img - lo) / (hi - lo) if hi > lo else img * 0
+        Image.fromarray((norm * 255).astype(np.uint8), "L").save(out)
+        print(f"{out}: min={lo:.6f} max={hi:.6f} mean={float(np.nanmean(img)):.6f}")
     elif fmt == "rg16f":
         # Our resolved dense field: render-resolution PIXELS, [0,0] upper-left, pointing back.
         mv = rows_of(raw, w, h, 4).view(np.float16).reshape(h, w, 2).astype(np.float32)
