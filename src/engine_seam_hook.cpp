@@ -100,6 +100,14 @@ std::atomic<std::uint64_t> g_pre_skipped{ 0 };
 std::atomic<std::uint64_t> g_l1_faults{ 0 };
 std::atomic<std::uint64_t> g_l1_fault_va{ 0 };
 std::atomic<bool> g_l1_disabled{ false };
+// The FRDGResource::Name self-check on the OUTPUT texture the engine hands back: it must read
+// L"TemporalAA" (seam::kTaaOutputName). One guarded pointer read per announcement that
+// validates the RDG layout L1's `ResourceRHI @16` sits in (`Name` is the qword before it).
+std::atomic<std::uint64_t> g_name_ok{ 0 };
+std::atomic<std::uint64_t> g_name_bad{ 0 };
+std::atomic<std::uint64_t> g_name_unreadable{ 0 };
+bool g_name_ok_logged = false;
+bool g_name_bad_logged = false;
 
 std::uint64_t read_ptr(const void *base, std::size_t offset)
 {
@@ -122,6 +130,8 @@ std::int32_t read_i32(const void *base, std::size_t offset)
 // Defined below with the rest of the guarded reader; declared here because the ONLY safe place
 // to call it is inside AddPasses, which is above it in this file.
 std::uint64_t resolve_at_announce(std::uint64_t rdg, seam::RhiChain &status);
+// The output texture's FRDGResource::Name against L"TemporalAA". Same guards, same latch.
+void verify_output_name(std::uint64_t rdg);
 // The fault latch, shared by the announce-time resolve and the claim-time consumer.
 bool l1_faulted();
 void l1_note_faults_and_latch();
@@ -209,6 +219,12 @@ void add_passes_thunk(const void *self, void *graph_builder, const void *view,
 			a.out_height = static_cast<std::uint32_t>(max_y - min_y);
 		}
 	}
+	// The OUTPUT texture the engine just wrote into *OutSceneColorTexture is `u0`
+	// (TemporalAA.cpp:696, :1515) and is alive right here, inside the builder's setup. Its
+	// FRDGResource::Name is unconditional in Shipping and must read L"TemporalAA": a free,
+	// read-only check on the RDG layout every other L1 read depends on.
+	if (out_colour != nullptr)
+		verify_output_name(read_ptr(out_colour, 0));
 	if (a.out_width == 0 || a.out_height == 0)
 	{
 		g_unreadable.fetch_add(1, std::memory_order_relaxed);
@@ -651,6 +667,89 @@ std::uint64_t resolve_at_announce(std::uint64_t rdg, seam::RhiChain &status)
 	return reinterpret_cast<std::uint64_t>(native);
 }
 
+// One guarded read of `rdg + 8` (FRDGResource::Name), then up to three guarded qwords of the
+// wide string it points at, compared against L"TemporalAA". Counted; said once each way.
+void verify_output_name(std::uint64_t rdg)
+{
+	seam::L1GateInputs gi;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		gi.inputs_enabled = g_inputs_enabled;
+		gi.mode = g_mode;
+	}
+	gi.hooked = true;
+	gi.announced = true;
+	gi.faulted = l1_faulted();
+	if (seam::l1_gate(gi) != seam::L1Gate::resolve)
+		return;
+
+	constexpr std::size_t kChars = sizeof(seam::kTaaOutputName) - 1; // 10
+	constexpr std::size_t kQwords = (2 * (kChars + 1) + 7) / 8;      // 22 bytes -> 3 qwords
+	std::uint64_t name_ptr = 0;
+	std::uint64_t raw[kQwords] = {};
+	bool readable = rdg != 0 && l1_read_u64(nullptr, rdg + seam::kRdgResourceNameOffset, &name_ptr) &&
+		name_ptr != 0;
+	for (std::size_t q = 0; readable && q < kQwords; ++q)
+		readable = l1_read_u64(nullptr, name_ptr + 8 * q, &raw[q]);
+	l1_note_faults_and_latch();
+	if (!readable)
+	{
+		g_name_unreadable.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	// UTF-16LE, compared char by char; anything non-ASCII is rendered as '?' for the log.
+	char shown[kChars + 4] = {};
+	bool match = true;
+	const auto *wide = reinterpret_cast<const unsigned char *>(raw);
+	for (std::size_t i = 0; i <= kChars; ++i)
+	{
+		const std::uint16_t c = static_cast<std::uint16_t>(wide[2 * i] | (wide[2 * i + 1] << 8));
+		const char want = seam::kTaaOutputName[i]; // '\0' at kChars
+		if (c != static_cast<std::uint16_t>(static_cast<unsigned char>(want)))
+			match = false;
+		if (i < kChars)
+			shown[i] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : (c == 0 ? '.' : '?');
+	}
+	if (match)
+	{
+		g_name_ok.fetch_add(1, std::memory_order_relaxed);
+		bool first = false;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			if (!g_name_ok_logged)
+			{
+				g_name_ok_logged = true;
+				first = true;
+			}
+		}
+		if (first)
+			STRAY_LOG_INFO("ENGINE SEAM: the engine's output texture (FRDGTexture %p, *OutSceneColorTexture "
+				"= u0) carries FRDGResource::Name L\"%s\" at +%zu - exactly kTAAOutputNames[Main*] "
+				"(TemporalAA.cpp:554-562). The RDG layout L1 reads ResourceRHI through (+%zu) is "
+				"the one this exe uses. Counted as u0name: ok= on the [seam] line.",
+				reinterpret_cast<void *>(rdg), shown, seam::kRdgResourceNameOffset,
+				seam::kRdgResourceRhiOffset);
+		return;
+	}
+	g_name_bad.fetch_add(1, std::memory_order_relaxed);
+	bool first = false;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (!g_name_bad_logged)
+		{
+			g_name_bad_logged = true;
+			first = true;
+		}
+	}
+	if (first)
+		STRAY_LOG_WARN("ENGINE SEAM ASSERTION: the engine's output texture (FRDGTexture %p) has "
+			"FRDGResource::Name reading \"%s\" at +%zu, not \"%s\". Either this exe's FRDGResource "
+			"layout differs from 4.27's header (which also puts L1's ResourceRHI @%zu in doubt) or "
+			"the out-parameter is not the TAA output. Once per session; the rate is u0name: bad=.",
+			reinterpret_cast<void *>(rdg), shown, seam::kRdgResourceNameOffset,
+			seam::kTaaOutputName, seam::kRdgResourceRhiOffset);
+}
+
 // THE VALIDATION, at claim, on the thread about to use the pointer. Our own registry sees every
 // ID3D12Resource the process creates; a pointer it has never seen is not a resource, whatever
 // the chain thought — and by this point the FRDGTexture it came from no longer exists, so this
@@ -909,7 +1008,8 @@ int format_report(char *buffer, std::size_t size)
 		"nearMiss=%llu | claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu "
 		"%s=%llu | "
 		"evaluated=%llu | "
-		"l1: resolved=%llu partial=%llu fellBack=%llu stale=%llu faults=%llu off=%d",
+		"l1: resolved=%llu partial=%llu fellBack=%llu stale=%llu faults=%llu off=%d | "
+		"u0name: ok=%llu bad=%llu unreadable=%llu",
 		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
 		static_cast<unsigned long long>(c.announced),
 		static_cast<unsigned long long>(c.claimed),
@@ -939,7 +1039,10 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(l1r), static_cast<unsigned long long>(l1p),
 		static_cast<unsigned long long>(l1f), static_cast<unsigned long long>(l1s),
 		static_cast<unsigned long long>(g_l1_faults.load(std::memory_order_relaxed)),
-		g_l1_disabled.load(std::memory_order_relaxed) ? 1 : 0);
+		g_l1_disabled.load(std::memory_order_relaxed) ? 1 : 0,
+		static_cast<unsigned long long>(g_name_ok.load(std::memory_order_relaxed)),
+		static_cast<unsigned long long>(g_name_bad.load(std::memory_order_relaxed)),
+		static_cast<unsigned long long>(g_name_unreadable.load(std::memory_order_relaxed)));
 }
 
 EngineInputs resolve_inputs(const Verdict &v)
@@ -1105,7 +1208,7 @@ void log_report(const char *when)
 	}
 	if (m == seam::Mode::off)
 		return;
-	char line[768] = {};
+	char line[1024] = {};
 	format_report(line, sizeof(line));
 	// `unclaimed` is the number that must stay at zero: an announced primary upscale we never
 	// intercepted is a frame that ran the engine's TAA. `preSkipped` is EXPECTED to grow (the

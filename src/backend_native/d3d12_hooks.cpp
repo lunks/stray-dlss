@@ -12,9 +12,19 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "perf.hpp"
+#include "u0_rhi_hook.hpp"
 
 #include <d3d12.h>
 #include <wrl/client.h>
+
+// The return address of the hook function itself - the instruction after the game's
+// `call [vtable+slot]`. Under MSVC an intrinsic; under mingw the GCC builtin.
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define STRAY_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define STRAY_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
 
 #include <atomic>
 #include <cstddef>
@@ -788,6 +798,12 @@ void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x,
 	// as not-the-game's costs nothing there and is exactly right here.
 	if (icept::Sink *sk = drive_sink())
 	{
+		// A GAME dispatch on its recording thread. Where we were called FROM is the seed for
+		// the engine's u0 route: inside FD3D12CommandContext::RHIDispatchComputeShader
+		// (D3D12Commands.cpp:120), whose function start the exe's own .pdata gives back, and
+		// whose vtable slot is IRHIComputeContext's slot 3. It also moves this thread's pending
+		// UAVIndex==0 bind into "the bind for THIS dispatch" before the sink can ask about it.
+		u0hook::note_dispatch(STRAY_RETURN_ADDRESS());
 		const bool suppress = sk->on_dispatch(context_for(self), x, y, z);
 		count_drive_dispatch(suppress);
 		if (suppress)

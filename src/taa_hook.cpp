@@ -3,6 +3,7 @@
 #include "core/exposure_plan.hpp"
 #include "core/feature_recreate.hpp"
 #include "engine_seam_hook.hpp"
+#include "u0_rhi_hook.hpp"
 #include "exposure_texture.hpp"
 
 #include "ngx_nr.hpp"
@@ -957,7 +958,23 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// no RHI resource at AddPasses time has one now. Each is validated against our own
 		// resource registry before it is used, so a wrong offset falls back rather than lies.
 		if (seam_gate == seam::Gate::engine)
+		{
 			engine_inputs = seamhook::resolve_inputs(seam_verdict);
+
+			// THE u0 ASSERTION ([STRAYDLSS] U0Hook=2). The engine bound its output UAV through
+			// IRHIComputeContext::RHISetUAVParameter on this very thread a moment before this
+			// dispatch; the descriptor walk resolved `u0` from the bound table. Compare them on
+			// every engine-announced dispatch and count the verdict (src/u0_rhi_hook.hpp). The
+			// walk stays authoritative here; a disagreement is one WARN per pass and the first
+			// line to read if the image is wrong.
+			std::uint64_t walk_u0 = 0;
+			for (const auto &u : b.uavs)
+			{
+				if (u.slot == m.output_uav && icept::backend()->is_resource_live(u.resource))
+					walk_u0 = u.resource;
+			}
+			u0hook::assert_at_claim(walk_u0, seam_verdict.out_width, seam_verdict.out_height, hash);
+		}
 
 		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)
 		{
