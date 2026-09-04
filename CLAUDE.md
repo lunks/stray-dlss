@@ -1414,58 +1414,70 @@ a launch sequence sent 2 s after reaching gameplay does nothing; Config A needs 
 `dxgi.dll` renamed aside, never `dxgi=b` (wine-builtin dxgi cannot create a swapchain on
 vkd3d-proton); `WINEDLLOVERRIDES` must keep `dwmapi=n,b` or UE4SS never loads.
 ---
+## 3. How it works
 
-## 3. How the add-on works
+**The shipping host is the UE4SS plugin, and it does NOT identify the pass by hash.** It patches
+UE 4.27's own `ITemporalUpscaler` vtable, so the ENGINE announces which dispatch is the temporal
+upscale. Everything the ReShade-era flow did by fingerprinting is now an assertion against that
+announcement rather than a gate.
 
 ```
-                    ┌────────────────── ReShade add-on events ──────────────────┐
- game frame ─▶ init_pipeline ──▶ fnv1a64 the DXBC ──▶ 0x1708ec956099e259?
-                                                      + binding signature + dispatch size
-                                                              │ yes
-               bind_pipeline ───────────────────────────────── ┘   (stage is `all`, NOT compute!)
-               push_descriptors / bind_descriptor_tables
-                          └─▶ capture by REGISTER: t0 depth, t2 velocity,
-                              t5/t6 colour, u0/u1 output, b1 View CB
-               dispatch ──▶ INTERCEPT
-                             ├─ map b1, copy the 2448-byte prefix, read rows
-                             │    122 ClipToPrevClip · 129/130 rect · 132 buffer size
-                             │    135.y PreExposure · 145.x CameraCut · 152 jitter
-                             ├─ identify history vs scene colour via last frame's u0 pointer
-                             ├─ InReset = CameraCut | jitter.zw==xy | 1x1 history/velocity
-                             ├─ our MV-resolve CS → dense RG16_FLOAT at render res:
-                             │     EncodedVelocity.x > 0 ? decode : camera motion from
-                             │     depth + ClipToPrevClip;  then * (0.5W, -0.5H), negated
-                             ├─ barrier inputs → NON_PIXEL_SHADER_RESOURCE, output → UAV
-                             ├─ NGX EvaluateFeature(colour, depth, denseMV, jitter) → u0
-                             ├─ RESTORE clobbered D3D12 state (heaps, root sig, PSO, ...)
-                             ├─ produce u1 (half-res filter of u0) — required!
-                             └─ return true  (skip the engine's dispatch)
-                             │
-               u0 becomes next frame's HistoryBuffer[0] ──▶ engine continues
+ startup   scan the game module for ITemporalUpscaler's vtable
+             validated by THREE independent constants from one scan (src/core/engine_seam.*):
+             GetDebugName returns the literal, GetMin/MaxUpsampleResolutionFraction decode
+             to exactly 0.5 and 2.0 (SceneView.h:1438-1439). A wrong answer is REFUSED.
+           patch the AddPasses slot; forward to the engine's own implementation every call,
+             so the image is unchanged until we choose otherwise.
+
+ frame  ─▶ AddPasses (ours)  ── the engine has just told us this is the temporal upscale
+             ├─ resolve the RDG wrappers HERE, not at claim time: FRDGBuilder::Execute()
+             │    calls Allocator.ReleaseAll() before the queued dispatch runs, so a pointer
+             │    read later is into recycled arena memory (this crashed once, on an
+             │    FIntPoint that had been two int32s a moment earlier)
+             └─ publish the claim
+           dispatch ──▶ CLAIM
+             ├─ View CB: search bound root CBVs in slot order; row 135 validates the offset by
+             │    itself — (denormal, P, 1/P, 0.0) with y*z == 1.0 by construction — and
+             │    view_fits_dispatch / view_fraction_plausible reject a shadow or capture view
+             ├─ u0 by the RHI bind stream (src/core/u0_rhi_uav.*), asserted against the
+             │    engine's own FPassInputs; measured agree 6603/0 and 39618/0
+             ├─ InReset = CameraCut | jitter.zw==xy | 1x1 history/velocity  (§2.8)
+             ├─ MV resolve → dense RG16_FLOAT at render res. MEASURED: 96% of the field is
+             │    this reconstruction, not the engine's velocity (§2.5, facts §37)
+             ├─ barrier inputs → NON_PIXEL_SHADER_RESOURCE, output → UAV
+             ├─ NGX EvaluateFeature(colour, depth, denseMV, jitter) → u0
+             ├─ RESTORE clobbered D3D12 state (heaps, root sig, PSO, ...)
+             └─ publish guides for the NR stage, and suppress the engine's dispatch
+
+ present ─▶ FG: two presents per game frame, paced against the previous REAL present
+             (src/backend_native/fg_present.cpp). No Streamline anywhere.
+           NR: a present-time stage over the BACK BUFFER — already display-referred, so no
+             codec, no exposure term, no feedback path (§5).
 ```
 
-Four stages, each testable in isolation as far as CI allows:
+**`unclaimed=` is the number that matters.** It counts frames where the engine announced a pass
+we did not claim, and it was the flicker: 134 -> 0 when the wrong-View bug was fixed. Any gate
+that refuses a matched pass logs one WARN per pass per reason — a pass that never reaches DLSS
+must never be indistinguishable from a pass that was not there.
 
-1. **Identify** — hash every compute shader's DXBC at `init_pipeline`; confirm with binding
-   signature and dispatch size; never select `0x901e041a7cadc9db`; never hook `0x52101a15e1a0c5cc`.
-   **This whole stage is ReShade-era, and since 2026-09-03 it is BYPASSED by default**:
-   `[STRAYDLSS] EngineSeam=3` (`src/core/engine_seam.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md`
-   §10, facts §36) takes the answer from the engine's own `ITemporalUpscaler::AddPasses` and
-   gates DLSS on it; the hash and the signature are assertions. The matcher still runs to
-   EXTRACT the register roles. Levels 0-2 put the heuristic back in charge.
-2. **Capture** — record bound SRVs/UAVs/CB **by register** and read the View CB rows.
-3. **Resolve** — our compute pass turning sparse velocity + depth + `ClipToPrevClip` into the dense
-   `RG16_FLOAT` field DLSS requires, in DLSS's units and sign.
-4. **Evaluate** — NGX into `u0`, restore state, produce `u1`, skip the engine dispatch.
+### The second host: the ReShade add-on
+
+`src/backend_reshade/` still builds as `stray-dlss.addon64` and is still tested by two CI lanes.
+It identifies the pass by hashing DXBC at `init_pipeline` and capturing bindings by register, and
+it needs `ext_unhook` for §1's native-with-repair. **ReShade may also be loaded alongside the
+plugin** (Config B), which is why `reshade_proxy_device` exists in the plugin host too — "the
+plugin host" never implies "no ReShade in the process".
+
+> **The stale diagram that used to live here named `0x1708ec956099e259` as the hook target.**
+> §2.3 identifies that hash as `FSSDTemporalAccumulationCS` and says never to hook it, so this
+> section was teaching the opposite of the same document. It is deleted rather than annotated,
+> because a wrong flow diagram in the "how it works" section is read long before the correction
+> three sections later. The add-on's real event-model constraints are in §5.
 
 ### Staging
 
-* **v0.1 — DLAA.** Render resolution == output resolution. No screen-percentage forcing. Isolates
-  one question: *are colour, depth, motion vectors and jitter correct?*
-* **v0.2 — DLSS SR.** See §4. Do not start v0.2 before v0.1 is confirmed correct **on the user's
-  machine**.
-
----
+Both v0.1 (DLAA) and v0.2 (DLSS SR) are done, and SR, Frame Generation and Neural Rendering all
+run on the box. What remains is not staging but the open questions in §5.
 
 ## 4. The super-resolution path
 
