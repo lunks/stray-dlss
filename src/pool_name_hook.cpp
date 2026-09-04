@@ -571,11 +571,13 @@ void log_locate(const pool::Locate &v)
 		STRAY_LOG_INFO("POOL NAMES: best candidate %#llx - reached from %u DISTINCT enclosing "
 			"functions (.pdata-derived, bar is %u) and %u distinct name literals (bar %u), %u "
 			"lea sites, nearest call %u bytes after the name load. Names: %s. Runner-up %#llx "
-			"with %u groups / %u names. Entry bytes: "
+			"with %u groups / %u names / nearest %u. Tie broken by the internal call: %s. "
+			"Entry bytes: "
 			"%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X%s",
 			static_cast<unsigned long long>(v.target), v.groups, pool::kMinAgreeingGroups,
 			v.names, pool::kMinAgreeingNames, v.sites, v.min_distance, names,
 			static_cast<unsigned long long>(v.runner_up), v.runner_up_groups, v.runner_up_names,
+			v.runner_up_distance, v.resolved_by_internal ? "YES" : "no (not needed, or not available)",
 			v.entry[0], v.entry[1], v.entry[2], v.entry[3], v.entry[4], v.entry[5], v.entry[6],
 			v.entry[7], v.entry[8], v.entry[9], v.entry[10], v.entry[11], v.entry[12],
 			v.entry[13], v.entry[14], v.entry[15],

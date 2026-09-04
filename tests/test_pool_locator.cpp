@@ -522,3 +522,81 @@ TEST_CASE("every status and verdict has a name, so a log line can never print a 
 	for (std::size_t i = 0; i < kNameCount; ++i)
 		CHECK(std::strlen(target_name(static_cast<Target>(i))) > 0);
 }
+
+TEST_CASE("a tie is broken by which candidate CALLS FindFreeElementInternal, not by proximity")
+{
+	// RenderTargetPool.cpp:703 — FindFreeElement's last act is FindFreeElementInternal. When
+	// this build kept the internal's own UE_LOG literal, that is a FACT that separates two
+	// otherwise-tied front-runners, and it is the only thing allowed to: no proximity, no
+	// name-count preference, nothing that is a guess dressed as a rule.
+	FakeModule m;
+	const std::uint64_t real_fn = m.cell_va(8);
+	const std::uint64_t decoy = m.cell_va(9);
+	const std::uint64_t internal_fn = m.cell_va(10);
+	m.declare(8);
+	m.declare(9);
+	m.text[m.cell_off(9)] = 0xC3;
+	m.declare(10);
+	const std::uint64_t fmt = m.put_wide("%d MB, NewRT %s %s");
+	m.write_lea(m.cell_off(10), fmt);
+	m.text[m.cell_off(10) + 7] = 0xC3;
+	// Only the real one calls the internal.
+	m.write_call(m.cell_off(8) + 0x10, internal_fn);
+	m.text[m.cell_off(8) + 0x15] = 0xC3;
+
+	// The DECOY is called FIRST at every site, so proximity and ordering both favour it.
+	m.write_caller(0, m.put_wide("GBufferA"), { decoy, real_fn });
+	m.write_caller(1, m.put_wide("SceneDepthZ"), { decoy, real_fn });
+	m.write_caller(2, m.put_wide("GBufferF"), { decoy, real_fn });
+	m.write_caller(3, m.put_wide("ScreenSpaceAO"), { decoy, real_fn });
+	m.sort_pdata();
+	Image img = m.image();
+	FunctionTable tab = m.table(img);
+
+	const Locate v = locate(img, tab);
+	CHECK(v.status == LocateStatus::ok);
+	CHECK(v.target == real_fn);
+	CHECK(v.runner_up == decoy);
+	CHECK(v.resolved_by_internal);
+	CHECK(v.internal_fn == internal_fn);
+	CHECK(v.internal_called_by_target);
+}
+
+TEST_CASE("if BOTH tied candidates call the internal, the tie is still a refusal")
+{
+	FakeModule m;
+	const std::uint64_t a = m.cell_va(8);
+	const std::uint64_t b = m.cell_va(9);
+	const std::uint64_t internal_fn = m.cell_va(10);
+	m.declare(8);
+	m.declare(9);
+	m.declare(10);
+	const std::uint64_t fmt = m.put_wide("%d MB, NewRT %s %s");
+	m.write_lea(m.cell_off(10), fmt);
+	m.text[m.cell_off(10) + 7] = 0xC3;
+	m.write_call(m.cell_off(8) + 0x10, internal_fn);
+	m.write_call(m.cell_off(9) + 0x10, internal_fn);
+
+	m.write_caller(0, m.put_wide("GBufferA"), { a, b });
+	m.write_caller(1, m.put_wide("SceneDepthZ"), { a, b });
+	m.write_caller(2, m.put_wide("GBufferF"), { a, b });
+	m.write_caller(3, m.put_wide("ScreenSpaceAO"), { a, b });
+	m.sort_pdata();
+	Image img = m.image();
+	FunctionTable tab = m.table(img);
+
+	const Locate v = locate(img, tab);
+	CHECK(v.status == LocateStatus::ambiguous);
+	CHECK_FALSE(v.resolved_by_internal);
+}
+
+TEST_CASE("with no internal literal the tiebreak cannot fire, and a clean win stays clean")
+{
+	// The healthy image has no UE_LOG literal, so nothing may be `resolved_by_internal` - the
+	// win has to come from the agreement bar alone.
+	Healthy h;
+	const Locate v = locate(h.img, h.tab);
+	CHECK(v.status == LocateStatus::ok);
+	CHECK_FALSE(v.resolved_by_internal);
+	CHECK_FALSE(v.internal_called_by_target);
+}

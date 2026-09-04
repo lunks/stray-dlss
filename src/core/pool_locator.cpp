@@ -544,46 +544,6 @@ Locate locate(const seam::Image &image, const u0::FunctionTable &table)
 		cands[j].name_count = n;
 	}
 
-	// Rank on DISTINCT ENCLOSING FUNCTIONS first: a helper shared by several call sites inside
-	// one function is reached by many names and only ever one group, which is exactly the
-	// false positive this ordering refuses. Names, then proximity, break ties for reporting.
-	std::size_t best = 0;
-	std::size_t second = cand_count;
-	for (std::size_t j = 1; j < cand_count; ++j)
-	{
-		const Candidate &a = cands[j];
-		const Candidate &b = cands[best];
-		const bool better = a.group_count > b.group_count ||
-			(a.group_count == b.group_count && a.name_count > b.name_count) ||
-			(a.group_count == b.group_count && a.name_count == b.name_count &&
-				a.min_distance < b.min_distance);
-		if (better)
-			best = j;
-	}
-	for (std::size_t j = 0; j < cand_count; ++j)
-	{
-		if (j == best)
-			continue;
-		if (second == cand_count || cands[j].group_count > cands[second].group_count ||
-			(cands[j].group_count == cands[second].group_count &&
-				cands[j].name_count > cands[second].name_count))
-			second = j;
-	}
-
-	v.target = cands[best].target;
-	v.names = cands[best].name_count;
-	v.groups = cands[best].group_count;
-	v.sites = cands[best].sites;
-	v.name_mask = cands[best].name_mask;
-	v.min_distance = cands[best].min_distance;
-	if (second != cand_count)
-	{
-		v.runner_up = cands[second].target;
-		v.runner_up_names = cands[second].name_count;
-		v.runner_up_groups = cands[second].group_count;
-	}
-	v.entry_read = image.read(v.target, v.entry, sizeof(v.entry));
-
 	// The residual, settled: is FindFreeElementInternal's own UE_LOG format string still here?
 	{
 		unsigned char needle[64] = {};
@@ -631,17 +591,79 @@ Locate locate(const seam::Image &image, const u0::FunctionTable &table)
 			}
 			v.internal_fn_candidates = fn_count;
 			if (fn_count == 1)
-			{
 				v.internal_fn = fns[0];
-				// RenderTargetPool.cpp:703 — FindFreeElement's last act is to call
-				// FindFreeElementInternal. When the literal survives, this is a fourth and
-				// completely independent confirmation that `target` is the right function.
-				v.internal_called_by_target = function_calls(image, table, v.target, v.internal_fn);
-			}
 		}
 	}
 
-	if (second != cand_count && cands[second].group_count >= cands[best].group_count)
+
+	// Rank on DISTINCT ENCLOSING FUNCTIONS first: a helper shared by several call sites inside
+	// one function is reached by many names and only ever one group, which is exactly the
+	// false positive this ordering refuses. Names, then proximity, break ties for reporting.
+	std::size_t best = 0;
+	std::size_t second = cand_count;
+	for (std::size_t j = 1; j < cand_count; ++j)
+	{
+		const Candidate &a = cands[j];
+		const Candidate &b = cands[best];
+		const bool better = a.group_count > b.group_count ||
+			(a.group_count == b.group_count && a.name_count > b.name_count) ||
+			(a.group_count == b.group_count && a.name_count == b.name_count &&
+				a.min_distance < b.min_distance);
+		if (better)
+			best = j;
+	}
+	for (std::size_t j = 0; j < cand_count; ++j)
+	{
+		if (j == best)
+			continue;
+		if (second == cand_count || cands[j].group_count > cands[second].group_count ||
+			(cands[j].group_count == cands[second].group_count &&
+				cands[j].name_count > cands[second].name_count))
+			second = j;
+	}
+
+	// AN INDEPENDENT TIEBREAK, and it is a FACT rather than a heuristic. When this build kept
+	// FindFreeElementInternal's log literal, `FindFreeElement`'s last act is to call it
+	// (RenderTargetPool.cpp:703) — so if exactly one of the two front-runners does, that one is
+	// the function, whatever the group counts say. Nothing here prefers proximity or any other
+	// guess: with no internal_fn, or with both calling it, or with neither, the ranking stands
+	// and a tie is still refused.
+	if (v.internal_fn != 0 && second != cand_count)
+	{
+		const bool best_calls = function_calls(image, table, cands[best].target, v.internal_fn);
+		const bool second_calls = function_calls(image, table, cands[second].target, v.internal_fn);
+		if (!best_calls && second_calls)
+		{
+			const std::size_t swap = best;
+			best = second;
+			second = swap;
+			v.resolved_by_internal = true;
+		}
+		else if (best_calls && !second_calls)
+		{
+			v.resolved_by_internal = true;
+		}
+	}
+	if (v.internal_fn != 0)
+		v.internal_called_by_target = function_calls(image, table, cands[best].target, v.internal_fn);
+
+	v.target = cands[best].target;
+	v.names = cands[best].name_count;
+	v.groups = cands[best].group_count;
+	v.sites = cands[best].sites;
+	v.name_mask = cands[best].name_mask;
+	v.min_distance = cands[best].min_distance;
+	if (second != cand_count)
+	{
+		v.runner_up = cands[second].target;
+		v.runner_up_names = cands[second].name_count;
+		v.runner_up_groups = cands[second].group_count;
+		v.runner_up_distance = cands[second].min_distance;
+	}
+	v.entry_read = image.read(v.target, v.entry, sizeof(v.entry));
+
+	if (second != cand_count && cands[second].group_count >= cands[best].group_count &&
+		!v.resolved_by_internal)
 	{
 		v.status = LocateStatus::ambiguous;
 		return v;

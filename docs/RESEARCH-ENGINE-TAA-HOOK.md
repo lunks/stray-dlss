@@ -2192,13 +2192,22 @@ work a decoder would have done less safely:
    alone holds seven name literals, so anything it calls is reached by seven names and only ever
    one group. Pinned by a test.
 3. **The bar is ≥ 3 groups and ≥ 4 names, the runner-up must be beaten OUTRIGHT on groups, and a
-   tie is `ambiguous` — a refusal, never a pick.** This is the equivalent of the seam's three
+   tie is `ambiguous` — a refusal, never a pick** (unless the internal-call fact below settles
+   it). This is the equivalent of the seam's three
    constants (§4.1): a candidate must be reached from several independent places in the engine's
    own code before anything is installed.
 
-A fourth check runs when the image allows it. `FindFreeElement`'s last act is
-`FindFreeElementInternal` (`RenderTargetPool.cpp:703`), and that function contains the `UE_LOG`
-format string `%d MB, NewRT %s %s` (`:403`). **The scan searches for it and reports either way**,
+A fourth check runs when the image allows it, and it is also the **only** thing permitted to
+break a tie. `FindFreeElement`'s last act is `FindFreeElementInternal`
+(`RenderTargetPool.cpp:703`), and that function contains the `UE_LOG` format string
+`%d MB, NewRT %s %s` (`:403`). When that literal survives, the internal is nameable from its own
+xref, and **if exactly one of the two front-runners calls it, that one is the function whatever
+the group counts say** (`resolved_by_internal`, reported on the scan line). That is a fact from
+the engine's source, not a preference — with no internal, or with both calling it, or with
+neither, the ranking stands and a tie is still refused. It matters because the realistic
+ambiguity in this binary is not a random address: it is some *other* helper genuinely called
+from four of the six allocators, and no amount of proximity heuristics would separate that
+honestly. **The scan searches for the literal and reports either way**,
 which SETTLES the residual `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.5 flags rather than
 assuming it — its presence means `USE_LOGGING_IN_SHIPPING`, names the internal outright, and gives
 a fourth independent confirmation of the winner (our target must call it); its absence closes that
@@ -2306,8 +2315,10 @@ The readings that decide the next step, in order:
 
 * **`VERDICT: ok` with `groups >= 3`** — the function is found and the bar is cleared. Level 2 is
   then one ini key on the SAME build.
-* **`ambiguous`** — two candidates tied on distinct enclosing functions. Terminal for the session
-  and the finding of the launch; both addresses are printed.
+* **`ambiguous`** — two candidates tied on distinct enclosing functions, and the internal-call
+  tiebreak could not settle it (no `NewRT` literal, or both call it). Terminal for the session and
+  the finding of the launch; both addresses, their group/name counts and their nearest-call
+  distances are printed, which is what a follow-up would need.
 * **`insufficient`** with a best candidate and its group/name counts — how close it came, and
   which bar it missed.
 * **`no_candidates` with `refs_found` non-zero** — the literals and their references are there and

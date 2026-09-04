@@ -177,6 +177,7 @@ struct Locate
 	std::uint64_t runner_up = 0;
 	unsigned runner_up_names = 0;
 	unsigned runner_up_groups = 0;
+	std::uint32_t runner_up_distance = 0;
 
 	// Stage counts, so a failure names the stage that refused rather than needing a round trip.
 	unsigned literals_found = 0;   // names whose UTF-16 literal is in the image
@@ -206,6 +207,10 @@ struct Locate
 	// `FindFreeElementInternal(...)`, so when the literal survives this is a fourth, entirely
 	// independent confirmation of the winner. False with internal_fn==0 means "not testable".
 	bool internal_called_by_target = false;
+	// The tie between the two front-runners was settled by which of them CALLS the internal,
+	// which is a fact from the engine's source rather than a preference. Only ever set when
+	// `internal_fn` is known and exactly one of the two calls it.
+	bool resolved_by_internal = false;
 };
 
 // The whole scan. Never executes anything it finds; never reads outside `image`.
