@@ -2671,3 +2671,48 @@ correct image here while RR has never had one.
   The user prefers the ground-truth AO, and SSGI's AO mask REPLACES `SceneContext.ScreenSpaceAO`
   whenever it runs (docs/RESEARCH-AMBIENT-OCCLUSION.md), so every AO setting in that ini had been
   invisible while SSGI was on.
+
+## §47 The `nvapi status -5` has a source-grounded explanation and a one-launch test (2026-09-04)
+
+Carried as UNCONFIRMED since the ReShade era, where it was §1's ext-vtable corruption signature.
+That reading is dead — `ext_unhook` is deleted and the count was **27 with the repair on and 27
+with it off** (§39) — so the cause is something else, and the DXVK-NVAPI source names it.
+
+**`-5` is `NVAPI_INVALID_ARGUMENT`, and `NvAPI_D3D12_GetCudaIndependentDescriptorObject` returns
+it from exactly two places** (`jp7677/dxvk-nvapi`, `src/nvapi_d3d12.cpp:317-361`):
+
+```cpp
+if (!pParams->pDevice || !pParams->desc.ptr)
+    return InvalidArgument(n);                 // PATH 1: null device, or a ZERO descriptor handle
+...
+switch (device->GetCudaIndependentDescriptorObject(&params)) {
+    case E_INVALIDARG: return InvalidArgument(n);   // PATH 2: vkd3d-proton rejects it
+```
+
+The two log identically, so the message alone cannot separate them. Everything else we have
+points at **path 1**:
+
+* It fires at **feature CREATION**, five times per SR feature (§32.8), not per frame.
+* The total is **constant across runs** — 27 and 27 — which is the shape of a fixed set of
+  unset inputs, not of anything scaling with real surfaces or frames.
+* SR, FG and NR all create, evaluate and produce a correct image through it.
+
+**Hypothesis, stated so it can be killed:** NGX enumerates the surfaces in its parameter block at
+create time and asks for a CUDA descriptor object for each, including the OPTIONAL inputs we
+deliberately leave null — the bias mask, the transparency mask, the exposure texture. Those
+carry `desc.ptr == 0`, so DXVK-NVAPI's own guard rejects them before vkd3d is ever called. On
+that reading the `-5` lines are NGX discovering what we did not supply, and are inert.
+
+**The test is one launch and we already own it.** `[STRAYDLSS] MvMask=1` binds
+`pInBiasCurrentColorMask`, an input that is null today (`src/mv_mask.cpp`, built, CI-green, never
+run). If the hypothesis holds, the `-5` count must **drop** when that input stops being null.
+It also doubles as the bias mask's own stage-1 test, which is otherwise unrun.
+
+**If the count does NOT drop, the hypothesis is wrong and path 2 is live** — vkd3d-proton
+rejecting a handle we consider valid — which would be a real defect worth chasing rather than a
+benign probe. That is why the prediction is written down before the run: an unchanged count
+would otherwise read as "no information".
+
+**Do not treat the current silence as safety.** A correct-looking image is not evidence that a
+driver-level rejection is benign; it is only evidence that whatever failed was not on the path
+that draws this frame.
