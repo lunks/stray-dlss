@@ -724,6 +724,11 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		host::cfg::get_int("NgxRecreateStableFrames",
 			static_cast<int>(core::kDefaultRecreateStableFrames)))));
 
+	// [STRAYDLSS] NgxLetterboxHold, default ON. See src/core/feature_recreate.hpp: the debounce
+	// alone stops the CreateFeature bursts but DECLINES every frame of the slide, and NR rides
+	// on SR's guides - so the user saw NR switch off for each scripted transition.
+	taa_hook::set_letterbox_hold(host::cfg::get_bool("NgxLetterboxHold", true));
+
 	const int ngx_preset = host::cfg::get_int("NgxPreset", 0);
 	if (ngx_preset != 0)
 	{
@@ -1140,6 +1145,32 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		unsigned long long rc_waits = 0;
 		unsigned long long rc_restarts = 0;
 		ngx::recreate_counters(rc_waits, rc_restarts);
+		std::uint64_t hold_held = 0;
+		std::uint64_t hold_refused[static_cast<std::size_t>(core::HoldRefusal::count)] = {};
+		taa_hook::hold_counters(hold_held, hold_refused, std::size(hold_refused));
+		if (hold_held != 0 ||
+			hold_refused[static_cast<std::size_t>(core::HoldRefusal::origin_moved)] != 0 ||
+			hold_refused[static_cast<std::size_t>(core::HoldRefusal::ratio_moved)] != 0)
+		{
+			char reasons[256];
+			int off = 0;
+			reasons[0] = '\0';
+			for (int i = 1; i < static_cast<int>(core::HoldRefusal::count); ++i)
+				if (hold_refused[i] != 0 && off >= 0 &&
+					off < static_cast<int>(sizeof(reasons)) - 1)
+					off += std::snprintf(reasons + off, sizeof(reasons) - off, " %s=%llu",
+						core::hold_refusal_name(static_cast<core::HoldRefusal>(i)),
+						static_cast<unsigned long long>(hold_refused[i]));
+			STRAY_LOG_INFO("[hold] %s: held=%llu (frames that evaluated at the LIVE feature's "
+				"extent through a shrinking view rect, so DLSS SR and NR kept running instead "
+				"of the frame being declined) | notHeld:%s | forcedResets=%llu. Read "
+				"originMoved FIRST: non-zero means this title does not anchor its shrinking "
+				"rect at the top left and the hold is wrong for it.", when,
+				static_cast<unsigned long long>(hold_held),
+				reasons[0] != '\0' ? reasons : " none",
+				static_cast<unsigned long long>(ngx::forced_reset_count()));
+		}
+
 		if (rc_waits != 0 || rc_restarts != 0)
 			STRAY_LOG_INFO("[recreate] %s: deferred=%llu restarts=%llu ([STRAYDLSS] "
 				"NgxRecreateStableFrames=%d). Each deferral is one frame of the engine's own "
@@ -1190,6 +1221,16 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				ngx::recreate_counters(rc_waits, rc_restarts);
 				std::fprintf(f, "dlss_recreate_deferred=%llu\n", rc_waits);
 				std::fprintf(f, "dlss_recreate_restarts=%llu\n", rc_restarts);
+				std::uint64_t sf_held = 0;
+				std::uint64_t sf_refused[static_cast<std::size_t>(core::HoldRefusal::count)] = {};
+				taa_hook::hold_counters(sf_held, sf_refused, std::size(sf_refused));
+				std::fprintf(f, "dlss_hold_held=%llu\n", (unsigned long long)sf_held);
+				for (int i = 1; i < static_cast<int>(core::HoldRefusal::count); ++i)
+					std::fprintf(f, "dlss_hold_%s=%llu\n",
+						core::hold_refusal_name(static_cast<core::HoldRefusal>(i)),
+						(unsigned long long)sf_refused[i]);
+				std::fprintf(f, "dlss_forced_resets=%llu\n",
+					(unsigned long long)ngx::forced_reset_count());
 			}
 			{
 				// The engine upscaler seam ([STRAYDLSS] EngineSeam). `orphans` is the number

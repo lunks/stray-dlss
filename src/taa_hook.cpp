@@ -1,6 +1,7 @@
 #include "taa_hook.hpp"
 
 #include "core/exposure_plan.hpp"
+#include "core/feature_recreate.hpp"
 #include "engine_seam_hook.hpp"
 #include "exposure_texture.hpp"
 
@@ -80,6 +81,15 @@ std::atomic<std::uint64_t> g_view_suspect_small{ 0 };
 std::atomic<std::uint64_t> g_view_amb_claimed{ 0 };
 std::atomic<std::uint64_t> g_view_amb_other{ 0 };
 std::atomic<std::uint32_t> g_view_amb_logged{ 0 };
+// THE LETTERBOX HOLD (src/core/feature_recreate.hpp). `held` counts frames that evaluated at the
+// LIVE feature's extent instead of rebuilding for a shrinking view rect - each one a frame that
+// keeps DLSS SR, and therefore NR, running through a scripted transition. The refusals say why a
+// frame could not be held, and `originMoved` is the one that would mean the whole idea is wrong
+// for this title.
+std::atomic<std::uint64_t> g_hold_frames{ 0 };
+std::atomic<std::uint64_t> g_hold_refused[static_cast<std::size_t>(core::HoldRefusal::count)];
+std::atomic<std::uint32_t> g_hold_logged{ 0 };
+bool g_letterbox_hold = true;
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -1270,6 +1280,80 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 					m.render_width, m.render_height);
 			}
 
+			// THE OUTPUT RECT THIS DISPATCH IS FOR. Hoisted above the motion-vector resolve
+			// because the letterbox hold below may substitute BOTH rects, and everything
+			// downstream - the resolve's extent, the DLSS subrect, the guides NR consumes - has
+			// to agree on one answer for the frame.
+			std::uint32_t want_out_w = 0;
+			std::uint32_t want_out_h = 0;
+			if (seam_gate == seam::Gate::engine && seam_verdict.out_width != 0 &&
+				seam_verdict.out_height != 0)
+			{
+				want_out_w = seam_verdict.out_width;
+				want_out_h = seam_verdict.out_height;
+			}
+			else
+			{
+				want_out_w = m.output_width ? m.output_width : render_w;
+				want_out_h = m.output_height ? m.output_height : render_h;
+			}
+
+			// HOLD THE LIVE FEATURE ACROSS A LETTERBOX SLIDE, so SR - and therefore NR - keeps
+			// running through a scripted transition instead of being declined for its whole
+			// second. The rects the engine announces during the slide are a shrinking PREFIX of
+			// the ones the feature was built for, so evaluating at the CREATED extent puts the
+			// engine's own rect exactly where it expects it; only rows below it, which nothing
+			// displays, are computed from input the engine did not render this frame. The gate
+			// is `core::plan_letterbox_hold` and every clause of it is a measurement - above
+			// all `View.ViewRectMin`, which is what distinguishes a top-left slide (safe) from a
+			// centred rect (not).
+			bool held = false;
+			if (g_letterbox_hold)
+			{
+				// The output UAV's own extent, found the same way the create site finds it.
+				// Holding writes the CREATED target rather than the engine's smaller rect, so
+				// the texture has to still be big enough for it; 0x0 refuses.
+				std::uint32_t hold_uav_w = 0;
+				std::uint32_t hold_uav_h = 0;
+				for (const auto &u : b.uavs)
+				{
+					if (u.slot == m.output_uav &&
+						icept::backend()->is_resource_live(u.resource))
+					{
+						hold_uav_w = u.width;
+						hold_uav_h = u.height;
+					}
+				}
+				const ngx::FeatureDesc livef = ngx::live_feature_desc();
+				const core::FeatureRect live{ livef.render_width, livef.render_height,
+					livef.output_width, livef.output_height };
+				const core::FeatureRect want{ render_w, render_h, want_out_w, want_out_h };
+				const core::HoldRefusal why = core::plan_letterbox_hold(live, want,
+					view.view_rect_min.x, view.view_rect_min.y, hold_uav_w, hold_uav_h);
+				g_hold_refused[static_cast<std::size_t>(why)].fetch_add(1,
+					std::memory_order_relaxed);
+				if (why == core::HoldRefusal::none)
+				{
+					if (g_hold_logged.fetch_add(1, std::memory_order_relaxed) < 3)
+						STRAY_LOG_INFO("LETTERBOX HOLD: the engine asked for %ux%u -> %ux%u and "
+							"the live DLSS feature is %ux%u -> %ux%u. Evaluating at the "
+							"CREATED extent instead of rebuilding: the created scale is "
+							"unchanged, View.ViewRectMin is (0,0) so the engine's rect is a "
+							"prefix of ours, and the rows below it are outside every "
+							"downstream view rect. DLSS SR and NR keep running through the "
+							"slide. Logged 3 times; the count is on the [recreate] line.",
+							render_w, render_h, want_out_w, want_out_h,
+							live.render_w, live.render_h, live.output_w, live.output_h);
+					render_w = live.render_w;
+					render_h = live.render_h;
+					want_out_w = live.output_w;
+					want_out_h = live.output_h;
+					held = true;
+					g_hold_frames.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			(void)held;
+
 			if (mv::initialise(native_device, render_w, render_h))
 			{
 				mv::ResolveInputs inputs;
@@ -1615,27 +1699,18 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								output = reinterpret_cast<ID3D12Resource *>(u.resource);
 						}
 
+						// Both rects were settled before the motion-vector resolve, because
+						// the letterbox hold may have substituted the live feature's extent for
+						// the engine's shrinking one and every consumer must agree. The engine's
+						// own OutputViewRect wins when it announced this dispatch: the matcher's
+						// figure is `group count x 8` clamped to the UAV, i.e. rounded UP to a
+						// multiple of 8 — identical at 3840x2160 (480 groups exactly) and wrong
+						// for any rect that is not.
 						ngx::FeatureDesc fd;
 						fd.render_width = render_w;
 						fd.render_height = render_h;
-						// THE ENGINE'S OWN OutputViewRect WINS when it announced this
-						// dispatch. The matcher's figure is `group count x 8` clamped to the
-						// UAV, i.e. rounded UP to a multiple of 8 — identical at 3840x2160
-						// (480 groups exactly) and wrong for any rect that is not, which would
-						// create the DLSS feature a few pixels too large and never say so.
-						// `rect_agrees` above already compares the two and asserts once per
-						// pass; this is that assertion's conclusion applied.
-						if (seam_gate == seam::Gate::engine && seam_verdict.out_width != 0 &&
-							seam_verdict.out_height != 0)
-						{
-							fd.output_width = seam_verdict.out_width;
-							fd.output_height = seam_verdict.out_height;
-						}
-						else
-						{
-							fd.output_width = m.output_width ? m.output_width : render_w;
-							fd.output_height = m.output_height ? m.output_height : render_h;
-						}
+						fd.output_width = want_out_w;
+						fd.output_height = want_out_h;
 
 						// The two dimensions come from DIFFERENT sources — render from the View
 						// CB's view rect, output from this dispatch's coverage — so they can
@@ -2136,6 +2211,26 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 {
 	attempts = g_resolve_attempts.load(std::memory_order_relaxed);
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
+}
+
+void set_letterbox_hold(bool on)
+{
+	g_letterbox_hold = on;
+	if (!on)
+		STRAY_LOG_WARN("NgxLetterboxHold=0: a scripted transition's shrinking view rect will be "
+			"DECLINED frame by frame instead of evaluated at the live feature's extent, so DLSS "
+			"SR - and therefore NR, which consumes the guides SR publishes - is off for the "
+			"whole animation. That is the 2026-09-03 behaviour, kept for an A/B.");
+}
+
+void hold_counters(std::uint64_t &held, std::uint64_t *refused_by_reason, std::size_t count)
+{
+	held = g_hold_frames.load(std::memory_order_relaxed);
+	const std::size_t n = count < static_cast<std::size_t>(core::HoldRefusal::count)
+		? count
+		: static_cast<std::size_t>(core::HoldRefusal::count);
+	for (std::size_t i = 0; i < n; ++i)
+		refused_by_reason[i] = g_hold_refused[i].load(std::memory_order_relaxed);
 }
 
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,

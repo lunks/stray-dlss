@@ -83,6 +83,25 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
 // first differing frame) so the box can A/B it without a rebuild.
 void set_recreate_stable_frames(unsigned int frames);
 
+// The rect the LIVE feature was created for, or all-zero if there is none. The caller needs it
+// to decide whether a differing request can be served by evaluating at THIS extent instead of
+// rebuilding (`core::plan_letterbox_hold`) - which is what keeps DLSS SR, and therefore NR,
+// running through a letterbox slide.
+FeatureDesc live_feature_desc();
+
+// FORCE `InReset` ON THE NEXT EVALUATE. DLSS reprojects its history assuming the motion vectors
+// describe exactly ONE frame of motion, so resuming after a gap - the debounce declining a run
+// of frames, or a fresh feature - reprojects across frames it never saw. That is the same error
+// class as a wrong MVecScale (CLAUDE.md §5) and it compounds rather than costing one frame. The
+// latch is set internally on a decline and on a creation; this is for callers that know of a
+// gap the backend cannot see.
+void force_reset_next_evaluate();
+
+// How many evaluates carried a FORCED reset (a gap or a fresh feature), as opposed to a camera
+// cut. It must be small: a rate that tracks the frame count means DLSS is being told to discard
+// its history continuously, which looks like DLSS doing nothing at all.
+unsigned long long forced_reset_count();
+
 // `waits` counts frames declined by the debounce, `restarts` the times the requested rect
 // changed AGAIN mid-debounce. A large `restarts` with `waits` climbing and no creations is an
 // ANIMATING rect — the scripted-transition signature — and is the debounce doing its job.

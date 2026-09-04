@@ -42,6 +42,9 @@ bool ensure_feature(ID3D12GraphicsCommandList *, const FeatureDesc &) { return f
 bool evaluate(ID3D12GraphicsCommandList *, const EvaluateInputs &) { return false; }
 void set_preset(int) {}
 void set_recreate_stable_frames(unsigned int) {}
+FeatureDesc live_feature_desc() { return FeatureDesc{}; }
+void force_reset_next_evaluate() {}
+unsigned long long forced_reset_count() { return 0; }
 void recreate_counters(unsigned long long &waits, unsigned long long &restarts)
 {
 	waits = 0;
@@ -118,6 +121,10 @@ char g_last_error[256] = "";
 // history and a full CreateFeature stall. Pure decision, unit-tested; this is only its state.
 core::RecreateState g_recreate_state;
 unsigned int g_recreate_stable_frames = core::kDefaultRecreateStableFrames;
+// See force_reset_next_evaluate(). Set on a declined frame and on a creation, consumed by the
+// next successful evaluate.
+bool g_force_reset = false;
+unsigned long long g_forced_resets = 0;
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
 exposure::Mode g_exposure_mode = exposure::Mode::automatic;
@@ -878,6 +885,9 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 				static_cast<unsigned long long>(g_recreate_state.waits),
 				static_cast<unsigned long long>(g_recreate_state.restarts));
 		}
+		// The history is now stale by however long this lasts, so the evaluate that resumes
+		// must not reproject across the gap.
+		g_force_reset = true;
 		return false;
 	}
 
@@ -986,6 +996,9 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 	g_feature_desc = desc;
 	g_last_error[0] = 0;
+	// A fresh feature has no history; say so explicitly rather than relying on the runtime to
+	// infer it, which is the same discipline the NR path already applies to a fresh feature.
+	g_force_reset = true;
 	STRAY_LOG_INFO("DLSS feature created: %ux%u -> %ux%u, %s, preset=%d, flags=0x%x",
 		desc.render_width, desc.render_height, desc.output_width, desc.output_height,
 		dlss_quality_name(derived), preset,
@@ -1021,7 +1034,15 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 
 	eval.InRenderSubrectDimensions.Width = in.render_width;
 	eval.InRenderSubrectDimensions.Height = in.render_height;
-	eval.InReset = in.reset ? 1 : 0;
+	// The camera-cut OR (CLAUDE.md §2.8), plus any gap in evaluates. Resuming after a gap with
+	// reset=0 tells DLSS the history is one frame old when it is many, and the error compounds
+	// through the accumulation instead of costing one frame.
+	eval.InReset = (in.reset || g_force_reset) ? 1 : 0;
+	if (g_force_reset)
+	{
+		g_force_reset = false;
+		++g_forced_resets;
+	}
 
 	// Our resolve already emits pixel-space motion vectors, so no further scaling.
 	eval.InMVScaleX = 1.0f;
@@ -1096,6 +1117,15 @@ void recreate_counters(unsigned long long &waits, unsigned long long &restarts)
 	waits = static_cast<unsigned long long>(g_recreate_state.waits);
 	restarts = static_cast<unsigned long long>(g_recreate_state.restarts);
 }
+
+FeatureDesc live_feature_desc()
+{
+	return g_feature != nullptr ? g_feature_desc : FeatureDesc{};
+}
+
+void force_reset_next_evaluate() { g_force_reset = true; }
+
+unsigned long long forced_reset_count() { return g_forced_resets; }
 
 void shutdown(ID3D12Device *device)
 {
