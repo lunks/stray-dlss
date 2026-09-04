@@ -109,15 +109,30 @@ end
 
 print("[StrayMaterialCensus] armed; create " .. FLAG .. " in the game dir to run it once\n")
 
+-- EXECUTEINGAMETHREAD IS ASYNCHRONOUS. It QUEUES the closure and returns immediately, so
+-- writing the report in the same tick that queues it writes whatever the variable held before
+-- the census ran — measured 2026-09-04, the first run produced exactly "error=census did not
+-- run" with the flag consumed, which looks identical to a census that failed.
+--
+-- StrayProbe already solved this and this mod should have copied it: the game thread only
+-- STORES into a table, and a LATER async tick does the file I/O. Two ticks, never one.
+local queued, ready, report = false, false, nil
+
 LoopAsync(TICK_MS, function()
+    if ready then                                 -- a previous tick's census has landed
+        atomicWrite(REPORT, report or "error=census produced nothing\n")
+        os.remove(FLAG)                           -- one-shot: consumed only once it has RUN
+        print("[StrayMaterialCensus] wrote " .. REPORT .. "\n")
+        return true                               -- stop the loop; re-arm by touching the flag
+    end
+    if queued then return false end               -- still waiting on the game thread
     if not flagPresent() then return false end
-    local report = "error=census did not run\n"
+
+    queued = true
     pcall(function() ExecuteInGameThread(function()
         local ok, r = pcall(census)
         report = ok and r or ("error=" .. tostring(r) .. "\n")
+        ready = true                              -- read by the async thread on a later tick
     end) end)
-    atomicWrite(REPORT, report)
-    os.remove(FLAG)                              -- one-shot: never runs twice off one arming
-    print("[StrayMaterialCensus] wrote " .. REPORT .. "\n")
     return false
 end)
