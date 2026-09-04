@@ -2154,6 +2154,80 @@ to compensate for where it runs, the placement is the bug.** This project spent 
 diagnosing the codec, the exposure loop and the feedback node as properties of NR, and every one
 of them was a property of `u0`.
 
+### "NR STOPS WHEN DLAA ENGAGES" — the evidence was a REPORTING artifact, and two real defects were behind it (2026-09-04)
+
+**THE HEADLINE EVIDENCE IS VOID, and it is worth reading why before trusting any counter in this
+project.** An archived session (`stray-dlss-plugin.log.pre-dlaaclean`) shows DLAA created at log
+line 1320, `NR STAGE:` lines at frames 300, 1200 and 3600 and **never again** through frame
+10200+, while `[fg/ngx]` printed normally at 4200, 4800 … 9600. Read as "NR went silent when DLAA
+engaged", that is a strong signal. It is not a signal at all:
+
+* **`NR STAGE:` is a THREE-SHOT report**, emitted inside `if (frame == 300 || frame == 1200 ||
+  frame == 3600)` in `DlssApp::on_present` — the block that re-checks the vkd3d ext hook. There
+  is no fourth. **HARD**, `src/app/dlss_app.cpp`.
+* **`[fg/ngx]` is PERIODIC**, inside the `frame % 600` block. **HARD**, same file.
+
+So the two lines were never comparable, and the DLAA creation simply happened to land after the
+last of the three. **`NR applied=`, `NR RESETS:` and `NR MASK:` are in the same three-shot block**
+— so NR is, uniquely among this project's subsystems, unobservable after frame 3600. That is the
+single most valuable thing to fix here and it is **not fixed**: `dlss_app.cpp` was owned by
+another agent at the time. Move the whole `if (nr::enabled())` block from the three-shot
+schedule to the `frame % 600` one; nothing in it is expensive.
+
+**The general rule, and this project has now paid for it twice: a counter's SCHEDULE is part of
+its meaning.** An absent line is evidence of nothing until you have read what emits it. The
+sibling case is §2.3's `preSkipped`/`unclaimed` pair, where conflating a rate with a reason cost a
+round trip.
+
+**BEHIND IT, TWO REAL DEFECTS, both found by source-reading and both fixed** (branch
+`nr-dlaa-engine-mvecs`, pure halves green on the Linux lane, `src/ngx_nr.cpp` **UNVERIFIED LIVE**
+— it is Windows-only and cannot be built on the development machine):
+
+1. **The guide grid was treated as the feature's IDENTITY, and it is not.** `ensure_feature` kept
+   a live feature 18 only while all four rects matched, guide rect included. But
+   `nrparam::build_create` writes `DLSSNR.Width` / `DLSSNR.Height` / `DLSSNR.ScalingRatio` and
+   nothing else, and `ngx_nr.cpp` passes **`in_w = out_w`** into it — the guide rect is **never an
+   argument to CreateFeature**. It is sent PER EVALUATE, through `DLSSNR.DepthSubrectWidth/Height`
+   and `DLSSNR.MVecSubrectWidth/Height` (**HARD**, `src/core/nr_params.cpp`). So a moved guide grid
+   needed no recreate at all — it needed exactly the single `DLSSNR.Reset` that
+   `nrplan::latch_guide_extent` **already forces**. Recreating instead cost, every time: feature
+   18's entire temporal accumulation, a run of frames refused as `recreating` while the deferred
+   release waited on the fence, and a `CreateFeature` — measured on the SR path at **57-79 ms
+   against a 16-18 ms median** (§2.1).
+
+   **DLAA is exactly this case**: `1920x1080 -> 3840x2160` became `3840x2160 -> 3840x2160`, so the
+   BACK BUFFER — the only thing `CreateFeature` is given — never moved and only the guides
+   doubled. The same shape recurs at every screen-percentage change (50% and 70% are both run
+   here) and at every letterbox slide the SR hold declines. The rule is now
+   `nrplan::feature_needs_recreate`, pure and pinned against the log's own rect pair.
+
+2. **A BLACK FRAME WAS TAKEN AS A VERDICT ON THE RUNTIME, permanently.** NR's validation reads a
+   128x128 centre crop of the neural output once per session, and a crop at or below the
+   luminance floor latched NR **off for the whole session** on one ERROR line. A frame that is
+   black **on the input** — a loading screen, a fade, a cinematic letterbox, the menu before the
+   first render — makes the network answer black *because that is the correct answer*, and it was
+   convicted on it.
+
+   **This project had already met and fixed this on the FG path** and the lesson did not transfer:
+   *"the crop gate must treat a black REAL crop as a neutral look, or every loading screen revokes
+   FG and re-validates three looks later (3 325 refused presents in one session)"* — that is
+   `core::fg::CropVerdict::dark`. NR **captures the colour-input crop beside the neural one and
+   prints both in the `NR LUMINANCE` line**; it simply never used the input half in the verdict.
+   `nrplan::judge_validation` now does: both black is **`inconclusive`** and returns to `pending`
+   for a later frame (counted, logged on the first and every hundredth); black against a lit input
+   is **`degenerate`** and latches exactly as before; an undecodable crop is its own verdict.
+
+   **The transferable half: when a gate can only ever fire once and its verdict is permanent, ask
+   what the WORLD was doing at the moment it fired.** Both of this project's once-per-session
+   verdicts — FG's and NR's — were wrong in the same way, for the same reason, three weeks apart.
+
+**What was NOT found, stated so it is not re-searched:** no path makes NR refuse permanently
+merely because the guide grid moved. The deferred release is gated on
+`nrlife::feature_release_ready`, the timeline advances on every present with or without a fence,
+and `release_feature_now` zeroes the rect record — so the old behaviour was expensive and
+history-destroying, not terminal. The two permanent latches are `g_create_latched` (a failed
+`CreateFeature`) and `Validation::failed` (defect 2 above), and each logs one ERROR.
+
 ### The cat is unchanged under NR, and the fur is NOT a motion-vector hole (2026-09-03)
 
 **The observation, the user's:** with NR running as a present stage, *"the rest of the world is
@@ -2193,11 +2267,36 @@ which is worth spelling out because one of them looks alarming at first: it is
 (!SELECTIVE_BASEPASS_OUTPUTS || !(STATICLIGHTING_TEXTUREMASK || STATICLIGHTING_SIGNEDDISTANCEFIELD
 || HQ_TEXTURE_LIGHTMAP || LQ_TEXTURE_LIGHTMAP || WATER_MESH_FACTORY))`. `GBUFFER_HAS_VELOCITY` is
 `IsUsingBasePassVelocity` (`ShaderCompiler.cpp:4708`), i.e. `r.BasePassOutputsVelocity`, which
-Stray ships True. The static-lighting term is disarmed twice over: `r.SelectiveBasePassOutputs`
-defaults to 0, and the lightmap defines come from the vertex factory's lightmap policy while
-gFur's VFs declare `bSupportsStaticLighting = false`. **So `bUsedWithStaticLighting` appearing in
-the fur material's own name table (§34.4) is not a problem** — it is a material USAGE flag, not a
-vertex-factory capability, and it cannot reach these defines.
+Stray ships True. The static-lighting term is disarmed for the FUR, and the lightmap defines come
+from the vertex factory's lightmap policy while gFur's VFs declare `bSupportsStaticLighting =
+false`. **So `bUsedWithStaticLighting` appearing in the fur material's own name table (§34.4) is
+not a problem** — it is a material USAGE flag, not a vertex-factory capability, and it cannot
+reach these defines.
+
+> **CORRECTED 2026-09-04, and the correction is this file's own trap sprung on this file.** This
+> paragraph said the term is *"disarmed twice over"* and gave as the first reason that
+> **`r.SelectiveBasePassOutputs` defaults to 0**. It does — and **Stray ships it as `True`**
+> (`docs/game-config/Hk_project_Config_DefaultEngine.ini:85`, inside
+> `[/Script/Engine.RendererSettings]`, HARD, the game's own cooked ini). That is verbatim the rule
+> stated three sections down under `r.SSR.Temporal`: *"a shipped
+> `[/Script/Engine.RendererSettings]` value silently beats every 'engine default is N' argument —
+> grep `docs/game-config/` before reasoning from a stock default"*. Two documents had already
+> recorded the real value (`docs/RESEARCH-RR-GBUFFER.md` §1.3, `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md`
+> §9) while this paragraph asserted the default.
+>
+> **The FUR conclusion is unaffected** and needs no re-argument: the second reason stands alone
+> and is the one that was always doing the work — gFur's vertex factories declare
+> `bSupportsStaticLighting = false`, so no lightmap define is ever set in a fur permutation and
+> the whole `SELECTIVE_BASEPASS_OUTPUTS` clause is true whatever the cvar says. Only the
+> *belt-and-braces* half was wrong.
+>
+> **What the real value changes is everything OUTSIDE the fur**, and it is the ceiling on
+> `r.BasePassForceOutputsVelocity`: with the cvar True and Stray's baked, HQ-lightmapped world
+> (`r.AllowStaticLighting=True` :38, `r.VirtualTexturedLightmaps=True` :81), the static world's
+> base-pass permutations contain **no velocity code at all**, and its velocity — if any — comes
+> from the SEPARATE opaque velocity pass instead (`DeferredShadingRenderer.cpp:2078-2083`,
+> `VelocityRendering.cpp:383-391`; HARD, `docs/RESEARCH-RR-GBUFFER.md` §1.3). The full assessment
+> is `docs/RESEARCH-ENGINE-WRITTEN-VELOCITY.md`.
 
 And the previous position the VS fetches is real, not a stand-in for the current one:
 `GFurFactory.ush:722-726` implements `VertexFactoryGetPreviousWorldPosition` → `SkinPreviousPosition`
@@ -2279,6 +2378,26 @@ shader-compile time: a translucent permutation contains neither the branch nor t
 for any future "does this thing write velocity?" question: flip it, and if the velocity appears
 the fault was a per-primitive gate; if it does not, the fault is the blend mode and no cvar will
 fix it.
+
+> **AMENDED 2026-09-04: there is a THIRD compile-time exclusion, it is not the blend mode, and on
+> this title it is the biggest one.** Everything above is verified and stands (the cvar's flags,
+> its single assignment, its four total references repo-wide, the two gates it bypasses). What it
+> misses is the rest of `WRITES_VELOCITY_TO_GBUFFER`'s own definition
+> (`BasePassCommon.ush:53-54`, HARD): the macro also requires
+> `(!SELECTIVE_BASEPASS_OUTPUTS || !(STATICLIGHTING_TEXTUREMASK || STATICLIGHTING_SIGNEDDISTANCEFIELD
+> || HQ_TEXTURE_LIGHTMAP || LQ_TEXTURE_LIGHTMAP || WATER_MESH_FACTORY))` — and **Stray ships
+> `r.SelectiveBasePassOutputs=True`** with a baked, HQ-lightmapped world. So every LIGHTMAPPED
+> permutation compiles with no velocity write, no `SV_Target4` and no cvar test, exactly as a
+> translucent one does. `r.SelectiveBasePassOutputs` is `ECVF_ReadOnly | ECVF_RenderThreadSafe`
+> and carries the engine's own comment *"Changing this causes a full shader recompile"*
+> (`BasePassRendering.cpp:21-27`), so in a cooked game it cannot be moved.
+>
+> **The discriminator is therefore three-valued, not two**, and reading a negative result as "the
+> blend mode" would be wrong here more often than right: flip the cvar and if the velocity does
+> not appear, the fault is the blend mode **or** the lightmap term, and separating them needs the
+> vertex factory's `SupportsStaticLighting()` rather than another run.
+> `docs/RESEARCH-ENGINE-WRITTEN-VELOCITY.md` carries the full ceiling analysis and the one-launch
+> experiment that measures it.
 
 #### Reading a cooked material out of Stray's pak, which is now a solved procedure
 

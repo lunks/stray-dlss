@@ -3016,3 +3016,62 @@ is to supply guides at the colour resolution rather than declaring a subrect and
 **Mitigation available today:** `NgxNR=0` removes it completely and costs Neural Rendering
 entirely. `NgxNRIntensity` is the graded alternative and is the only strength control that does
 NOT force a `DLSSNR.Reset` (§5, the CG2R control audit), so it can be swept in one session.
+
+## §55 The "NR stops at DLAA" log is a three-shot report, not a silence (2026-09-04)
+
+**Source:** the archived plugin log `stray-dlss-plugin.log.pre-dlaaclean` on the box, quoted to
+this session rather than fetched (the box was in use). **The log lines are HARD; everything below
+them is source-reading, labelled.**
+
+What the log shows:
+
+```
+line  726:  DLSS feature created: 1920x1080 -> 3840x2160, Performance, preset=13, flags=0x4b
+line 1320:  DLSS feature created: 3840x2160 -> 3840x2160, DLAA, preset=13, flags=0x4b
+            WARN  fg/ngx: guide copies (re)created: depth 3840x2160 fmt 19 flags 0x2,
+                  mvecs 3840x2160 fmt 34
+            WARN  NR: the guide grid moved to 3840x2160 (MVecScale is now 1.00000/1.00000).
+```
+
+`NR STAGE:` appears at frames 300, 1200 and 3600 — all before line 1320 — and never again through
+frame 10200+, while `[fg/ngx]` prints at 4200, 4800 … 9600 with `publishes=4007 generates=4005`.
+
+**The reading "NR went silent when DLAA engaged" is WRONG, and the two lines were never
+comparable.** **HARD**, `src/app/dlss_app.cpp`:
+
+* the whole `if (nr::enabled())` block — `NR applied=`, `NR RESETS:`, `NR STAGE:`, `NR MASK:` —
+  sits inside `if (frame == 300 || frame == 1200 || frame == 3600)`, the vkd3d-ext-hook re-check.
+  **There is no fourth emission.** NR is unobservable after frame 3600 by construction.
+* `[fg/ngx]` sits inside the `frame % 600` block.
+
+The DLAA creation simply landed after the last of the three shots. **A frame count is part of a
+counter's meaning; an absent line is evidence of nothing until you have read what emits it.**
+
+**Corroborating, and independent of the schedule:** `[fg/ngx] publishes=4007` proves the TAA hook
+was still publishing guides after the DLAA creation, so the SR path — which is what calls
+`nrhook::note_guides` after a successful evaluate — never stopped.
+
+**What the ordering of the two WARNs does prove [HARD, from the code path].** `ensure_feature` is
+called *before* `latch_guide_extent` in `nr::apply`, and a declined `ensure_feature` returns
+before the latch. The "guide grid moved" WARN therefore fired on a frame where a live feature
+already existed for `3840x2160 -> 3840x2160` — i.e. the release-and-recreate cycle the old
+identity key forced had **already completed** by then. The DLAA transition was self-recovering,
+expensive, and history-destroying; it was never terminal.
+
+**The two defects behind it**, both source-read and both now fixed on branch
+`nr-dlaa-engine-mvecs` (pure halves CI-green; `src/ngx_nr.cpp` UNVERIFIED LIVE): the guide rect
+was part of feature 18's identity when it is not an argument to `CreateFeature` at all, and the
+once-per-session validation verdict convicted the runtime on a black crop without checking
+whether the INPUT was black too. Full argument: CLAUDE.md §5, "NR STOPS WHEN DLAA ENGAGES".
+
+**What would settle the remainder, and it needs a run.** One line, at frame 4200 or later, from a
+build carrying the periodic-NR change:
+
+```
+[frame 4200] NR STAGE: triggered=N applied=M ... reasons: ... guides-stale=X guides-absent=Y
+```
+
+`applied` climbing after a DLAA transition ends the question. `applied` frozen with
+`recreating=` climbing would mean a release that never completes; `applied` frozen with
+`nr_validated=0` in `stray-dlss-status.txt` would mean the validation latch. Nothing currently in
+the log distinguishes those three.
