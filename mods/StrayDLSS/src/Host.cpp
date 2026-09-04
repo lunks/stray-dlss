@@ -417,6 +417,68 @@ bool install_device_hook()
 
 } // namespace
 
+// THE DLSS ON-SCREEN INDICATOR, AND WHY IT HAS TO BE SET FROM IN HERE.
+//
+// The indicator is gated on HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator
+// = 0x400 (CLAUDE.md §5). Setting it in the Proton prefix with the game closed does not work, and
+// MEASURED 2026-09-04 is why: PROTON_NVIDIA_LIBS=1 REINSTALLS the NVIDIA wine NGX libraries and
+// REWRITES that whole registry block on every launch. Our value was verified written with the
+// game down and the wineserver down, and came back dword:00000000 with a fresh block timestamp
+// and freshly dated nvngx.dll / _nvngx.dll. So the race is not with wineserver, it is with
+// Proton's own setup, and nothing outside the process can win it.
+//
+// Inside the process we can. This runs at start_mod, which UE4SS calls ~970 ms before the game's
+// D3D12CreateDevice (facts §12) and long before NGX initialises, so it lands after Proton has
+// finished writing and before anything reads.
+//
+// [STRAYDLSS] NgxIndicator / NgxIndicatorFG: -1 (default) leaves the key exactly as found, 0
+// writes off, 1 writes on. Default is "do not touch" on purpose: this is the one thing in the
+// plugin that writes OUTSIDE the game directory, into a registry hive shared with whatever else
+// uses NGX in this prefix, so it happens only when asked for by name.
+static void apply_ngx_indicator_keys()
+{
+	struct Knob { const char *key; const wchar_t *value; unsigned on; };
+	static const Knob knobs[] = {
+		{ "NgxIndicator",   L"ShowDlssIndicator",  0x400u }, // DLSS SR/RR overlay
+		{ "NgxIndicatorFG", L"DLSSG_IndicatorText", 1u    }, // frame-generation text
+	};
+
+	for (const Knob &k : knobs)
+	{
+		const int want = host::cfg::get_int(k.key, -1);
+		if (want < 0)
+			continue; // left exactly as found, which is the default
+
+		HKEY hkey = nullptr;
+		const LSTATUS open = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+			L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0, nullptr,
+			REG_OPTION_NON_VOLATILE, KEY_SET_VALUE | KEY_QUERY_VALUE, nullptr, &hkey, nullptr);
+		if (open != ERROR_SUCCESS || hkey == nullptr)
+		{
+			STRAY_LOG_ERROR("host: [STRAYDLSS] %s=%d but the NGXCore registry key could not be "
+				"opened (RegCreateKeyEx = %ld). The indicator will not appear.", k.key, want, (long)open);
+			continue;
+		}
+
+		DWORD before = 0, cb = sizeof(before), type = 0;
+		const bool had = RegQueryValueExW(hkey, k.value, nullptr, &type,
+			reinterpret_cast<BYTE *>(&before), &cb) == ERROR_SUCCESS && type == REG_DWORD;
+
+		DWORD value = want ? k.on : 0u;
+		const LSTATUS set = RegSetValueExW(hkey, k.value, 0, REG_DWORD,
+			reinterpret_cast<const BYTE *>(&value), sizeof(value));
+		RegCloseKey(hkey);
+
+		if (set == ERROR_SUCCESS)
+			STRAY_LOG_WARN("host: NGX indicator: wrote %ls = 0x%08lX (was %s0x%08lX). Proton rewrites this "
+				"block on every launch, which is why it is set from in here rather than in the prefix.",
+				k.value, (unsigned long)value, had ? "" : "absent, ", (unsigned long)before);
+		else
+			STRAY_LOG_ERROR("host: NGX indicator: RegSetValueEx(%ls) failed (%ld); the indicator will "
+				"not appear.", k.value, (long)set);
+	}
+}
+
 void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 {
 	log::init_file_sink((game_dir + L"stray-dlss-plugin.log").c_str());
@@ -492,6 +554,9 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 		g_ini_path.clear();
 	}
 	host::cfg::set_source(&g_source);
+
+	// Before anything can initialise NGX. See apply_ngx_indicator_keys.
+	apply_ngx_indicator_keys();
 
 	g_tweak_ui.store(host::cfg::get_bool("TweakUi", true));
 	STRAY_LOG_INFO("host: [STRAYDLSS] TweakUi=%d - the in-game tuning tab %s. It lives in UE4SS's "
