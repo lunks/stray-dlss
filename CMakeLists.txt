@@ -84,6 +84,7 @@ add_library(stray_dlss_core STATIC
     src/core/rr_guides.hpp
     src/core/envbrdf.cpp
     src/core/envbrdf.hpp
+    src/core/menu_scan.cpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -397,6 +398,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_core.cpp
         tests/test_view_params.cpp
         tests/test_dlss_quality.cpp
+        tests/test_menu_scan.cpp
         tests/test_taa_signature.cpp
         tests/test_engine_seam.cpp
         tests/test_view_cached.cpp

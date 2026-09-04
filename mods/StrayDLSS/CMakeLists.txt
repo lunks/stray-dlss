@@ -82,6 +82,8 @@ add_subdirectory(${STRAY_DLSS_ROOT} stray_dlss_root)
 add_library(StrayDLSS SHARED
     src/Host.cpp
     src/Host.hpp
+    src/MenuScan.cpp
+    src/MenuScan.hpp
     src/Mod.cpp
     src/Platform.cpp
     src/Platform.hpp

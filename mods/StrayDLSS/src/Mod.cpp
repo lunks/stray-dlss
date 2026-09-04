@@ -32,6 +32,7 @@
 #include <string>
 
 #include "Host.hpp"
+#include "MenuScan.hpp"
 #include "Platform.hpp"
 #include "TweakUi.hpp"
 #include "Version.hpp"
@@ -102,6 +103,11 @@ class StrayDlssMod : public RC::CppUserModBase
     auto on_update() -> void override
     {
         stray_dlss::plugin::Tick();
+        // The menu offset scan. Off unless [STRAYDLSS] MenuScan is set, and it stops for good
+        // after it has reported once. It reads a live widget's own bytes and logs; it changes
+        // nothing. Kept here rather than in Host.cpp because it needs the UE4SS reflection
+        // headers, which the plain-Win32 half deliberately does not have.
+        stray_menu_scan::Tick();
     }
 };
 
