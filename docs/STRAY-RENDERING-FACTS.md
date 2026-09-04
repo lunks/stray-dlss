@@ -2870,3 +2870,47 @@ was replacing `ScreenSpaceAO` outright for a day:
 Live ini after: 97 -> 88 non-blank lines. Backup `Engine.ini.bak-before-drop`. The measured,
 load-bearing settings are untouched: `r.RayTracing=False`, `r.SSGI.Enable=0`,
 `r.AmbientOcclusion.Method=1` with its GTAO knobs, `r.TemporalAASamples=8`, `r.SSR.Temporal=1`.
+
+## §52 `r.SSR.Quality` 4 -> 3 and the mip-bias removal bought ~5%; the LOD scale costs NOTHING (2026-09-04)
+
+Two results from one session, both against the same scenario and instrument.
+
+**SSR 4 -> 3, plus §50's mip-bias removal.** Epic's own help text for `r.SSR.Quality` reads
+`4: very high (likely too slow for real-time)` against `3: high (glossy/using roughness, few
+samples)`, and this title was on 4 — the most expensive SSR tier, spent on the one effect whose
+motion vectors we have established cannot be made right (§42, §49).
+
+```
+before (SSGI off, TAA 8, SSR 4, MipMapLODBias -1)   46.4 - 47.2   median 46.5
+after  (SSR 3, no manual mip bias)                  48.3 - 50.0   median 49.1
+```
+
+**~5.6% for free**, and neither change was made for performance: the mip bias was doubled
+(§50) and SSR 4 is a tier Epic labels unsuitable. The tuned config is now FASTER than the
+untuned original ini (47.9) while keeping GTAO, doubled view distance, the shadow block and the
+LOD stack.
+
+**`r.StaticMeshLODDistanceScale`: no measurable cost between 0.25 and 0.5.**
+
+```
+lod-025   50.0 / 49.1 / 48.3   median 49.1     host load1 1.05
+lod-050   48.5 / 47.9 / 48.2   median 48.2     host load1 3.47
+```
+
+**The direction is BACKWARDS, which is what makes this a clean negative rather than a weak
+positive.** 0.5 transitions LODs at half the distance of 0.25, so it draws LESS geometry and
+should be FASTER if static-mesh LOD were a bottleneck. It measured slightly slower. A difference
+that runs the wrong way is noise, and the arms bracket each other.
+
+So `0.25` — holding LOD0 geometry to 4x the normal distance — is effectively **free** on this
+content, and was restored. The scene is not static-mesh-LOD bound.
+
+**Two honest limits.** The arms were at different host load (1.05 against 3.47); that would
+depress arm 2, so the true 0.5 figure may be slightly higher — which would *strengthen* the
+"0.25 costs nothing" reading, not weaken it. And this is one 17 s route in The Slums; a denser
+vista could be LOD-bound where this is not. The claim is "not bound on the benched content",
+not "never bound".
+
+**Consequence for the ini:** of the settings blamed for the tuned config's cost, the LOD scale
+is not one of them. What actually cost was SSGI (§46, ~9%) and SSR at quality 4 (~5% here).
+Both are now off or reduced.
