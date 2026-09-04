@@ -3665,9 +3665,30 @@ Reconstruction (a separate project: needs albedo/normal/roughness capture and nv
 **The DLSS on-screen indicator under `PROTON_NVIDIA_LIBS=1`:**
 `DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS` is a DXVK-NVAPI feature and does nothing when NVIDIA's own
 wine NGX libs provide the NGX core (measured: env var present in the game process, no
-indicator drawn). Set the Windows registry key in the prefix instead:
-`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator = dword 0x400`, with the
-wineserver down.
+indicator drawn). The key is
+`HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator = dword 0x400`.
+
+> **BUT SETTING IT IN THE PREFIX DOES NOT WORK, AND THIS SECTION SAID IT DID FOR DAYS
+> (CORRECTED 2026-09-04).** The instruction used to end "with the wineserver down", which
+> identifies the wrong race. **`PROTON_NVIDIA_LIBS=1` REINSTALLS the NVIDIA wine NGX libraries
+> and REWRITES that entire registry block on every launch**, so a value written with the game
+> closed is clobbered before NGX ever reads it. Measured: the key was written with the game
+> down AND the wineserver confirmed down, verified as `dword:00000400`, and after the next
+> launch read back `dword:00000000` — with a fresh block timestamp and freshly dated
+> `nvngx.dll` / `_nvngx.dll`. Nothing outside the process can win that race.
+>
+> **Set it from INSIDE the process instead: `[STRAYDLSS] NgxIndicator` (and `NgxIndicatorFG`
+> for the frame-generation text), `mods/StrayDLSS/src/Host.cpp`.** `-1` is the default and
+> leaves the key exactly as found; `0`/`1` write it. `start_mod` runs ~970 ms before
+> `D3D12CreateDevice` (facts §12) and long before NGX initialises, which is after Proton has
+> finished writing and before anything reads. The log prints the previous value, so if Proton's
+> timing ever changes it will read `was 0x400` rather than `was 0x0`.
+>
+> **The general trap, and it has now cost this project twice in one day:** a documented
+> procedure that was true when written is indistinguishable from one that still works. This one
+> and `r.SelectiveBasePassOutputs` (§5, the fur section) were both wrong for the same reason —
+> the environment moved and the note did not. Re-measure a procedure before spending a round
+> trip on why it "isn't working".
 
 **Steam launch options can be set programmatically** through steamwebhelper's CEF debugger
 (`tools/steam_cef_launchopts.py`: port 8080, `SharedJSContext` target,
@@ -3890,8 +3911,9 @@ They are complementary and none of them replaces seeing the game render.
   harness's *real* command list, so the native calls execute and are validated for free.
 * Give the user one copy-pasteable launch line for bug reports:
   `DXVK_NVAPI_LOG_LEVEL=info PROTON_LOG=1 VKD3D_DEBUG=warn %command%`. For visual proof DLSS
-  is running, the env-var indicator does NOT work under `PROTON_NVIDIA_LIBS=1` — set the
-  `NGXCore\ShowDlssIndicator = 0x400` registry key in the prefix instead (Gotchas ledger, §5).
+  is running, the env-var indicator does NOT work under `PROTON_NVIDIA_LIBS=1`, and **neither
+  does setting the registry key in the prefix** — Proton rewrites that block every launch. Use
+  `[STRAYDLSS] NgxIndicator=1`, which writes it in-process before NGX init (Gotchas ledger, §5).
 
 ---
 
