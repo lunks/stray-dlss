@@ -45,6 +45,15 @@ struct MaskShadow
 };
 MaskShadow g_mask;
 
+// NgxNRDepthInverted has a setter (nr::set_depth_inverted) and no getter, so the tab shadows it
+// the same way, seeded from the config source and pushed on seed for the same reason.
+struct DepthShadow
+{
+	bool seeded = false;
+	bool inverted = true;
+};
+DepthShadow g_depth;
+
 void push_mask()
 {
 	mvmask::configure(g_mask.enabled, g_mask.value,
@@ -71,6 +80,17 @@ MaskShadow &mask()
 		push_mask();
 	}
 	return g_mask;
+}
+
+bool &depth_inverted()
+{
+	if (!g_depth.seeded)
+	{
+		g_depth.seeded = true;
+		g_depth.inverted = host::cfg::get_int("NgxNRDepthInverted", 1) != 0;
+		nr::set_depth_inverted(g_depth.inverted ? 1u : 0u);
+	}
+	return g_depth.inverted;
 }
 
 // ---- the registry ----
@@ -106,6 +126,13 @@ const Knob kNr[] = {
 	  "MEASURED INERT in this runtime: DLSSNR.UICorrection cannot arm without a DLSSNR.Backbuffer, "
 	  "which we do not bind, so this has never done anything (CLAUDE.md §5). Kept visible so its "
 	  "inertness is a stated fact rather than a mystery.",
+	  Kind::boolean, 0.0f, 1.0f, false, false, nullptr, 0 },
+	{ "NgxNRDepthInverted", "Depth inverted",
+	  "UE 4.27 is reversed-Z, so 1 is the TRUE value and 0 is a DELIBERATE LIE. It exists to "
+	  "answer one question no amount of reading can: does feature 18 use our depth at all? If "
+	  "telling it the opposite of the truth changes nothing on screen, depth is inert here and "
+	  "every depth-shaped hypothesis about NR is dead. Leave it at 1 unless you are running "
+	  "that experiment.",
 	  Kind::boolean, 0.0f, 1.0f, false, false, nullptr, 0 },
 	{ "NgxNRMVecScale", "MVec scale override",
 	  "0 = the built-in 1.0. Feature 18 reprojects its OWN history with these vectors, so a scale "
@@ -196,6 +223,7 @@ float value_of(const Knob &k)
 	if (std::strcmp(k.ini_key, "NgxNRAutoMask") == 0) return n.auto_mask ? 1.0f : 0.0f;
 	if (std::strcmp(k.ini_key, "NgxNRPreset") == 0) return static_cast<float>(n.preset);
 	if (std::strcmp(k.ini_key, "NgxNRUICorrection") == 0) return n.ui_correction ? 1.0f : 0.0f;
+	if (std::strcmp(k.ini_key, "NgxNRDepthInverted") == 0) return depth_inverted() ? 1.0f : 0.0f;
 	if (std::strcmp(k.ini_key, "NgxNRMVecScale") == 0) return n.mvec_scale;
 	if (std::strcmp(k.ini_key, "MVConvention") == 0) return static_cast<float>(n.mv_convention);
 	if (std::strcmp(k.ini_key, "MVInvertX") == 0) return n.mv_invert_x ? 1.0f : 0.0f;
@@ -243,6 +271,12 @@ void set_value(const Knob &k, float v)
 			"Disabling is immediate; ENABLING mid-session cannot arm a swapchain whose "
 			"replacement buffers were never handed out.", b ? 1 : 0);
 		native::fg::configure(cfg);
+		return;
+	}
+	if (std::strcmp(k.ini_key, "NgxNRDepthInverted") == 0)
+	{
+		depth_inverted() = b;
+		nr::set_depth_inverted(b ? 1u : 0u);
 		return;
 	}
 	if (std::strncmp(k.ini_key, "MvMask", 6) == 0)
