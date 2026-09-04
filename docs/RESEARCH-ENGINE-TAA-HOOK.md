@@ -1361,6 +1361,16 @@ search, but the engine's own named G-buffer textures**, taken from the `const FV
 
 ## 15. The View constant buffer by IDENTITY: the wall, the one route through it, and the arithmetic that says wait (2026-09-03)
 
+> **SUPERSEDED 2026-09-04 by §19.** The decision rule in §15.4 fired NON-ZERO (`ambClaimed=36`,
+> facts §36.20) and the mechanism was built — but not as §15.2 designed it. The two-offset route
+> through `FD3D12UniformBuffer` and `FD3D12ResourceLocation` was prototyped on branch
+> `view-cb-identity` (`EngineSeamView`, never merged, never run on the box) and is retired by
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §2: `FViewInfo::CachedViewUniformShaderParameters` is
+> ONE offset into an object we already hold, its pointee is the 2448-byte prefix itself, and it
+> needs no VA map, no upload-heap read from a foreign thread and no `USE_STATIC_ROOT_SIGNATURE`.
+> §15.1's wall stands (it is why the RHI route was wrong); §15.3's guards and ladder and §15.4's
+> arithmetic stand and are what §19 implements. Read §15 for why, §19 for what.
+
 **The question.** The View CB is still located by SEARCH — try every bound root CBV, keep the
 first that decodes as a plausible `View` (`taa_hook.cpp`, and CLAUDE.md §2.6). That search has now
 been the proximate cause of the visible flicker once (facts §36.18: a 4088×4088 shadow view on a
@@ -1556,6 +1566,147 @@ result arrives rather than after:
 | Anything in §15.2 working on this executable | **UNCONFIRMED.** Not built, not run |
 
 ---
+
+## 19. The View from the engine's own CPU struct: built, CI-green, one launch from measured (2026-09-04)
+
+**The problem, measured (§15.4's decision rule, facts §36.20).** `ambClaimed=36` of ~10 800 claimed
+dispatches: two bound View buffers, `b3=1920x1080 b4=1920x1080`, both the real render rect for the
+SAME view, both passing plausibility, row 135, the fit bound and the 0.5 minimum fraction, and
+still disagreeing on `ClipToPrevClip`, jitter and `CameraCut`. UE4's fast constant allocator
+recycles its ring and a previous frame's copy sits on a lower root parameter; the search walks
+slot order. **No structural test can separate the two — they differ only in when they were
+written.** So the rule said build, and this section is what was built.
+
+### 19.1 The route: one pointer in the object `AddPasses` already hands us
+
+HARD, `AlexMercer-MA/UnrealEngine-4.27` @ `306a7e9`, read 2026-09-04:
+
+```cpp
+// SceneRendering.h, class FViewInfo : public FSceneView — right after ViewRect and ViewState
+/** Cached view uniform shader parameters, to allow recreating the view uniform buffer
+    without having to fill out the entire struct. */
+TUniquePtr<FViewUniformShaderParameters> CachedViewUniformShaderParameters;
+
+// SceneRendering.cpp, FViewInfo::InitRHIResources()
+CachedViewUniformShaderParameters = MakeUnique<FViewUniformShaderParameters>();
+SetupUniformBufferParameters(..., *CachedViewUniformShaderParameters);
+ViewUniformBuffer = TUniformBufferRef<FViewUniformShaderParameters>::
+    CreateUniformBufferImmediate(*CachedViewUniformShaderParameters, UniformBuffer_SingleFrame);
+
+// TemporalAA.cpp:767
+PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+```
+
+Three more facts from the same file settle the lifetime questions §15.3 raised:
+
+* The only other writer is `FViewInfo::UpdateLateLatchData()` (VR late-latching), and it copies
+  the struct INTO the buffer (`ViewUniformBuffer.UpdateUniformBufferImmediate(*Cached...)`) —
+  the struct is always the source, never the buffer. **So at `AddPasses` the struct holds the
+  bytes TAA will bind.**
+* `FViewInfo::CreateSnapshot()` memcpys a NULL `TUniquePtr` into the snapshot's field, so a
+  snapshot view (shadow depth rendering) carries none. That reads as `empty`, never as a wrong
+  answer; the primary view `AddPasses` receives is not a snapshot.
+* `BufferSizeAndInvSize` (row 132) is `SceneContext.GetBufferSizeXY()` clamped to ≥ 1
+  (`SetupUniformBufferParameters`) — the scene-buffer extent, which is the extent of the depth
+  texture L1 already resolves for the same announcement. [derived] that `SceneDepthZ` is
+  allocated at exactly that size.
+
+`TUniquePtr<T>` with the default deleter is one pointer (the deleter is an empty base). So the
+whole route is **one offset into `FViewInfo`**, and the pointee is the 2448-byte prefix
+`read_view_cb` already parses — same rows, same row-135 self-check, same decode. Item 6 of the
+replan is honoured: nothing reads an `FSceneView` field directly.
+
+### 19.2 Discovered, not derived — and the validator that ties it to the bound buffer
+
+`sizeof(FSceneView)` is unobservable (`FFinalPostProcessSettings` alone is kilobytes of
+`#if`-conditioned members), so the offset is SCANNED for over a 32 KB window of the `FViewInfo`
+(`viewcached::scan`, `src/core/view_cached.hpp`). A qword survives only if, in order:
+
+| # | Prediction | Kind |
+|---|---|---|
+| 1 | pointer-shaped, 16-aligned, and its pointee is readable for `kViewPrefixBytes` (VirtualQuery, region-cached per scan) | reader |
+| 2 | the pointee parses and passes `view_params_plausible` | contents |
+| 3 | row 135 passes: `y*z == 1.0`, `x` denormal, `w == 0` | self-check |
+| 4 | `ViewSizeAndInvSize` fits the announcement's own output rect from above (`view_fits_dispatch`) and below (`view_fraction_plausible`) | the engine's rect |
+| 5 | `BufferSizeAndInvSize` equals the depth extent L1 resolved for this announcement (skipped, not refused, when L1 resolved none) | L1's extent |
+| 6 | **at claim, the carried 2448 bytes are IDENTICAL to what the search read from the bound constant buffer** for the dispatch that claimed the announcement | **the one that latches** |
+
+Prediction 6 is what the `0.5`/`2.0` constants are to the vtable scan: an exact equality between
+2448 bytes the engine wrote into its own struct and 2448 bytes we mapped out of a buffer the
+engine demonstrably bound, by two separate routes. A wrong offset cannot reproduce it; once it has
+held `kLatchAgreements` (8) announcements running, the offset is the field. Predictions 1-5 run
+on the render thread inside `AddPasses`; the result is carried in the `seam::Announcement`
+(decoded `ViewParams` plus the raw prefix) and prediction 6 is judged on the recording thread at
+claim, where the search's bytes exist. Nothing dereferences the `FViewInfo` outside `AddPasses`.
+
+**Why prediction 6 is expected to FAIL sometimes, and what that means.** The search is stale on
+0.33% of claimed dispatches. Before the latch a byte disagreement resets the run — a wrong offset
+must never accumulate agreements, and a stale search merely delays the latch by a few frames.
+After the latch a disagreement is counted as `disagree=`: **the search reading a stale ring copy,
+which is exactly the event this exists to name.** A latched offset is never demoted by bytes; it
+is demoted by nothing, because the alternative readings are all worse. Two survivors on one
+announcement is `ambiguous`, terminal for the session; `kAbsentAfter` (240) consecutive claimed
+announcements with no survivor is `absent`, terminal — both sticky **in the state machine**
+(`viewcached::Latch`), not by the caller declining to call, which was the correction the
+`ecd3d2b` audit of `view-cb-identity` demanded.
+
+### 19.3 The ladder, `[STRAYDLSS] EngineSeamViewParams`
+
+| Level | Name | What changes |
+|---|---|---|
+| 0 | off | nothing scanned |
+| **1** | **discover** (default) | scan, carry, compare at claim, latch, log. **The search still supplies the View; the image is byte-identical.** |
+| 2 | authoritative | once latched, the struct supplies the View for every announced dispatch that carries it; the search is the assertion (one WARN per pass on disagreement, counted). `ambClaimed` reads 0 by construction because the search no longer chooses. An announcement that carries nothing, or carries from another offset, falls back to the search — `fellBack=`. |
+| 3 | exclusive | delete the search. **Declared, not built** — asking logs at ERROR and runs 2. A separate decision after 2 runs clean in gameplay. |
+
+Guards, L1's verbatim: `VirtualQuery` before every read (region-cached within a scan so an
+`FViewInfo` full of heap pointers costs a handful of syscalls, not hundreds), SEH around the read,
+a fault latches the mechanism off for the session at ERROR naming the address (`faults= off=`),
+every decline a counted fallback. **Windows-portable only:** the pointee is ordinary heap memory —
+no D3D12 resource is mapped, nothing touches vkd3d, DXVK or Wine. The scan runs only while
+`searching`; once latched each announcement costs one guarded qword and one guarded 2448-byte read.
+
+### 19.4 What one menu launch prints, in order
+
+```
+ENGINE SEAM VIEW PARAMS: discover ([STRAYDLSS] EngineSeamViewParams=1). ...
+ENGINE SEAM VIEW PARAMS: first scan of the engine's own FViewInfo at 0x..., 32768-byte window,
+    announcement rect 3840x2160, depth extent 1920x1080 - 1 candidate offset(s) survived
+    predictions 1-5 - exactly one, which is what a clean answer looks like.
+ENGINE SEAM VIEW PARAMS: candidates by stage: qwords=4096 pointer-shaped=N probed=N readable=R
+    plausible=1 row135=1 fitsRect=1 aboveMinFraction=1 bufferSize=1 survivors=1
+ENGINE SEAM VIEW PARAMS: FViewInfo+<O> -> FViewUniformShaderParameters at 0x...: 1920x1080 view,
+    buffer 1920x1080, jitter (...), PreExposure ..., CameraCut 0. DISCOVERED, NOT DERIVED ...
+ENGINE SEAM VIEW PARAMS: first byte comparison - ... : IDENTICAL (identical). That is prediction 6
+    holding: the struct IS the bound buffer. ...
+ENGINE SEAM VIEW PARAMS LATCHED after 8 claimed announcements: FViewInfo+<O> is
+    CachedViewUniformShaderParameters. ...
+[viewParams] frame 600: viewParams: mode=discover latch=latched offset=<O> latched=1 scans=...
+    observed=... agree=... disagree=<about 0.33% of observed> preDisagree=<0-3> uncompared=0
+    unverified=0 ambiguous=0 empty=0 faults=0 off=0 used=0 fellBack=0
+```
+
+`<O>` is the number to paste. `disagree` at level 1 should track `ambClaimed` on the `[view]`
+line event for event — the same stale frames counted from both sides. The readings that are a
+round trip rather than a thing to keep running on: `survivors=0` with the stage counts naming the
+refusing prediction (a `bufferSize` refusal means the row-132 derivation is wrong on this
+executable); `MORE THAN ONE` (ambiguous, terminal); `DIFFERENT` on every comparison with no latch
+ever forming (the struct is not the bound buffer on this executable — which §19.1's source reading
+says cannot happen, so it would be the finding of the session); any `faults`.
+
+### 19.5 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| `FViewInfo::CachedViewUniformShaderParameters` is a `TUniquePtr<FViewUniformShaderParameters>` declared right after `ViewRect` / `ViewState` | **HARD**, `SceneRendering.h` @ 306a7e9, read 2026-09-04 |
+| `ViewUniformBuffer` is created from it in `InitRHIResources`; `UpdateLateLatchData` is the only in-place writer and copies struct -> buffer; `CreateSnapshot` nulls it | **HARD**, `SceneRendering.cpp` @ 306a7e9 |
+| TAA binds `View.ViewUniformBuffer` | **HARD**, `TemporalAA.cpp:767` |
+| `BufferSizeAndInvSize` is `SceneContext.GetBufferSizeXY()` | **HARD**, `SetupUniformBufferParameters` |
+| `SceneDepthZ` is allocated at `GetBufferSizeXY()` | **[derived]**; a mismatch refuses at its own stage counter |
+| The struct's byte layout equals the constant buffer's (so the 2448-byte prefix parses at the same rows) | **HARD** in effect: `CreateUniformBufferImmediate` copies the struct's bytes, and `read_view_cb` has parsed those bytes for weeks |
+| `TUniquePtr` with the default deleter is one pointer | **HARD**, UE4 `UniquePtr.h` (EBO on `TDefaultDelete`) |
+| The scan finds exactly one survivor on this executable, and it latches | **UNCONFIRMED.** Nothing has run on the box |
+| Level 2 drives `ambClaimed` to 0 and moves the 0.33% into `disagree=` | **UNCONFIRMED.** Pure logic tested (`tests/test_view_cached.cpp`, including the measured stale-copy pair as a regression case); not measured live |
 
 ## 16. The engine warrants the DISPATCH, not the RENDER RECT — and the gap put a magnified corner of the frame on screen (2026-09-03)
 
