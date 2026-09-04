@@ -35,8 +35,21 @@ ssh_box() { ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCou
                 -o BatchMode=yes "$BOX_HOST" "$@"; }
 
 if [ "$MODE" = status ]; then
+    # ASK THE LOCK, NOT THE OWNER FILE. The file is written under the lock and removed by an
+    # EXIT trap, so a shell that is SIGKILLed leaves it behind and the box reads BUSY forever
+    # while it is actually free (observed 2026-09-04). flock -n is the authoritative test; the
+    # owner file is only ever a label on top of it.
     ssh_box "pct exec $BOX_CT -- bash -c '
-        if [ -s $OWNER ]; then echo \"BUSY: \$(cat $OWNER)\"; else echo FREE; fi'"
+        if flock -n 9 2>/dev/null 9>$LOCK; then
+            if [ -s $OWNER ]; then
+                echo \"FREE (stale owner file from a killed shell: \$(cat $OWNER))\"
+                rm -f $OWNER
+            else
+                echo FREE
+            fi
+        else
+            echo \"BUSY: \$(cat $OWNER 2>/dev/null || echo \"holder did not name itself\")\"
+        fi'"
     exit $?
 fi
 

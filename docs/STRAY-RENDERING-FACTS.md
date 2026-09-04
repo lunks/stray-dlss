@@ -2716,3 +2716,50 @@ would otherwise read as "no information".
 **Do not treat the current silence as safety.** A correct-looking image is not evidence that a
 driver-level rejection is benign; it is only evidence that whatever failed was not on the path
 that draws this frame.
+
+## §48 The `nvapi -5` is NGX probing inputs we leave NULL — prediction confirmed (2026-09-04)
+
+§47 predicted, before the run, that binding a previously-null optional NGX input would make the
+`-5` count DROP, and that an unchanged count would leave the alternative (vkd3d rejecting a
+handle we consider valid) alive. Measured, menu sessions, same build, `--no-drive`:
+
+```
+RUN A   MvMask=0 (pInBiasCurrentColorMask NULL)   nvapi status -5 = 17
+RUN B   MvMask=1 (the mask BOUND)                 nvapi status -5 = 12
+```
+
+**Down by exactly 5**, which is the same per-SR-feature count §32.8 recorded. And the mask
+demonstrably engaged rather than being silently ignored, which is what makes the number mean
+anything:
+
+```
+mv_mask ready: bias-current-colour mask 1920x1080 fmt=0
+MV MASK PHASE ACTIVE at frame 120: bias-current-colour mask filled with 1.0000
+```
+
+**So the `-5` lines are NGX asking DXVK-NVAPI for a CUDA descriptor object for inputs that carry
+`desc.ptr == 0`, and being refused by its own null guard before vkd3d is ever called**
+(`nvapi_d3d12.cpp:339-340`). They are a census of what we do not supply, not a fault. Path 2 —
+vkd3d rejecting a real handle — is not implicated by this evidence.
+
+**Strength, stated honestly:** n=1 per arm, and the two arms are different sessions. Against
+that, the `ext_unhook` A/B (§39) gave 27 and 27 across two comparable sessions, so run-to-run
+variance in a fixed scene appears low, and the drop matches a mechanism that predicted its exact
+size in advance. A repeat would firm it up; nothing depends on it that cannot wait.
+
+**Second result from the same run: the bias mask is not inert at the API level.** NGX accepts
+`pInBiasCurrentColorMask`, and it probes it — which was the open question gating every masking
+idea, including using it to mark reflection pixels whose history should not be believed
+(`mv-dense-reflections`, §42). Whether it changes the IMAGE is still unmeasured and needs the
+alternating A/B against screenshots, in gameplay.
+
+**Two process notes worth more than the result.**
+
+* **The first attempt was a false negative that never got reported.** The box's `StrayDLSS.ini`
+  had no `MvMask` key at all — it predates the merge, and only the DLL is deployed, never the ini
+  — so `sed -i "s/^MvMask=.*/MvMask=1/"` matched nothing and run B ran with the mask still off. It
+  was caught only because the payload also printed whether the mask actually bound. **A test that
+  does not verify its own treatment was applied is not a test.**
+* **`tools/stray-box.sh --status` read the owner FILE rather than the lock**, so a shell killed
+  without running its EXIT trap left the box reporting BUSY forever while it was free. Now fixed
+  to ask `flock -n` and to clear a stale label when it finds one.
