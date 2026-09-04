@@ -3,6 +3,7 @@
 #include "core/engine_seam.hpp"
 #include "intercept/backend.hpp"
 #include "log.hpp"
+#include "view_params_hook.hpp"
 
 #include <windows.h>
 
@@ -214,6 +215,14 @@ void add_passes_thunk(const void *self, void *graph_builder, const void *view,
 		g_unreadable.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
+
+	// THE VIEW FROM THE ENGINE'S OWN STRUCT ([STRAYDLSS] EngineSeamViewParams). `view` is the
+	// `const FViewInfo&` the engine handed us, alive by construction here; its
+	// CachedViewUniformShaderParameters is scanned for (or verified, once latched) and carried
+	// in the announcement DECODED, so the claim never touches the FViewInfo. Runs after the
+	// forwarded call because the engine's output rect is one of its predictions, and before the
+	// ledger files the announcement because the announcement is what carries it.
+	vphook::scan_at_announce(view, a, a.depth_res);
 
 	bool log_first = false;
 	{
@@ -795,6 +804,15 @@ Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 		v.out_width = a->out_width;
 		v.out_height = a->out_height;
 		v.sequence = a->sequence;
+		// The View the render thread read from the engine's struct at announce, if any.
+		v.view_carried = a->view_carried;
+		v.view_survivors = a->view_survivors;
+		v.view_offset = a->view_offset;
+		if (a->view_carried)
+		{
+			v.view = a->view;
+			std::memcpy(v.view_prefix, a->view_prefix, sizeof(v.view_prefix));
+		}
 		// IDENTITY is claimed with the ledger's deliberate slack (up to kRetireAfter*), which
 		// is what keeps `unclaimed` honest when a dispatch arrives late. POINTERS are not:
 		// they are only dereferenceable while the announcing FRDGBuilder still lives. Decide

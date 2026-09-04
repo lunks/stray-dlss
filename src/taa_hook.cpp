@@ -3,6 +3,7 @@
 #include "core/exposure_plan.hpp"
 #include "core/feature_recreate.hpp"
 #include "engine_seam_hook.hpp"
+#include "view_params_hook.hpp"
 #include "exposure_texture.hpp"
 
 #include "ngx_nr.hpp"
@@ -381,7 +382,9 @@ const char *hook_format_name(TexFormat f)
 // command-recording time on the thread that just set the root arguments, because UE4's
 // FD3D12FastConstantAllocator sub-allocates from an upload ring that the CPU writer will
 // advance past later in the frame. (docs/RESEARCH.md §2.6)
-bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out)
+// `raw` (optional, kViewPrefixBytes) receives the exact bytes read, so the pick can later be
+// compared BYTE FOR BYTE against the engine's own struct (src/view_params_hook.hpp).
+bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out, unsigned char *raw = nullptr)
 {
 	// Liveness and facts from the backend, never a dereference of ours: the ReShade backend
 	// checks liveness first, the native backend answers from its creation-time snapshot.
@@ -407,6 +410,8 @@ bool read_view_cb(const icept::BufferRange &cb, ue4::ViewParams &out)
 	if (!icept::backend()->read_buffer(cb, sizeof(copy), copy))
 		return false;
 
+	if (raw != nullptr)
+		std::memcpy(raw, copy, sizeof(copy));
 	return ue4::parse_view_params(copy, sizeof(copy), out);
 }
 
@@ -766,6 +771,9 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
+	// The winner's exact bytes, for the comparison against the engine's own struct at claim.
+	unsigned char view_prefix[ue4::kViewPrefixBytes];
+	unsigned char cand_prefix[ue4::kViewPrefixBytes];
 	// THE LOOP RUNS TO THE END even after a winner is accepted, and for two different reasons.
 	// The first is a GATE: a candidate too large for the dispatch (facts §36.18) or below the
 	// engine's own 0.5 minimum fraction (§36.21) is skipped and the search CONTINUES, so the
@@ -784,7 +792,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	{
 		ue4::ViewParams candidate{};
 		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
-		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
+		if (!read_view_cb(cb.second, candidate, cand_prefix) || !ue4::view_params_plausible(candidate))
 			continue;
 		if (cand_off >= 0 && cand_off < static_cast<int>(sizeof(cand_list)) - 1)
 			cand_off += std::snprintf(cand_list + cand_off, sizeof(cand_list) - cand_off,
@@ -837,6 +845,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		}
 		view = candidate;
 		view_ok = true;
+		std::memcpy(view_prefix, cand_prefix, sizeof(view_prefix));
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
@@ -924,12 +933,35 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
 
+		// THE VIEW FROM THE ENGINE'S OWN STRUCT ([STRAYDLSS] EngineSeamViewParams). The
+		// announcement carried the 2448-byte prefix of FViewInfo::CachedViewUniformShader-
+		// Parameters, read on the render thread inside AddPasses; here it is judged against
+		// the bytes the search just read from the bound constant buffer (prediction 6, the
+		// one that ties the discovered offset to a buffer the engine BOUND), and - at level 2,
+		// once latched - it SUPPLIES the View. A stale ring copy on a lower root parameter is
+		// then the search disagreeing with the engine, counted as disagree=, never the reverse.
+		// Below level 2, or before the latch, nothing here changes what DLSS sees.
+		bool view_from_engine = false;
+		if (seam_gate == seam::Gate::engine)
+		{
+			const vphook::ViewSource vs = vphook::resolve_at_claim(seam_verdict, view_ok,
+				view_ok ? view_prefix : nullptr, view);
+			if (vs.use_engine)
+			{
+				view = vs.params;
+				view_ok = true;
+				view_from_engine = true;
+			}
+		}
+
 		// THE QUIET-RESIDUE VERDICT, and it is only meaningful on a CLAIMED dispatch. The
 		// question is not "was any dispatch's View ambiguous" - look-alikes outnumber real
 		// upscales here - it is "was DLSS SR itself ever handed a view it had to guess at".
 		// `distinct_rival` means a second surviving candidate would have given different
 		// ClipToPrevClip / jitter / CameraCut, i.e. the slot-order search was guessing.
-		if (view_ok && distinct_rival)
+		// NOT counted when the engine's struct supplied the View: the search did not choose,
+		// so it cannot have guessed - those events are disagree= on the [viewParams] line.
+		if (view_ok && distinct_rival && !view_from_engine)
 		{
 			const bool claimed = (seam_gate == seam::Gate::engine);
 			if (claimed)

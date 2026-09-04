@@ -26,6 +26,8 @@
 // again, and discovery still refuses loudly and dumps what it did not understand.
 #pragma once
 
+#include "view_params.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -368,6 +370,18 @@ struct Announcement
 	// and that builder lives on one thread's stack for the length of one Execute — so a claim
 	// from another thread is a claim against memory that thread may already have recycled.
 	std::uint64_t thread = 0;
+	// THE VIEW, FROM THE ENGINE'S OWN CPU STRUCT (src/core/view_cached.hpp). Read inside
+	// AddPasses from `FViewInfo::CachedViewUniformShaderParameters` - the struct
+	// `View.ViewUniformBuffer` is created from and TAA binds - and carried here DECODED plus
+	// as the raw 2448-byte prefix, because a stale ring copy (facts §36.20) is only tellable
+	// from the current one by WHEN it was written, and the struct is per-FViewInfo, rebuilt
+	// per frame. `view_survivors` is how many offsets passed the scan's predictions on this
+	// announcement (1 means `view` is filled; >1 is ambiguity the latch refuses).
+	bool view_carried = false;
+	unsigned view_survivors = 0;
+	std::uint32_t view_offset = 0;
+	ue4::ViewParams view{};
+	unsigned char view_prefix[ue4::kViewPrefixBytes] = {};
 	bool consumed = false;
 };
 
