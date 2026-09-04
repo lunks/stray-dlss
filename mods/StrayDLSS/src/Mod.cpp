@@ -13,14 +13,27 @@
 //     D3D12CreateDevice (docs/STRAY-RENDERING-FACTS.md §12)
 //   on_update is UE4SS's own jthread, ~200 Hz,   UE4SSProgram.cpp:1205,1322-1341        HARD
 //     NOT the game thread
+//   register_tab(StringViewType,                 UE4SS/include/Mod/CppUserModBase.hpp:  HARD
+//     GUI::GUITab::RenderFunctionType)             the callback type is a PLAIN function
+//     and on_ui_init + UE4SS_ENABLE_IMGUI          pointer `void(*)(CppUserModBase*)`,
+//                                                  not a std::function
+//   the debug GUI renders into its OWN OS window  UE4SS/src/GUI/GUI.cpp:510              HARD
+//     in every RenderMode; [Debug] RenderMode        (DebuggingGUI::setup ends with
+//     only picks WHICH THREAD pumps it              m_os_backend->create_window)
+//   Ctrl + [Debug] ToggleGUIKey (default O)       UE4SSProgram.cpp:1103-1130             HARD
+//     opens it, and only when GuiConsoleEnabled=1
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Mod/CppUserModBase.hpp>
+#include <UE4SSProgram.hpp>
+
+#include <imgui.h>
 
 #include <string>
 
 #include "Host.hpp"
 #include "Platform.hpp"
+#include "TweakUi.hpp"
 #include "Version.hpp"
 
 namespace {
@@ -57,6 +70,14 @@ class StrayDlssMod : public RC::CppUserModBase
         ModAuthors     = STR("stray-dlss");
 
         stray_dlss::plugin::Start(sds::ModuleDir(reinterpret_cast<const void*>(&Widen)), sds::GameBinariesDir());
+
+        // The live-tuning tab. Registered here because register_tab's own cleanup is tied to
+        // CppUserModBase's destructor, and gated on [STRAYDLSS] TweakUi so a UI fault can be
+        // switched off on the box without a 20-minute rebuild. UE4SS_ENABLE_IMGUI must NOT go
+        // here: RE-UE4SS's changelog records a crash from exactly that race, and on_ui_init is
+        // the documented place.
+        if (stray_dlss::plugin::TweakUiEnabled())
+            register_tab(STR("StrayDLSS"), &stray_dlss::plugin::RenderTweakTab);
         Say(STR("[StrayDLSS] ") + Widen(STRAY_DLSS_PLUGIN_VERSION_STRING) +
             STR(" loaded; log is <game>/stray-dlss-plugin.log"));
     }
@@ -67,6 +88,15 @@ class StrayDlssMod : public RC::CppUserModBase
     }
 
     auto on_unreal_init() -> void override {}
+
+    // Fired when UE4SS's debug GUI initialises (i.e. when someone first opens it). Without the
+    // macro the mod's own imgui translation unit has a NULL context and a different allocator,
+    // and the first widget we draw crashes the process.
+    auto on_ui_init() -> void override
+    {
+        UE4SS_ENABLE_IMGUI()
+        Say(STR("[StrayDLSS] imgui context adopted; the StrayDLSS tab is live"));
+    }
 
     // NOT the game thread: UE4SS's own event-loop jthread, ~200 Hz.
     auto on_update() -> void override

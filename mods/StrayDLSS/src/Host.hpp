@@ -22,4 +22,15 @@ void Tick();
 // detour removed, the log closed.
 void Stop();
 
+// The StrayDLSS.ini that Start() actually found, or "" if it found none. The live-tuning tab
+// saves back into THIS file rather than re-deriving the path, so a save can never land beside
+// the file the session is reading (Start tries the mod root and then the dlls/ directory, and
+// which one won is a runtime fact).
+const std::string &IniPath();
+
+// [STRAYDLSS] TweakUi, default 1. Gates BOTH halves of the live-tuning path: the UE4SS tab and
+// the hot-apply of its knobs on an ini reload. It exists so a UI bug can be switched off on the
+// box without a rebuild, which is the only remedy available at a 20-minute build round trip.
+bool TweakUiEnabled();
+
 } // namespace stray_dlss::plugin

@@ -13,6 +13,8 @@
 #include "ngx_nr.hpp"
 #include "pool_name_hook.hpp"
 
+#include "TweakState.hpp"
+
 #include <MinHook.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -54,6 +56,10 @@ std::atomic<bool> g_device_dead{ false };
 host::IniFile g_ini;
 std::string g_ini_path;
 std::atomic<bool> g_native_mode_overridden{ false };
+// [STRAYDLSS] TweakUi. Read once in Start(), because the tab is registered once and a key that
+// could turn the whole path off mid-session would be a second thing to reason about, not a
+// smaller one.
+std::atomic<bool> g_tweak_ui{ true };
 
 struct IniSource final : host::cfg::Source
 {
@@ -477,9 +483,24 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 		}
 	}
 	if (!loaded)
+	{
 		STRAY_LOG_ERROR("host: StrayDLSS.ini not found (tried %s and the dll dir); every [STRAYDLSS] key reads its "
 			"default, which leaves EnableNGX/NgxEvaluate OFF and DLSS inert.", sds::Narrow(candidates[0]).c_str());
+		// The loop above leaves the LAST candidate it tried in g_ini_path. An unfound file has no
+		// path, and IniPath()'s one caller - the tuning tab's save - must refuse rather than
+		// create a second ini beside a file the session never read.
+		g_ini_path.clear();
+	}
 	host::cfg::set_source(&g_source);
+
+	g_tweak_ui.store(host::cfg::get_bool("TweakUi", true));
+	STRAY_LOG_INFO("host: [STRAYDLSS] TweakUi=%d - the in-game tuning tab %s. It lives in UE4SS's "
+		"own debug GUI, which at UE4SS 68caddcf renders into a SEPARATE OS window (there is no "
+		"in-game overlay path at that commit): open it with Ctrl+<[Debug] ToggleGUIKey, default "
+		"O> and only when [Debug] GuiConsoleEnabled=1. Whether that window is usable under "
+		"gamescope's DRM backend is UNCONFIRMED - if it is not, hand-editing this ini is the "
+		"same control path: every key the tab exposes is now re-applied on reload.",
+		g_tweak_ui.load() ? 1 : 0, g_tweak_ui.load() ? "is registered" : "is DISABLED");
 
 	// The application's one-time configuration (which events a host must deliver; here the
 	// native hooks deliver them all, so the answer is only logged).
@@ -512,8 +533,22 @@ void Tick()
 		// the caller's thread by design — it queues, and nr::on_present carries the teardown out
 		// once the GPU fence has passed the last evaluate.
 		//
-		// Every other key stays startup-only. A knob that reconfigures the device or the feature
-		// mid-frame is a much larger promise than a boolean that gates a pass.
+		// ...and, since 2026-09-04, every knob the live-tuning tab exposes (TweakState.hpp) -
+		// which is the SAME argument extended, not a new one: not the render thread, plain
+		// scalar setters, values re-sent to the NGX parameter block on every evaluate, so the
+		// change lands on the next frame with no feature recreation and no lock on the render
+		// path. It is what keeps this file a WORKING control channel on a box where UE4SS's
+		// debug GUI - a separate OS window, not an overlay - may not be openable at all.
+		//
+		// Every OTHER key stays startup-only. A knob that reconfigures the device or the
+		// feature mid-frame is a much larger promise than a value that rides the next evaluate.
+		if (g_tweak_ui.load())
+		{
+			const int moved = tweak::apply_from_config();
+			if (moved > 0)
+				STRAY_LOG_WARN("host: %d live tuning value(s) re-applied from %s.", moved, g_ini_path.c_str());
+		}
+
 		const bool want = host::cfg::get_bool("NgxNR", nr::enabled());
 		if (want != nr::enabled())
 		{
@@ -524,6 +559,16 @@ void Tick()
 			nr::set_enabled(want);
 		}
 	}
+}
+
+const std::string &IniPath()
+{
+	return g_ini_path;
+}
+
+bool TweakUiEnabled()
+{
+	return g_tweak_ui.load();
 }
 
 void Stop()
