@@ -2712,12 +2712,15 @@ demonstrably running — both adaptive triggers engaged 2.1 s in:
 > **OPEN, and not smoothed over.** A *different* `Scratch_VIBE` start, also `Level=0.000` and also
 > with no other start in its window, ramped to `peak=0.13303` then `0.63949` about two seconds in
 > (22:45:38–41). So a level-0 scratch is sometimes silent and sometimes not.
-> **`SetPS5VibrationLevel` is not the explanation**: it was hook-registered successfully at startup
-> (`fields of SetPS5VibrationLevel: Level:float[4]@0`) and called **zero times** in the whole
-> session — which also means §9's *"`SetPS5VibrationLevel` at ~60 Hz, 0.0 idle, ~0.47–0.52 while
-> scratching"* did not reproduce on this build and should be re-read as a shim-era measurement.
-> Leading hypothesis: the asset's own envelope, since `Scratch_VIBE` loops (§12) and a scratch held
-> long enough reaches a louder part of the loop. **Unresolved.**
+> **RESOLVED the same day — see §20.10.** This note first blamed the asset's envelope and asserted
+> that `SetPS5VibrationLevel` was *"called zero times in the whole session"*. **That was reading
+> absence of LOGGING as absence of CALLS**, and it was wrong: `CbSetVibrationLevel`
+> (`Mod.cpp:1042-1048`) carries no log statement at all — deliberately, since it would fire at
+> ~60 Hz — so the calls are invisible in the log by design. The Blueprint bytecode (§20.10) shows
+> `SetPS5VibrationLevel` calling `UAudioComponent::SetVolumeMultiplier`, which is exactly the ramp:
+> a scratch starts at `SetVolumeMultiplier(0)` and is driven up while it is held. §9's *"~60 Hz,
+> 0.0 idle, ~0.47–0.52 while scratching"* stands unamended. **A silent hook is not a hook that did
+> not fire — check the callback before drawing a negative from a grep.**
 
 #### Therefore the plugin is already right here
 
@@ -2820,6 +2823,157 @@ does not, the fix did not take.
 * **Which child of `Submix_unused` is processed first** is [derived] from registration order
   (`Runtime.cpp:365-367`: parent, vibration, speaker) plus `TMap` insertion order. That the
   *speaker* lane is the contaminated one is HARD from the meters; *why it is that way round* is not.
-* **The `Scratch_VIBE` level-0 ramp** (§20.4) is unexplained.
+* ~~**The `Scratch_VIBE` level-0 ramp**~~ — **RESOLVED, §20.10**: `SetPS5VibrationLevel` →
+  `SetVolumeMultiplier`, unlogged by design.
 * **Whether the engine's loudspeaker fold is the right fold for an actuator** (§20.2) is a design
   question nobody has tested.
+* **Whether the fold does anything at all on this title** (§20.10, Correction 1). Its stated
+  justification — spatialised haptic sends — is refuted: `PS5VibrationAttenuation` has
+  `bSpatialize = false`. Whether haptic content reaches any channel but FL/FR is now UNCONFIRMED.
+* **The pad speaker's level** (§20.10, Correction 2). `SCLASS_controller` routes into
+  `Submix_controller`, the PARENT of the submix carrying `SBFX_Boost`, so the +5 dB appears to be
+  out of the path entirely and `SpeakerGain = 1.0` may be 5 dB short. Needs the pak-wide sweep.
+* **The pak-wide caller census** — which asset is started at which literal `Level`, across all
+  23,846 cooked packages — is BLOCKED while the game runs (`tools/paksweep.py` refuses by design).
+  §20.5's table is one session's observed calls, not the content's full authored set.
+
+### 20.10 The pak confirms it from the other side — and corrects three things — 2026-09-03
+
+Everything in §20.4 was measured from the *outside*, by correlating call-site levels against tap
+peaks. The game's own Blueprint bytecode and the routing assets say the same thing from the
+inside, and settle three claims this document had wrong.
+
+Extracted with `tools/pakextract.py` (26 targeted entries, 14.6 KB, `ionice -c3 nice -n19`, game
+untouched) and an arm64 `oozraw` built with `sse2neon`. All 26 unpacked to exactly their declared
+`usize` and every `.uasset` carries UE4 magic `0x9E2A83C1`. **Note for the next session:
+`tools/paksweep.py` refuses to run while the game is up, by design — a pak-WIDE census needs a
+window with the game down. `pakextract.py` can seek to named entries and is what was used here.**
+
+#### The call sites, decoded — HARD
+
+`Hk_project/Content/Technical/BP_HKPlayerController.uexp`. The package's imported `AudioComponent`
+UFunctions are exactly `GetPlayState`, `SetPaused`, `SetSound`, **`SetVolumeMultiplier`**, plus
+virtual calls to `Play`, `FadeIn`, `FadeOut`, `IsPlaying`, `Stop`. **There is no `SetSubmixSend`,
+`SetSubmixSendLevel`, `AdjustVolume` or `AdjustAttenuation` anywhere in the package.**
+
+`StartPS5Vibration`, fully decoded (1121 bytes):
+
+```
+if (GetPlatform() == PS5  ||  DebugPS5Haptic):
+    ControllerVibration.SetSound(SoundVibration)
+    cond = (Level == 0.0) OR (FadeInTime == 0.0)
+    if cond:  SetVolumeMultiplier(Level); Play(0.0)
+    else:     SetVolumeMultiplier(1.0);   FadeIn(FadeInTime, Level, 0.0, Linear)
+```
+
+| function | applies `Level` via |
+|---|---|
+| `StartPS5Vibration` / `…OnAudioComponent` | `SetVolumeMultiplier(Level)` **or** `FadeIn(FadeInTime, Level, …)` — the two-arm branch above |
+| `SetPS5VibrationLevel` / `…OnAudioComponent` | `SetVolumeMultiplier` — **the ~60 Hz ramp** |
+| `StartPS5ControllerSound` / `…OnAudioComponent` | **always** `FadeIn(FadeInTime, Level, 0.0, Linear)`; no branch, no `SetVolumeMultiplier` |
+| `SetPS5ControllerSoundLevel` / `…OnAudioComponent` | `SetVolumeMultiplier` |
+| `Stop*` | `FadeOut` |
+
+**Every one of these is a gain on the AudioComponent — i.e. on the SOURCE, upstream of
+`Submix_vibration` → `Submix_vibrationMaster` → our listener.** That is §20.4's reading (a),
+confirmed by a completely independent method. `Level=0, FadeInTime=0` (the scratch) takes the first
+arm: `SetVolumeMultiplier(0)` then `Play` — genuinely silent, exactly as the 3 s of measured
+silence showed. **The plugin must not apply `Level`; there is nothing to recover.**
+
+The branch *polarity* is [derived] (the `JumpIfNot` sense was not decoded), but it does not matter:
+both arms apply `Level` on the component.
+
+#### The send carries no level either — the second, independent refutation
+
+`Content/Sound/tools/settings/attenuation/PS5VibrationAttenuation.uasset`, **HARD**:
+
+```
+bAttenuate = false   bSpatialize = false   bEnableReverbSend = false
+SubmixSendSettings[0]:
+  Submix                    = VibrationEndpointSubmix
+  SubmixSendMethod          = ESubmixSendMethod::Manual
+  ManualSubmixSendLevel     = 1.0
+  SubmixSendLevelMin/Max    = 1.0 / 1.0
+  SubmixSendDistanceMin/Max = 400.0 / 6000.0   (unused — the method is Manual)
+```
+
+**A constant unity Manual send.** It carries no per-sound level and cannot vary, so the reading
+that `Level` rides the dead endpoint send is refuted from the content as well as from the meters.
+
+#### CORRECTION 1 — Stray's haptic sends are NOT spatialised, and §18's stated reason for the fold is wrong
+
+§18 justifies the AC-3 fold with *"Stray's sends ARE spatialised (`PS5VibrationAttenuation`, HARD
+from the pak)"*. **The asset says `bSpatialize = false` and `bAttenuate = false`.** HARD, and it
+contradicts that line directly.
+
+**What this does and does not change.** It does **not** make the fold wrong — §20.2 establishes
+independently that Epic's endpoint folds device-width to the endpoint's stereo pair with the same
+matrix, for the vibration port as for the speaker. What it removes is the *evidence offered for
+why it mattered here*: the claim that content the panner placed behind the cat was vanishing from
+the coils. With `bSpatialize = false` on the vibration attenuation, that mechanism is not
+established, and **whether any haptic content lands outside FL/FR at all is now UNCONFIRMED**. The
+fold may well be a no-op on this title. One run says which: a non-zero difference between folding
+and not folding, on the coil lane, over a scratch.
+
+#### CORRECTION 2 — the `_CONTROL` assets never traverse `SBFX_Boost`
+
+The submix graph, read from the assets (**HARD**; parents as serialised):
+
+```
+VibrationEndpointSubmix    EndpointType = "Vibration Output"
+  Submix_vibrationMaster
+    Submix_vibration                 <- SCLASS_controllerVibration.DefaultSubmix
+
+ControllerEndpointSubmix   EndpointType = "Pad Speaker Output"
+  Submix_controllerMaster
+    Submix_controller                <- SCLASS_controller.DefaultSubmix
+      Submix_controllerPre           SubmixEffectChain = [SBFX_Boost]
+
+Submix_unused              bMuteWhenBackgrounded=True; no parent, no children, no effects
+```
+
+`SBFX_Boost` is confirmed exactly as §10 recorded it — `InputGainDb 5.0, ThresholdDb 0.0,
+Ratio 1.0, KneeBandwidthDb 0.0, LookAheadMsec 0.0, bAnalogMode false`.
+
+**But audio flows child → parent, and `SCLASS_controller` routes into `Submix_controller` — the
+PARENT of the boost.** So a `_CONTROL` sound entering by the class default **never passes through
+`Submix_controllerPre` and never receives the +5 dB.** HARD graph, [derived] conclusion.
+
+This contradicts §18's *"the tap on the master is post-effects, so the +5 dB is IN the samples.
+`SpeakerGain = 1.0`; carrying `kSpeakerBoost` over would double it."* On this graph the boost is in
+neither the samples nor the path, so `SpeakerGain = 1.0` may leave the pad speaker **5 dB quieter
+than the PS5** rather than correct. §10's original observation — that ×1.7783 *"sounded right"* on
+the asset-replay path — is consistent with the boost being absent from the graph, not present in it.
+
+**Open, and cheap to settle:** whether anything else routes into `Submix_controllerPre` (a
+SoundCue-level submix send would), which needs the pak-wide sweep and therefore a window with the
+game down. Until then, treat the speaker lane's level as **unresolved**, and note it is the one
+place where a deliberate gain of ours might be justified — the opposite conclusion from the coil
+lane.
+
+#### Confirmations, so they stop being open
+
+| claim | verdict |
+|---|---|
+| `SCLASS_controllerVibration.DefaultSubmix = Submix_vibration` | **HARD**, confirms §14's probe |
+| `SCLASS_controller.DefaultSubmix = Submix_controller` | **HARD** — closes §18's explicitly-open cell |
+| No `Volume` on either sound class (not serialised → default 1.0) | **HARD**, confirms §9 |
+| No `OutputVolume` serialised on **any** submix in either tree | **HARD** — every stage is unity, confirms §9 |
+| `Submix_unused` has no parent, no children, no effects | **HARD**, confirms §14's characterisation |
+| `m_scratchablePS5TriggerEffect = {Feedback, Value2: 2}` | **HARD**, confirms §13 exactly |
+| `m_PS5VibrationSubmix = Submix_vibrationMaster` | **HARD**, confirms §14 |
+
+#### CORRECTION 3 — there are TWO audio components, not one
+
+`BP_HKPlayerController` owns **`ControllerAudio`** (speaker) *and* **`ControllerVibration`**
+(coils). §14 records only the latter. `BP_CatPawn` owns the component-attached ones:
+`PS5Vibration_Jump`, `PS5Vibration_ZurkGrab`, `PS5Vibration_ZurkSucking`,
+`PS5VibrationSound_ZurkSucking`. **HARD.**
+
+#### And the correction this document owes itself
+
+§20.4's original note asserted `SetPS5VibrationLevel` was *"called zero times in the whole
+session"*, on the strength of a grep of the log. **`CbSetVibrationLevel` (`Mod.cpp:1042-1048`)
+contains no log statement** — deliberately, because it fires at ~60 Hz. The calls were there all
+along and were invisible by design. **A silent hook is not a hook that did not fire; check the
+callback before drawing a negative from a grep.** §9's ~60 Hz measurement never needed defending.
