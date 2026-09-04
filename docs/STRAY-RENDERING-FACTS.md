@@ -2914,3 +2914,51 @@ not "never bound".
 **Consequence for the ini:** of the settings blamed for the tuned config's cost, the LOD scale
 is not one of them. What actually cost was SSGI (§46, ~9%) and SSR at quality 4 (~5% here).
 Both are now off or reduced.
+
+## §53 `pInBiasCurrentColorMask` is BOUND and IGNORED at R8_UNORM (measured 2026-09-04)
+
+Stage 1 of the bias mask, run on the box by the user: `MvMask=1 MvMaskValue=1.0
+MvMaskAlternate=900`, gameplay in The Slums, camera held on reflective ground across several
+phase flips.
+
+**User verdict: "I don't see any changes in reflection whatsoever", and the reflection artefact
+is unchanged — "kinda there, like before, it's mitigated but reproducible".**
+
+**The instrument rules out every plumbing failure**, which is what makes this a result rather
+than a shrug:
+
+```
+MV MASK: enabled=1 phase=ACTIVE value=1.0000 1920x1080 fmt=0
+         bound=15357 fills=18  refused: disabled=0 notReady=0 unfilled=0 extent=0
+```
+
+* `bound=15357` — the texture was attached to that many SR evaluates.
+* every refusal counter is **0** — it was never declined for being disabled, unready, unfilled
+  or wrong-extent.
+* 18 phase flips, alternating neutral (0.0) and ACTIVE (1.0), logged with frame numbers.
+* `NgxRR=0`, so DLSS **SR** is the evaluate the mask rides on (`eval.pInBiasCurrentColorMask`)
+  — the right path, not RR's.
+* `unclaimed=0` and FG 1.98x: the frame was healthy throughout.
+
+A full-strength mask instructs DLSS to distrust its temporal history at **every pixel**. That
+should visibly cost temporal stability — more aliasing and crawl on high-contrast edges — and it
+produced nothing observable at all.
+
+**So the masking route for the reflection problem is dead at this format**, which is exactly what
+stage 1 was built to determine, and it cost one launch. The design note in `nr_mask.hlsl` — that
+an ignored mask and a working-but-neutral mask look identical on a screenshot, so stage 1 must be
+a CONSTANT full-strength fill — is what made a null result interpretable instead of ambiguous.
+
+**What is NOT established, and the knob exists because of it.** Only `MvMaskFormat=0`
+(`R8_UNORM`) was tested. `MvMaskFormat` was built precisely because **NVIDIA documents no
+required format for this input**; `1` is `R16_FLOAT` and `2` is `RGBA8_UNORM`. Until at least one
+other format has been tried, the claim is "bound and ignored at R8_UNORM", not "the runtime
+ignores this input". That is one more launch and it should be spent before the idea is retired,
+because the alternative — a content-driven mask — is a lot of work to build on an input that may
+simply need different bytes.
+
+**Consequence if the other formats also do nothing:** the reflection mismatch (§42, §49) has no
+cheap lever left. RT reflections cost 35% (§49), correct reflection motion vectors need
+`pInMotionVectorsReflections` which NVIDIA places in its research-purposes block, and marking the
+pixels is what this section just tested. The honest options then are reducing SSR's contribution,
+or accepting it.
