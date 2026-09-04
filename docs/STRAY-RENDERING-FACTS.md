@@ -2457,3 +2457,61 @@ completes it — which is the opposite of what more samples is supposed to buy. 
 whether 64 is visibly worse than 32 here**; nothing has been A/B'd. The live ini was deliberately
 NOT changed, because it is a visible-quality change to a configuration the user is mid-way
 through evaluating.
+
+## §42 Translucency and WPO velocity: both of my earlier claims were wrong (UE 4.27.2 source)
+
+I asserted in this session that particles/translucency get *no* velocity and that WPO geometry
+"moves in the vertex shader with no velocity unless the material opts in". Read against
+`VelocityRendering.cpp` at 4.27/`306a7e9`, **neither is right**.
+
+**1. UE 4.27 fully supports translucent velocity.** `FTranslucentVelocityMeshProcessor` exists
+(`:550-586`) and its own comment is the important part:
+
+> *"Velocity for translucency is always relevant because the pass also writes depth. Therefore,
+> the primitive can't be filtered based on motion, or it will break post effects like depth of
+> field which rely on depth information."*
+
+So an opted-in translucent primitive writes **depth AND velocity** — which is exactly what DLSS
+needs, and means such pixels are correctly guided rather than reconstructed.
+
+**2. The gate is purely per-material, with no cvar and no project setting**
+(`Material.cpp:5723-5726`):
+
+```cpp
+bool UMaterial::IsTranslucencyWritingVelocity() const
+{
+    return bOutputTranslucentVelocity && IsTranslucentBlendMode(GetBlendMode());
+}
+```
+
+`bOutputTranslucentVelocity` is the material's own "Output Depth and Velocity" flag, default
+false. Nothing global can turn it on, and `r.BasePassForceOutputsVelocity` cannot reach it —
+which is why the fur investigation found the blend mode settling that chain.
+
+**3. `r.BasePassOutputsVelocity=True` does NOT suppress it**, which is what I expected to find
+and did not. `IsSeparateVelocityPassSupported` (`:366`) is **only a pixel-format check**, and in
+`FVelocityVS::ShouldCompilePermutation` the material's own request is OR'd in independently:
+
+```cpp
+const bool bIsSeparateVelocityPassRequiredByMaterial =
+    Parameters.MaterialParameters.bIsTranslucencyWritingVelocity;
+return bHasPlatformSupport && (bIsSeparateVelocityPassRequired || bIsSeparateVelocityPassRequiredByMaterial);
+```
+
+**4. WPO geometry is covered, and by the base pass rather than the separate one.**
+`bMayModifyMeshes` sits inside `bIsSeparateVelocityPassRequired`, but that is AND-ed with
+`IsSeparateVelocityPassRequiredByVertexFactory` (`:382-391`), whose first term is
+`!BasePassCanOutputVelocity`. Stray ships base-pass velocity ON, so that term is false and WPO
+materials output velocity **from the base pass** instead. My claim that they silently get none
+was wrong.
+
+**What remains genuinely open, stated as a question rather than a claim:** how many of Stray's
+translucent materials set `bOutputTranslucentVelocity`. Every non-opted-in one writes neither
+depth nor velocity, so our reconstruction hands it the motion of whatever opaque surface is
+BEHIND it — smoke, steam, dust and neon glow moving with the wall behind them.
+
+**The decisive test is a pak read, not a launch.** UE serialises only non-default properties, so
+the name `bOutputTranslucentVelocity` appearing in a cooked material's tag stream means it was
+turned on. It needs `tools/pakextract.py` over the material assets plus `tools/oodle_unblock.py`
+with an `ooz` build, because the entries are Oodle-compressed and a raw grep over the pak cannot
+see the string. Not run here.
