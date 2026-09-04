@@ -49,8 +49,18 @@ int g_attempts = 0;
 // needs no name lookup at all, so that ambiguity cannot bite. If the page's region turns out
 // not to hold the index, adding the rows is a second, informed step.
 //
-// THREADING, stated honestly rather than assumed away: on_update is UE4SS's own ~200 Hz
-// jthread, NOT the game thread (Mod.cpp, from UE4SSProgram.cpp:1205,1322-1341). Reading a live
+// THREADING. on_update is UE4SS's own jthread, NOT the game thread. VERIFIED 2026-09-04 by
+// reading RE-UE4SS at the pinned SHA 68caddcf rather than trusting the note in Mod.cpp:
+//
+//   UE4SSProgram.cpp:501   m_event_loop = std::jthread{&UE4SSProgram::update, this};
+//   UE4SSProgram.cpp:1205  auto UE4SSProgram::update() -> void
+//   UE4SSProgram.cpp:1206      ProfilerSetThreadName("UE4SS-UpdateThread");
+//   UE4SSProgram.cpp:1333      mod->fire_update();     <- what calls every mod's on_update
+//
+// The thread is created at :501, names itself at :1206, and fires mod updates at :1333. HARD.
+// Worth the five minutes: UE4SS's own documentation states the OPPOSITE - that on_update runs
+// on the game thread - and building the guard on that would have been building it on nothing.
+// Reading a live
 // UObject from it can give a TORN sample. For a diagnostic that is a spurious log line, not a
 // wrong conclusion - we are looking for bytes that change consistently across a button press.
 // The real hazard is the widget being freed when the menu closes, and the SEH guard turns that
