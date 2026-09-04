@@ -118,7 +118,6 @@ char g_last_error[256] = "";
 // history and a full CreateFeature stall. Pure decision, unit-tested; this is only its state.
 core::RecreateState g_recreate_state;
 unsigned int g_recreate_stable_frames = core::kDefaultRecreateStableFrames;
-unsigned long long g_recreate_waits_logged = 0;
 
 // [STRAYDLSS] NgxExposure (ngx_backend.hpp). Creation-time property.
 exposure::Mode g_exposure_mode = exposure::Mode::automatic;
@@ -878,7 +877,6 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 				g_recreate_state.pending_count, g_recreate_stable_frames,
 				static_cast<unsigned long long>(g_recreate_state.waits),
 				static_cast<unsigned long long>(g_recreate_state.restarts));
-			++g_recreate_waits_logged;
 		}
 		return false;
 	}
