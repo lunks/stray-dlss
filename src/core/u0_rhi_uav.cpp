@@ -106,12 +106,20 @@ bool expectation_holds(const seam::Image &image, const std::uint64_t *slot, std:
                        const SlotExpectation &e)
 {
 	static const unsigned char kRet[] = { 0xC3 };
+	// MEASURED on Stray-Win64-Shipping.exe 2026-09-04 (facts §37.2): MSVC emitted every empty
+	// body of this class as `ret 0` — C2 00 00 — not C3, and ICF folded all six required slots
+	// onto ONE address. `C3` alone therefore refused a vtable that held every other prediction,
+	// slot 36's `33 C0 C3` included. Both encodings are a body-less return; accept either and
+	// nothing else, so the prediction stays as sharp as it was.
+	static const unsigned char kRetImm[] = { 0xC2, 0x00, 0x00 };
 	static const unsigned char kXorRet[] = { 0x33, 0xC0, 0xC3 };
 	const std::uint64_t fn = slot[e.slot];
 	switch (e.expect)
 	{
 	case Expect::code: return image.is_code(fn);
-	case Expect::ret: return begins_with(image, fn, kRet, sizeof(kRet));
+	case Expect::ret:
+		return begins_with(image, fn, kRet, sizeof(kRet)) ||
+			begins_with(image, fn, kRetImm, sizeof(kRetImm));
 	case Expect::xorret: return begins_with(image, fn, kXorRet, sizeof(kXorRet));
 	case Expect::seed: return fn == seed;
 	}

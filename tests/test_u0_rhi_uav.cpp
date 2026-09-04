@@ -209,6 +209,48 @@ TEST_CASE("discover_context_vtable: ICF-folded empty bodies are reported, not re
 	CHECK(d.ret_fold == 6);
 }
 
+// MEASURED on Stray-Win64-Shipping.exe 2026-09-04 (facts §37.2). Every slot the design predicts
+// to be an empty body — 5, 10, 11, 12, 13, 25, and the reported 28/32/37 — is MSVC's `ret 0`,
+// C2 00 00, all folded by ICF onto one address, while slot 36 is `33 C0 C3` exactly as predicted.
+// Accepting only C3 refused that vtable at slot 5 (`survivors=0 failedSlot=5`) even though every
+// other prediction held, which is what this case pins.
+TEST_CASE("discover_context_vtable: MSVC's `ret 0` (C2 00 00) is an empty body too - Stray's own shape")
+{
+	FakeModule m;
+	m.build_vtable(/*fold_rets=*/true);
+	for (const SlotExpectation &e : kSlotExpectations)
+	{
+		if (e.expect != Expect::ret)
+			continue;
+		const std::size_t at = m.fn(e.slot);
+		m.text[at + 0] = 0xC2;
+		m.text[at + 1] = 0x00;
+		m.text[at + 2] = 0x00;
+	}
+	const CtxDiscovery d = discover_context_vtable(m.image(), m.seed());
+	REQUIRE(d.status == CtxStatus::ok);
+	CHECK(d.vtable_va == m.vtable_va());
+	CHECK(d.survivors == 1);
+	CHECK(d.ret_fold == 6);
+	// The reported predictions hold on this shape too, slot 36's xor eax,eax; ret included.
+	for (std::size_t k = 0; k < kSlotExpectationCount; ++k)
+		CHECK((d.expectation_mask & (1u << k)) != 0);
+}
+
+TEST_CASE("discover_context_vtable: a `ret imm16` that is not `ret 0` is NOT an empty body")
+{
+	FakeModule m;
+	m.build_vtable();
+	// C2 08 00 pops 8 bytes: not a body-less return, and no x64 empty body compiles to it.
+	m.text[m.fn(kSlotSetAsyncComputeBudget) + 0] = 0xC2;
+	m.text[m.fn(kSlotSetAsyncComputeBudget) + 1] = 0x08;
+	m.text[m.fn(kSlotSetAsyncComputeBudget) + 2] = 0x00;
+	const CtxDiscovery d = discover_context_vtable(m.image(), m.seed());
+	CHECK(d.status == CtxStatus::prediction_failed);
+	CHECK(d.failed_slot == kSlotSetAsyncComputeBudget);
+	CHECK(d.survivors == 0);
+}
+
 TEST_CASE("discover_context_vtable: no seed, a seed outside code, a seed no qword holds")
 {
 	FakeModule m;

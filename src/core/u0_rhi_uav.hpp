@@ -157,7 +157,8 @@ constexpr unsigned kProbeCount = kProbeLastSlot - kProbeFirstSlot + 1;
 enum class Expect : std::uint8_t
 {
 	code,   // inside an executable section of the module
-	ret,    // the first byte is C3: an empty body, and nothing else on this class overrides it
+	ret,    // an empty body, and nothing else on this class overrides it. TWO encodings: C3, and
+	        // MSVC's `ret 0` C2 00 00 — which is the one Stray's exe actually uses (facts §37.2)
 	xorret, // 33 C0 C3: `return nullptr`
 	seed,   // equals the function the Dispatch hook's return address resolved to
 };
@@ -197,7 +198,7 @@ enum class CtxStatus : std::uint8_t
 	no_vtable,        // no read-only qword equals the seed
 	ambiguous,        // more than one candidate survived every required prediction
 	slot_not_code,    // a slot below kSlotsChecked does not point into code
-	prediction_failed,// a required Expect::ret slot does not begin with C3
+	prediction_failed,// a required Expect::ret slot is not an empty body (neither C3 nor C2 00 00)
 	count
 };
 const char *ctx_status_text(CtxStatus s);

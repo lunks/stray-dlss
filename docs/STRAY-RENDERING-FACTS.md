@@ -3615,12 +3615,58 @@ the menu runs the TAA pass, so every counter below is readable there.
 | The bracket binds exactly ONE uniform buffer and its register == the View-CB search's choice | the View register |
 | `(*OutSceneColorTexture)->Name` reads `L"TemporalAA"` at the seam | RDG layout self-check |
 
-### 37.2 Measured
+### 37.2 Measured — the vtable is RIGHT, and one prediction's ENCODING was wrong (2026-09-04)
 
-**NOT YET RUN.** The artifact is CI run `33842689249` (`StrayDLSS.dll` md5
-`f21bb04c0b35e9dbee51fe4b6b66a97d`, 929 792 bytes, PDB GUID `03F3D544-478C-4F23-A519-133E2EB929A1`),
-staged on the host at `/tmp/u0/` with `box-deploy.sh` (backs the DLL up, sets `U0Hook=2`). The lines
-that settle each prediction above, in the order they appear in `stray-dlss-plugin.log`:
+**RUN at level 1 on the box, Config A, `--no-drive`, main menu, 3 600 frames.** Artifact md5
+`f21bb04c0b35e9dbee51fe4b6b66a97d` (CI run `33842689249`). Discovery **REFUSED**, verbatim:
+
+```
+U0 HOOK MODE: discover ([STRAYDLSS] U0Hook=1). Waiting for 8 agreeing Dispatch return addresses
+  to seed the FD3D12CommandContext vtable search (module base 0x6ffff7190000, 8 sections,
+  .pdata entries=242902).
+U0 HOOK: FD3D12CommandContext vtable NOT FOUND - a slot predicted to be an empty body is not one
+  (seed=0x6ffff88b2830 from 8 agreeing Dispatch return addresses, qwordHits=1 survivors=0
+  failedSlot=5, 10.2 ms).
+```
+
+**Every prediction of §37.1 held except one, and the one that failed was a BYTE, not a layout.**
+A static scan of `Stray-Win64-Shipping.exe` itself (`ImageBase 0x140000000`, seed RVA `0x1722830`,
+the single 8-aligned `.rdata` qword holding it at RVA `0x3cb6c08`, candidate vtable `0x3cb6bf0`)
+dumps all 38 slots:
+
+| Slot | Predicted | Measured first bytes | |
+|---|---|---|---|
+| 3 | the seed | `48 89 5c 24 10 48 89 6c` @ `.text 0x1722830` | **seed held** |
+| 5, 10, 11, 12, 13, 25 | `C3` (REQUIRED) | **`c2 00 00`, all six at ONE address `0x830de0`** | **encoding wrong, ICF folded** |
+| 28, 32, 37 | `C3` (reported) | `c2 00 00`, same address | same |
+| 33 | `C3` (reported) | `48 8b c2 41 b8 04 00 00` — real code | **reported prediction did NOT hold** |
+| 36 | `33 C0 C3` (reported) | **`33 c0 c3`** | **held, and it is the proof** |
+| 0-37 | all code in module | all 38 in `.text` | **held** |
+| 16, 17 | two distinct adjacent overloads | `0x1727620` / `0x17275a0`, distinct, reverse address order | **consistent** |
+
+**Four independent things say the vtable is the right one**: `qwordHits=1` (exactly one read-only
+qword equals the seed — §37.1's vtable prediction, unqualified); 38/38 slots inside `.text`;
+**slot 36 carrying `33 C0 C3` at exactly the predicted index**, a distinctive 3-byte pattern that
+no misalignment survives; and six ret-shaped slots landing on precisely the six predicted indices.
+
+**So the refusal was ours.** MSVC emitted this class's empty bodies as **`ret 0` — `C2 00 00`** —
+rather than `C3`, and `expectation_holds` tested `C3` alone. `Expect::ret` now accepts either
+encoding **and nothing else** (`C2 08 00`, a real stack-popping return, is still refused; pinned
+in `tests/test_u0_rhi_uav.cpp`). Slot 33 is `RHIBuildAccelerationStructure(FRHIRayTracingGeometry*)`
+with a real body — expected, since Stray ships `r.RayTracing=True` so D3D12's RT path is compiled
+in — and it was never a gate, exactly as §10.4 intended.
+
+**The lesson is the one this project keeps re-earning in a new place.** The prediction *"this
+virtual has an empty body"* was correct about the engine and wrong about the compiler; a
+refusal message naming the failing slot turned a dead end into a one-line fix, where a silent
+`survivors=0` would have read as "the route does not exist on this exe". **Predict the semantics,
+but never assume one encoding of them** — and keep the failing slot in the refusal.
+
+**The self-check in the same session passed independently**: `[seam] frame 3600: ... u0name:
+ok=3603 bad=0 unreadable=0`, so `FRDGResource::Name` at +8 reads `L"TemporalAA"` on every one of
+3 603 announcements — §37.1's RDG-layout prediction, **HARD**.
+
+The lines that settle each prediction, in the order they appear in `stray-dlss-plugin.log`:
 
 | Line | Settles |
 |---|---|
