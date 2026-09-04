@@ -2359,3 +2359,34 @@ RR and bias-mask work was blocked on.
 pool's `SceneColorDeferred` is not the texture the TAA pass binds at `t1`. The design declared
 this comparison an observation with no prediction attached; what it means is not yet established
 and should not be assumed to be a defect in either route.
+
+## §39 `ext_unhook` is INERT under the plugin host, and it is NOT the nvapi -5 (2026-09-04)
+
+Hypothesis: with no ReShade in the process nothing patches vkd3d's ID3D12DeviceExt vtable, so
+`ext_unhook`'s write-back of "pristine" slot pointers before every NGX call is either a no-op or
+is itself creating the corruption it exists to fix — and `NvAPI_D3D12_GetCudaIndependent-
+DescriptorObject failed - nvapi status -5` is exactly that corruption's signature (§1).
+
+**Tested by A/B in two consecutive launches of the same build, same scene, same scenario:**
+
+| | `nvapi status -5` | unclaimed | FG |
+|---|---|---|---|
+| `ExtUnhook` default (on) | **27** | 0 | 1.96x |
+| `ExtUnhook=0` | **27** | 0 | 1.96x |
+
+Identical, and the run confirms the flag took effect (`ExtUnhook=0: ReShade's vkd3d ext-vtable
+patch will NOT be undone before NGX calls`). `ext_unhook` still logs `captured 4 pristine vtable
+slots (ID3D12DeviceExt2)` in both, because capture is unconditional.
+
+**Two conclusions, and the second is the useful one.**
+
+1. **The -5 is NOT ours.** It is not the ext-vtable patch and not our repair for it. 27 is
+   constant across launches, which points at a fixed set of surfaces registered once rather than
+   anything per-frame; DLSS SR, FG (validated crops, `black=0 stale=0`) and NR all produce a
+   correct image through it. The leading remaining explanation is DXVK-NVAPI not implementing
+   that entry point for some descriptor type and NGX falling back — **UNCONFIRMED**, and it
+   should not be assumed benign merely because the image looks right.
+2. **`ext_unhook` has no effect in this configuration and can go with the ReShade removal.** It
+   is 2 files, a config key, and eight call sites across `ngx_backend`, `ngx_snippet`, `ngx_fg`,
+   `ngx_nr`, `nr_hook`, `dlss_app` and `backend_native/vtable_patch` — all of it existing solely
+   to undo a patch that only ReShade installs. Measured inert, not argued inert.
