@@ -21,6 +21,10 @@ namespace {
 std::atomic<std::uint8_t> g_mode{ static_cast<std::uint8_t>(Mode::fast) };
 inline Mode current_mode() { return static_cast<Mode>(g_mode.load(std::memory_order_relaxed)); }
 
+// [STRAYDLSS] ShadowGraphicsHeaps (see the header). Read relaxed on the write hot path; set once
+// at init, before any hook can fire.
+std::atomic<bool> g_shadow_graphics{ false };
+
 // Counters shared by both implementations (the resolver drives them; the status file reads them).
 std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
 std::atomic<std::uint64_t> g_null_lookups{ 0 };
@@ -148,6 +152,14 @@ void note_heap_created(::ID3D12DescriptorHeap *heap, bool via_bind)
 	if (desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
 	    desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV && desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
 		return; // samplers are never resolved
+	// RTV/DSV heaps get no slot array unless someone asked for them. Registering the heap and
+	// then refusing its writes would be worse than not registering it: an unregistered handle
+	// falls into the OVERFLOW map, which takes a shard lock. The hooks refuse at the source
+	// (d3d12_hooks.cpp) so nothing ever reaches here for those heaps in the default
+	// configuration; this is the second line of defence, not the first.
+	if (!g_shadow_graphics.load(std::memory_order_relaxed) &&
+	    desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+		return;
 	const std::uint64_t cpu_base = heap->GetCPUDescriptorHandleForHeapStart().ptr;
 	std::uint64_t gpu_base = 0;
 	if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0)
@@ -553,6 +565,9 @@ void set_mode(Mode m)
 }
 Mode mode() { return current_mode(); }
 const char *mode_name() { return current_mode() == Mode::fast ? "fast (flat lock-free arrays)" : "debug (sharded map + provenance)"; }
+
+void set_shadow_graphics_heaps(bool on) { g_shadow_graphics.store(on, std::memory_order_relaxed); }
+bool shadow_graphics_heaps() { return g_shadow_graphics.load(std::memory_order_relaxed); }
 
 // -------- the public interface: dispatch on the mode --------
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry)

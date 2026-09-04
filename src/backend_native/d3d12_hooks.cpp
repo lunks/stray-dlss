@@ -439,6 +439,11 @@ void STDMETHODCALLTYPE hk_CreateUnorderedAccessView(ID3D12Device *self, ID3D12Re
 void STDMETHODCALLTYPE hk_CreateRenderTargetView(ID3D12Device *self, ID3D12Resource *res, const D3D12_RENDER_TARGET_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateRenderTargetView(self, res, desc, handle);
+	// NOTHING READS AN RTV ENTRY ON THE SHIPPING PATH, so by default we do not record one.
+	// Refused BEFORE the perf scope and the counter: a view we never record is not a view we
+	// wrote, and counting it would make `shadow-write` report work that is not being done.
+	if (!shadow::shadow_graphics_heaps())
+		return;
 	perf::Scope _ps(perf::kShadowWrite);
 	perf::count(perf::kCntViews);
 	if (in_own_code())
@@ -454,6 +459,9 @@ void STDMETHODCALLTYPE hk_CreateRenderTargetView(ID3D12Device *self, ID3D12Resou
 void STDMETHODCALLTYPE hk_CreateDepthStencilView(ID3D12Device *self, ID3D12Resource *res, const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	g_orig_CreateDepthStencilView(self, res, desc, handle);
+	// As CreateRenderTargetView above: no reader, so no record, and no counter either.
+	if (!shadow::shadow_graphics_heaps())
+		return;
 	perf::Scope _ps(perf::kShadowWrite);
 	perf::count(perf::kCntViews);
 	if (in_own_code())
@@ -468,7 +476,11 @@ void STDMETHODCALLTYPE hk_CreateDepthStencilView(ID3D12Device *self, ID3D12Resou
 
 bool shadowed_heap_type(D3D12_DESCRIPTOR_HEAP_TYPE t)
 {
-	return t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || t == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || t == D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+	if (t == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+		return true;
+	// RTV and DSV only when asked (descriptor_shadow.hpp, ShadowGraphicsHeaps). Samplers never.
+	return shadow::shadow_graphics_heaps() &&
+		(t == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || t == D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 }
 
 std::uint32_t increment_for(ID3D12Device *device, D3D12_DESCRIPTOR_HEAP_TYPE t)

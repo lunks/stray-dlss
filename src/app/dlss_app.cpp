@@ -428,6 +428,21 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	}
 	native::shadow::set_mode(sm);
 
+	// [STRAYDLSS] ShadowGraphicsHeaps, default 0. The RTV and DSV halves of the descriptor
+	// shadow have NO reader on any path: the two that existed were the dataflow pass finder
+	// (deleted 2026-09-03) and the differential observer, which resolves COMPUTE tables only.
+	// So they are not recorded unless asked. Set 1 to restore the previous behaviour exactly -
+	// the knob is kept because a custom-depth consumer (the DLSSNR ControlMask idea, CLAUDE.md
+	// §5) would want DSVs shadowed again. The saving is small and [derived]; see the header.
+	{
+		const bool graphics_heaps = host::cfg::get_bool("ShadowGraphicsHeaps", false);
+		native::shadow::set_shadow_graphics_heaps(graphics_heaps);
+		STRAY_LOG_INFO("ShadowGraphicsHeaps=%d: RTV/DSV descriptors are %s. Nothing reads them "
+			"(the pass finder is deleted and the differential observer resolves COMPUTE tables "
+			"only), so recording them was a write for nobody.",
+			graphics_heaps ? 1 : 0, graphics_heaps ? "RECORDED" : "not recorded");
+	}
+
 	// [STRAYDLSS] NgxRR. RAY RECONSTRUCTION IS NOT WIRED UNDER THIS HOST, and this refuses
 	// LOUDLY rather than doing nothing. Its guide source was the heuristic G-buffer finder —
 	// GBufferA-E identified by descriptor SHAPE — which was deleted 2026-09-03 along with the
