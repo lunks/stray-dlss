@@ -11,14 +11,16 @@ UNREAL SIDE (hooks, src/Mod.cpp)              SONY SIDE (the game's libScePad.dl
   reroute the two dead endpoint submixes:       scePadSetAudioOutPath(3) + scePadSetVolumeGain
     Submix_vibrationMaster  -> Submix_unused    scePadSetTriggerEffect
     Submix_controllerMaster -> Submix_unused
-  tap both (RegisterSubmixBufferListener)     TRANSPORT (src/Runtime.cpp, src/SubmixSink.cpp)
+  tap each master's CHILD, NOT the master:    TRANSPORT (src/Runtime.cpp, src/SubmixSink.cpp)
+    Submix_vibration, Submix_controller
+    (RegisterSubmixBufferListener)
   trigger hooks -> enum translation             ONE WASAPI client on the pad's 4-ch endpoint:
                                                   FL/FR <- speaker tap   RL/RR <- vibration tap
                                                 HidMode valid_flag0 = 0x00 (§12, measured)
 ```
 
 **The engine does the mixing, the fades, the levels, the looping and the speaker's boost chain
-(`Submix_controllerPre`'s `SBFX_Boost`).** The plugin makes the two pad submixes render on PC
+(`Submix_controllerPre`'s `SBFX_Boost`, which the `_CONTROL` assets are NOT routed through — §20.10).** The plugin makes the two pad submixes render on PC
 (their roots are dead endpoint submixes — `docs/STRAY-DUALSENSE.md` §14/§16), moves the samples
 from where the engine put them to where the pad reads them, and makes Sony's DLL select the
 speaker route. That is the entire job. There is no asset replay, no loop list, no fade ramp, no
@@ -35,7 +37,8 @@ HidMode and RL/RR write; `docs/STRAY-DUALSENSE.md` §14–§17). **Speaker via t
 |---|---|---|
 | **Coils out of rumble emulation** | Writes DualSense USB output report `0x02` with `valid_flag0 = 0x00` (claim nothing) over the raw HID device (SetupAPI + `HidD_GetAttributes`, VID `054C` PID `0CE6`), every 2 s and again on the coil lane's silence → signal edge. Without this every audio path is silent: the firmware is busy synthesising rumble on the same coils. | §12 |
 | **Haptics from the engine's own mix** | The game's `StartPS5Vibration` Blueprints play the `_VIBE` asset on the `ControllerVibration` AudioComponent once `DebugPS5Haptic` is true (written from our pre-hook, on the hook's own Context object, every call). `Submix_vibrationMaster` is re-parented under `Submix_unused` at volume 0 and re-registered so the engine renders it; an `ISubmixBufferListener` receives the mix; the sink writes it to **RL/RR**. Rain + purr + scratch **sum**, as on PS5. | §14, §15, §17 |
-| **Speaker from the engine's own mix** | The identical treatment for `Submix_controllerMaster` (dead for the identical reason), written to **FL/FR of the same stream**. Tapped post-effects, so the game's own +5 dB `SBFX_Boost` is already in the samples (`SpeakerGain` is 1.0 and is an A/B knob, not a level). | §16 (routing), §18 |
+| **Speaker from the engine's own mix** | The identical treatment for `Submix_controllerMaster` (dead for the identical reason), written to **FL/FR of the same stream**. `SpeakerGain` is 1.0 and is an A/B knob, not a level. | §16 (routing), §18 |
+| **The two lanes do not share a buffer** | Both masters are re-parented under one `Submix_unused`, which makes them **siblings** — and UE 4.27 hands a buffer listener the **parent's** accumulation, zeroed once per callback rather than once per child (`AudioMixerSubmix.cpp:1364`, `:1380`), so the second sibling processed reads both. Measured: the lanes' `peak` **and** `rms` were bit-identical in **95.2%** of 2,483 non-silent status periods, and every haptic was emitted on the pad speaker too. Each lane now taps its master's **child**. | §20.1 |
 | **Pad speaker ROUTING** | `scePadSetAudioOutPath(3 = SPEAKER)` + `scePadSetVolumeGain({80, 80, 0, 0})`, resolved out of the libScePad the game already mapped and called with the handle `scePadGetHandle` gives us — the retired shim's `audio_probe`, verbatim. **The pad's default routing MUTES its internal speaker**; without this the samples reach the pad and go nowhere. | §16, user-confirmed |
 | **Adaptive triggers** | Reads `HKPlayerController::m_scratchablePS5TriggerEffect` (`{Mode, Value1, Value2, Value3}`, game enum space), translates the game's `EPS5TriggerEffectMode` to Sony's (they are in **different orders**), and drives `scePadSetTriggerEffect` on both sides, accumulated per side from `SetPS5TriggerActivated(State, Side)`. | §13 |
 | **PS glyphs** | A post-hook on `InputSubsystem:GetGameControllerType` rewrites a gamepad answer to PS5; keyboard prompts are left alone. | §14 |
@@ -57,7 +60,8 @@ link-tested without the SDK (the mingw lane).
 | `SubmixTap` | the `ISubmixBufferListener` itself: leaked page, hand-built vtable, trampoline; the per-lane meter and ring write | mingw |
 | `SubmixDsp` | the **sink's arithmetic**: channel fold, soft clip, resampler, level meter, SPSC ring, and the two-lane interleave onto FL FR RL RR | **unit** |
 | `SubmixSink` | the **sink**: one WASAPI client, two rings → one 4-channel stream | mingw |
-| `SubmixWatch` | the three pure instruments: the per-start watch (NoData / Silent / Mixed), the N-lane reroute watchdog, the lane verdict | **unit** |
+| `SubmixWatch` | the four pure instruments: the per-start watch (NoData / Silent / Mixed), the N-lane reroute watchdog, the lane verdict, and the **lane-alias detector** that convicted §20.1 and now guards against its return | **unit** |
+| `SubmixRouting` | **which submix each lane taps** (the master's child, not the master — §20.1) and the two assets that route themselves to the dead endpoint and can never be tapped | **unit** |
 | `HidMode` | the `valid_flag0` write and its re-assert thread | mingw |
 | `ScePad` / `PadAudio` | binding the game's already-mapped `libScePad.dll`; pad selection by the `connected` byte; **the Sony calls** (triggers, speaker route) and their measured values | pad audio: **unit** |
 | `Triggers` / `TriggerEffect` | per-side accumulation, transmit on change; game↔Sony enum translation and the `ScePadTriggerEffectParam` layout | effect: **unit** |
@@ -125,11 +129,20 @@ grep -n "FIRST REAL SIGNAL" "$L"
 grep -n "pad audio: scePad\|SONY ACCEPTED" "$L" | head -3
 # 6. the level-load repair, if it fired
 grep -n "STOPPED RENDERING\|RE-SUBMITTED" "$L"
+# 7. THE 0.4.1 CHECK: are the two lanes still one buffer? (must be ~0%)
+grep -o "alias pairs=[0-9]* identical=[0-9]* ([0-9.]*%)[^|]*" "$L" | tail -3
+grep -n "READING ONE BUFFER" "$L"
+# 8. and the same thing the long way, for a scratch: the two lanes side by side
+grep -E "SUBMIX (vibration|speaker) .* peak=" "$L" | grep -v "peak=0.00000" | tail -20
 ```
 
 | what the log says | reading |
 |---|---|
+| `alias pairs=N identical=0 (0.0%)` | **the lanes are separate — this is the fix working.** `pairs` must be non-trivial (tens) before the number means anything |
+| `alias … identical=…(9x.x%)` and `THE TWO LANES ARE READING ONE BUFFER` | the taps are back on the two re-parented masters. Check `SubmixTapPath` / `SubmixSpeakerTapPath` and the `lane '…' taps '…'` lines (§20.1) |
+| `alias … (40-70%)` | a PARTIAL fix: one lane moved to its child and the other did not. The `lane '…' taps` lines say which, and `spkOnly=` / `coilOnly=` say which direction still leaks |
 | `submix watch [vibration] 'X_VIBE': the engine MIXED it - peak 0.7…` | the coils are on the engine's mix; unchanged from `9553b9e` |
+| `submix watch [vibration] 'DetectZone_VIBE': silent, AND THAT IS EXPECTED` | not a fault: that asset overrides its own submix onto the dead endpoint root and can never reach a tap (§20.11). Do not read the reroute or the gate from it |
 | `submix watch [speaker] 'cat_purr_loop_01_CONTROL': the engine MIXED it` + `FIRST REAL SIGNAL on 'speaker'` + `SONY ACCEPTED the route` | **the speaker works** if it is audible; if not, the fault is downstream of the tap — `SpeakerGain`, `PadSpeakerGain`, or the endpoint's FL/FR |
 | `submix watch [speaker] …: NO DATA FROM THE TAP` while `[vibration]` mixes | **the hypothesis "the same reroute works on the speaker tree" is dead**: `Submix_controllerMaster` is not being rendered. Read the `REROUTE` lines and `resolved speaker` (is it a plain `SoundSubmix`?) |
 | `submix watch [speaker] …: the engine mixed NOTHING` with `frames` > 0 | rendered but silent: the `_CONTROL` sound is not landing in that tree — the gate (`gate[open=…]`), or `SCLASS_controller`'s default submix is elsewhere |

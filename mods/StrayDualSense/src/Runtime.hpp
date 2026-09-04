@@ -32,6 +32,7 @@
 #include "ScePad.hpp"
 #include "SubmixDiscovery.hpp"
 #include "SubmixDsp.hpp"
+#include "SubmixRouting.hpp"
 #include "SubmixSink.hpp"
 #include "SubmixTap.hpp"
 #include "SubmixWatch.hpp"
@@ -65,6 +66,11 @@ struct Lane
 
     submix::Tap*       tap = nullptr;
     submix::SubmixRing ring;
+    // WHICH submix this lane's listener is on, and whether that is the master (aliasing) or
+    // its child (clean). Decided once at bind time by submix::PlanTap; see SubmixRouting.hpp.
+    // Every log line about this lane names `plan.target`, never the reroute target, because
+    // they are different objects now and confusing them is how §20.1 happened.
+    submix::TapPlan    plan;
     // The tap has delivered a REAL SIGNAL (>= SubmixLiveThreshold), not merely callbacks.
     std::atomic<bool>  live{false};
 
@@ -154,8 +160,14 @@ public:
     // a master re-parented earlier is dropped from the parent's child list. Returns true when
     // the listeners have been handed to the engine; false means "not yet, or refused", and the
     // reason has already been logged.
+    //
+    // FIVE objects, and the split is the point (docs §20.1): the two MASTERS are what the
+    // reroute re-parents and re-registers, the two TAP objects are where the listeners go, and
+    // they are no longer the same submixes. Passing a master as a tap target reproduces the
+    // aliasing bug, which is exactly what an empty SubmixTapPath asks for.
     bool BindSubmixTap(const void* worldObject, const void* engineObject,
                        void* vibrationMasterObject, void* speakerMasterObject,
+                       void* vibrationTapObject, void* speakerTapObject,
                        void* rerouteParentObject, const void* imageBase, std::size_t imageSize);
 
 private:
@@ -163,7 +175,11 @@ private:
     void LogStatus();
     void StartSubmix();
     void SubmixStatus();     // the numbers proof: one log line per lane and one status file
-    void LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line, std::size_t lineSize);
+    // `outLevel` hands back the reading this window consumed, because TakeLevels() RESETS the
+    // meter and the lane-alias detector needs the same numbers the line prints. Reading them
+    // twice would read zeros.
+    void LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line, std::size_t lineSize,
+                    submix::LevelReading& outLevel);
     void SubmixWarnIfDue(uint64_t now);
     // Detects "bound, but a subtree has stopped rendering" and re-arms the reroute.
     void RerouteWatchdog(uint64_t now);
@@ -196,6 +212,11 @@ private:
     // rendering that subtree; neither firing = the tap itself is broken).
     Lane               m_coils;
     Lane               m_speaker;
+
+    // THE REGRESSION DETECTOR for §20.1. Fed the two lanes' readings every status period; if
+    // they start agreeing bit-for-bit again, the taps are back on one buffer and it says so
+    // once, loudly, instead of waiting to be noticed. UE4SS update thread only.
+    LaneAliasWatch     m_alias;
     submix::SubmixSink m_submixSink;
     submix::Tap*       m_tapMaster    = nullptr;
     std::atomic<bool>  m_submixBound{false};

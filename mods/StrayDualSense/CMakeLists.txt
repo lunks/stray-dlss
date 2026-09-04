@@ -16,7 +16,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(StrayDualSense
-    VERSION 0.4.0
+    VERSION 0.4.1
     DESCRIPTION "DualSense adaptive triggers, coil haptics and controller speaker for Stray"
     LANGUAGES CXX)
 
@@ -54,6 +54,8 @@ add_library(straydualsense_core STATIC
     src/SubmixChoice.hpp
     src/SubmixDsp.cpp
     src/SubmixDsp.hpp
+    src/SubmixRouting.cpp
+    src/SubmixRouting.hpp
     src/SubmixWatch.cpp
     src/SubmixWatch.hpp
     src/TriggerEffect.cpp
@@ -63,7 +65,7 @@ target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
 enable_testing()
-foreach(t asset_name trigger_effect submix_dsp submix_choice submix_watch pad_audio)
+foreach(t asset_name trigger_effect submix_dsp submix_choice submix_watch submix_routing pad_audio)
     add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
     target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
     target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
@@ -111,6 +113,8 @@ add_library(StrayDualSense SHARED
     src/SubmixDiscovery.hpp
     src/SubmixDsp.cpp
     src/SubmixDsp.hpp
+    src/SubmixRouting.cpp
+    src/SubmixRouting.hpp
     src/SubmixSink.cpp
     src/SubmixSink.hpp
     src/SubmixTap.cpp

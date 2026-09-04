@@ -677,14 +677,16 @@ int g_submixAttempts = 0;
 // owning object Casts to USoundSubmix (AudioMixerSubmix.cpp:1370) — an endpoint or soundfield
 // submix would register cleanly and then never call us, which is the exact silent null
 // result this plugin must not produce — so the resolved class is logged, once per lane.
-UObject* ResolveSubmix(const char* path, const char* lane)
+UObject* ResolveSubmix(const char* path, const char* lane, int slot)
 {
     UObject* submix = RC::Unreal::UObjectGlobals::StaticFindObject<UObject*>(
         nullptr, nullptr, Widen(std::string(path)));
     if (submix == nullptr)
         return nullptr;
-    static bool logged[2] = { false, false };
-    bool& once = logged[lane[0] == 'v' ? 0 : 1];
+    // Four now, not two: each lane's reroute target AND its tap target, which since 0.4.1 are
+    // different submixes (docs §20.1). One line each, once.
+    static bool logged[4] = { false, false, false, false };
+    bool& once = logged[slot];
     if (!once)
     {
         once = true;
@@ -754,11 +756,27 @@ void MaybeBindSubmixOnGameThread()
     UObject* world  = RC::Unreal::UObjectGlobals::FindFirstOf(STR("World"));
     UObject* engine = RC::Unreal::UObjectGlobals::FindFirstOf(STR("Engine"));
 
-    // The two masters to tap, by the exact paths measured in the box's own UE4SS object dump,
-    // and the parent they are re-parented under.
+    // The two masters the REROUTE re-parents, by the exact paths measured in the box's own
+    // UE4SS object dump, and the parent they go under. These are no longer what we tap - see
+    // the block below, and docs/STRAY-DUALSENSE.md §20.1 for why the two roles had to split.
     const sds::Config& cfg = sds::Rt().Cfg();
-    UObject* vibration = ResolveSubmix(cfg.submixPath.c_str(), "vibration");
-    UObject* speaker   = ResolveSubmix(cfg.submixSpeakerPath.c_str(), "speaker");
+    UObject* vibration = ResolveSubmix(cfg.submixPath.c_str(), "vibration (reroute)", 0);
+    UObject* speaker   = ResolveSubmix(cfg.submixSpeakerPath.c_str(), "speaker (reroute)", 1);
+
+    // WHERE THE LISTENERS GO. The reroute re-parents the two masters above; the taps go on
+    // their children, because two listeners on siblings of one parent are handed the SAME
+    // buffer by UE 4.27 and every haptic came out of the pad speaker (docs §20.1). An empty
+    // path deliberately means "tap the master", i.e. the old behaviour, for a one-ini A/B.
+    const std::string& coilTapPath =
+        cfg.submixTapPath.empty() ? cfg.submixPath : cfg.submixTapPath;
+    const std::string& spkTapPath =
+        cfg.submixSpeakerTapPath.empty() ? cfg.submixSpeakerPath : cfg.submixSpeakerTapPath;
+    UObject* vibrationTap = coilTapPath == cfg.submixPath
+                                ? vibration
+                                : ResolveSubmix(coilTapPath.c_str(), "vibration (tap)", 2);
+    UObject* speakerTap   = spkTapPath == cfg.submixSpeakerPath
+                                ? speaker
+                                : ResolveSubmix(spkTapPath.c_str(), "speaker (tap)", 3);
 
     // THE REROUTE's UObject half (docs/STRAY-DUALSENSE.md §14): the parent's OutputVolume goes
     // to 0 so nothing leaks into the speakers, and each master's ParentSubmix points at it.
@@ -811,13 +829,14 @@ void MaybeBindSubmixOnGameThread()
     {
         announced = true;
         SDS_LOG_INFO("submix: binding from the game thread. exe=%p+0x%zX world=%p engine=%p "
-                     "targets='%s' + '%s'", imageBase, imageSize, static_cast<void*>(world),
-                     static_cast<void*>(engine), cfg.submixPath.c_str(),
-                     cfg.submixSpeakerPath.c_str());
+                     "reroute='%s' + '%s' tap='%s' + '%s'", imageBase, imageSize,
+                     static_cast<void*>(world), static_cast<void*>(engine),
+                     cfg.submixPath.c_str(), cfg.submixSpeakerPath.c_str(),
+                     coilTapPath.c_str(), spkTapPath.c_str());
     }
 
-    sds::Rt().BindSubmixTap(world, engine, vibration, speaker, rerouteParent, imageBase,
-                            imageSize);
+    sds::Rt().BindSubmixTap(world, engine, vibration, speaker, vibrationTap, speakerTap,
+                            rerouteParent, imageBase, imageSize);
 }
 
 // ---------------------------------------------------------------------------------------

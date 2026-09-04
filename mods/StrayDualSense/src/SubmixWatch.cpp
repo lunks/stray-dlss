@@ -192,4 +192,69 @@ LaneVerdict JudgeLane(const LaneFacts& f)
     return v;
 }
 
+// ---------------------------------------------------------------------------------------
+// The lane-alias detector (SubmixWatch.hpp).
+// ---------------------------------------------------------------------------------------
+namespace {
+
+// Bit-identical, deliberately. NOT a tolerance: the whole point is that two independent
+// meters produced the same float from the same samples, and any epsilon here would start
+// admitting two lanes that merely carry similar audio.
+bool SameReading(float aPeak, float aRms, float bPeak, float bRms)
+{
+    return aPeak == bPeak && aRms == bRms;
+}
+
+} // namespace
+
+bool LaneAliasWatch::Observe(float coilPeak, float coilRms, float speakerPeak, float speakerRms,
+                             float silentEpsilon)
+{
+    const bool coilQuiet    = coilPeak    <= silentEpsilon;
+    const bool speakerQuiet = speakerPeak <= silentEpsilon;
+    if (coilQuiet && speakerQuiet)
+        return false;   // says nothing about aliasing; see the header
+
+    ++m_pairs;
+    if (SameReading(coilPeak, coilRms, speakerPeak, speakerRms))
+        ++m_identical;
+    else if (speakerPeak > coilPeak || speakerRms > coilRms)
+        ++m_speakerOnly;
+    else
+        ++m_coilsOnly;
+
+    if (!m_reported && m_pairs >= kAliasMinPairs)
+    {
+        const float rate = static_cast<float>(m_identical) / static_cast<float>(m_pairs);
+        if (rate > kAliasSuspectRate)
+        {
+            m_reported = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+AliasVerdict LaneAliasWatch::Verdict() const
+{
+    AliasVerdict v;
+    v.pairs       = m_pairs;
+    v.identical   = m_identical;
+    v.speakerOnly = m_speakerOnly;
+    v.coilsOnly   = m_coilsOnly;
+    v.rate        = m_pairs > 0 ? static_cast<float>(m_identical) / static_cast<float>(m_pairs)
+                                : 0.0f;
+    v.aliasing    = m_pairs >= kAliasMinPairs && v.rate > kAliasSuspectRate;
+    return v;
+}
+
+void LaneAliasWatch::Reset()
+{
+    m_pairs       = 0;
+    m_identical   = 0;
+    m_speakerOnly = 0;
+    m_coilsOnly   = 0;
+    m_reported    = false;
+}
+
 } // namespace sds

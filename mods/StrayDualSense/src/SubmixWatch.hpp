@@ -203,4 +203,80 @@ struct LaneVerdict
 
 LaneVerdict JudgeLane(const LaneFacts& f);
 
+// ---------------------------------------------------------------------------------------
+// THE LANE-ALIAS DETECTOR — the instrument that convicted the bug, kept so it can convict a
+// regression.
+//
+// MEASURED 2026-09-03 (docs/STRAY-DUALSENSE.md §20.1). Two listeners on two sibling submixes
+// under one parent are handed THE SAME BUFFER by UE 4.27 (AudioMixerSubmix.cpp:1380 passes the
+// parent's accumulation, and the parent zeroes it once per callback, not once per child). The
+// symptom in our own numbers was unmistakable once looked for: over 2,483 paired status
+// periods the two lanes' `peak` AND `rms` were bit-identical in 2,365 of them — 95.2% — while
+// the speaker lane was strictly greater in 116 (a `_CONTROL` sound playing too) and the
+// vibration lane in 2 (a meter-read race).
+//
+// Two independent meters agreeing to five decimal places on two statistics is not a
+// coincidence, and that is the whole test. It needs no engine knowledge, no new plumbing and
+// no extra cost: the numbers are already computed for the status line.
+//
+// WHAT THE NUMBER SHOULD BE. Aliased, it is ~95%. Fixed, the only periods that can still agree
+// are the ones in which BOTH lanes are exactly silent — which are excluded here, because a
+// silent pair says nothing about aliasing — so the identical rate over NON-SILENT pairs should
+// fall to approximately zero. Anything above `kAliasSuspectRate` with a real sample is
+// reported, once, as a defect rather than left for someone to notice a year later.
+//
+// A DELIBERATE ASYMMETRY: only pairs where at least one lane is non-silent are counted. Both
+// lanes are silent most of the time in normal play, and counting those would bury the signal
+// under a ~99% "identical" rate that means nothing.
+//
+// Pure: no clock, no threads, no allocation. The caller feeds it the two readings it already
+// has.
+// ---------------------------------------------------------------------------------------
+
+// Above this fraction of non-silent pairs agreeing exactly, the lanes are reading one buffer.
+// 0.5 is far below the 0.952 measured while broken and far above anything two genuinely
+// separate submixes could reach by chance.
+constexpr float kAliasSuspectRate = 0.5f;
+
+// How many non-silent pairs before the rate means anything. A handful of pairs can agree by
+// chance when only one lane is ever active.
+constexpr unsigned kAliasMinPairs = 40;
+
+struct AliasVerdict
+{
+    unsigned pairs       = 0;   // non-silent pairs observed
+    unsigned identical   = 0;   // peak AND rms bit-identical
+    unsigned speakerOnly = 0;   // speaker strictly greater on either statistic
+    unsigned coilsOnly   = 0;   // coils strictly greater on either statistic
+    float    rate        = 0.0f;// identical / pairs, 0 when pairs == 0
+    // True once there is enough evidence: the lanes are aliasing and the tap targets are
+    // wrong. Latches, so one line is printed rather than one per second.
+    bool     aliasing    = false;
+};
+
+class LaneAliasWatch
+{
+public:
+    // One status period's readings for the two lanes. `silentEpsilon` is the level below which
+    // a lane counts as silent; a pair with both lanes silent is ignored entirely.
+    //
+    // Returns true exactly on the observation that first concludes aliasing, so the caller
+    // logs once.
+    bool Observe(float coilPeak, float coilRms, float speakerPeak, float speakerRms,
+                 float silentEpsilon);
+
+    AliasVerdict Verdict() const;
+
+    // Forget everything. The tap targets can change at runtime only by an ini edit plus a
+    // restart, but a re-arm re-registers nothing, so this exists for tests and for symmetry.
+    void Reset();
+
+private:
+    unsigned m_pairs       = 0;
+    unsigned m_identical   = 0;
+    unsigned m_speakerOnly = 0;
+    unsigned m_coilsOnly   = 0;
+    bool     m_reported    = false;
+};
+
 } // namespace sds

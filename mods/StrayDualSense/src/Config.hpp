@@ -91,6 +91,27 @@ struct Config
     std::string submixPath          = "/Game/Sound/tools/settings/Submix_vibrationMaster.Submix_vibrationMaster";
     std::string submixSpeakerPath   = "/Game/Sound/tools/settings/Submix_controllerMaster.Submix_controllerMaster";
     std::string submixRerouteParent = "/Game/Sound/tools/settings/Submix_unused.Submix_unused";
+
+    // WHERE THE LISTENERS GO, which is NOT what we re-parent. See src/SubmixRouting.hpp for
+    // the derivation and docs/STRAY-DUALSENSE.md §20.1 for the measurement.
+    //
+    // Both masters are re-parented under ONE `Submix_unused`, which makes them siblings, and
+    // UE 4.27 hands a buffer listener the PARENT's accumulation buffer after this submix mixed
+    // into it (AudioMixerSubmix.cpp:1364, :1380) — zeroed once per callback, not once per
+    // child. So a listener on the second sibling processed reads BOTH lanes. Measured in the
+    // running game: the two lanes' `peak` and `rms` were bit-identical in 95.2% of 2,483
+    // non-trivial status periods, and every `_VIBE` the engine mixed was emitted on the pad
+    // SPEAKER as well as the coils.
+    //
+    // Tapping each master's own CHILD removes the sharing instead of compensating for it: the
+    // buffer handed to a child's listener is its master's InputBuffer, which holds that
+    // master's subtree and nothing else.
+    //
+    // EMPTY means "tap the master", i.e. the old aliasing behaviour — kept deliberately,
+    // because it is the A/B that proves the fix inside one session with no rebuild. The
+    // `submix alias` line reports a completely different number in the two modes.
+    std::string submixTapPath        = "/Game/Sound/tools/settings/Submix_vibration.Submix_vibration";
+    std::string submixSpeakerTapPath = "/Game/Sound/tools/settings/Submix_controller.Submix_controller";
     int         submixRegisterSoundSubmixSlot = 14;
 
     // FAudioDevice::RegisterSubmixBufferListener's vtable index. 16 for stock UE 4.27.2 and
