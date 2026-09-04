@@ -10,6 +10,79 @@ of reading; releases up to `v0.13.0-beta.1` checked), and the Deep Fried Chicken
 is this project at `ec0ce00`, `src/ngx_nr.cpp`, `src/nr_hook.cpp`, `src/nr_stage.cpp`,
 `docs/RESEARCH-RENODX-DLSS5.md` and `docs/RESEARCH-DLSSNR-STYLES.md`.
 
+**UPDATED 2026-09-04**, on a request to replace the SOFT prose with a disassembly of Deep Fried
+Chicken. **The binary could not be obtained — §0.0 records every route and why each failed, so the
+search is not repeated.** What was disassembled instead is `nvngx_dlssnr.dll` itself, which settles
+the consequence of the multi-pass question outright: **§3.1, HARD.**
+
+---
+
+## 0.0 Acquisition: THE DFC BINARY IS NOT OBTAINABLE FROM ANY PUBLIC URL (2026-09-04)
+
+This document's DFC rows were all SOFT, so the obvious next step was to do to
+`deep-fried-chicken.addon64` what CLAUDE.md §5 did to `nvngx_dlssnr.dll` — read the code instead of
+the prose. **The disassembly did not happen, because the binary cannot be obtained.** Recorded at
+this length so nobody repeats the search.
+
+**Every route tried, and how each ended:**
+
+| Route | Result |
+|---|---|
+| The **one published direct URL** — `Dfc` in the feeder's own installer, `tools/Install-DLSS5Feeder.ps1:164` | A Discord CDN attachment link. **HTTP 404, `This content is no longer available.`** Its `ex=6a99c287` is hex Unix time = **2026-09-03 18:55:03 UTC**, i.e. it expired the day before this attempt |
+| The same file **upstream on `main`** (re-fetched live, not from the clone) | Byte-identical, same expired link. The author has not refreshed it |
+| Feeder **GitHub release assets**, every release to `v0.13.0-beta.1` | Only `DLSS5-Feeder-*.zip` and `AUTOMATIC_INSTALLATION_AVAILABLE.txt`. DFC is never bundled — its own README says so, and so does the feeder's |
+| **DFC's own repository** | Does not exist. GitHub code search for `deep-fried-chicken` returns 241 hits across 35 repos, of which exactly **one** (`jlrouzies-fr/DLSS5-Feeder`) is this project; the rest are recipe sites and restaurant menus |
+| **GitHub issues/comments** on the feeder, searched for `cdn.discordapp` | 0 hits. No user has posted a fresh link publicly |
+| **Wayback Machine**, for that attachment and for any `Deep-Fried*` on the CDN | No snapshots |
+| **Third-party mirror** (`playground.ru` hosts the feeder) | Mentions the three DFC filenames in its *instructions* only; hosts no DFC file |
+| **The box** (`pct exec 113`, read-only, game was up so nothing heavy) | `/run/media/deck/GamesLinux/dlss5-stage/` holds `renodx-dlss5.addon64`, four `nvngx_dlssnr.dll` variants, OptiScaler, SL 2.13 — **no Deep Fried Chicken anywhere** |
+| **This machine** (`~/Downloads`, `~/Desktop`) | RenoDX DLSS5 builds and `nvngx_dlssnr.dll`, no DFC |
+
+**Every source says the same thing, including the author's own:** the feeder's README, its release
+notes and its web listings all read *"from its Discord"* / *"Get it from its Discord"*, and the
+release asset `AUTOMATIC_INSTALLATION_AVAILABLE.txt:65` states it outright — *"The Discord download
+links inside the script expire. When one does, the script says so and tells you which parameter
+takes a fresh link or file."* **DFC is a Discord-only drop with a deliberately transient CDN link,
+and joining, scraping or authenticating to that server is out of scope.** The task stops here.
+
+**What would unlock it, in one action, and what to do with it.** The user is in that Discord (they
+follow this project). A fresh link, or the zip dropped anywhere readable, is enough — and
+**provenance is verifiable without trusting the source**, because the vendored
+`external/deepfried/v1.4.8-alpha/SHA256SUMS.txt` publishes the official hashes:
+
+```
+106143DE0D74853B966A7141C19C2BB0FB46E7CE32C7F67D830D2DC5CDDF80EC  deep-fried-chicken.addon64
+E218CE8C20858D58E53A85B2AFC2C1E6F55768A96659E819FF40D71E872393A3  deep-fried-chicken-nvngx.dll
+014AB26C0437FD6180595452C2ACC3ECBA50B1DF42C088212F1B20BAAEFF4CEC  dlss5-dx11-bridge.addon64
+```
+
+Match one of those and it is the official unmodified binary; do not analyse a copy that does not.
+The questions waiting on it are §2 (Native Look's exact arithmetic), the `DLSSNR.*` name audit, and
+whether each pass is really its own NGX feature — **that last one no longer blocks the conclusion,
+because §3.1 answered the consequence from NVIDIA's runtime instead.**
+
+---
+
+## 0.1 What WAS disassembled instead, and why it was the right substitute
+
+The most consequential open question was not really about DFC's code at all. *"Does DFC's per-pass
+slider handling trip the ε-1e-5 history reset on every pass?"* decomposes into a question about
+**NVIDIA's runtime**, which we do have: *what is the SCOPE of the previous-controls record that
+`CG2R_ResetTemporalHistoryOnControlChange` compares against?* If that record is global, then any
+caller running N passes with differing settings resets every pass every frame; if it is per feature
+handle, no such storm is possible for anyone. **That is answerable from `nvngx_dlssnr.dll`, and it
+is answered in §3.1 — HARD.**
+
+Subject: the local `nvngx_dlssnr.dll`, 165,840,496 bytes, md5 `35ab301e9e2cb6e00a3a2dc8e31ed2bb`.
+**This is not the same file as CLAUDE.md §5's md5 `eea91faf`** — it is one of the Ada-patched copies
+— but the `.text` section is only 0xaae00 bytes and the patch is a ~13.5 MB substitution of zstd
+cubin payload in `.data`/`.rsrc` plus three gate constants (CLAUDE.md §5), so the code is expected
+to be identical. **That expectation was checked rather than assumed:** its PDB path is the same
+`...\snippets\rel_310_8\source\features\dlssnr\` build, and the seven compared controls found below
+match the five-named-plus-two-resolved list our own audit recorded from the other copy, at ε
+`0x3727c5ac` = 1e-5f exactly. Tooling: `radare2` for disassembly, Python over the raw `.text` and
+`.pdata` for call-site and function-bound discovery.
+
 ---
 
 ## 0. The framing correction that has to come first
@@ -50,6 +123,10 @@ outside has read.** Do not treat any of it as verified, and specifically do not 
 verified that a parameter name exists in the runtime — that is the `DLSSNR.Scale` lesson, and
 nothing in their docs shows a string audit.
 
+**Those SOFT rows are still SOFT after the 2026-09-04 attempt to promote them, and §0.0 says why:
+the DFC binary is a Discord-only drop whose one published link has expired.** The exception is the
+multi-pass row, whose *consequence* was settled from NVIDIA's runtime instead — §3.1, HARD.
+
 ---
 
 ## 1. The option table
@@ -59,7 +136,7 @@ Ordered by how much it could matter to us.
 | Option (whose) | Mechanism | Do we do it? | Does our runtime support it? | Verdict |
 |---|---|---|---|---|
 | **Native Look / "post processing only"** (DFC) | Output composite, not an NGX parameter: compare final neural luminance against the retained proxy, clamp the relative change to ±0.50 stops, apply it as a **scalar gain** to the untouched native frame; discard equal-luminance chroma change. **SOFT** | **No — mechanism we have no equivalent of.** Our present stage replaces the back buffer wholesale | N/A — pure shader arithmetic on our side of NGX | **The one genuinely interesting idea.** Cheap, placement-compatible, testable. See §2 |
-| **Passes 1–30** (DFC) | N sequential DLSSNR evaluates chained in one output-resolution colour domain; each pass its own feature handle and its own temporal history; one shared codec wraps the whole chain. **SOFT** | **No — mechanism we have no equivalent of.** We evaluate feature 18 exactly once per frame | Nothing forbids N features. Cost is ours to pay | Plausible but expensive, and their own **Clean Fry** exists to clean up what it produces. See §3 |
+| **Passes 1–30** (DFC) | N sequential DLSSNR evaluates chained in one output-resolution colour domain; each pass its own feature handle and its own temporal history; one shared codec wraps the whole chain. **SOFT** | **No — mechanism we have no equivalent of.** We evaluate feature 18 exactly once per frame | **HARD (§3.1):** the runtime's previous-controls record is **per feature handle**, so N passes cannot cross-trip each other's ε-1e-5 history reset — no hidden reset storm, for them or for us | Plausible but expensive, and their own **Clean Fry** exists to clean up what it produces. See §3 |
 | **Neural work scale 10–150%** (DFC 1.4.4+) | Run the neural work at `ceil(display × pct/100)` and reconstruct to native output. **Their own resample — not `DLSSNR.ScalingRatio`.** **SOFT** | **No.** Our stage is 1:1 on the back buffer | **Consistent with our HARD finding** that `DLSSNR.ScalingRatio` is read then overwritten with `1.0f` (`0x18001a96a`) — feature 18 cannot upscale, so any scaling must be the caller's | A perf knob. Real, but it moves the colour/guide ratio, which our own guide-extent latch says costs a history reset. See §4 |
 | **Clean Fry** (DFC 1.4.4+) | Spatial guard for ≥2 passes: 3×3 YCoCg range envelope + log-luminance residual, moving each pixel only along its own proxy→neural line. Cleanup Strength ~0.35, Detail Retention ~0.85. **SOFT** | **No** | N/A — our-side shader | Only meaningful if multi-pass lands first. Its existence is evidence the cascade needs it |
 | **NR Preset: Default / #1 / #2 / #3** (DFC per pass) | `DLSSNR.Hint.Render.Preset`, four values | **Yes — same parameter.** We ship `g_preset = 1` (`src/ngx_nr.cpp:187`, RenoDX's value); DFC's golden default is `Default` | **Present in the runtime string set** (`RESEARCH-RENODX-DLSS5.md:174`) | **Likely inert on both sides.** The shipped DLL is reported to contain a single network (`RESEARCH-RENODX-DLSS5.md:519-521`, web-sourced). A four-way selector over one network is a knob shaped like a feature |
@@ -174,6 +251,68 @@ one extra evaluate per frame. Our single-pass NR already sits around 57–62 fps
 measurements; a second pass is not free and must be judged on the bench protocol
 (`tools/stray-bench.sh`, identical instrument per arm), not by eye. **Not recommended before
 Native Look**, which is cheaper and answers a question we actually have.
+
+## 3.1 The multi-pass reset storm does NOT exist — the previous-controls record is PER FEATURE HANDLE
+
+**HARD, read out of `nvngx_dlssnr.dll` 310.8.0 on 2026-09-04.** This was the one hypothesis that
+would have been a significant finding about a shipping tool: DFC exposes NR Preset, Style and four
+strength sliders **per pass**, across up to thirty passes, and CLAUDE.md §5 establishes that
+changing Style / UseAutoMask / LocalTone / LocalStructure / SkinStructure sets `DLSSNR.Reset = 1`
+when this frame's controls differ from "the previous frame's" by more than ε 1e-5. If the runtime
+kept ONE previous-controls record, thirty passes with thirty different settings would each look
+like a control change to the next, and a 30-pass configuration would wipe every history every
+frame. **It does not, and here is why.**
+
+`CG2R_ResetTemporalHistoryOnControlChange` is a real function at **`0x1800179d0`–`0x180017d18`**
+(bounds from `.pdata`; identified by its own log strings at `0x1800ae9d0` and
+`0x1800ae998` — *"DLSSNR: reset temporal history for %s after %s"* — and `cg2r.cpp:120`). It takes
+`rcx` = a state object holding the previous controls, `r8` = this frame's controls. The comparison
+block at `0x180017ad8` is **two int32 compares and five float compares against ε `0x3727c5ac`**:
+
+```
+[rdi+0x164] vs [rbx+0xec]   int      [rdi+0x15c] vs [rbx+0xe4]   float, |d| > 1e-5
+[rdi+0x168] vs [rbx+0xf0]   int      [rdi+0x160] vs [rbx+0xe8]   float
+                                     [rdi+0x16c] vs [rbx+0xf4]   float
+                                     [rdi+0x170] vs [rbx+0xf8]   float
+                                     [rdi+0x174] vs [rbx+0xfc]   float
+```
+
+Seven controls — two integer (Style, UseAutoMask) and five float (the three strengths plus the two
+resolved values), exactly the list CLAUDE.md §5 records. `mov dword [rbx + 0x100], 1` is the
+`DLSSNR.Reset` write; `0x180017bfb` onward memcpy's this frame's controls into `[rdi + 0x78]`,
+i.e. **the snapshot is stored back into the `rcx` object.**
+
+**So everything turns on what `rcx` is, and it is not a global.** The function has **exactly one
+caller**, found by scanning the whole `.text` for `E8` relative calls resolving to `0x1800179d0`:
+`0x180018e89`, inside `0x180018620`–`0x180019e67`, which the strings identify as
+**`NGXCG2R::EvaluateFeature` (`cg2r.cpp:1072`)**. At the call site `rcx` is `rdi`, and in the whole
+of `EvaluateFeature` **`rdi` is written exactly once** — `0x18001869c`, `lea rdi, [rax + 8]` —
+where `rax` is the result of a **map lookup keyed on the feature handle**: `EvaluateFeature` reads
+the handle from its third argument (`mov rbx, qword [r8]`), looks it up in the container at
+`r15 + 0x70`, and compares the result against the tree's end sentinel (`r15 + 0x88 | 1`), logging
+*"DLSSNR: EvaluateFeature feature %u has no network manager"* when the node has none.
+
+**Therefore the previous-controls snapshot lives in the per-feature record, one per NGX feature
+handle.** Consequences:
+
+* **Refuted:** a 30-pass chain does not reset thirty histories per frame. With static settings it
+  resets **zero** times in steady state, exactly like a one-pass chain. The remaining SOFT link is
+  DFC's own claim that each pass is a distinct feature handle — but their docs are consistent and
+  specific about it (*"Increasing the pass count grows private handles live"*), and the arithmetic
+  agrees: their stated 29 intermediates at 30 passes is N−1 buffers between N features.
+* **Confirmed for us too, and this is the part that outlives DFC.** If this project ever runs more
+  than one feature-18 evaluate per frame — the §3 idea — the passes cannot poison each other's
+  accumulation through this mechanism. The cost of multi-pass is VRAM, GPU time and compounding
+  motion error; it is **not** a hidden reset storm.
+* **A second, undocumented reset source turned up in the same function.** Before the numeric
+  compares, `0x180017a30`–`0x180017ac7` fetches a **string** (via `0x180022a50`, which returns
+  `"none"` when empty, else indexes an array of 240-byte records) and `memcmp`s it against the one
+  cached at `[rdi+0x1d8]`. A mismatch takes the `dl = 1` path, which forces the same
+  `DLSSNR.Reset = 1` but logs the cause as **`"config/control-state init"`** rather than
+  **`"control change"`**. The string is the selected network/model variant, so **switching the
+  loaded model resets history too** — sensible, but neither our record nor DFC's docs mentioned it,
+  and it means the runtime's own log distinguishes two reset causes that a reader could otherwise
+  conflate. Grep a DLSSNR log for `after config/control-state init` versus `after control change`.
 
 ---
 
@@ -346,6 +485,9 @@ side of the `UseAutoMask` gate that ours sits on the live side of.
    list.
 2. **Multi-pass** — real added capability, but it compounds motion-vector error through N
    accumulations and needs its own cleanup pass to be usable. **Not before Native Look.**
+   **Cheaper than feared, though:** §3.1 refutes the reset-storm objection from the runtime's own
+   code, so the cost is only VRAM, GPU time and compounding motion error — all of which the bench
+   protocol can measure.
 3. **A bias-current-colour mask on the SR path** — a fourth option for the reflection problem
    CLAUDE.md currently calls structural. **Record, do not build**, until there is a real
    per-pixel reflection signal.
