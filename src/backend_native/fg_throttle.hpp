@@ -47,8 +47,8 @@ void wait_for_slot(bool hurried);
 // reconfiguration). Recorded because it leaves a surplus count on the swapchain's semaphore.
 void note_bypassed();
 
+// The counters and the arming verdict, by value. The [fg] line formats its throttle section
+// from this (fg_present.cpp's log_stats); there is no pre-formatted string kept alongside.
 core::fg::ThrottleState state();
-// The [fg] line's throttle section. Never null; "off" when the knob was never set.
-const char *report();
 
 } // namespace stray_dlss::native::fg::throttle

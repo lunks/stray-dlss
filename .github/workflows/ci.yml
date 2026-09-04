@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity ]
+    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-fg-throttle-report ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity ]
+    branches: [ main, dlss-ue4ss, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-fg-throttle-report ]
   workflow_dispatch:
 
 env:

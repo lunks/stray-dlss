@@ -610,7 +610,11 @@ bool test_fg_flip_throttle(Gpu &gpu)
 		check(st.waits == st.slots + st.timeouts + st.failures, "every wait is accounted for as a slot, a timeout or a failure");
 		check(st.armed || st.refusal == cfg::ThrottleRefusal::gave_up,
 			"the throttle is either still getting slots or has GIVEN UP - it never keeps blocking on a queue that stopped draining");
-		std::printf("  after 8 waits at a 5 ms timeout: %s\n", fgt::report());
+		std::printf("  after 8 waits at a 5 ms timeout: %s (%s) waits=%llu slots=%llu timeouts=%llu failed=%llu blocked max %.2f ms\n",
+			st.armed ? "ARMED" : "inactive", cfg::throttle_refusal_name(st.refusal),
+			static_cast<unsigned long long>(st.waits), static_cast<unsigned long long>(st.slots),
+			static_cast<unsigned long long>(st.timeouts), static_cast<unsigned long long>(st.failures),
+			st.blocked_max_ns / 1e6);
 	}
 
 	fgt::disarm("throttle harness done");
