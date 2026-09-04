@@ -1171,9 +1171,30 @@ tally on the periodic `[view]` line.
 > > > fit the announcement's own output rect from above and below, carry L1's depth extent at row
 > > > 132 — and then match the bound bytes `kLatchAgreements` announcements running. After the
 > > > latch a byte disagreement is the SEARCH reading a stale copy (`disagree=` on the
-> > > `[viewParams]` line), never a demotion. Level 1 (default) changes nothing and reports; level
-> > > 2 makes the struct the source and `ambClaimed` reads 0 by construction; level 3 (delete the
-> > > search) is declared, not built. **UNCONFIRMED LIVE** — CI-green, no launch yet.
+> > > `[viewParams]` line), never a demotion. Level 1 changes nothing and reports; level 2 makes
+> > > the struct the source and `ambClaimed` reads 0 by construction; level 3 (delete the search)
+> > > is declared, not built.
+> > >
+> > > **MEASURED THE SAME DAY, and the offset is HARD: `FViewInfo+5768` (facts §36.22).** Level 1,
+> > > main menu, one launch. **Exactly one** candidate survived the scan; its 2448 bytes were
+> > > **byte-IDENTICAL** to what the search read from the bound buffer on the first comparison and
+> > > then on eight claimed announcements running (`preDisagree=0`); `faults=0 off=0 ambiguous=0
+> > > empty=0 uncompared=0 unverified=0`. **And `disagree=4` matched the search's own
+> > > `ambClaimed=4` EVENT FOR EVENT**, with every assertion WARN naming jitter / `PreExposure` /
+> > > `ClipToPrevClip` at row 0 — §36.20's stale-ring shape, confirmed rather than inferred.
+> > >
+> > > **LEVEL 2 IS THE DEFAULT SINCE 2026-09-04**, and it is safe by construction rather than by
+> > > optimism: substitution requires the latch, the latch requires eight byte-exact agreements
+> > > with a buffer the engine BOUND, and where no latch forms the search supplies the View
+> > > exactly as at level 0 — so the worst case of shipping 2 is the behaviour of 1. The default
+> > > is `viewcached::kDefaultLevel` and is pinned by a test.
+> > >
+> > > **Still UNCONFIRMED, and it needs GAMEPLAY:** that the substitution drives `ambClaimed` to 0
+> > > and moves those frames under `disagree=`. The menu has no shadow, capture or planar-
+> > > reflection view, and §36.21 records a sibling counter going 0 → 171 across that boundary —
+> > > this file's own menu/load trap, for the fourth time. And whether removing a stale
+> > > `ClipToPrevClip` from ~0.3-0.7% of frames changes the picture is §5's compounding class:
+> > > for the user's eyes, not for a counter.
 
 **The method is the transferable part, and it cost nothing.** The predicate already existed; only
 the log line was missing. One line settled a question that would otherwise have justified a new

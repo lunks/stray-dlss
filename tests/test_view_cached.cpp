@@ -634,3 +634,46 @@ TEST_CASE("the mode ladder declares level 3 and refuses to pretend it exists")
 	CHECK(std::strcmp(viewcached::refusal_name(viewcached::Refusal::buffer_mismatch),
 		"buffer-size-mismatch") == 0);
 }
+
+TEST_CASE("THE SHIPPED DEFAULT IS LEVEL 2, and moving it is a deliberate edit")
+{
+	// Pinned for the same reason tests/test_nr_history_plan.cpp pins NgxNRRestoreHistory's
+	// default OFF: the rung the plugin ships at decides whether the engine's struct SUPPLIES the
+	// View or merely reports on the search, and that must not be changeable by one character
+	// nobody reviews. 2 since 2026-09-04, on the level-1 launch of facts §36.22.
+	CHECK(viewcached::kDefaultLevel == 2);
+	CHECK(viewcached::mode_from_level(viewcached::kDefaultLevel) ==
+		viewcached::Mode::authoritative);
+	// And whatever the default is, it must be a rung that EXISTS - shipping the ladder's
+	// declared-but-unbuilt top would silently run one rung lower, which is precisely the
+	// silent-downgrade failure `seam::decide` was written to avoid.
+	CHECK(viewcached::mode_is_implemented(viewcached::mode_from_level(viewcached::kDefaultLevel)));
+}
+
+TEST_CASE("THE PROBE BUDGET COVERS THE WHOLE DEFAULT WINDOW (facts §36.22 truncated at 2048)")
+{
+	// The first live scan reported `qwords=3973 pointer-shaped=2049 probed=2048 ... TRUNCATED`:
+	// it stopped 123 qwords short of the window's end with the budget exhausted. One survivor had
+	// already been found, so the answer stood - but "EXACTLY ONE offset survived" is a claim about
+	// the WHOLE window, and a truncated scan cannot make it. The budget is now the window.
+	CHECK(viewcached::kMaxProbesPerScan >= viewcached::kScanWindowBytes / sizeof(std::uint64_t));
+
+	// So a window made ENTIRELY of pointer-shaped qwords - the worst case the live half can meet,
+	// and far denser than the measured 51.6% - is judged to the end with the flag clear. The
+	// decoy is readable but is not a View, so nothing survives; the point is `truncated == false`
+	// and `qwords` reaching the window's end.
+	World w;
+	std::vector<unsigned char> view(viewcached::kScanWindowBytes, 0);
+	for (std::size_t o = 0; o + 8 <= view.size(); o += 8)
+		std::memcpy(view.data() + o, &kDecoyAddr, 8);
+	w.blocks[kViewAddr] = view;
+	w.blocks[kDecoyAddr] = std::vector<unsigned char>(4096, 0);
+	const viewcached::Reader r = reader_for(w);
+	viewcached::Candidate got[1];
+	viewcached::StageCounts sc;
+	CHECK(viewcached::scan(r, kViewAddr, expect_4k(), got, 1, &sc) == 0);
+	CHECK_FALSE(sc.truncated);
+	CHECK(sc.qwords == viewcached::kScanWindowBytes / 8);
+	CHECK(sc.probed == sc.pointers);
+	CHECK(sc.probed == viewcached::kScanWindowBytes / 8);
+}

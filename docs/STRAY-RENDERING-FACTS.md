@@ -3591,3 +3591,82 @@ creation histogram alone would have shown group A; **only the ordered sequence s
 one costs a second creation**, which is what turned "37 of 62 look wrong" into "59% of all
 creations are this bug". When a counter is a total, ask for the order before estimating what
 removing it buys.
+
+---
+
+## 36.22 The View comes from the engine's own struct: `FViewInfo+5768`, discovered and latched (2026-09-04)
+
+First launch of `[STRAYDLSS] EngineSeamViewParams=1` (discover), **main menu, one launch, no
+injected input**. Level 1 gates nothing — the search still supplied the View to every consumer and
+the image was byte-identical — so this measures the *mechanism*, not an image change. Design,
+predictions and ladder: `docs/RESEARCH-ENGINE-TAA-HOOK.md` §19; the route:
+`docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §2.
+
+```
+ENGINE SEAM VIEW PARAMS: first scan ... 1 candidate offset(s) survived predictions 1-5
+    - exactly one, which is what a clean answer looks like.
+ENGINE SEAM VIEW PARAMS: candidates by stage: qwords=3973 pointer-shaped=2049 probed=2048
+    readable=1986 plausible=1 row135=1 fitsRect=1 aboveMinFraction=1 bufferSize=1 survivors=1
+    <- TRUNCATED: the probe budget ran out before the window was fully judged;
+       raise kMaxProbesPerScan
+ENGINE SEAM VIEW PARAMS: FViewInfo+5768 -> FViewUniformShaderParameters at 000000003F642EC0:
+    1920x1080 view, buffer 1920x1080
+ENGINE SEAM VIEW PARAMS: first byte comparison: IDENTICAL
+ENGINE SEAM VIEW PARAMS LATCHED after 8 claimed announcements: FViewInfo+5768 is
+    CachedViewUniformShaderParameters (preDisagree=0)
+[viewParams] frame 600: latch=latched offset=5768 scans=601 observed=601 agree=589 disagree=4
+    preDisagree=0 uncompared=0 unverified=0 ambiguous=0 empty=0 faults=0 off=0
+[view] ambClaimed=4
+```
+
+### 36.22.1 `FViewInfo+5768` is HARD on this executable
+
+**Discovered, not derived** — `sizeof(FSceneView)` is unobservable from outside, so the offset was
+scanned for and had to survive six independent predictions. The one that settles it is prediction
+6: the 2448 bytes behind that pointer were **byte-identical** to the 2448 bytes the search mapped
+out of the bound constant buffer, on the first comparison and then on eight claimed announcements
+running (`preDisagree=0` — not one false start). Two routes, two threads, two mechanisms, one
+exact 2448-byte agreement. A wrong offset cannot produce that.
+
+`survivors=1` at every stage is the second half of it: the scan does **not** stop at the first
+hit, so "exactly one" is a statement about everything it judged. `ambiguous=0`, `empty=0`,
+`uncompared=0`, `unverified=0`, `faults=0`, `off=0` — every guard silent, no read the CPU refused.
+
+### 36.22.2 `disagree=4` IS `ambClaimed=4`, event for event — §36.20's residue, now attributed
+
+Four claimed dispatches out of 601 where the struct and the search disagreed, and the `[view]`
+line's own ambiguity counter reads **4** in the same session. Two independent instruments, one
+from each side of the disagreement, counting the same events. Every assertion WARN named the
+differing fields as **jitter / `PreExposure` / `ClipToPrevClip`, first differing row 0** — §36.20's
+stale-ring shape exactly: the same view, the same rect, different motion fields, because UE4's
+fast constant allocator recycles the ring and the search walks slot order.
+
+**So §36.20's reading is confirmed rather than merely plausible.** The residue was never a foreign
+view; it is a previous frame's copy of this one, and the search has no way to tell. The struct
+does, because it is per-`FViewInfo` and rebuilt per frame.
+
+**Rate caveat, stated because this file has paid for the opposite three times:** this is the MENU,
+where §36.21 already proved a counter can read 0 for want of the phenomenon. 4/601 (0.67%) is the
+menu's rate at level 1, not gameplay's, and it is not a refinement of §36.20's 0.33%.
+
+### 36.22.3 What was TRUNCATED, and what it cost to fix
+
+The scan stopped at qword **3973 of 4096** with `probed=2048` — the budget exhausted, 3% of the
+window unjudged. One survivor was already in hand so the answer stood, but *"exactly one offset
+survived"* is a claim about the whole window and a truncated scan cannot make it.
+`kMaxProbesPerScan` is now derived from the window (`kScanWindowBytes / 8` = 4096), so with the
+default window it cannot fire at all. **Cost, from this session's own density** (2049
+pointer-shaped qwords in 3973, 51.6%): about **64 more probes and ~156 KB more guarded reading per
+scan**, against the ~5.0 MB it already did. The scan runs only while `searching` — 8 announcements
+here — after which an announcement costs one guarded qword and one guarded 2448-byte read.
+
+### 36.22.4 What this session could NOT settle
+
+* **Level 2 is unmeasured.** This launch ran level 1, where the search still supplies the View, so
+  the four stale frames still reached DLSS. `EngineSeamViewParams=2` is the default from
+  2026-09-04 and its acceptance criterion is `ambClaimed=0` with the events under `disagree=`.
+* **It must be judged in GAMEPLAY.** The menu has no shadow-casting world, no planar reflections
+  and no scene captures, and §36.21 measured `suspectSmall` going 0 → 171 across that boundary.
+* **Whether it changes the image is not settled by any counter.** Removing a stale
+  `ClipToPrevClip` and jitter from ~0.3-0.7% of frames is §5's compounding-error class; it is for
+  the user's eyes, not for a log line.

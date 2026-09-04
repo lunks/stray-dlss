@@ -109,7 +109,31 @@ constexpr std::size_t kScanWindowBytes = 32768;
 
 // A pointer-shaped qword whose pointee cannot be probed is skipped; probing costs a VirtualQuery
 // in the live half, so the number of probes per scan is bounded and the bound is REPORTED.
-constexpr unsigned kMaxProbesPerScan = 2048;
+//
+// THE BUDGET IS THE WHOLE WINDOW, and it has to be, because the claim this scan makes is
+// "EXACTLY ONE offset survived" - a claim about the entire window, which a scan that stopped
+// three quarters of the way through cannot make. MEASURED 2026-09-04 on the box (facts §36.22)
+// at the old budget of 2048:
+//
+//     candidates by stage: qwords=3973 pointer-shaped=2049 probed=2048 readable=1986
+//       plausible=1 row135=1 fitsRect=1 aboveMinFraction=1 bufferSize=1 survivors=1
+//       <- TRUNCATED: the probe budget ran out before the window was fully judged
+//
+// It broke at qword 3973 of 4096 with one survivor already found, so the answer stood - but only
+// 97% of the window had been judged and the other 3% was unexamined. At the observed pointer
+// density (2049 pointer-shaped qwords in 3973, 0.516) the unjudged tail holds about 63 more
+// pointer-shaped qwords, so a full-window scan probes ~2112 rather than 2048: **about 64 more
+// probes, ~156 KB more guarded reading, per scan.** A probe that gets past the range test costs
+// one region-cache lookup plus a kViewPrefixBytes (2448) memcpy under SEH, so a whole-window
+// scan is ~5.2 MB of guarded copying - and it runs ONLY while `searching`, which the same launch
+// measured ending after 8 claimed announcements. Once latched an announcement costs one guarded
+// qword and one guarded 2448-byte read, whatever this constant says.
+//
+// Deriving it from the window rather than picking a round number is what makes `truncated` mean
+// something again: with the default window it CANNOT fire, so if it ever does, someone widened
+// the window without raising the budget, which is exactly what the flag should catch.
+constexpr unsigned kMaxProbesPerScan =
+	static_cast<unsigned>(kScanWindowBytes / sizeof(std::uint64_t)); // 4096
 
 // ---------------------------------------------------------------------------------------
 // The reader contract
@@ -296,6 +320,26 @@ enum class Mode : std::uint8_t
 Mode mode_from_level(int level);
 const char *mode_name(Mode m);
 bool mode_is_implemented(Mode m);
+
+// THE SHIPPED DEFAULT, pinned here rather than left as a literal at the config call site, so
+// that moving the ladder's default rung is a deliberate edit against a test and not a one-
+// character change nobody reviews (the same discipline `tests/test_nr_history_plan.cpp` applies
+// to `NgxNRRestoreHistory`'s default OFF).
+//
+// **2 (authoritative), since 2026-09-04.** Level 1 ran on the box (facts §36.22) and answered
+// every question it was built to answer: exactly one candidate offset, byte-IDENTICAL to the
+// bound buffer on the first comparison, latched after 8 claimed announcements, `faults=0`, and
+// `disagree=4` matching `ambClaimed=4` event for event with every assertion WARN naming jitter /
+// PreExposure / ClipToPrevClip - facts §36.20's stale-ring shape exactly. Level 2 is what turns
+// that measurement into a fix: the struct supplies the View, the search becomes the assertion.
+//
+// It is a SAFE default in the strong sense - not "we think it will work" but "it cannot act
+// before it has proven itself". `use_engine_view` requires the latch, and the latch requires 8
+// byte-exact agreements with a buffer the engine bound; on an executable where the offset is
+// wrong, or moved, or where any reader refuses, no latch forms, nothing is substituted, and the
+// search supplies the View exactly as at level 0. A fault at any point disables the mechanism
+// for the session at ERROR. So the worst case of shipping 2 rather than 1 is the behaviour of 1.
+constexpr int kDefaultLevel = 2;
 
 // Whether the struct's View is used for THIS dispatch. Pure, so the gate is tested rather than
 // asserted: below `authoritative`, or before the latch, or when the announcement carried

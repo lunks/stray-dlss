@@ -1567,7 +1567,17 @@ result arrives rather than after:
 
 ---
 
-## 19. The View from the engine's own CPU struct: built, CI-green, one launch from measured (2026-09-04)
+## 19. The View from the engine's own CPU struct: MEASURED, and level 2 is the default (2026-09-04)
+
+> **UPDATED 2026-09-04 EVENING, from the box (facts §36.22).** Level 1 ran, in the menu, one
+> launch. **`FViewInfo+5768` is the offset**, discovered with **exactly one** survivor,
+> byte-IDENTICAL to the bound buffer on the first comparison and then eight announcements running
+> with `preDisagree=0`; `faults=0 off=0 ambiguous=0 empty=0 uncompared=0 unverified=0`. And
+> `disagree=4` matched the search's own `ambClaimed=4` **event for event**, every WARN naming
+> jitter / `PreExposure` / `ClipToPrevClip` at row 0 — §36.20's stale-ring shape, now attributed
+> rather than inferred. Two consequences, both shipped: `kMaxProbesPerScan` is raised to cover the
+> whole window (the scan TRUNCATED at 3973 of 4096 qwords, §19.6), and **level 2 is the default**
+> (§19.3). §19.5's ledger is updated where the launch settled a row.
 
 **The problem, measured (§15.4's decision rule, facts §36.20).** `ambClaimed=36` of ~10 800 claimed
 dispatches: two bound View buffers, `b3=1920x1080 b4=1920x1080`, both the real render rect for the
@@ -1655,8 +1665,8 @@ announcements with no survivor is `absent`, terminal — both sticky **in the st
 | Level | Name | What changes |
 |---|---|---|
 | 0 | off | nothing scanned |
-| **1** | **discover** (default) | scan, carry, compare at claim, latch, log. **The search still supplies the View; the image is byte-identical.** |
-| 2 | authoritative | once latched, the struct supplies the View for every announced dispatch that carries it; the search is the assertion (one WARN per pass on disagreement, counted). `ambClaimed` reads 0 by construction because the search no longer chooses. An announcement that carries nothing, or carries from another offset, falls back to the search — `fellBack=`. |
+| 1 | discover | scan, carry, compare at claim, latch, log. **The search still supplies the View; the image is byte-identical.** The rung the box ran on 2026-09-04 (facts §36.22) |
+| **2** | **authoritative** (default since 2026-09-04) | once latched, the struct supplies the View for every announced dispatch that carries it; the search is the assertion (one WARN per pass on disagreement, counted). `ambClaimed` reads 0 by construction because the search no longer chooses. An announcement that carries nothing, or carries from another offset, falls back to the search — `fellBack=`. |
 | 3 | exclusive | delete the search. **Declared, not built** — asking logs at ERROR and runs 2. A separate decision after 2 runs clean in gameplay. |
 
 Guards, L1's verbatim: `VirtualQuery` before every read (region-cached within a scan so an
@@ -1665,6 +1675,16 @@ a fault latches the mechanism off for the session at ERROR naming the address (`
 every decline a counted fallback. **Windows-portable only:** the pointee is ordinary heap memory —
 no D3D12 resource is mapped, nothing touches vkd3d, DXVK or Wine. The scan runs only while
 `searching`; once latched each announcement costs one guarded qword and one guarded 2448-byte read.
+
+**Why 2 rather than 1 is a safe default, and it is a structural argument rather than optimism.**
+Substitution requires `use_engine_view` to return true, which requires the LATCH, which requires
+eight byte-exact agreements with a buffer the engine bound. On an executable where the offset
+moved, where any reader refuses, or where two candidates survive, **no latch forms, nothing is
+substituted, and the search supplies the View exactly as at level 0** — so the worst case of
+shipping 2 is the behaviour of 1. A fault past the guards disables the mechanism for the session
+at ERROR. The default is `viewcached::kDefaultLevel` and is pinned by a test, so moving the rung
+is a deliberate edit rather than a one-character change (the discipline
+`tests/test_nr_history_plan.cpp` applies to `NgxNRRestoreHistory`).
 
 ### 19.4 What one menu launch prints, in order
 
@@ -1705,8 +1725,39 @@ says cannot happen, so it would be the finding of the session); any `faults`.
 | `SceneDepthZ` is allocated at `GetBufferSizeXY()` | **[derived]**; a mismatch refuses at its own stage counter |
 | The struct's byte layout equals the constant buffer's (so the 2448-byte prefix parses at the same rows) | **HARD** in effect: `CreateUniformBufferImmediate` copies the struct's bytes, and `read_view_cb` has parsed those bytes for weeks |
 | `TUniquePtr` with the default deleter is one pointer | **HARD**, UE4 `UniquePtr.h` (EBO on `TDefaultDelete`) |
-| The scan finds exactly one survivor on this executable, and it latches | **UNCONFIRMED.** Nothing has run on the box |
-| Level 2 drives `ambClaimed` to 0 and moves the 0.33% into `disagree=` | **UNCONFIRMED.** Pure logic tested (`tests/test_view_cached.cpp`, including the measured stale-copy pair as a regression case); not measured live |
+| The scan finds exactly one survivor on this executable, and it latches | **HARD**, facts §36.22: `survivors=1` at every stage, `FViewInfo+5768`, latched after 8 claimed announcements with `preDisagree=0`. Menu, one launch |
+| The offset is `FViewInfo+5768` on this build of `Stray-Win64-Shipping.exe` | **HARD**, facts §36.22 — measured, not derived. Not portable across a game patch, which is why it is scanned for rather than pinned |
+| `SceneDepthZ` is allocated at `GetBufferSizeXY()` (prediction 5) | **HARD in effect**, facts §36.22: `bufferSize=1` — the survivor passed the row-132 test against L1's own depth extent, so a wrong derivation would have refused it |
+| The guards hold on the render thread against a discovered offset | **HARD**, facts §36.22: `faults=0 off=0` over 601 scans, no read the CPU refused |
+| The search's residue is a STALE RING COPY of the same view, not a foreign view | **HARD**, facts §36.22: `disagree=4` == `ambClaimed=4` event for event, every WARN naming jitter / `PreExposure` / `ClipToPrevClip` at row 0 |
+| Level 2 drives `ambClaimed` to 0 and moves the residue into `disagree=` | **UNCONFIRMED.** Level 1 is what ran; the mechanism it depends on is now HARD, the substitution is not. Pure logic tested (`tests/test_view_cached.cpp`, including the measured stale-copy pair as a regression case) |
+| The disagreement RATE (4/601, 0.67%) | **MENU ONLY**, and not comparable with §36.20's gameplay-free 0.33%. §36.21 measured a sibling counter going 0 → 171 across the menu/gameplay boundary |
+| That removing the stale View changes the image | **UNCONFIRMED and not settleable by a counter.** §5's compounding class; the user's eyes decide |
+
+### 19.6 The probe budget had to be the whole window, and it cost ~64 probes
+
+The first live scan came back **TRUNCATED**: `qwords=3973 pointer-shaped=2049 probed=2048`, i.e.
+the 2048-probe budget ran out 123 qwords short of the 4096-qword window. One survivor was already
+in hand, so `FViewInfo+5768` stands — but the claim this scan exists to make is **"exactly ONE
+offset survived"**, and that is a claim about the entire window. A scan that stopped 3% early
+cannot make it, and the difference matters precisely because the latch REFUSES on two survivors
+rather than picking one: a second survivor hiding in the unjudged tail would have been the finding
+of the session, and instead it would have gone unseen.
+
+`kMaxProbesPerScan` is now `kScanWindowBytes / sizeof(uint64_t)` = **4096**, derived rather than
+picked, so with the default window `truncated` **cannot** fire — which restores the flag's meaning:
+if it ever does fire, someone widened the window without raising the budget.
+
+**The cost is small and measured rather than guessed.** At this session's own pointer density
+(2049 of 3973 qwords, 51.6%), the unjudged tail holds about **63 more pointer-shaped qwords** — so
+a full-window scan probes ~2112 instead of 2048: **about 64 more probes, ~156 KB more guarded
+reading, per scan**, against the ~5.0 MB it already did. A probe that clears the range test costs
+one region-cache lookup (VirtualQuery is cached per region, per scan) plus a 2448-byte `memcpy`
+under SEH. And **the scan runs only while `searching`** — eight announcements in this launch —
+after which each announcement costs one guarded qword and one guarded 2448-byte read regardless of
+this constant. The budget's real job is bounding a session where the field is ABSENT, where the
+scan runs for `kAbsentAfter` (240) announcements before giving up: 240 × ~5.2 MB, spread over 240
+frames, on the render thread.
 
 ## 16. The engine warrants the DISPATCH, not the RENDER RECT — and the gap put a magnified corner of the frame on screen (2026-09-03)
 

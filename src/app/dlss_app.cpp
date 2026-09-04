@@ -358,15 +358,18 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		host::cfg::get_bool("EngineSeamFallback", true),
 		host::cfg::get_bool("EngineSeamInputs", true));
 
-	// [STRAYDLSS] EngineSeamViewParams, default 1 (discover). The View CB is located by SEARCH
-	// over the bound root CBVs, and the search was measured taking a STALE RING COPY of this
-	// very view on 0.33% of claimed dispatches (facts §36.20) - two candidates, both the real
-	// render rect, differing only in ClipToPrevClip, jitter and CameraCut, which no structural
-	// test can separate. The engine's own FViewInfo::CachedViewUniformShaderParameters is the
-	// CPU struct that buffer is created from; level 1 discovers its offset and compares it
-	// byte for byte against the search at every claim, changing nothing; level 2 makes it the
-	// source once latched. src/view_params_hook.hpp, docs/RESEARCH-ENGINE-AWARE-REPLAN.md §2.
-	vphook::configure(host::cfg::get_int("EngineSeamViewParams", 1));
+	// [STRAYDLSS] EngineSeamViewParams, default 2 (AUTHORITATIVE since 2026-09-04). The View CB
+	// is located by SEARCH over the bound root CBVs, and the search was measured taking a STALE
+	// RING COPY of this very view on 0.33% of claimed dispatches (facts §36.20) - two candidates,
+	// both the real render rect, differing only in ClipToPrevClip, jitter and CameraCut, which no
+	// structural test can separate. The engine's own FViewInfo::CachedViewUniformShaderParameters
+	// is the CPU struct that buffer is created from; level 1 discovered its offset on the box and
+	// compared it byte for byte against the search at every claim (facts §36.22: FViewInfo+5768,
+	// IDENTICAL on the first comparison, latched after 8 announcements, faults=0), and level 2
+	// makes it the SOURCE once latched. The default lives in `viewcached::kDefaultLevel` and is
+	// pinned by a test, so moving the rung is deliberate. src/view_params_hook.hpp,
+	// docs/RESEARCH-ENGINE-AWARE-REPLAN.md §2, docs/RESEARCH-ENGINE-TAA-HOOK.md §19.
+	vphook::configure(host::cfg::get_int("EngineSeamViewParams", viewcached::kDefaultLevel));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
