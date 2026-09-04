@@ -2435,6 +2435,111 @@ because its guides come from a path tracer that writes dense, correct vectors. *
 "temporal network + screen-space reflections" as a structural mismatch, not an open bug** — the
 available moves are reducing NR's strength on that content, disabling SSR, or accepting it.
 
+> **THERE IS A FOURTH MOVE, and NVIDIA's own header settles the argument for it (2026-09-04,
+> branch `mv-dense-reflections`).** `NVSDK_NGX_D3D12_DLSS_Eval_Params::pInBiasCurrentColorMask`
+> (`nvsdk_ngx_helpers.h:391`, `"DLSS.Input.Bias.Current.Color.Mask"` at `nvsdk_ngx_defs.h:815`)
+> is DLSS SR's per-pixel *"do not trust the history here"* channel, and we have never sent one.
+> It does not claim to know where the reflection went — it says the history is not to be
+> believed for these pixels, which is **precisely and only what we can honestly assert about
+> them**. Built as `[STRAYDLSS] MvMask`, default OFF, constant fill for now.
+>
+> **CORRECTING the sentence above it: "correct reflection motion vectors would need the
+> reflected geometry's motion, which the velocity buffer does not carry" understates the
+> problem.** Four things block the correction, and only the first is about UE 4.27:
+>
+> 1. **The hit distance is not in any buffer.** SSR's ray march knows how far along the
+>    reflected ray it landed and throws that away; UE 4.27's SSR output carries colour and a
+>    fade, not a distance. Without it there is no reflected point to reproject.
+> 2. **The previous frame's NORMALS are not retained.** A mirror's virtual image position needs
+>    the surface's previous position *and* its previous orientation. UE 4.27 keeps no
+>    previous-frame G-buffer, so even a perfect hit distance leaves the reprojection
+>    underdetermined the moment the reflecting surface rotates.
+> 3. **A reflective pixel is a BLEND, so no single vector can be right.** SSR is composited into
+>    scene colour with a fresnel/roughness weight, so the pixel is `(1-w)·diffuse + w·reflection`.
+>    Stray's wet ground is not a mirror; a vector correct for the reflection half is wrong for
+>    the diffuse half, and the motion-vector field has one slot per pixel. This is the decisive
+>    one, and it is not a UE 4.27 limitation — it is arithmetic.
+> 4. **A rough reflection has no single reflected point** (the lobe is wide), and a ray that
+>    missed falls back to a reflection capture, which moves differently again. Coverage varies
+>    per pixel and per frame.
+>
+> **NVIDIA agrees, and says so in the struct.** The same header carries
+> `pInMotionVectorsReflections` — *"motion vectors of reflected objects like for mirrored
+> surfaces"* — a **separate texture**, not a corrected single field, which is the header
+> conceding that one field cannot express both. It sits in the `/*** OPTIONAL - only for
+> research purposes ***/` block beside `GBufferSurface` and `pInMotionVectors3D`. Note the
+> contrast that makes this readable: NVIDIA marked `pInTransparencyMask` *"Unused/Reserved for
+> future use"* and left the bias mask unmarked, so they do label the dead ones.
+>
+> **So option (1), correcting the vector, is not soundly computable from what UE 4.27 gives us,
+> and the honest treatment is to MARK the pixels instead.** That is a conclusion from the data
+> available, not a preference — and the argument survives the G-buffer arriving, because (3)
+> and (4) are untouched by better inputs.
+>
+> **What is NOT yet known, and it gates everything:** whether this runtime honours the mask at
+> all. An NGX parameter block is an unvalidated string map (§5, three times over), so a name
+> being in the header proves nothing about the shipped `nvngx_dlss.dll`, and DLSS's own
+> `ControlMask` sibling in feature 18 turned out to have **two of its three channels dead**.
+> The test is one launch and costs no theory: bind a full-strength constant mask, alternate it
+> against neutral inside one session (`MvMaskAlternate`), and look. A full-strength mask that
+> changes nothing on screen kills the whole idea cleanly — which is worth far more than a
+> content-driven mask that changes nothing, because that would be indistinguishable from a
+> content signal that found nothing.
+>
+> **And the content signal is level 3, deliberately unbuilt.** Roughness (`GBufferB.b`) needs
+> G-buffer access this tree does not have — the heuristic finder was deleted 2026-09-03 and
+> `pool-name-hook` is what would supply the named textures. A better signal than roughness may
+> exist: **the SSR pass's own output alpha** is the actual per-pixel SSR contribution and hit
+> confidence, which accounts for failed rays and the composite weight that roughness alone
+> cannot. Whether UE 4.27's `ScreenSpaceReflections` RDG texture is reachable by name through
+> the outer `FindFreeElement` the pool hook targets is **UNCONFIRMED** and is the first thing
+> to check when that lands.
+
+### The motion-vector density has never been measured — `[STRAYDLSS] MvStats` (2026-09-04)
+
+`shaders/mv_resolve.hlsl` has had two branches since it was written, and **nobody has ever
+measured the split.** That number bounds everything downstream of it: if UE 4.27 writes 95% of
+the field, the quality of our camera reconstruction barely matters; if it writes 40%, it matters
+a great deal. Stray ships `r.BasePassOutputsVelocity=True` (§2.3.1), which broadens coverage
+beyond stock UE4 by an amount that **cannot be reasoned out — only counted**, because the
+per-primitive gates (§5, the fur section) decide it and they are content-dependent.
+
+`MvStats=1` adds sixteen per-pixel counters, reduced through LDS into a **root UAV** (not a
+descriptor-table slot: that would have widened the per-frame slice from three to four and moved
+every offset the shipping path reads). The vector written to `OutMV` is **bit-identical** either
+way. `src/core/mv_census.hpp` is pure, CI-tested, and **refuses to print percentages when its own
+invariants fail** — a broken instrument that prints plausible numbers anyway is worse than one
+that stops, because the numbers get quoted.
+
+Four counters beyond the split are the interesting ones, and each answers a question that could
+not previously be asked:
+
+* **`genuinely moving`** — engine-written pixels whose vector differs from what the camera branch
+  would have produced by more than half a pixel. This separates real movers from *static geometry
+  the base pass merely happened to write a velocity for*, which is the distinction
+  `r.BasePassOutputsVelocity=True` makes and nothing else can see.
+* **`w<=0 rejected`** — the camera branch emits an **exact zero** when `prev_clip.w <= 0`, and
+  DLSS reads a zero as *"this pixel did not move"*, not as *"unknown"*. Every one of those is a
+  lie told to a temporal accumulator. Watch it against `far/sky` in particular: points at
+  infinity under an infinite reversed-Z projection are where `w` is numerically worst, and sky
+  under camera rotation genuinely does move.
+* **`UNORM-clamped`** — the engine's `R16G16B16A16_UNORM` velocity encodes to `V*0.2495 + 0.49999`,
+  so it represents roughly ±2.004 NDC and **clamps** outside that. A clamped value decodes to a
+  wrong vector rather than to nothing, and a `y` that hit the low rail is indistinguishable from
+  "not written" as far as the `x`-channel validity test is concerned.
+* **`non-finite`** — must be 0. If it is not, nothing else on the line is worth reading.
+
+**It complements the velocity dump rather than duplicating it.** `NgxDumpInputs` already writes
+the engine's raw velocity plus a coverage mask PNG (§5, the fur section) — that is two frames with
+a *picture*, which is what shows you *where* the coverage is. The census is a distribution over
+hundreds of frames with the branch health broken out, and it needs no file transfer. **Set
+`NgxDumpAt` past the loading screen and run both in the same launch.**
+
+**And there is a free upper bound available for the same price.**
+`r.BasePassForceOutputsVelocity=1` (§5) bypasses the two per-primitive gates but not the blend
+mode, so a second census arm with it set says exactly how much coverage is lost to per-primitive
+gating versus to translucency. That is the control the raw number wants.
+
 ### The SSR fade and most of the flicker: resolved, cause not fully isolated (2026-09-01)
 
 The long-running "reflections and fine detail fade over tens of seconds, then recover" stopped
