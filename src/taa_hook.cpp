@@ -1307,7 +1307,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			// is `core::plan_letterbox_hold` and every clause of it is a measurement - above
 			// all `View.ViewRectMin`, which is what distinguishes a top-left slide (safe) from a
 			// centred rect (not).
-			bool held = false;
 			if (g_letterbox_hold)
 			{
 				// The output UAV's own extent, found the same way the create site finds it.
@@ -1348,11 +1347,9 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 					render_h = live.render_h;
 					want_out_w = live.output_w;
 					want_out_h = live.output_h;
-					held = true;
 					g_hold_frames.fetch_add(1, std::memory_order_relaxed);
 				}
 			}
-			(void)held;
 
 			if (mv::initialise(native_device, render_w, render_h))
 			{
