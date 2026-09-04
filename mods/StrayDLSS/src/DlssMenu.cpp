@@ -120,14 +120,23 @@ struct Args
 // A widget we construct is referenced by nothing the engine knows about, so the collector takes
 // it and the next tick dereferences freed memory. That is the single cause behind nine Lua
 // crashes on 2026-09-04: the viewport roots a top-level widget and the game's own UI roots its
-// children, but our own hierarchy roots nothing. RF_MarkAsRootSet (UnrealFlags.hpp:69) is
-// exposed to C++ via UObject::SetFlags and is NOT reachable from Lua, which is why no
-// arrangement of Lua calls could fix it.
+// children, but our own hierarchy roots nothing.
+//
+// The root set is an INTERNAL flag (EInternalObjectFlags::RootSet on the FUObjectItem), not an
+// EObjectFlags one. RF_MarkAsRootSet looks like the answer and is a trap: UE 4.27
+// UObjectBase.cpp:181-185 consumes it ONCE, inside AddObject at registration, converts it to the
+// internal flag and CLEARS it - so SetFlags(RF_MarkAsRootSet) on an object that already exists
+// writes a bit nothing ever reads again. The first version of this file did exactly that; it
+// compiled, and it would have crashed like every Lua attempt. UObject::SetRootSet
+// (UEPseudo UObject.hpp:290) sets the real one through the object array, and is C++-only.
 void Root(UObject *o)
 {
 	if (o == nullptr)
 		return;
-	o->SetFlags(static_cast<EObjectFlags>(RF_MarkAsRootSet | RF_Standalone));
+	o->SetRootSet();
+	if (!o->IsRootSet())
+		STRAY_LOG_ERROR("dlss-menu: SetRootSet did not take on %p - expect a crash",
+			static_cast<void *>(o));
 }
 
 void console(const std::wstring &cmd)
@@ -245,8 +254,8 @@ void OnToggle()
 			return;
 		}
 		Root(g_widget);   // before anything can tick
-		STRAY_LOG_WARN("dlss-menu: widget created and ROOTED at %p",
-			static_cast<void *>(g_widget));
+		STRAY_LOG_WARN("dlss-menu: widget created at %p, rootSet=%d",
+			static_cast<void *>(g_widget), g_widget->IsRootSet() ? 1 : 0);
 	}
 
 	UFunction *add = find_fn(STR("/Script/UMG.UserWidget:AddToViewport"));

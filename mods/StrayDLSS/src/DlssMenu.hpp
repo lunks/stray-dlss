@@ -19,7 +19,8 @@
 // children, and a widget we create and host ourselves is rooted by nothing - so the garbage
 // collector takes it and the next tick dereferences freed memory. The timing fits exactly.
 //
-// The fix is EObjectFlags::RF_MarkAsRootSet (Unreal/UnrealFlags.hpp:69) via UObject::SetFlags,
+// The fix is UObject::SetRootSet (UEPseudo UObject.hpp:290) - the INTERNAL RootSet flag, not
+// RF_MarkAsRootSet, which UE 4.27 consumes once at registration and clears (UObjectBase.cpp:181) -
 // which UE4SS exposes to C++ and NOT to Lua. Lua could not express the fix, which is why every
 // Lua attempt failed the same way however the widgets were arranged.
 //
