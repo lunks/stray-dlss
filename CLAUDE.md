@@ -522,6 +522,41 @@ Guard Evaluate to no-op when observed sizes differ from creation sizes.
 > **The general shape, which this project keeps meeting: a value that is still moving is not a
 > value to build against.** The same reasoning that says do not force a `DLSSNR.Reset` on a
 > continuously varying codec scale (§5) says do not rebuild a feature for a rect mid-animation.
+>
+> **AND NOT REBUILDING IS NOT THE SAME AS NOT RUNNING — the debounce alone turned DLSS OFF for
+> every cinematic (2026-09-04, report §18).** USER-REPORTED: *"I think DLSS NR was deactivated on
+> the scene transitions, so it should probably support it?"*, and *"it's a letterbox animation,
+> it slowly slides back to 100% frame."* `RecreateAction::wait` **declines the frame**, and NR
+> consumes the guides the TAA hook publishes on a successful SR evaluate — so SR *and* NR were
+> both off for the whole slide. Removing the hitch was real; leaving DLSS off through every
+> cinematic was not the end state.
+>
+> **The fix is to hold `InRenderSubrectDimensions` at the extent the feature was CREATED with**,
+> and it is exact rather than approximate. The eval params have no output size — `OutWidth`/
+> `OutHeight` are create-time (`nvsdk_ngx_helpers.h:437-440`) and the six `*SubrectBase` fields
+> including `InOutputSubrectBase` are **base coordinates only** (`:377-398`) — so DLSS always
+> upscales the render subrect to the created target. Feed it the engine's shrinking subrect and
+> you get a **non-uniform stretch that animates** (1920x1037 into 3840x2160 is 2.000x across,
+> 2.083x down). Feed it the created extent and the scale never moves; and because UE anchors both
+> rects at the origin, **the engine's shrunken output rect is precisely the image of its shrunken
+> input rect** — it renders rows 0..1036, DLSS maps them to output rows 0..2073, it reads
+> 0..2072, its own `OutputViewRect`. The rows below are computed from input it did not render and
+> nothing displays them.
+>
+> **Two clauses of `core::plan_letterbox_hold` are the load-bearing ones**, and neither is an
+> assumption: `originMoved` re-reads `View.ViewRectMin` every frame, because the prefix mapping
+> is false the moment a title centres its shrinking rect instead of anchoring it top-left; and
+> `outputTooSmall` asks whether the UAV can still hold the created target, which is what stops a
+> genuine resolution change — **1280x720 -> 2560x1440 has the SAME 2.0 scale, so no ratio test
+> can tell it from a slide** — from becoming an out-of-bounds write that vkd3d-proton has no
+> debug layer to object to. That hole was found by the tests, not by reading.
+>
+> **Also fixed, and it was a defect in the debounce as shipped: SR had no reset after a gap.**
+> `ei.reset` was the camera-cut OR alone, so resuming after a declined run reprojected a
+> second-old history across one frame of motion — §5's compounding class exactly. A forced reset
+> is now latched on a decline and on a fresh feature and counted as `forcedResets`.
+>
+> `[STRAYDLSS] NgxLetterboxHold=0` restores the decline. Read `[hold] held= ... notHeld: ...`.
 
 ### 2.2 Filesystem layout
 
