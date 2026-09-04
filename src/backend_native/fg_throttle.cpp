@@ -7,7 +7,6 @@
 #include <dxgi1_4.h>
 
 #include <atomic>
-#include <cstdio>
 #include <mutex>
 
 namespace stray_dlss::native::fg::throttle {
@@ -19,20 +18,6 @@ core::fg::ThrottleState g_state;
 HANDLE g_handle = nullptr;
 std::atomic<bool> g_active{ false }; // fast path for wait_for_slot: armed AND enabled
 bool g_probed_dxgi_device = false;
-char g_report[320] = "throttle: off";
-
-void refresh_report_locked()
-{
-	std::snprintf(g_report, sizeof(g_report),
-		"throttle: %s (%s) latency %u->%u (asked %u) waits=%llu slots=%llu timeouts=%llu failed=%llu skipped=%llu blocked mean %.2f ms max %.2f ms",
-		g_state.armed ? "ARMED" : "inactive", core::fg::throttle_refusal_name(g_state.refusal),
-		g_state.max_latency_before, g_state.max_latency_after, g_state.max_latency_requested,
-		static_cast<unsigned long long>(g_state.waits), static_cast<unsigned long long>(g_state.slots),
-		static_cast<unsigned long long>(g_state.timeouts), static_cast<unsigned long long>(g_state.failures),
-		static_cast<unsigned long long>(g_state.skipped),
-		core::fg::throttle_blocked_mean_ms(g_state), g_state.blocked_max_ns / 1e6);
-}
-
 void close_handle_locked()
 {
 	if (g_handle != nullptr)
@@ -81,7 +66,6 @@ void configure(const core::fg::ThrottleConfig &cfg)
 		g_state.armed = false;
 		g_active.store(false);
 	}
-	refresh_report_locked();
 	if (cfg.enabled)
 		STRAY_LOG_WARN("fg/throttle: ENABLED (maxLatency=%u timeoutMs=%u giveUpAfter=%u). It arms only on a swapchain created with "
 			"DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT - see [STRAYDLSS] NgxFGWaitableSwapChain.",
@@ -102,14 +86,10 @@ void arm(IDXGISwapChain *sc, ID3D12Device *device)
 	// A give-up is for the session: re-arming after a resize must not resurrect a throttle
 	// that has already proved it blocks forever.
 	if (g_state.refusal == core::fg::ThrottleRefusal::gave_up)
-	{
-		refresh_report_locked();
 		return;
-	}
 	if (!g_cfg.enabled || sc == nullptr)
 	{
 		g_state.refusal = core::fg::ThrottleRefusal::disabled;
-		refresh_report_locked();
 		return;
 	}
 	probe_dxgi_device_locked(device);
@@ -151,7 +131,6 @@ void arm(IDXGISwapChain *sc, ID3D12Device *device)
 	if (!g_state.armed)
 		close_handle_locked();
 	g_active.store(g_state.armed && g_cfg.enabled);
-	refresh_report_locked();
 	if (g_state.armed)
 		STRAY_LOG_WARN("fg/throttle: ARMED on swapchain %p: waitable handle %p, max frame latency %u -> %u (asked for %u), "
 			"timeout %u ms, give up after %u consecutive timeouts. Every present we issue now waits for a flip slot FIRST, "
@@ -175,7 +154,6 @@ void disarm(const char *why)
 	g_state.armed = false;
 	g_active.store(false);
 	close_handle_locked();
-	refresh_report_locked();
 	if (was)
 		STRAY_LOG_INFO("fg/throttle: disarmed (%s)", why != nullptr ? why : "?");
 }
@@ -220,7 +198,6 @@ void wait_for_slot(bool hurried)
 			g_active.store(false);
 			close_handle_locked();
 		}
-		refresh_report_locked();
 	}
 	if (gave_up)
 		STRAY_LOG_ERROR("fg/throttle: GIVING UP after %u consecutive results that were not a freed flip slot "
@@ -243,7 +220,5 @@ core::fg::ThrottleState state()
 	std::lock_guard<std::mutex> lock(g_mutex);
 	return g_state;
 }
-
-const char *report() { return g_report; }
 
 } // namespace stray_dlss::native::fg::throttle
