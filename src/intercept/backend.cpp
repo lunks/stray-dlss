@@ -11,7 +11,6 @@ class NullBackend final : public Backend
 public:
 	const char *name() const override { return "null"; }
 	bool resolve_compute_bindings(const CommandContext &, DispatchBindings &) override { return refuse(); }
-	void describe_view(DescriptorId, std::uint32_t, std::vector<BoundTexture> &) override { refuse(); }
 	bool describe_resource(ResourceId, ResourceInfo &) override { return refuse(); }
 	bool resource_from_view(DescriptorId, ResourceId &) override { return refuse(); }
 	bool read_buffer(const BufferRange &, std::uint64_t, void *) override { return refuse(); }

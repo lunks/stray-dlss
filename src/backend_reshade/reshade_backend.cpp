@@ -72,12 +72,6 @@ bool ReshadeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, 
 	return cl != nullptr && rsb::resolve_compute_bindings(cl, out);
 }
 
-void ReshadeBackend::describe_view(icept::DescriptorId view, std::uint32_t reg, std::vector<BoundTexture> &out)
-{
-	if (g_device != nullptr)
-		rsb::describe_bound_view(g_device, reshade::api::resource_view{ view }, reg, out);
-}
-
 bool ReshadeBackend::describe_resource(icept::ResourceId res, icept::ResourceInfo &out)
 {
 	// Liveness FIRST: get_resource_desc dereferences the resource, and ReShade's own maps

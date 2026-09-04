@@ -336,12 +336,6 @@ void dump_tracker_state(reshade::api::device *device, state_tracking *state, des
 	STRAY_LOG_INFO("---------------------------------");
 }
 
-void describe_bound_view(reshade::api::device *device, reshade::api::resource_view view,
-                         std::uint32_t reg, std::vector<BoundTexture> &out)
-{
-	describe(device, view, reg, out);
-}
-
 bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBindings &out)
 {
 	reshade::api::device *device = cmd_list->get_device();

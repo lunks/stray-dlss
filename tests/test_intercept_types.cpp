@@ -49,15 +49,10 @@ TEST_CASE("with no backend installed every query is refused, and set_backend(nul
 	CHECK_FALSE(b->resource_from_view(0x1000, r));
 	unsigned char buf[16];
 	CHECK_FALSE(b->read_buffer(icept::BufferRange{ 0x1000, 0, 16 }, 16, buf));
-	std::vector<BoundTexture> out;
-	b->describe_view(0x1000, 0, out);
-	CHECK(out.empty());
-
 	struct Fake final : icept::Backend
 	{
 		const char *name() const override { return "fake"; }
 		bool resolve_compute_bindings(const icept::CommandContext &, icept::DispatchBindings &) override { return true; }
-		void describe_view(icept::DescriptorId, std::uint32_t, std::vector<BoundTexture> &) override {}
 		bool describe_resource(icept::ResourceId, icept::ResourceInfo &) override { return true; }
 		bool resource_from_view(icept::DescriptorId, icept::ResourceId &) override { return true; }
 		bool read_buffer(const icept::BufferRange &, std::uint64_t, void *) override { return true; }

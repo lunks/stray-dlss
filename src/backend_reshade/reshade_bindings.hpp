@@ -55,12 +55,6 @@ bool resolve_compute_bindings(reshade::api::command_list *cmd_list, DispatchBind
 // dataflow walk's anchor. No root descriptors (UE4 pushes uniform buffers through those,
 // never textures) and no UAVs.
 
-// Describes one bound view — liveness-checked FIRST, exactly like every other view this
-// module touches — into `out`. For callers outside this file (the pass finder's render
-// targets and depth-stencil views) so the stale-view hazard has a single implementation.
-void describe_bound_view(reshade::api::device *device, reshade::api::resource_view view,
-                         std::uint32_t reg, std::vector<BoundTexture> &out);
-
 // Our own pipeline-layout tracking. ReShade's descriptor_tracking utility cannot be used for
 // this: its register_pipeline_layout only deep-copies the range array for
 // pipeline_layout_param_type::descriptor_table, and keeps the caller's POINTER for
