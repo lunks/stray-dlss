@@ -31,6 +31,7 @@
 #include "shader_dump.hpp"
 #include "taa_hook.hpp"
 #include "engine_seam_hook.hpp"
+#include "view_params_hook.hpp"
 
 #include <d3d12.h>
 
@@ -356,6 +357,19 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	seamhook::configure(host::cfg::get_int("EngineSeam", 3),
 		host::cfg::get_bool("EngineSeamFallback", true),
 		host::cfg::get_bool("EngineSeamInputs", true));
+
+	// [STRAYDLSS] EngineSeamViewParams, default 2 (AUTHORITATIVE since 2026-09-04). The View CB
+	// is located by SEARCH over the bound root CBVs, and the search was measured taking a STALE
+	// RING COPY of this very view on 0.33% of claimed dispatches (facts §36.20) - two candidates,
+	// both the real render rect, differing only in ClipToPrevClip, jitter and CameraCut, which no
+	// structural test can separate. The engine's own FViewInfo::CachedViewUniformShaderParameters
+	// is the CPU struct that buffer is created from; level 1 discovered its offset on the box and
+	// compared it byte for byte against the search at every claim (facts §36.22: FViewInfo+5768,
+	// IDENTICAL on the first comparison, latched after 8 announcements, faults=0), and level 2
+	// makes it the SOURCE once latched. The default lives in `viewcached::kDefaultLevel` and is
+	// pinned by a test, so moving the rung is deliberate. src/view_params_hook.hpp,
+	// docs/RESEARCH-ENGINE-AWARE-REPLAN.md §2, docs/RESEARCH-ENGINE-TAA-HOOK.md §19.
+	vphook::configure(host::cfg::get_int("EngineSeamViewParams", viewcached::kDefaultLevel));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
@@ -1111,6 +1125,8 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		char when[32];
 		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
 		seamhook::log_report(when);
+		// The View from the engine's own struct: latch state, and the search judged against it.
+		vphook::log_report(when);
 		// Beside it, the ONE number that says whether the View constant buffer we are reading
 		// every frame is the right one. It is located by SEARCH and `view_params_plausible` is
 		// a shape test the wrong buffer can satisfy; row 135 validates itself from one read
@@ -1257,6 +1273,10 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				char seam[768] = {};
 				if (seamhook::format_report(seam, sizeof(seam)) > 0)
 					std::fprintf(f, "%s\n", seam);
+				// And the View-from-the-struct latch beside it (src/view_params_hook.hpp).
+				char vp[512] = {};
+				if (vphook::format_report(vp, sizeof(vp)) > 0)
+					std::fprintf(f, "%s\n", vp);
 			}
 			{
 				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame

@@ -97,6 +97,14 @@ struct Verdict
 	bool threads_first_seen = false; // this claim latched the announce/claim thread pair
 	bool threads_changed = false;    // the pair moved mid-session — worth one WARN
 	std::uint64_t ledger_sequence = 0;
+	// The View carried from the engine's own CachedViewUniformShaderParameters, copied from
+	// the announcement (seam::Announcement's `view_*`). Judged and used, or not, by
+	// vphook::resolve_at_claim (src/view_params_hook.hpp); never dereferenced here.
+	bool view_carried = false;
+	unsigned view_survivors = 0;
+	std::uint32_t view_offset = 0;
+	ue4::ViewParams view{};
+	unsigned char view_prefix[ue4::kViewPrefixBytes] = {};
 };
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y);
 

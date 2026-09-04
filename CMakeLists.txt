@@ -75,6 +75,8 @@ add_library(stray_dlss_core STATIC
     src/core/taa_signature.hpp
     src/core/engine_seam.cpp
     src/core/engine_seam.hpp
+    src/core/view_cached.cpp
+    src/core/view_cached.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -225,6 +227,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/taa_hook.hpp
         src/engine_seam_hook.cpp
         src/engine_seam_hook.hpp
+        src/view_params_hook.cpp
+        src/view_params_hook.hpp
         src/perf.cpp
         src/perf.hpp
         src/nr_hook.cpp
@@ -461,6 +465,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_dlss_quality.cpp
         tests/test_taa_signature.cpp
         tests/test_engine_seam.cpp
+        tests/test_view_cached.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp

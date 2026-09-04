@@ -31,7 +31,7 @@ refused, which every row must have or it does not ship.
 | # | What we reconstruct today | Lines held | Route the engine offers | What it deletes | Validator | Verdict |
 |---|---|---|---|---|---|---|
 | **1** | **Which resource is bound at each compute register** — the descriptor shadow, fed by 5 `Create*View` + 2 `CopyDescriptors` + heap hooks, walked per dispatch | `descriptor_shadow.{cpp,hpp}` **827**, `heap_math` **59**, the table walk `native_backend.cpp:174-308` **~135**, 8 of the device hooks in `d3d12_hooks.cpp` (**~350** of 1161), `va_map` **81**; **1.694 ms/frame** | **The engine's own bind stream**: `IRHIComputeContext::RHISetShaderTexture` / `RHISetShaderResourceViewParameter` / `RHISetUAVParameter` / `RHISetShaderUniformBuffer`, each carrying the **register index** and the RHI view object (`RHIContext.h:184-215`), issued in a fixed order per pass (`ShaderParameterStruct.h:198-283`) and bracketed by `RHISetComputeShader` / `RHIDispatchComputeShader` (`RenderGraphUtils.h:246-253`) | **All of the above.** Every SRV `t0-t5` and UAV `u0` of §2.3's register map, by the engine's own hand, no copy tracking | The `FRHIUnorderedAccessView*`/`FRHIShaderResourceView*` resolves to a resource in **our registry** via the `CreateUnorderedAccessView`/`CreateShaderResourceView` descriptor-handle cross-match (prior-art §4.5); agreement with the shadow while both run; the `UnsetShaderUAVs` nulls ignored | **Build. This is the dominant simplification** (§1) |
-| **2** | **Which bound CB is `View`** — search every root CBV, keep the first plausible; measured taking a stale ring copy on 0.33% of claimed dispatches (facts §36.20) | `taa_hook.cpp` `read_view_cb` + search + `view_fits_dispatch` + the `[view]` counters **~200**; 1 of 9 root hooks; `registry::buffer_for_va`; the never-built two-offset design of TAA-hook §15 | **`FViewInfo::CachedViewUniformShaderParameters`** (`SceneRendering.h:1047`) — a **CPU copy of the exact struct** TAA's `View.ViewUniformBuffer` is created from (`SceneRendering.cpp:1859-1869`, bound at `TemporalAA.cpp:767`), reachable from the `const FViewInfo&` `AddPasses` already hands us | The search, the CB mapping, the ring-copy hazard, the ambiguity instrument, one root hook, `va_map` | The pointee must pass `view_params_plausible` **and** row 135 **and** its rows 129/130 must equal the extents L1 already resolves — then be **byte-identical** to `read_view_cb`'s 2448-byte prefix while both run | **Build** (§2) |
+| **2** | **Which bound CB is `View`** — search every root CBV, keep the first plausible; measured taking a stale ring copy on 0.33% of claimed dispatches (facts §36.20) | `taa_hook.cpp` `read_view_cb` + search + `view_fits_dispatch` + the `[view]` counters **~200**; 1 of 9 root hooks; `registry::buffer_for_va`; the never-built two-offset design of TAA-hook §15 | **`FViewInfo::CachedViewUniformShaderParameters`** (`SceneRendering.h:1047`) — a **CPU copy of the exact struct** TAA's `View.ViewUniformBuffer` is created from (`SceneRendering.cpp:1859-1869`, bound at `TemporalAA.cpp:767`), reachable from the `const FViewInfo&` `AddPasses` already hands us | The search, the CB mapping, the ring-copy hazard, the ambiguity instrument, one root hook, `va_map` | The pointee must pass `view_params_plausible` **and** row 135 **and** its rows 129/130 must equal the extents L1 already resolves — then be **byte-identical** to `read_view_cb`'s 2448-byte prefix while both run | **BUILT AND MEASURED 2026-09-04** — `[STRAYDLSS] EngineSeamViewParams`, `src/core/view_cached.hpp`, `src/view_params_hook.cpp`. Level 1 ran on the box: **`FViewInfo+5768`**, one survivor, byte-IDENTICAL to the bound buffer, latched, `faults=0`, and `disagree=4` == the search's own `ambClaimed=4` **event for event** (facts §36.22). **Level 2 is now the DEFAULT**; level 3 (delete the search) declared, not built. Level 2's substitution is **UNCONFIRMED live and needs GAMEPLAY** (§2.4, TAA-hook report §19) |
 | **3** | **`u0`** — the SRV/UAV table walk's sole irreducible job | (counted in #1) | Three routes: the RHI bind stream (#1), the pool hook by name `L"TemporalAA"`, a fake `ISceneViewExtension` reading `ResourceRHI` inside `Execute()` | The reason #1 could not be deleted | Per route, in `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` | **In progress** on the box |
 | **4** | **The structural matcher's register roles, depth+stencil signature, rect arithmetic, cooked-hash table, pin, round-trip, shape gates** — bypassed under `EngineSeam=3`, still executed | sweep §11 steps 2+3: **~550** (`taa_hook.cpp` ~230, `taa_signature.cpp` ~160, `taa_hashes.hpp` 51, tests ~60) | Already the seam; #1 removes the last reason to run the matcher at all (register roles) | ~550 lines and the `MatchResult` dependency | The seam's own `unclaimed=0`/`orphans=0` session, already the licence condition | **Delete, after #1** — the sweep already said so; #1 removes its last excuse (§4) |
 | **5** | **RR's G-buffer guides** — the heuristic finder was deleted (~1 900 lines) and RR now refuses; nothing replaces it | 0 today; **~1 900 prevented** from regrowing | **The render-target pool's name argument.** In 4.27 `GBufferA-E`, `SceneDepthZ`, `GBufferVelocity`, `SceneColorDeferred` are allocated through the *outer* `FRenderTargetPool::FindFreeElement` with literal names (`SceneRenderTargets.cpp:1005-1741`) — **the exact function UEVR hooks**, with `Out` as an explicit parameter and no ABI trap | Any future finder. Replaces 1 900 lines with ~150 | Name equality + `FPooledRenderTargetDesc` format/extent + the `+8` `FRHITexture` → registry; and `FSceneRenderTargets`'s public members (`SceneRenderTargets.h:459-476`) as an independent oracle | **Build when RR is wired; do not rebuild a finder** (§5) |
@@ -197,6 +197,53 @@ we already parse.
 **Failure mode.** The block is `TUniquePtr`-owned by the `FViewInfo`; `FViewInfo` lives in the scene
 renderer, which is destroyed after the frame. Reading at `AddPasses` is inside its lifetime (§12.9's
 rule); reading later is not. Carry values, never the pointer.
+
+### 2.4 Status: BUILT 2026-09-04; level 1 MEASURED, level 2 shipped as the default
+
+`src/core/view_cached.{hpp,cpp}` (pure: scan, six predictions, byte diff, latch, decision),
+`src/view_params_hook.{hpp,cpp}` (live: guarded readers, the announce-time scan, the claim-time
+comparison and substitution), `[STRAYDLSS] EngineSeamViewParams` (default 2 since 2026-09-04;
+it shipped at 1 and the level-1 launch below is what moved it). Two refinements
+against the design above, both from reading the source rather than assuming it:
+
+* **Prediction 4 uses row 132 against L1's depth extent, not rows 129/130.** `ViewSizeAndInvSize`
+  is the VIEW rect, which is smaller than the depth texture whenever the scene buffer is left
+  oversized (§2.3 of CLAUDE.md measured 2560x1440 depth under a 1280x720 rect); what equals the
+  depth extent is `BufferSizeAndInvSize` = `SceneContext.GetBufferSizeXY()` (HARD,
+  `SetupUniformBufferParameters`). Rows 129/130 are tested against the announcement's own output
+  rect instead, from above and below, with the two predicates the search already uses.
+* **Byte-equality is judged at CLAIM, not at announce**, because the search's bytes only exist
+  there; the announcement carries the decoded `ViewParams` and the raw prefix. That is also what
+  makes the latch honest about the 0.33%: a disagreement BEFORE the latch resets the run (a wrong
+  offset never latches), and one AFTER it is counted as the search's error, which is the only
+  reading left once the offset has matched the bound buffer eight announcements running.
+
+Level 1 discovers, compares and reports and changes nothing; level 2 makes the struct the source
+once latched and gates `ambClaimed` off for those dispatches; level 3 deletes the search and is
+declared, not built. Full design, the launch checklist and the provenance ledger:
+`docs/RESEARCH-ENGINE-TAA-HOOK.md` §19.
+
+**MEASURED THE SAME DAY, level 1, main menu, one launch (facts §36.22).** Every prediction the
+design made held:
+
+* **`FViewInfo+5768`**, with **`survivors=1` at every stage** — and the scan does not stop at the
+  first hit, so that is a statement about everything it judged (with the caveat in §19.6: the
+  probe budget truncated the last 3% of the window, and has been raised to cover it).
+* **Prediction 6 held on the first comparison and then eight announcements running**,
+  `preDisagree=0`. Two routes, two threads, one exact 2448-byte agreement.
+* **`disagree=4` matched the search's own `ambClaimed=4` event for event**, every WARN naming
+  jitter / `PreExposure` / `ClipToPrevClip` at row 0. So facts §36.20's residue really is a stale
+  ring copy of the same view, confirmed rather than inferred — which is the claim this whole row
+  rests on.
+* `faults=0 off=0 ambiguous=0 empty=0 uncompared=0 unverified=0`. Every guard silent.
+
+**Level 2 is therefore the default from 2026-09-04**, and it is safe by construction rather than
+by optimism: substitution requires the latch, the latch requires eight byte-exact agreements with
+a buffer the engine bound, and where no latch forms the search supplies the View exactly as at
+level 0. **What is still UNCONFIRMED is the substitution itself, and it must be judged in
+GAMEPLAY** — the menu offers no shadow, capture or planar-reflection view, and §36.21 records a
+sibling counter going 0 → 171 across that boundary. The criterion is `ambClaimed=0` on the
+`[view]` line with the stale events appearing under `disagree=` on `[viewParams]`.
 
 ---
 
