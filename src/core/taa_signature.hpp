@@ -171,6 +171,71 @@ std::uint64_t find_eye_adaptation_srv(const std::vector<BoundTexture> &srvs);
 // GTemporalAATileSizeX/Y. The dispatch is ceil(viewrect / 8). (docs/RESEARCH.md §4.1)
 constexpr std::uint32_t kTaaTileSize = 8;
 
+// UE 4.27's own floor on a temporal upscale, `kMinTAAUpsampleResolutionFraction`
+// (SceneView.h:1438-1439) — the same constant `seam::discover` already decodes out of
+// ITemporalUpscaler's vtable to prove it found the right interface. The engine will not ask
+// for an upscale from below half the output rect on either axis, so a render rect under it is
+// not this dispatch's view.
+constexpr double kMinUpsampleFraction = 0.5;
+// DLSS's most aggressive quality mode is Ultra Performance at 3x linear; 3.5 leaves room for a
+// future mode without letting an absurd ratio through.
+constexpr double kMaxUpscaleFactor = 3.5;
+// UE4 quantises the render rect to 8-pixel tiles, which moves the ratio by well under this at
+// every screen percentage this project runs. A genuine mismatch (1:1 against 16:9) is off by 78%.
+constexpr double kAspectTolerance = 0.04;
+
+// IS (render -> output) A SHAPE DLSS CAN PERFORM ON THE PRIMARY VIEW?
+//
+// The two operands come from DIFFERENT authorities and that is the whole point of the test.
+// `out_*` is the engine's own announced OutputViewRect; `render_*` is the View constant
+// buffer's ViewSizeAndInvSize, and the View CB is located by SEARCHING every bound constant
+// buffer in slot order and keeping the first plausible hit (CLAUDE.md §2.6, taa_hook.cpp). A
+// shadow, cubemap-face, planar-reflection or scene-capture view IS a real `View` uniform
+// buffer: it passes plausibility, the row-135 self-check and `view_fits_dispatch` (which
+// bounds the view only from ABOVE), so one sitting on a lower root parameter wins the search.
+//
+// MEASURED on the box 2026-09-03, one 114,000-frame session: 37 of 62 DLSS features were
+// created at render rects that cannot be the primary view — 64x34 through 64x52, 128x109,
+// 128x126, 256x240, 1024x1024 — every one of them announced by the engine as an upscale to
+// 3840x2160. DLSS was then told `InRenderSubrectDimensions` of 64x41 against the real
+// 1920x1080 scene colour, so it read the TOP-LEFT CORNER of the frame and magnified it ~60x
+// over the whole screen. That is the user's "a texture pops up over the whole screen".
+//
+// Being announced through `ITemporalUpscaler::AddPasses` warrants the DISPATCH and the OUTPUT
+// rect. It warrants nothing about a constant buffer we went looking for ourselves, which is
+// why this test must run under the engine's gate too.
+bool primary_view_shape_ok(std::uint32_t render_w, std::uint32_t render_h,
+                           std::uint32_t out_w, std::uint32_t out_h);
+
+// IS `t` ACCEPTABLE AS DLSS's pInColor FOR A RENDER SUBRECT OF `render_w` x `render_h`?
+//
+// The colour input is the ONLY DLSS input with no independent authority behind it. Depth and
+// velocity come from the engine's own FPassInputs (L1); depth, stencil, velocity and the
+// output UAV are each format-matched in `match_taa_dispatch`. Colour is taken from register
+// t1 (CLAUDE.md §2.3) and, until this predicate, from nothing else at all — a live pointer was
+// the entire test.
+//
+// It cannot be cross-checked against the engine either, and the reason is structural rather
+// than incidental: `FPassInputs.SceneColorTexture` is the post-chain scene colour, whose
+// `ResourceRHI` is assigned inside `FRDGBuilder::Execute()`, so it resolves `rhi_null` at
+// announce BY DESIGN. The live log reads `l1: resolved=0 partial=103402` — depth and velocity
+// resolved on every claim, colour on none — so the L1 disagreement assertion for colour has
+// never once executed. "Nothing has ever suggested colour was misidentified"
+// (docs/RESEARCH-ENGINE-TAA-HOOK.md §14.4) is therefore an artifact of never having looked.
+//
+// What CAN be asserted is what the shader itself requires of `InputSceneColor`:
+//   * a Tex2D — NGX rejects anything else outright ("input Color parameter needs to be Tex2D
+//     resource"), and `describe()` reports width/height 0 for a buffer;
+//   * an HDR float colour format — RGBA16_FLOAT in gameplay, R11G11B10_FLOAT in the menu
+//     (CLAUDE.md §5). A streamed material texture is BC-compressed and can never be either;
+//   * at least the render subrect DLSS is told to read. NOT equality: UE4 allocates the scene
+//     buffer at the scene-buffer extent, not the view size (CLAUDE.md §2.5), and under dynamic
+//     resolution the view rect is strictly smaller — this session announced 3840x2073.
+// `output_format` is the TAA output UAV's format when known: TAA reads and writes the same
+// buffer kind, so it is a free extra assertion. Pass `TexFormat::unknown` to skip it.
+bool colour_input_acceptable(const BoundTexture &t, std::uint32_t render_w,
+                             std::uint32_t render_h, TexFormat output_format);
+
 // `view_width`/`view_height` are the RENDER rect (View.ViewSizeAndInvSize). The dispatch is
 // sized over the OUTPUT rect, which under temporal upsampling is larger, so the match is made
 // against the output UAV's own extent instead of against the render rect.

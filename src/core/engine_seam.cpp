@@ -413,6 +413,7 @@ const char *seam_refusal_name(SeamRefusal r)
 	case SeamRefusal::view_unreadable: return "viewUnreadable";
 	case SeamRefusal::dead_inputs:     return "deadInputs";
 	case SeamRefusal::role_unresolved: return "roleUnresolved";
+	case SeamRefusal::bad_render_rect: return "badRenderRect";
 	case SeamRefusal::mv_failed:       return "mvFailed";
 	case SeamRefusal::create_failed:   return "createFailed";
 	case SeamRefusal::eval_failed:     return "evalFailed";

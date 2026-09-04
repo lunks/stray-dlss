@@ -884,7 +884,8 @@ int format_report(char *buffer, std::size_t size)
 	return std::snprintf(buffer, size,
 		"seam=%s mode=%s hooked=%d announced=%llu claimed=%llu unclaimed=%llu orphans=%llu "
 		"lookalikesRefused=%llu overflow=%llu unreadableRect=%llu | notClaimed: %s=%llu "
-		"nearMiss=%llu | claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu | "
+		"nearMiss=%llu | claimedButNoSR: %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu %s=%llu "
+		"%s=%llu | "
 		"evaluated=%llu | "
 		"l1: resolved=%llu partial=%llu fellBack=%llu stale=%llu faults=%llu off=%d",
 		on ? "found" : "off", seam::mode_name(m), hooked() ? 1 : 0,
@@ -903,6 +904,8 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::dead_inputs)]),
 		seam::seam_refusal_name(seam::SeamRefusal::role_unresolved),
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::role_unresolved)]),
+		seam::seam_refusal_name(seam::SeamRefusal::bad_render_rect),
+		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::bad_render_rect)]),
 		seam::seam_refusal_name(seam::SeamRefusal::mv_failed),
 		static_cast<unsigned long long>(out[static_cast<std::size_t>(seam::SeamRefusal::mv_failed)]),
 		seam::seam_refusal_name(seam::SeamRefusal::create_failed),

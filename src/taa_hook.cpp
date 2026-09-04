@@ -172,6 +172,8 @@ std::unordered_map<std::uint64_t, bool> g_candidate_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_disagreement_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_hash_assert_logged;
 std::unordered_map<std::uint64_t, bool> g_seam_rect_assert_logged;
+// One WARN per pass when register t1 holds something that cannot be InputSceneColor.
+std::unordered_map<std::uint64_t, bool> g_colour_reg_rejected_logged;
 bool g_seam_first_engine_claim_logged = false;
 
 // Why a structurally matched TAA pass never reached DLSS.
@@ -1359,13 +1361,70 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							m.verdict == MatchVerdict::hash_and_structural ||
 							seam_gate == seam::Gate::engine;
 
+						// THE COLOUR INPUT IS SHAPE-CHECKED LIKE EVERY OTHER DLSS INPUT.
+						//
+						// Until 2026-09-03 it was not, and it is the only one that was not:
+						// depth, stencil and velocity are format-matched in match_taa_dispatch,
+						// the output UAV must be an HDR float colour target, depth and velocity
+						// additionally come from the engine's own FPassInputs (L1) — while the
+						// register pick took whatever was live at t1, with no format, no extent
+						// and no dimensionality test, and handed it to NGX as pInColor.
+						//
+						// It cannot be cross-checked against the engine either, and that is
+						// structural rather than incidental: FPassInputs.SceneColorTexture is
+						// the post-chain scene colour, whose ResourceRHI is assigned inside
+						// FRDGBuilder::Execute(), so it resolves `rhi_null` at announce BY
+						// DESIGN. The live log reads `l1: resolved=0 partial=103402` — depth and
+						// velocity on every claim, colour on none — so the L1 disagreement
+						// assertion below has never once executed for colour, and
+						// docs/RESEARCH-ENGINE-TAA-HOOK.md §14.4's "nothing has ever suggested
+						// colour was misidentified" is an artifact of never having looked.
+						//
+						// So assert what the shader itself requires of InputSceneColor, and
+						// REFUSE rather than evaluate when t1 does not meet it. Refusing costs
+						// one frame of the engine's own TAA; not refusing puts an arbitrary
+						// texture through the upscaler and into u0.
 						std::uint64_t reg_colour = 0;
+						const BoundTexture *reg_colour_tex = nullptr;
+						bool reg_colour_rejected = false;
 						if (trust_registers)
 						{
 							for (const auto &t : b.srvs)
 							{
-								if (t.slot == kSceneColourReg && icept::backend()->is_resource_live(t.resource))
+								if (t.slot != kSceneColourReg ||
+									!icept::backend()->is_resource_live(t.resource))
+									continue;
+								reg_colour_tex = &t;
+								if (colour_input_acceptable(t, render_w, render_h,
+										out_tex != nullptr ? out_tex->format : TexFormat::unknown))
 									reg_colour = t.resource;
+								else
+									reg_colour_rejected = true;
+							}
+							if (reg_colour_rejected && reg_colour == 0)
+							{
+								bool first = false;
+								{
+									std::lock_guard<std::mutex> lock(g_mutex);
+									first = !g_colour_reg_rejected_logged[hash];
+									g_colour_reg_rejected_logged[hash] = true;
+								}
+								if (first)
+									STRAY_LOG_WARN("COLOUR INPUT REFUSED on pass 0x%016llx: "
+										"register t%u holds %p (%ux%u fmt=%d) which is not "
+										"InputSceneColor — it must be a 2D HDR float colour "
+										"texture (the output UAV is fmt=%d) of at least the "
+										"render rect %ux%u. DLSS SR does not run on this "
+										"dispatch; the engine's own TAA does. If this fires "
+										"steadily, read the render rect first: it comes from "
+										"the View CB slot-order search, and a wrong one makes "
+										"every colour candidate fail. Once per pass.",
+										static_cast<unsigned long long>(hash), kSceneColourReg,
+										reinterpret_cast<void *>(reg_colour_tex->resource),
+										reg_colour_tex->width, reg_colour_tex->height,
+										static_cast<int>(reg_colour_tex->format),
+										out_tex != nullptr ? static_cast<int>(out_tex->format) : -1,
+										render_w, render_h);
 							}
 							if (!g_ngx_registers_logged)
 							{
@@ -1505,26 +1564,34 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						// descriptor's render size comes from the View CB's view rect (see the
 						// comment above). Gating the matcher left this path untouched — the
 						// bogus creates continued with zero rejections logged.
-						// Under the engine's gate the shape test is moot: a cubemap face or
-						// a reflection capture never reaches ITemporalUpscaler::AddPasses.
-						bool shape_ok = true;
-						if (seam_gate != seam::Gate::engine &&
-							fd.render_width > 0 && fd.render_height > 0 &&
-							fd.output_width > 0 && fd.output_height > 0)
-						{
-							const double in_aspect = static_cast<double>(fd.render_width) /
-								static_cast<double>(fd.render_height);
-							const double out_aspect = static_cast<double>(fd.output_width) /
-								static_cast<double>(fd.output_height);
-							// 4% absorbs UE4's 8-pixel tile quantisation at every ratio we run;
-							// a genuine mismatch (5.8:1 against 1.78:1) is out by 225%.
-							if (in_aspect > out_aspect * 1.04 || in_aspect < out_aspect * 0.96)
-								shape_ok = false;
-							// Ultra Performance is 3x linear; 3.5 leaves room for a future mode.
-							if (static_cast<double>(fd.output_width) /
-								static_cast<double>(fd.render_width) > 3.5)
-								shape_ok = false;
-						}
+						// THE SHAPE TEST RUNS UNDER THE ENGINE'S GATE TOO, and it was wrong
+						// not to. (CORRECTED 2026-09-03; the skip was added by f947ee4, the
+						// commit that made EngineSeam=3 the default, reasoning "a cubemap
+						// face or a reflection capture never reaches
+						// ITemporalUpscaler::AddPasses".)
+						//
+						// That reasoning covers ONE of the test's two operands. `fd.output_*`
+						// is the engine's own announced OutputViewRect and is trustworthy.
+						// `fd.render_*` is `View.ViewSizeAndInvSize` out of a constant buffer
+						// we located by SEARCHING every bound CB in slot order and keeping the
+						// first plausible hit — nothing the engine announced. A shadow,
+						// planar-reflection or scene-capture view IS a real View uniform
+						// buffer, so it passes plausibility, the row-135 self-check and
+						// `view_fits_dispatch` (which bounds the view only from ABOVE), and one
+						// on a lower root parameter wins the search.
+						//
+						// MEASURED on the box, one 114,000-frame session: 37 of 62 DLSS
+						// features were created at render rects that cannot be the primary view
+						// — 64x34 through 64x52, 128x109, 128x126, 256x240, 1024x1024 — every
+						// one of them upscaling to the announced 3840x2160. DLSS was then told
+						// InRenderSubrectDimensions of 64x41 against the real 1920x1080 scene
+						// colour, so it read the TOP-LEFT CORNER of the frame and magnified it
+						// ~60x over the whole screen. Refusing costs one frame of the engine's
+						// own TAA (`suppress_engine_dispatch` is only set on a successful
+						// evaluate); not refusing puts an unrelated part of the world on the
+						// display. Prime directive 2.
+						const bool shape_ok = primary_view_shape_ok(
+							fd.render_width, fd.render_height, fd.output_width, fd.output_height);
 
 						const bool dims_ok = shape_ok &&
 							fd.output_width >= fd.render_width &&
@@ -1549,7 +1616,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 						const bool roles_ok =
 							dims_ok && colour != nullptr && output != nullptr;
 						const bool feature_ok = roles_ok && ngx::ensure_feature(native, fd);
-						if (seam_gate == seam::Gate::engine && !roles_ok)
+						// A shape refusal and a role refusal are different fixes, so they are
+						// different counters: the first says the View CB search handed us
+						// another view's size, the second that a binding could not be named.
+						if (seam_gate == seam::Gate::engine && !shape_ok)
+							seamhook::note_outcome(seam::SeamRefusal::bad_render_rect);
+						else if (seam_gate == seam::Gate::engine && !roles_ok)
 							seamhook::note_outcome(seam::SeamRefusal::role_unresolved);
 						else if (seam_gate == seam::Gate::engine && !feature_ok)
 							seamhook::note_outcome(seam::SeamRefusal::create_failed);
