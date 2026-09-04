@@ -369,9 +369,24 @@ int apply_from_config()
 			if (k.read_only || !host::cfg::has(k.ini_key))
 				continue;
 			const float now = value_of(k);
-			const float want = k.kind == Kind::real
-				? host::cfg::get_float(k.ini_key, now)
-				: static_cast<float>(host::cfg::get_int(k.ini_key, static_cast<int>(std::lround(now))));
+			// Each kind through ITS OWN coercion, because they are not interchangeable:
+			// ini_parse_int("true") fails its strtol and silently returns the fallback, so
+			// reading a boolean as an int would make `NgxNR=true` a no-op that looks like a
+			// value the tab refused rather than one it never parsed.
+			float want = now;
+			switch (k.kind)
+			{
+			case Kind::boolean:
+				want = host::cfg::get_bool(k.ini_key, now != 0.0f) ? 1.0f : 0.0f;
+				break;
+			case Kind::integer:
+			case Kind::combo:
+				want = static_cast<float>(host::cfg::get_int(k.ini_key, static_cast<int>(std::lround(now))));
+				break;
+			case Kind::real:
+				want = host::cfg::get_float(k.ini_key, now);
+				break;
+			}
 			if (want == now)
 				continue;
 			set_value(k, want);
