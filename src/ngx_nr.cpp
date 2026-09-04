@@ -190,6 +190,7 @@ unsigned int g_ui_correction = 1;
 // wrote DLSSNR.Style before this knob existed, so 0 reproduces that behaviour exactly rather
 // than picking a value that merely looks neutral.
 unsigned int g_style = 0;
+unsigned int g_depth_inverted = 1;   // reversed-Z; 0 is the deliberate lie, see the header
 float g_mvec_scale_override = 0.0f;
 // NR's OWN temporal accumulation is keyed on the COLOUR grid, so nothing in the feature notices
 // when the GUIDE grid moves underneath it — and ours moves whenever the screen percentage does
@@ -614,8 +615,8 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 	// is what the smear under high-contrast objects turned out to be (facts §54, §55).
 	//
 	// Writing both costs two map entries and removes the question rather than arguing it.
-	g_params->Set(kDepthInverted, 1u);
-	g_params->Set(kDepthInverted, 1);
+	g_params->Set(kDepthInverted, g_depth_inverted);
+	g_params->Set(kDepthInverted, static_cast<int>(g_depth_inverted));
 	g_params->Set(kEnabled, 1u);
 	g_params->Set(kIntensity, g_intensity);
 	g_params->Set(kLocalTone, g_local_tone);
@@ -991,6 +992,7 @@ void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
 }
 
 void set_style(unsigned int style) { g_style = style; }
+void set_depth_inverted(unsigned int inverted) { g_depth_inverted = inverted ? 1u : 0u; }
 
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
 {
@@ -1299,8 +1301,8 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kMVecScaleY, scale_y);
 	// Both overloads — see the create site for why. kReset below is already written signed,
 	// which is the inconsistency that made this worth suspecting in the first place.
-	g_params->Set(kDepthInverted, 1u);
-	g_params->Set(kDepthInverted, 1);
+	g_params->Set(kDepthInverted, g_depth_inverted);
+	g_params->Set(kDepthInverted, static_cast<int>(g_depth_inverted));
 	g_params->Set(kReset, reset ? 1 : 0);
 	g_params->Set(kEnabled, 1u);
 	g_params->Set(kEnabled, 1);
