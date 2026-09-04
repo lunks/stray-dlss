@@ -202,7 +202,8 @@ rule); reading later is not. Carry values, never the pointer.
 
 `src/core/view_cached.{hpp,cpp}` (pure: scan, six predictions, byte diff, latch, decision),
 `src/view_params_hook.{hpp,cpp}` (live: guarded readers, the announce-time scan, the claim-time
-comparison and substitution), `[STRAYDLSS] EngineSeamViewParams` (default 1). Two refinements
+comparison and substitution), `[STRAYDLSS] EngineSeamViewParams` (default 2 since 2026-09-04;
+it shipped at 1 and the level-1 launch below is what moved it). Two refinements
 against the design above, both from reading the source rather than assuming it:
 
 * **Prediction 4 uses row 132 against L1's depth extent, not rows 129/130.** `ViewSizeAndInvSize`
