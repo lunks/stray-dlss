@@ -494,6 +494,35 @@ Observed swapchains from `IDXGISwapChain::ResizeBuffers`:
 **[derived]** Each output-resolution change requires a full NGX `ReleaseFeature` + `CreateFeature`.
 Guard Evaluate to no-op when observed sizes differ from creation sizes.
 
+> **AND THE DISTINCTION INSIDE THAT SENTENCE IS LOAD-BEARING (2026-09-03, report §17, facts
+> §36.21).** A **render**-rect change within one output needs NO recreate — DLSS takes it per
+> evaluate through `InRenderSubrectDimensions`, which `ngx_backend::evaluate` has always set. An
+> **output**-rect change does, because NGX has no output-subrect DIMENSIONS: the eval params
+> carry only `InOutputSubrectBase`, a base coordinate, and the target extent is fixed at
+> `CreateFeature` (**HARD**, `nvsdk_ngx_helpers.h:377-398`).
+>
+> **The user's second defect lives exactly there.** *"During some script scene transitions, the
+> NR kinda pops up/slows down as if there was something off."* Measured: a cinematic-bar
+> animation walks the view rect `3840x2160 -> 3840x2073` and back, aspect **1.778 -> 1.85**, in
+> runs of **6 to 10 consecutive feature creations** — 31 of one session's 88. Both operands move
+> together, so it is the engine genuinely upscaling into a shrinking rect, and every step
+> destroyed DLSS's temporal accumulation (the pop) and paid a full `CreateFeature` (the hitch;
+> the same session carries 164 stalls, recent ones 57-79 ms against a 16-18 ms median).
+>
+> **So the fix is not to recreate faster, it is to stop CHASING.** `src/core/feature_recreate.hpp`
+> debounces RE-creation: a differing rect must be asked for `[STRAYDLSS] NgxRecreateStableFrames`
+> (default 8) frames running before anything is torn down, and meanwhile `ensure_feature` returns
+> false so the engine's own TAA renders the frame. Against the measured sequence that is **zero
+> creations per transition**, and because the primary feature is never released **DLSS's history
+> survives the whole cinematic** — so the pop at the END goes too. The FIRST creation is never
+> debounced; a genuine resolution change settles at once and costs 8 frames. `=0` restores the old
+> behaviour for an A/B. Read `[recreate] deferred= restarts=`, and
+> `dlss_recreate_deferred/restarts` in the status file.
+>
+> **The general shape, which this project keeps meeting: a value that is still moving is not a
+> value to build against.** The same reasoning that says do not force a `DLSSNR.Reset` on a
+> continuously varying codec scale (§5) says do not rebuild a feature for a rect mid-animation.
+
 ### 2.2 Filesystem layout
 
 ```
@@ -731,6 +760,23 @@ Config and saves live in the **Proton prefix**:
 > **And the remedy is still the search, not the gate** — gate `ue4::view_fraction_plausible`
 > (already written, already measured, deliberately ungated) so the wrong candidate is SKIPPED and
 > the real view found, rather than the frame declined. Report §16.5.
+>
+> **BOTH HALVES ARE NOW SHIPPED, AND THE FIX IS WORTH MORE THAN §16 THOUGHT (2026-09-03, report
+> §17, facts §36.21).** `view_fraction_plausible` is GATED inside the search — a candidate below
+> the engine's 0.5 minimum is skipped and the search continues to the real view — with
+> `primary_view_shape_ok` / `colour_input_acceptable` / `badRenderRect` kept as the create-site
+> backstop. `suspectSmall` becomes **`tooSmall=`** on the `[view]` line and now counts the fix
+> firing, not a frame we got wrong.
+>
+> **Measured over a longer session of the same build: 88 DLSS feature creations, and the
+> SEQUENCE is what settles the value.** Each of the 26 impossible-rect creations is a LONE
+> excursion (`…C A C…`), so it also costs the primary-view recreation that follows it:
+> **52 of 88, 59%, are this bug.** §36.20's `suspectSmall=0` was **the menu**, where no shadow,
+> capture or planar-reflection view exists to be offered — a counter reading 0 where the
+> phenomenon cannot occur is not a refutation, and that retraction is the §2.4 menu/load trap in
+> a new place.
+>
+> **The other 31 creations are REAL and are the user's second defect** — see §2.1.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does

@@ -1667,6 +1667,16 @@ exactly the number this session produced (`suspectSmall=162`). **It should be ga
 
 It lives on `seam-l1-crash`, not on `main`, so it is not duplicated here.
 
+> **DONE, 2026-09-03, branch `fix-render-rect` (facts §36.21).** Both halves are assembled into
+> one build: `view_fraction_plausible` is now GATED inside the View-CB search — a candidate below
+> the engine's 0.5 minimum is SKIPPED and the search continues to the real view, so DLSS runs
+> correctly instead of the frame being declined — and `primary_view_shape_ok` /
+> `colour_input_acceptable` / `badRenderRect` stay as the create-site backstop for when it does
+> not. `suspectSmall` changes meaning accordingly and is reported as **`tooSmall=`**: it now
+> counts a candidate REJECTED and stepped over, i.e. the fix firing, not a frame we got wrong.
+> The complementarity of the two bounds is pinned in CI over the live log's own rects
+> (`tests/test_view_params.cpp`, "the two bounds are COMPLEMENTARY").
+
 ### 16.6 Provenance ledger
 
 | Claim | Status |
@@ -1681,3 +1691,99 @@ It lives on `seam-l1-crash`, not on `main`, so it is not duplicated here.
 | The colour resource itself was correct in the measured session | **HARD** for the pinned pass's DISPATCH REPORT; **SOFT** that it was correct on every frame — nothing logs it per frame |
 | That the magnified corner is what the user saw as "a carpet full screen" | **SOFT.** The mechanism is measured and the appearance follows from it; no screenshot ties a specific frame to a specific bogus rect |
 | Whether refusing these frames removes the artefact | **UNCONFIRMED.** Not run on the box |
+
+
+---
+
+## 17. THE SAME SEARCH COSTS 59% OF ALL DLSS FEATURE CREATIONS — and the other 40% is a cinematic (2026-09-03)
+
+§16 diagnosed the wrong-View bug from 62 feature creations and predicted a fix. This section
+**measures what the fix is worth**, from a longer session of the same build, and answers the
+second user report in the same pass. Everything here is read from the live
+`stray-dlss-plugin.log` at frame 258 600 — read-only, while the user was playing. Facts §36.21.
+
+### 17.1 Classify the creations, then look at their ORDER
+
+88 `DLSS feature created:` lines, classified by `primary_view_shape_ok`:
+
+| group | count |
+|---|---|
+| **A** impossible rects (`64x34` … `1024x1024` -> `3840x2160`) | **26** |
+| **B** `1920x10xx -> 3840x20xx`, 22 distinct pairs | **31** |
+| **C** `1920x1080 -> 3840x2160`, the primary view | **31** |
+
+```
+CBBBBBBBCACBBBBBBBBCACACACACACACACACACACACACACACACACACACACACACACACBBBBBBCBBBBBBBBBBCACAC
+```
+
+**Every A is a lone excursion**, so each one also costs the C that follows it: **52 of 88
+creations, 59%, are the wrong-View bug**, not 26. **Every B is part of a run** — 7, 8, 6 and 10
+consecutive — which is the shape of an animation, not of a setting change.
+
+**The order was the whole measurement.** The histogram alone shows group A; only the sequence
+shows that removing A removes 26 more creations with it. When a counter is a total, ask for the
+order before estimating what removing it buys.
+
+### 17.2 Group B is real, and it is the user's second defect
+
+*"During some script scene transitions, the NR kinda pops up/slows down as if there was something
+off."* The B rects walk `3840x2160` down to `3840x2073` and back with the aspect going
+**1.778 -> 1.85** — cinematic bars, animated — while the render rect tracks the output rect at
+exactly 0.5. **Both operands move together, so this is the engine genuinely upscaling into a
+shrinking view rect**, not a wrong buffer: it passes `primary_view_shape_ok`, and should.
+
+Each step destroyed DLSS's temporal accumulation (the pop) and paid a full `CreateFeature` (the
+hitch — the same session carries 164 stalls, the recent ones 57-79 ms against a 16-18 ms median).
+
+### 17.3 A subrect cannot express it, so the recreate is genuine
+
+The obvious remedy — create once at the maximum and pass the actual rect per evaluate — is what
+DLSS offers for **dynamic resolution**, and `ngx_backend::evaluate` already does it:
+`InRenderSubrectDimensions` is set from `fd.render_*` every frame.
+
+**But there is no output equivalent.** `NVSDK_NGX_D3D12_DLSS_Eval_Params` carries
+`InRenderSubrectDimensions` (dimensions) and `InOutputSubrectBase` (a base COORDINATE only); the
+target extent is fixed at `CreateFeature` by `InTargetWidth/Height`. **HARD**,
+`nvsdk_ngx_helpers.h:377-398`. Dynamic resolution works precisely because the output rect does
+*not* move. Here it does, on every step.
+
+**So CLAUDE.md §2.1's rule is intact and the distinction it invites is real but does not rescue
+this case:** a render-rect change within one output needs no recreate (and gets none), an
+output-rect change does.
+
+### 17.4 The fix is to stop CHASING, not to recreate faster
+
+`src/core/feature_recreate.hpp`. A rect that is still moving is not a rect worth building a
+feature for — by the time the tensors are allocated it has moved again. So a RE-creation is
+debounced: a differing rect must be asked for `[STRAYDLSS] NgxRecreateStableFrames` (default 8)
+frames running before anything is torn down, and meanwhile `ensure_feature` returns false so the
+engine's own TAA renders the frame. The first creation is never debounced.
+
+Replayed against the measured sequence (`tests/test_feature_recreate.cpp`) that is **zero
+creations per transition** — and, because the primary feature is never released, **DLSS's history
+survives the whole cinematic**, so the pop at the END of the animation goes too. A genuine
+resolution change asks for the same new rect every frame, settles at once, and costs 8 frames of
+engine TAA.
+
+`NgxRecreateStableFrames=0` restores the old behaviour exactly, for an A/B without a rebuild.
+
+### 17.5 What one launch should show
+
+| read | Defect | pass |
+|---|---|---|
+| `[view] tooSmall=` | 1 | counting up, while **no** `DLSS feature created:` line names an impossible rect (`64x…`, `1024x1024`, a portrait) |
+| `[seam] … badRenderRect=` | 1 | at or near 0. It is the backstop; a rising rate means the search is still losing and the gate is carrying it |
+| `[recreate] deferred= restarts=` | 2 | both counting up across a scripted transition, with **no** creation inside it |
+| `DLSS feature created:` total | both | ONE per resolution actually used. 88 was the measured before |
+
+### 17.6 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| 88 creations, split 26 / 31 / 31, in the sequence quoted | **HARD**, the live log, one session |
+| Each group-A creation is a lone excursion costing one group-C recreation | **HARD**, from that sequence |
+| `suspectSmall=171` in gameplay against `0` in the menu (§36.20) | **HARD**, same log; §36.20's "refuted" is retracted |
+| NGX has no output-subrect DIMENSIONS, only a base coordinate | **HARD**, `nvsdk_ngx_helpers.h:377-398` |
+| Group B is cinematic letterboxing rather than dynamic resolution | **SOFT.** The aspect change 1.778 -> 1.85 and the run structure say so; no engine-side confirmation was sought |
+| The debounce produces zero creations per transition | **HARD in CI** against the measured rects; **UNCONFIRMED live** |
+| 8 frames is the right threshold | **[derived]** from the ~3-frame step cadence the runs imply. A knob for that reason |
