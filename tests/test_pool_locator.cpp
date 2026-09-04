@@ -600,3 +600,41 @@ TEST_CASE("with no internal literal the tiebreak cannot fire, and a clean win st
 	CHECK_FALSE(v.resolved_by_internal);
 	CHECK_FALSE(v.internal_called_by_target);
 }
+
+TEST_CASE("the internal-call fact settles a TIE and never overrules a clear ranking")
+{
+	// A four-group winner that does not call the internal, beside a one-group candidate that
+	// does. The ranking already decided; a mis-attributed internal_fn must not be able to
+	// promote the loser. What the scan does instead is REPORT it, which is what a human should
+	// see rather than what a rule should act on.
+	FakeModule m;
+	const std::uint64_t winner = m.cell_va(8);
+	const std::uint64_t oddity = m.cell_va(9);
+	const std::uint64_t internal_fn = m.cell_va(10);
+	m.declare(8);
+	m.text[m.cell_off(8)] = 0xC3;
+	m.declare(9);
+	m.write_call(m.cell_off(9) + 0x10, internal_fn);
+	m.declare(10);
+	const std::uint64_t fmt = m.put_wide("%d MB, NewRT %s %s");
+	m.write_lea(m.cell_off(10), fmt);
+	m.text[m.cell_off(10) + 7] = 0xC3;
+
+	m.write_caller(0, m.put_wide("GBufferA"), { winner, oddity });
+	m.write_caller(1, m.put_wide("SceneDepthZ"), { winner });
+	m.write_caller(2, m.put_wide("GBufferF"), { winner });
+	m.write_caller(3, m.put_wide("ScreenSpaceAO"), { winner });
+	m.sort_pdata();
+	Image img = m.image();
+	FunctionTable tab = m.table(img);
+
+	const Locate v = locate(img, tab);
+	CHECK(v.status == LocateStatus::ok);
+	CHECK(v.target == winner);
+	CHECK(v.groups == 4);
+	CHECK(v.runner_up == oddity);
+	CHECK(v.runner_up_groups == 1);
+	CHECK_FALSE(v.resolved_by_internal);
+	CHECK(v.internal_fn == internal_fn);
+	CHECK_FALSE(v.internal_called_by_target);
+}

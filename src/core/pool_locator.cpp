@@ -595,7 +595,6 @@ Locate locate(const seam::Image &image, const u0::FunctionTable &table)
 		}
 	}
 
-
 	// Rank on DISTINCT ENCLOSING FUNCTIONS first: a helper shared by several call sites inside
 	// one function is reached by many names and only ever one group, which is exactly the
 	// false positive this ordering refuses. Names, then proximity, break ties for reporting.
@@ -630,18 +629,29 @@ Locate locate(const seam::Image &image, const u0::FunctionTable &table)
 	// and a tie is still refused.
 	if (v.internal_fn != 0 && second != cand_count)
 	{
-		const bool best_calls = function_calls(image, table, cands[best].target, v.internal_fn);
-		const bool second_calls = function_calls(image, table, cands[second].target, v.internal_fn);
-		if (!best_calls && second_calls)
+		// Only a real TIE is "resolved" by this. Setting the flag when the ranking had already
+		// separated them would make the log claim a fact settled something it never had to.
+		// ONLY A REAL TIE. This fact is allowed to settle a tie the ranking cannot; it is not
+		// allowed to overrule a candidate the ranking separated, because then a single
+		// mis-attributed `internal_fn` could promote a one-group candidate over a six-group
+		// one. Where the ranking already decided, the internal call is REPORTED and nothing
+		// more - and it reading "does NOT call it" on a clear winner is exactly the kind of
+		// thing a human should see rather than a rule should act on.
+		const bool tied = cands[second].group_count >= cands[best].group_count;
+		if (tied)
 		{
-			const std::size_t swap = best;
-			best = second;
-			second = swap;
-			v.resolved_by_internal = true;
-		}
-		else if (best_calls && !second_calls)
-		{
-			v.resolved_by_internal = true;
+			const bool best_calls = function_calls(image, table, cands[best].target, v.internal_fn);
+			const bool second_calls = function_calls(image, table, cands[second].target, v.internal_fn);
+			if (best_calls != second_calls)
+			{
+				if (second_calls)
+				{
+					const std::size_t swap = best;
+					best = second;
+					second = swap;
+				}
+				v.resolved_by_internal = true;
+			}
 		}
 	}
 	if (v.internal_fn != 0)
