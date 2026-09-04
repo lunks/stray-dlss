@@ -6,6 +6,8 @@
 // more predictable than interleaving with ReShade's heap management. (docs/RESEARCH.md §3.5)
 #pragma once
 
+#include "core/mv_census.hpp"
+
 #include <cstdint>
 
 struct ID3D12Device;
@@ -105,6 +107,31 @@ struct Stats
 };
 
 const Stats &stats();
+
+// --- The census: LEVEL 1, measures and changes nothing ---
+//
+// [STRAYDLSS] MvStats (default 0 = OFF, i.e. byte-identical to before this existed). When on,
+// shaders/mv_resolve.hlsl additionally reduces sixteen per-pixel counters through LDS into a
+// root UAV; the vector it writes to the output texture is unchanged either way. Every
+// `window` dispatches the counters are copied to a readback buffer and zeroed on the GPU, and
+// the result is folded in a few presents later by on_present().
+//
+// The number this exists to produce: what fraction of the motion field UE 4.27 actually WROTE
+// versus what we reconstruct from depth. It bounds how much the reconstruction's quality can
+// matter, and nobody has ever measured it. (src/core/mv_census.hpp)
+void set_stats(bool enabled, std::uint32_t window_frames);
+bool stats_enabled();
+
+// Drains any completed census readback. Must be called once per present, from the same place
+// input_dump::on_present() is called — the readback is fence-free and paced in presents, the
+// same conservative latency every other readback in this project uses.
+void on_present();
+
+// Everything folded in so far, plus the most recent window on its own. Both are handed to
+// mvcensus::format_report / format_status, which REFUSE to print a split when the counters
+// contradict the shader's own construction.
+const mvcensus::Census &census_total();
+const mvcensus::Census &census_last();
 
 const char *last_error();
 

@@ -85,6 +85,10 @@ add_library(stray_dlss_core STATIC
     src/core/nr_lifetime.hpp
     src/core/nr_mask_plan.cpp
     src/core/nr_mask_plan.hpp
+    src/core/mv_census.cpp
+    src/core/mv_census.hpp
+    src/core/mv_mask_plan.cpp
+    src/core/mv_mask_plan.hpp
     src/core/nr_params.cpp
     src/core/nr_params.hpp
     src/core/present_plan.cpp
@@ -247,6 +251,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/input_dump.hpp
         src/mv_resolve.cpp
         src/mv_resolve.hpp
+        src/mv_mask.cpp
+        src/mv_mask.hpp
         src/d3d12_restore.cpp
         src/d3d12_restore.hpp
         # The native backend: our own D3D12 vtable hooks, the descriptor and root shadows,
@@ -406,6 +412,11 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         # same reason (src/nr_mask.hpp), so the debug layer can judge whether it stores as well
         # as records.
         src/nr_mask.cpp
+        # The bias-current-colour mask: one committed texture and a typed UAV clear. There is no
+        # shader here at all, so what the harness judges is the STATE MACHINE - the texture must
+        # be UNORDERED_ACCESS for the clear and NON_PIXEL_SHADER_RESOURCE when NGX reads it, and
+        # D3D12 cannot be asked which it is (src/mv_mask.hpp).
+        src/mv_mask.cpp
         # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
         # 2026-09-02), so the harness that links present_owner must also link perf.
         src/perf.cpp
@@ -477,6 +488,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp
+        tests/test_mv_census.cpp
+        tests/test_mv_mask_plan.cpp
         tests/test_nr_params.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp

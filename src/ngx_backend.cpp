@@ -1034,6 +1034,14 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 
 	eval.InRenderSubrectDimensions.Width = in.render_width;
 	eval.InRenderSubrectDimensions.Height = in.render_height;
+
+	// Null unless [STRAYDLSS] MvMask is on, which is the default — so this line is inert until
+	// somebody asks for it. The subrect base is (0,0) because the mask is our own texture,
+	// allocated grow-only at the render extent with the frame's rect anchored at the origin,
+	// exactly like the motion-vector field beside it.
+	eval.pInBiasCurrentColorMask = in.bias_mask;
+	eval.InBiasCurrentColorSubrectBase.X = 0;
+	eval.InBiasCurrentColorSubrectBase.Y = 0;
 	// The camera-cut OR (CLAUDE.md §2.8), plus any gap in evaluates. Resuming after a gap with
 	// reset=0 tells DLSS the history is one frame old when it is many, and the error compounds
 	// through the accumulation instead of costing one frame.
@@ -1092,6 +1100,10 @@ bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 	ka.resources[2] = in.motion_vectors;
 	ka.resources[3] = in.output;
 	ka.resources[4] = in.exposure; // null under NgxExposure=auto
+	// Slot 5 is free on the SR path (RR uses 4-7 for its guides and takes no exposure texture).
+	// The mask is ours and outlives the frame anyway, but NGX holds no references to anything
+	// it is handed, so it is kept alive on the same terms as every other input.
+	ka.resources[5] = in.bias_mask; // null unless MvMask is on
 	for (ID3D12Resource *r : ka.resources)
 		if (r != nullptr)
 			r->AddRef();

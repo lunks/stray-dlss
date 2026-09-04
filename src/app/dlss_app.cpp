@@ -26,6 +26,7 @@
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
 #include "nr_hook.hpp"
+#include "mv_mask.hpp"
 #include "nr_mask.hpp"
 #include "perf.hpp"
 #include "shader_dump.hpp"
@@ -340,6 +341,56 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	int mv_dispatch_mode = 2;
 	mv_dispatch_mode = host::cfg::get_int("MvDispatch", mv_dispatch_mode);
 	taa_hook::configure(mv_resolve, restore_heaps, restore_state, mv_dispatch_mode);
+
+	// --- The motion-vector census. LEVEL 1: measures, changes nothing. ---
+	//
+	// [STRAYDLSS] MvStats (default 0). Answers the question nobody has ever measured on this
+	// title: what fraction of the motion field UE 4.27 actually WROTE, versus what our resolve
+	// reconstructs from depth and ClipToPrevClip. That number bounds how much the
+	// reconstruction's quality can matter. Stray ships r.BasePassOutputsVelocity=True
+	// (CLAUDE.md §2.3.1), so coverage is broader than stock UE4 by an amount that cannot be
+	// reasoned out — only counted. (src/core/mv_census.hpp)
+	bool mv_stats = false;
+	mv_stats = host::cfg::get_bool("MvStats", mv_stats);
+	int mv_stats_frames = 300;
+	mv_stats_frames = host::cfg::get_int("MvStatsFrames", mv_stats_frames);
+	if (mv_stats_frames < 0)
+		mv_stats_frames = 0;
+	mv::set_stats(mv_stats, static_cast<std::uint32_t>(mv_stats_frames));
+	if (mv_stats)
+		STRAY_LOG_INFO("[STRAYDLSS] MvStats=1 MvStatsFrames=%d: the resolve additionally counts "
+			"which branch every pixel took. The vector written to the motion-vector texture is "
+			"UNCHANGED; read the MV CENSUS lines.", mv_stats_frames);
+
+	// --- The DLSS bias-current-colour mask. LEVEL 2: observes and asserts. ---
+	//
+	// [STRAYDLSS] MvMask (default 0 = nothing is bound and the behaviour is byte-identical to
+	// before this existed). MvMaskValue is the constant fill; MvMaskAlternate flips between it
+	// and neutral every N frames so the A/B happens INSIDE one session, which is the only way
+	// CLAUDE.md §5 has ever managed to compare a temporal change honestly. MvMaskFormat exists
+	// because NVIDIA documents no required format and the runtime validates none.
+	//
+	// Stage 1 is a CONSTANT fill on purpose: a mask that is silently ignored and a mask that is
+	// bound and doing nothing look identical on a screenshot, so the plumbing must be proven
+	// with a value whose effect is known before any content signal is written.
+	bool mv_mask = false;
+	mv_mask = host::cfg::get_bool("MvMask", mv_mask);
+	double mv_mask_value = 1.0;
+	mv_mask_value = host::cfg::get_float("MvMaskValue", static_cast<float>(mv_mask_value));
+	int mv_mask_alternate = 0;
+	mv_mask_alternate = host::cfg::get_int("MvMaskAlternate", mv_mask_alternate);
+	if (mv_mask_alternate < 0)
+		mv_mask_alternate = 0;
+	int mv_mask_format = mvmask::kDefaultFormat;
+	mv_mask_format = host::cfg::get_int("MvMaskFormat", mv_mask_format);
+	mvmask::configure(mv_mask, static_cast<float>(mv_mask_value),
+		static_cast<std::uint32_t>(mv_mask_alternate), mv_mask_format);
+	if (mv_mask)
+		STRAY_LOG_WARN("[STRAYDLSS] MvMask=1 value=%.4f alternate=%d format=%d: DLSS SR is being "
+			"handed pInBiasCurrentColorMask. This CHANGES THE IMAGE by design - a non-zero mask "
+			"tells DLSS to distrust its history. Judge it against the alternation's own phases, "
+			"never across launches.",
+			mv_mask_value, mv_mask_alternate, mv_mask_format);
 
 	bool ngx_evaluate = false;
 	ngx_evaluate = host::cfg::get_bool("NgxEvaluate", ngx_evaluate);
@@ -1233,6 +1284,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 	// identifies which state produced it.
 	taa_hook::note_present(frame);
 	input_dump::on_present();
+	// Drains any completed MV census readback and emits the MV CENSUS line. Fence-free and
+	// paced in presents, the same conservative latency input_dump uses; a no-op with MvStats=0.
+	mv::on_present();
 
 	// A machine-readable heartbeat, so automation can tell menu from gameplay without a human
 	// looking at the screen. Rewritten in place every StatusFileFrames presents (default 30);
@@ -1399,6 +1453,19 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				std::fprintf(f, "nr_validated=%d\n", nr::validated() ? 1 : 0);
 				for (int i = 0; i < nr::kNrRefusalCount; ++i)
 					std::fprintf(f, "nr_refused_%s=%u\n", nr::kNrRefusalNames[i], nr_reasons[i]);
+			}
+
+			// The motion-vector census and the bias mask. Both write their keys even when off,
+			// so a shell reading the file can tell "measured zero" from "never measured" —
+			// mv_census_windows=0 is the second, and the invariant field says whether the
+			// numbers are believable at all.
+			{
+				char block[1536];
+				if (mvcensus::format_status(block, sizeof(block), mv::census_total()) > 0)
+					std::fputs(block, f);
+				std::fprintf(f, "mv_stats_enabled=%d\n", mv::stats_enabled() ? 1 : 0);
+				if (mvmask::format_status(block, sizeof(block)) > 0)
+					std::fputs(block, f);
 			}
 			std::fclose(f);
 		}
@@ -1641,6 +1708,30 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 					static_cast<double>(sc.mask_b),
 					static_cast<unsigned long long>(sc.mask_fills), nrmask::format(),
 					static_cast<unsigned long long>(sc.mask_bytes >> 10));
+		}
+	}
+
+	if ((frame % 600) == 0 && frame > 0)
+	{
+		char when[32];
+		std::snprintf(when, sizeof(when), "frame %llu", static_cast<unsigned long long>(frame));
+
+		// The RUNNING TOTAL, once per 600 presents. The per-window MV CENSUS lines are emitted
+		// by mv::on_present as each readback lands; this is the session's aggregate, and the
+		// two differ exactly as much as the session's content does — a menu, a loading screen
+		// and a walked street have different splits, which is why both are printed.
+		if (mv::stats_enabled())
+		{
+			char report[768];
+			mvcensus::format_report(report, sizeof(report), mv::census_total());
+			STRAY_LOG_INFO("[%s] MV CENSUS TOTAL - %s", when, report);
+		}
+
+		if (mvmask::enabled())
+		{
+			char line[320];
+			mvmask::format_report(line, sizeof(line));
+			STRAY_LOG_INFO("[%s] %s", when, line);
 		}
 	}
 

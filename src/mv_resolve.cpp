@@ -25,6 +25,23 @@ float g_legacy_transposed_clip = 0.0f;
 float g_sparse_sign[2] = { 1.0f, 1.0f };
 float g_camera_sign[2] = { 1.0f, 1.0f };
 
+// [STRAYDLSS] MvStats / MvStatsFrames. OFF by default: with this false the shader takes the
+// uniform `stats` branch nowhere and the output is bit-identical to the build before the
+// census existed.
+bool g_stats_enabled = false;
+std::uint32_t g_census_window = 300;
+
+// How many presents a census readback is left alone before it is mapped. The same conservative
+// latency src/input_dump.cpp uses, and for the same reason: there is no fence of our own on the
+// game's queue, so progress is counted in presents.
+constexpr std::uint64_t kCensusReadbackPresents = 5;
+
+constexpr std::size_t kCensusBytes =
+	static_cast<std::size_t>(mvcensus::kCounterCount) * sizeof(std::uint32_t);
+
+mvcensus::Census g_census_total;
+mvcensus::Census g_census_last;
+
 struct Params
 {
 	float clip_to_prev_clip[16];
@@ -35,9 +52,13 @@ struct Params
 	float pad0;
 	float sparse_sign[2];
 	float camera_sign[2];
-	float padding[4];
+	// Takes one float out of what used to be `float padding[4]`, so sizeof(Params) and every
+	// preceding offset are unchanged. See the matching note in shaders/mv_resolve.hlsl.
+	float stats_enable;
+	float padding[3];
 };
 static_assert(sizeof(Params) % 16 == 0, "constant buffer must be 16-byte aligned");
+static_assert(sizeof(Params) == 128, "the cbuffer layout is pinned; a shift here is silent");
 
 // The versioning arithmetic lives in core/ring.hpp so it can be unit-tested; getting a slot
 // offset wrong corrupts silently rather than failing.
@@ -61,6 +82,21 @@ struct State
 	std::uint64_t paint_frame = 0;
 	ID3D12Resource *constants = nullptr;       // upload heap, kFrameCount * aligned Params
 	ID3D12Resource *out_mv = nullptr;          // R16G16_FLOAT at render resolution
+
+	// The census. Resolution-independent, so these are created once and NEVER retired by a
+	// resolution change — the grow path below deliberately does not touch them.
+	ID3D12Resource *stats_counters = nullptr;  // DEFAULT heap, UAV, kCensusBytes
+	ID3D12Resource *stats_zero = nullptr;      // UPLOAD heap, kCensusBytes of zeroes
+	ID3D12Resource *stats_readback[kFrameCount] = {};
+	std::uint64_t window_frames = 0;           // dispatches since the last snapshot
+	struct PendingCensus
+	{
+		std::uint32_t slot = 0;
+		std::uint64_t frames = 0;
+		std::uint64_t presents_left = 0;
+		bool live = false;
+	};
+	PendingCensus pending[kFrameCount];
 
 	UINT descriptor_size = 0;
 	UINT constant_stride = 0;
@@ -138,15 +174,22 @@ bool create_root_signature()
 	ranges[1].BaseShaderRegister = 0;
 	ranges[1].OffsetInDescriptorsFromTableStart = 2;
 
-	D3D12_ROOT_PARAMETER params[2] = {};
+	D3D12_ROOT_PARAMETER params[3] = {};
 	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	params[0].Descriptor.ShaderRegister = 0; // b0
 	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	params[1].DescriptorTable.NumDescriptorRanges = 2;
 	params[1].DescriptorTable.pDescriptorRanges = ranges;
+	// The census counters, as a ROOT UAV. Deliberately not a table slot: a table entry would
+	// widen the per-frame descriptor slice from three to four and shift every offset
+	// ring::descriptor_offset computes, so an instrument that is supposed to change nothing
+	// would have moved the descriptors the shipping path reads. A root descriptor costs two
+	// DWORDs of the root signature and no heap space at all.
+	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+	params[2].Descriptor.ShaderRegister = 1; // u1
 
 	D3D12_ROOT_SIGNATURE_DESC desc = {};
-	desc.NumParameters = 2;
+	desc.NumParameters = 3;
 	desc.pParameters = params;
 	desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -304,6 +347,104 @@ bool create_resources(std::uint32_t width, std::uint32_t height)
 	return true;
 }
 
+// The census's own resources: a counter buffer the shader atomically adds into, a page of
+// zeroes to reset it with on the GPU, and one readback buffer per ring slot.
+//
+// Created ONCE, resolution-independent, and never retired — the grow path retires the heap,
+// the constants and the output texture, none of which these are. The counter buffer is bound
+// as a root UAV on EVERY dispatch whether or not the census is enabled, because a shader that
+// declares u1 must have it bound; with the census off nothing ever writes to it.
+bool create_census_resources()
+{
+	if (g_state.stats_counters != nullptr)
+		return true;
+
+	D3D12_RESOURCE_DESC buf = {};
+	buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	buf.Width = kCensusBytes;
+	buf.Height = 1;
+	buf.DepthOrArraySize = 1;
+	buf.MipLevels = 1;
+	buf.Format = DXGI_FORMAT_UNKNOWN;
+	buf.SampleDesc.Count = 1;
+	buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	D3D12_HEAP_PROPERTIES default_heap = {};
+	default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC uav_buf = buf;
+	uav_buf.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	HRESULT hr = g_state.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
+		&uav_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+		IID_PPV_ARGS(&g_state.stats_counters));
+	if (FAILED(hr))
+	{
+		set_error("CreateCommittedResource(stats_counters)", hr);
+		return false;
+	}
+
+	D3D12_HEAP_PROPERTIES upload = {};
+	upload.Type = D3D12_HEAP_TYPE_UPLOAD;
+	hr = g_state.device->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &buf,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_state.stats_zero));
+	if (FAILED(hr))
+	{
+		set_error("CreateCommittedResource(stats_zero)", hr);
+		return false;
+	}
+	{
+		void *mapped = nullptr;
+		D3D12_RANGE no_read = { 0, 0 };
+		if (SUCCEEDED(g_state.stats_zero->Map(0, &no_read, &mapped)) && mapped != nullptr)
+		{
+			std::memset(mapped, 0, kCensusBytes);
+			D3D12_RANGE written = { 0, kCensusBytes };
+			g_state.stats_zero->Unmap(0, &written);
+		}
+	}
+
+	D3D12_HEAP_PROPERTIES readback = {};
+	readback.Type = D3D12_HEAP_TYPE_READBACK;
+	for (UINT f = 0; f < kFrameCount; ++f)
+	{
+		hr = g_state.device->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buf,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_state.stats_readback[f]));
+		if (FAILED(hr))
+		{
+			set_error("CreateCommittedResource(stats_readback)", hr);
+			return false;
+		}
+	}
+	return true;
+}
+
+// Snapshots the counters into this slot's readback buffer and zeroes them on the GPU, so the
+// next window starts from nothing. Recorded on the GAME's list, immediately after the dispatch
+// whose UAV barrier already made the writes visible.
+void record_census_snapshot(ID3D12GraphicsCommandList *cmd, UINT slot)
+{
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = g_state.stats_counters;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	cmd->ResourceBarrier(1, &b);
+
+	cmd->CopyBufferRegion(g_state.stats_readback[slot], 0, g_state.stats_counters, 0,
+		kCensusBytes);
+
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	cmd->ResourceBarrier(1, &b);
+
+	cmd->CopyBufferRegion(g_state.stats_counters, 0, g_state.stats_zero, 0, kCensusBytes);
+
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	cmd->ResourceBarrier(1, &b);
+}
+
 // Copies the game's own SRV descriptors into our heap.
 //
 // This deliberately does NOT recreate the views from resource pointers. ReShade never calls
@@ -437,7 +578,15 @@ const Stats &stats()
 	g_state.stats.bytes_live = bytes;
 	return g_state.stats;
 }
-bool is_ready() { return g_state.pso != nullptr && g_state.out_mv != nullptr; }
+// The census counter buffer is part of readiness, not an extra. The shader DECLARES u1, so
+// its root descriptor must be bound on every dispatch; a caller that ignored initialise()'s
+// return and dispatched with u1 unbound would be the silent-fault class this project keeps
+// paying for, and vkd3d-proton has no debug layer to object.
+bool is_ready()
+{
+	return g_state.pso != nullptr && g_state.out_mv != nullptr &&
+		g_state.stats_counters != nullptr;
+}
 ID3D12Resource *output() { return g_state.out_mv; }
 
 bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
@@ -492,6 +641,13 @@ bool initialise(ID3D12Device *device, std::uint32_t width, std::uint32_t height)
 		return false;
 	if (g_state.heap == nullptr && !create_resources(width, height))
 		return false;
+	// REQUIRED even with the census off, and it is not a judgement call: the shader declares
+	// u1, so its root descriptor must be bound on every dispatch, and a NULL root descriptor
+	// under a driver with no debug layer is exactly the class of silent fault this project
+	// keeps paying for. These are four buffers of 64 bytes; if they cannot be allocated the
+	// device is already lost, and refusing loudly here beats dispatching with u1 unbound.
+	if (!create_census_resources())
+		return false;
 
 	STRAY_LOG_INFO("mv_resolve ready: R16G16_FLOAT %ux%u", width, height);
 	return true;
@@ -515,6 +671,14 @@ void shutdown()
 			li.b->Release();
 	}
 	g_state.input_keep_alive.clear();
+
+	release(g_state.stats_counters);
+	release(g_state.stats_zero);
+	for (auto &rb : g_state.stats_readback)
+		release(rb);
+	for (auto &p : g_state.pending)
+		p = State::PendingCensus{};
+	g_state.window_frames = 0;
 
 	release(g_state.out_mv);
 	release(g_state.constants);
@@ -635,6 +799,12 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	params.sparse_sign[1] = g_sparse_sign[1];
 	params.camera_sign[0] = g_camera_sign[0];
 	params.camera_sign[1] = g_camera_sign[1];
+	// The census counts a WINDOW of dispatches, so it must be on for every dispatch in that
+	// window or the counters describe a mixture. A mid-window toggle simply starts counting;
+	// the frame count below is what makes the resulting percentages honest either way.
+	const bool stats_this_frame = g_stats_enabled && g_state.stats_counters != nullptr &&
+		dispatch_mode == 2;
+	params.stats_enable = stats_this_frame ? 1.0f : 0.0f;
 
 	void *mapped = nullptr;
 	D3D12_RANGE no_read = { 0, 0 };
@@ -658,6 +828,8 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 	D3D12_GPU_DESCRIPTOR_HANDLE table = g_state.heap->GetGPUDescriptorHandleForHeapStart();
 	table.ptr += ring::descriptor_offset(slot, g_state.descriptor_size);
 	cmd->SetComputeRootDescriptorTable(1, table);
+	// Bound unconditionally: the shader declares u1 whether or not it writes to it.
+	cmd->SetComputeRootUnorderedAccessView(2, g_state.stats_counters->GetGPUVirtualAddress());
 
 	if (dispatch_mode != 0)
 	{
@@ -672,9 +844,102 @@ bool record(ID3D12GraphicsCommandList *cmd, const ResolveInputs &in, int dispatc
 		uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 		uav_barrier.UAV.pResource = g_state.out_mv;
 		cmd->ResourceBarrier(1, &uav_barrier);
+
+		if (stats_this_frame)
+		{
+			// The census's own writes need their own visibility barrier; the one above names
+			// the motion-vector texture.
+			D3D12_RESOURCE_BARRIER stats_barrier = {};
+			stats_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+			stats_barrier.UAV.pResource = g_state.stats_counters;
+			cmd->ResourceBarrier(1, &stats_barrier);
+
+			++g_state.window_frames;
+			const UINT census_slot = slot;
+			if (g_census_window != 0 && g_state.window_frames >= g_census_window &&
+				!g_state.pending[census_slot].live)
+			{
+				record_census_snapshot(cmd, census_slot);
+				State::PendingCensus &p = g_state.pending[census_slot];
+				p.slot = census_slot;
+				p.frames = g_state.window_frames;
+				p.presents_left = kCensusReadbackPresents;
+				p.live = true;
+				g_state.window_frames = 0;
+			}
+		}
 	}
 
 	return true;
+}
+
+void set_stats(bool enabled, std::uint32_t window_frames)
+{
+	g_stats_enabled = enabled;
+	g_census_window = window_frames;
+}
+
+bool stats_enabled() { return g_stats_enabled; }
+
+const mvcensus::Census &census_total() { return g_census_total; }
+const mvcensus::Census &census_last() { return g_census_last; }
+
+void on_present()
+{
+	for (auto &p : g_state.pending)
+	{
+		if (!p.live)
+			continue;
+		if (p.presents_left > 0)
+		{
+			--p.presents_left;
+			continue;
+		}
+
+		ID3D12Resource *rb = g_state.stats_readback[p.slot];
+		if (rb == nullptr)
+		{
+			p.live = false;
+			continue;
+		}
+
+		void *mapped = nullptr;
+		D3D12_RANGE read = { 0, kCensusBytes };
+		if (SUCCEEDED(rb->Map(0, &read, &mapped)) && mapped != nullptr)
+		{
+			std::uint32_t raw[mvcensus::kCounterCount] = {};
+			std::memcpy(raw, mapped, kCensusBytes);
+			D3D12_RANGE nothing = { 0, 0 };
+			rb->Unmap(0, &nothing);
+
+			g_census_last.clear();
+			g_census_last.add(raw, p.frames);
+			g_census_total.add(raw, p.frames);
+
+			// The window's own numbers, not the running total: a session-long total averages
+			// a walked street together with the menu and the loading screens, and the split
+			// this exists to measure differs between them.
+			char report[768];
+			mvcensus::format_report(report, sizeof(report), g_census_last);
+			STRAY_LOG_INFO("%s", report);
+
+			// The uint32 counters are zeroed every window, so the only way to overflow is a
+			// window long enough that kTotal wraps. Say so rather than printing the wrapped
+			// percentages, which look entirely reasonable.
+			const std::uint64_t px_per_frame = p.frames == 0
+				? 0
+				: g_census_last.c[mvcensus::kTotal] / p.frames;
+			const std::uint64_t safe = mvcensus::safe_window_frames(px_per_frame);
+			if (safe != 0 && p.frames > safe)
+				STRAY_LOG_WARN("MV CENSUS window of %llu frames exceeds the uint32 ceiling of "
+					"%llu at %llu px/frame - the counters have WRAPPED and every percentage "
+					"above is wrong. Lower MvStatsFrames.",
+					static_cast<unsigned long long>(p.frames),
+					static_cast<unsigned long long>(safe),
+					static_cast<unsigned long long>(px_per_frame));
+		}
+		p.live = false;
+	}
 }
 
 } // namespace stray_dlss::mv
