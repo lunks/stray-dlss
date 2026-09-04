@@ -45,6 +45,18 @@ struct MaskShadow
 };
 MaskShadow g_mask;
 
+void push_mask()
+{
+	mvmask::configure(g_mask.enabled, g_mask.value,
+		static_cast<std::uint32_t>(g_mask.alternate < 0 ? 0 : g_mask.alternate), g_mask.format);
+}
+
+// SEEDING ALSO PUSHES, and that is the whole point rather than belt-and-braces. The shadow is
+// seeded lazily, and the first thing that touches it may well be apply_from_config() reacting
+// to an ini edit - at which point the config source ALREADY holds the new value, so the shadow
+// would seed to it, compare equal, and the module would never be told. Pushing on seed makes
+// that case correct; in every other case it re-sends what dlss_app configured at startup, which
+// is a store of four scalars.
 MaskShadow &mask()
 {
 	if (!g_mask.seeded)
@@ -56,15 +68,9 @@ MaskShadow &mask()
 		if (g_mask.alternate < 0)
 			g_mask.alternate = 0;
 		g_mask.format = host::cfg::get_int("MvMaskFormat", mvmask::kDefaultFormat);
+		push_mask();
 	}
 	return g_mask;
-}
-
-void push_mask()
-{
-	MaskShadow &m = mask();
-	mvmask::configure(m.enabled, m.value, static_cast<std::uint32_t>(m.alternate < 0 ? 0 : m.alternate),
-		m.format);
 }
 
 // ---- the registry ----
