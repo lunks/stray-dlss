@@ -3666,6 +3666,100 @@ but never assume one encoding of them** — and keep the failing slot in the ref
 ok=3603 bad=0 unreadable=0`, so `FRDGResource::Name` at +8 reads `L"TemporalAA"` on every one of
 3 603 announcements — §37.1's RDG-layout prediction, **HARD**.
 
+### 37.3 Level 2: the route WORKS, `u0` and `t0..t5` agree 100%, and the View register does not
+
+**RUN on the box with the corrected predicate** (md5 `3f3d1ed5869ea22469c33aa4cb5f3d96`, CI run
+`33844879113`, both workflows green), Config A, `EngineSeam=3`, `EngineSeamInputs=1`, `U0Hook=2`,
+`--no-drive`, **main menu only, no injected input**, 8 400 frames, **zero ERROR lines, no crash**.
+
+Discovery now succeeds and every §37.1 prediction is settled:
+
+```
+U0 HOOK FOUND: FD3D12CommandContext vtable at 0x6ffffb606bf0 (10.2 ms). ... Predictions held at
+  slots: 3 5 10 11 12 13 25 28 32 36 37; not held (reported, never gated): 33.
+  ICF: 6 of the 6 empty bodies share one address. qwordHits=1 survivors=1.
+U0 HOOK INSTALLED: 7 of 7 slots ... now point at forwarding thunks
+U0 HOOK: the UAV object's CPU descriptor handle sits at +40, latched after 3 agreeing scans.
+  [derived] expectation was +40 ... - MATCHES.
+U0 HOOK: vtable slot 17 classified as uav after 16 objects (uav=8 srv=0 none=0 ambiguous=8)
+```
+
+**The `+40` [derived] offset is now HARD**, and so is the slot: MSVC put the 3-argument
+`RHISetUAVParameter` at **17**, not 16 — slot 16 was never called once (`16=0/unknown`), which is
+why the design measured the pair instead of counting it. The SRV handle also latched at `+40`.
+
+**Counters at frame 6600** (`[u0]` line), and the split is the whole result:
+
+| Group | Result |
+|---|---|
+| `assert:` (`u0`) | **`agree=6603 disagree=0`**, and every refusal reason zero — `noBind=0 unresolved=0 notLive=0 walkAbsent=0 descMismatch=0 extentNe=0 shaderMismatch=0 hookOff=0` |
+| `regs:` (`t0..t5`) | **`agree=39618 disagree=0 disagreeMask=0`**, `engineAbsent=13206`, `walkAbsent=0`, `unresolved=0` |
+| `viewReg:` | **`agree=0 disagree=6603`**, `noneBound=0 multipleBound=0 walkAbsent=0` |
+| health | `faults=0 off=0 latchedReads=347994 misses=0 nativeRefused=0 seedForeign=0` |
+
+`39618 = 6603 x 6` and `13206 = 6603 x 2`: **all six bound registers agree on every claim**, and the
+two absent ones are `t6`/`t7`, which this shader does not use. So `u0` and the §2.3 register map are
+now confirmed **twice, by two independent routes, on 100% of announced dispatches** — the engine's
+own bind stream and the descriptor walk name the same `ID3D12Resource*` every time.
+
+#### The View register disagrees on EVERY frame, and this instrument cannot say why
+
+```
+U0 HOOK REGISTERS ... | View at b-mask 0x2 (1 uniform buffers bound), walk chose b4 (valid=1): DISAGREE
+U0 HOOK ASSERTION: ... the engine bound its one uniform buffer (ViewUniformBuffer) at b-mask 0x2
+  and the View-CB search chose b4.
+```
+
+The engine binds **exactly one** uniform buffer (`noneBound=0`, `multipleBound=0` on 6 603 claims)
+at index **1** — which agrees with the shader's own `dcl_constantbuffer cb1[145]` (§2.3) and with
+§2.6's "the View uniform buffer at register `b1`". The walk chose **b4** (and `b3` in the 44
+ambiguous frames). 6 603 of 6 603.
+
+**But the assertion compares REGISTER NUMBERS, not buffers** (`u0::judge_view_register` is
+`reg == walk_reg`; the `FRHIUniformBuffer*` is never resolved to a resource). So a 100%
+disagreement is consistent with **two different readings and this run cannot separate them**:
+
+1. **The search is on another view's buffer** — the §36.18 class, at 100% instead of 1.2%. The
+   session's own `[view]` line is suggestive: `ambClaimed=44` frames where a second legal-shaped
+   View survived and *disagreed on `ClipToPrevClip` / jitter / `CameraCut`*, with the log itself
+   saying such a frame "would need the View CB by IDENTITY to settle".
+2. **The two numbering conventions differ** — the walk enumerates bound descriptor-TABLE slots
+   while the engine's index is the shader register, and §2.3 already records that "UE4 binds
+   tables wider than any one shader's declarations". Under this reading b3/b4 are table slots the
+   shader never reads and nothing is wrong.
+
+**Reading 2 has the stronger evidence today, and it is not ours.** The `view-cb-cached-params`
+work latched `FViewInfo+5768` and its byte-assertion agreed with the search's buffer on **589 of
+593** claims (the four being stale ring copies). If the search were reading another view's buffer,
+that comparison would disagree, not agree. Against that, `row135 self-check ok=15562 bad=0` proves
+only that the chosen buffer is **a** View — §2.6's own rule: *a self-validating check tells you
+what KIND of thing you have, never WHICH one.*
+
+**The next step is one line of code, not another launch: compare the BUFFER.** The thunk holds the
+`FRHIUniformBuffer*` and the walk holds an `ID3D12Resource*` plus the offset it read (`View CB at
+b4, offset 4921600`); matching those settles reading 1 against reading 2 outright. **Do not act on
+the register-number disagreement until that is done** — and note it is the same trap this file
+records twice already: an assertion that compares the wrong quantity fails loudly and truthfully
+while saying nothing about the thing you care about.
+
+#### What deleting the descriptor table walk still needs
+
+The `u0` and `t0..t5` halves are as clean as they can be **in the menu**, and the menu is **not
+sufficient** to authorise the deletion:
+
+* **Sufficient in the menu:** discovery, the vtable, the slot classification, both `+40` latches,
+  and the fact that the route produces an answer at all — the seam fires on frame 0 and the menu
+  runs the TAA pass (8 403 announcements, `unclaimed=0`).
+* **Gameplay REQUIRED:** every failure mode the walk is being replaced *for* lives where shadow,
+  capture and planar-reflection views exist, and the menu has none — `tooSmall=0` here, and §36.21
+  already records a menu `suspectSmall=0` being a non-refutation of exactly this. The walk's own
+  `wrongView=14829` skips and the 44 ambiguous claims say the population of rival views is what
+  matters, and gameplay is where it is largest.
+* **Also required before deletion:** the buffer-identity comparison above, since level 3 replaces
+  the View-CB search with the engine's answer and this run has *not* established which of the two
+  is right; and a decision about `t4`, whose engine side comes from the SRV handle cross-match
+  rather than `GetNativeResource`.
+
 The lines that settle each prediction, in the order they appear in `stray-dlss-plugin.log`:
 
 | Line | Settles |
