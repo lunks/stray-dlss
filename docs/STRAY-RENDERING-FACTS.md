@@ -3016,3 +3016,87 @@ is to supply guides at the colour resolution rather than declaring a subrect and
 **Mitigation available today:** `NgxNR=0` removes it completely and costs Neural Rendering
 entirely. `NgxNRIntensity` is the graded alternative and is the only strength control that does
 NOT force a `DLSSNR.Reset` (§5, the CG2R control audit), so it can be swept in one session.
+
+---
+
+## §55 The render-target pool's name hook DISCOVERED, and RR's guides now come from it (2026-09-04)
+
+**Level 1 (`[STRAYDLSS] PoolNames=1`, discover only) ran on the box and PASSED.** Verbatim from
+the plugin log:
+
+```
+POOL NAMES: scan of 8 sections - literals found 19/20, names referenced 18, lea sites 21,
+  distinct call targets 21. VERDICT: ok.
+POOL NAMES: best candidate 0x6ffff958c740 - reached from 5 DISTINCT enclosing functions
+  (.pdata-derived, bar is 3) and 18 distinct name literals (bar 4), 32 lea sites, nearest
+  call 26 bytes after the name load.
+  Names: GBufferA GBufferB GBufferC GBufferD GBufferE GBufferF SceneDepthZ SceneDepthAux
+         GBufferVelocity SmallDepthZ ScreenSpaceAO LightAccumulation DirectionalOcclusion
+         SkySHIrradian...
+POOL NAMES: the scan took 313 ms on the device-creation thread. It runs ONCE.
+```
+
+**HARD.** `FRenderTargetPool::FindFreeElement` is located, by five independent enclosing
+functions agreeing on one `.pdata` function start, and the names DLSS Ray Reconstruction needs —
+`GBufferA`, `GBufferB`, `GBufferC` — are among the eighteen literals that reach it.
+
+**A residual settled in the same scan, and it cost nothing.**
+`docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.5 asked whether this image still carries
+`"%d MB, NewRT %s %s"`, the `UE_LOG` format string **inside** `FindFreeElementInternal`
+(`RenderTargetPool.cpp:403`). It does **not**, so this build strips `UE_LOG` in Shipping, there
+is no in-function anchor for the internal, and §2.5's route 1 to `FindFreeElementForRDG` is
+**closed**. That costs this route nothing: every RR guide goes through the OUTER
+`FindFreeElement`, which is the one that was found.
+
+**Level 2 (install the forwarding recorder) has NOT run.** Everything about the recorder — that
+`IPooledRenderTarget::RenderTargetItem.TargetableTexture` is at +8, that
+`FRHITexture::GetNativeResource` is virtual slot 7 on these objects, that the name argument
+reads back as a wide string — is UNCONFIRMED on this executable. The `name-unreadable` counter
+is the runtime validator: a hook on the wrong function is handed something that is not a name.
+
+### What was built on top of it, and what a run has to judge
+
+`PoolNames=3` (supply) and `NgxRR=2` are wired end to end (`src/core/rr_guides.hpp`,
+`src/pool_name_hook.cpp`, `src/gbuffer_resolve.cpp`, `shaders/gbuffer_resolve.hlsl`,
+`taa_hook::try_evaluate_rr`). **None of it has run against the game.**
+
+**The one open question is not the plumbing, it is the CONTENT.** A 2026-08-31 measurement of the
+OLD, heuristically-identified G-buffers found them recycled at this same hook point: GBufferA
+read near-black, `ShadingModelID` decoded 0, and the unlit fallback covered ~95% of every guide.
+That is why the deleted code recorded the resolve at the first screen-space-denoiser dispatch
+instead — a trigger that no longer exists in the frame at all (`r.SSGI.Enable=0`).
+
+Two facts argue the other way, both primary-source:
+
+* NVIDIA's own UE plugin resolves the G-buffer at **exactly** the upscale point —
+  `AddGBufferResolvePass`, `DLSSUpscaler.cpp:578-589`. **HARD.**
+* UE 4.27 holds `GBufferRefCount = 1` from before the base pass until **after**
+  `AddPostProcessingPasses` (`docs/RESEARCH-RR-GBUFFER.md` §1.1). While that refcount is held the
+  pool cannot hand those elements to anything else. **HARD-via-mirror.**
+
+**The old finding was made on resources whose identity was a guess, so it does not transfer — and
+it is not refuted either.** It is the single thing the first run has to look at.
+
+**The instrument, and it needs no new theory.** `NgxDumpInputs=1` now captures the four guides as
+`straydlss_rr_{diffuse,specular,normals,roughness}_<n>.bin`, and `tools/rawdump2png.py` grows
+`rgba16f_normal`, `rgba8` and `r16f`. **`rgba16f_normal` prints the DEGENERATE fraction** — the
+share of pixels whose decoded normal had no length, which is the `+Z` fallback a cleared or
+recycled GBufferA produces. High means the 2026-08-31 finding reproducing under a correct
+identity; low means the guides are real. Set `NgxDumpAt` past the loading screen (§5's own trap).
+
+### The log lines that decide each question, in order
+
+| Question | Line | The answer that says yes |
+|---|---|---|
+| Did the recorder install? | `POOL NAMES: forwarding recorder INSTALLED on ... at 0x...` | it appears at all |
+| Is it on the right function? | `POOL NAMES: FRenderTargetPool::FindFreeElement reached us, and its fourth argument reads as the wide string "..."` | the string is a real target name |
+| Do the chains resolve? | `[pool] ... ok=N notRegistered=0 rhiNull=... faults=0 off=0` | `faults=0`, `notRegistered` small |
+| Does the map agree with the other engine routes? | `[pool] assert: depth a/d/x velocity a/d/x extent a/d/x` | `disagree` 0 |
+| Is a guide set usable? | `[rr] evaluates=N fallbacks=M ... refusals: ...` | `fallbacks` small, no reason dominating |
+| Are the guides REAL? | `tools/rawdump2png.py ... rgba16f_normal` | DEGENERATE fraction low, `|N| mean` ≈ 1.0 |
+| Is the image better? | the user's eyes | — |
+
+**And RR running is not RR being worth running.** `docs/RESEARCH-RR-REFLECTION-DENOISE.md` argues
+this title may have no noisy signal left for it to denoise (`r.RayTracing=False`,
+`r.SSGI.Enable=0`, and Stray's own shipped `r.SSR.Temporal=1` already filtering SSR before the
+composite). That question is upstream of this one and is still open.

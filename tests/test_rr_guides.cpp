@@ -2,6 +2,8 @@
 
 #include "core/rr_guides.hpp"
 
+#include <cstring>
+
 using namespace stray_dlss;
 
 namespace {
@@ -224,8 +226,8 @@ TEST_CASE("rr guides: every refusal has a distinct name for the log line")
 		const char *a = rrguides::refusal_name(static_cast<rrguides::Refusal>(i));
 		REQUIRE(a != nullptr);
 		CHECK(a[0] != '\0');
-		CHECK(std::string(a) != "?");
+		CHECK(std::strcmp(a, "?") != 0);
 		for (std::size_t j = i + 1; j < rrguides::kRefusalCount; ++j)
-			CHECK(std::string(a) != rrguides::refusal_name(static_cast<rrguides::Refusal>(j)));
+			CHECK(std::strcmp(a, rrguides::refusal_name(static_cast<rrguides::Refusal>(j))) != 0);
 	}
 }
