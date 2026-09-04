@@ -483,11 +483,14 @@ void Start(const std::wstring &mod_dir, const std::wstring &game_dir)
 		}
 	}
 	if (!loaded)
+	{
 		STRAY_LOG_ERROR("host: StrayDLSS.ini not found (tried %s and the dll dir); every [STRAYDLSS] key reads its "
 			"default, which leaves EnableNGX/NgxEvaluate OFF and DLSS inert.", sds::Narrow(candidates[0]).c_str());
-	if (!loaded)
-		g_ini_path.clear(); // the loop leaves the LAST candidate tried in it; an unfound file has no path,
-		                    // and IniPath()'s only caller must refuse rather than write beside nothing
+		// The loop above leaves the LAST candidate it tried in g_ini_path. An unfound file has no
+		// path, and IniPath()'s one caller - the tuning tab's save - must refuse rather than
+		// create a second ini beside a file the session never read.
+		g_ini_path.clear();
+	}
 	host::cfg::set_source(&g_source);
 
 	g_tweak_ui.store(host::cfg::get_bool("TweakUi", true));
@@ -530,13 +533,15 @@ void Tick()
 		// the caller's thread by design — it queues, and nr::on_present carries the teardown out
 		// once the GPU fence has passed the last evaluate.
 		//
-		// Every other key stays startup-only. A knob that reconfigures the device or the feature
-		// mid-frame is a much larger promise than a boolean that gates a pass.
-		// ...and, since the tuning tab exists, every knob the tab exposes. Same argument, same
-		// thread, same setters: those values are re-sent to the NGX parameter block on every
-		// evaluate, so applying them here lands on the next frame with no feature recreation and
-		// no lock on the render path. This is what keeps the ini a WORKING control channel on a
-		// box where the debug GUI's separate window may not be openable at all.
+		// ...and, since 2026-09-04, every knob the live-tuning tab exposes (TweakState.hpp) -
+		// which is the SAME argument extended, not a new one: not the render thread, plain
+		// scalar setters, values re-sent to the NGX parameter block on every evaluate, so the
+		// change lands on the next frame with no feature recreation and no lock on the render
+		// path. It is what keeps this file a WORKING control channel on a box where UE4SS's
+		// debug GUI - a separate OS window, not an overlay - may not be openable at all.
+		//
+		// Every OTHER key stays startup-only. A knob that reconfigures the device or the
+		// feature mid-frame is a much larger promise than a value that rides the next evaluate.
 		if (g_tweak_ui.load())
 		{
 			const int moved = tweak::apply_from_config();
