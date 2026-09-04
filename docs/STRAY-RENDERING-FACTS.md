@@ -3100,3 +3100,91 @@ identity; low means the guides are real. Set `NgxDumpAt` past the loading screen
 this title may have no noisy signal left for it to denoise (`r.RayTracing=False`,
 `r.SSGI.Enable=0`, and Stray's own shipped `r.SSR.Temporal=1` already filtering SSR before the
 composite). That question is upstream of this one and is still open.
+
+---
+
+## §56 Level 2 and 3 RAN, the inline engine hook HOLDS — and the RR probe was silent (2026-09-04)
+
+**MEASURED, branch `rr-guides-pool-names` @ `508dd9d`, two menu-only sessions (`--no-drive`, no
+input injected).**
+
+### Rung 1: `PoolNames=2 NgxRR=0`, 6600 frames, zero ERRORs. HARD.
+
+```
+POOL NAMES: forwarding recorder INSTALLED on FRenderTargetPool::FindFreeElement
+            at 0x6ffff9d3c740 (original trampoline 00006FFFF46E0F80)
+POOL NAMES: ... its fourth argument reads as the wide string "WhiteDummy"
+frame 6600 [pool] mode=observe discovered=1 hooked=1 calls=133026 census=45(+0)
+            unknown=60390 faults=0 off=0 guideReads=0 guideDead=0
+            | ok=72636 notRegistered=0 rhiNull=0 outNull=0 nameBad=0
+            | assert: depth 6603/0/0 velocity 6603/0/0 extent 52824/0/0
+                      colour 0/6603/6603 (agree/disagree/absent)
+            | GBufferA=ok(1920x1080,fmt24) GBufferB=ok(1920x1080,fmt90)
+              GBufferC=ok(1920x1080,fmt90) GBufferD=ok(1920x1080,fmt90)
+              GBufferE=ok(1920x1080,fmt90) SceneDepthZ=ok(1920x1080,fmt19)
+              GBufferVelocity=ok(1920x1080,fmt11) SceneColorDeferred=ok(1920x1080,fmt10)
+              SmallDepthZ=ok(960x540,fmt19) ScreenSpaceAO=ok(1920x1080,fmt61)
+```
+
+**This project's first inline hook into ENGINE code works, and every constant behind it is now
+measured rather than derived:**
+
+* `IPooledRenderTarget::RenderTargetItem.TargetableTexture` at **+8** and
+  `FRHITexture::GetNativeResource` at **virtual slot 7** — `ok=72636`, `nameBad=0`,
+  `notRegistered=0`, `faults=0`. A wrong offset yields `not-registered`, never a plausible lie,
+  so 72 636 clean resolutions is the proof. **HARD.**
+* The name argument reads back as a wide string on every call (`"WhiteDummy"` on the first) —
+  the runtime validator a hook on the wrong function would fail. **HARD.**
+* The map AGREES with the two engine routes that already answer for the same textures:
+  `depth 6603 agree / 0 disagree`, `velocity 6603 / 0`, `extent 52824 / 0`. Three independent
+  chains, no disagreement in 6603 frames. **HARD.**
+* **The RR guide set is complete and its formats are exactly what the recipe assumes**:
+  GBufferA `fmt24` = `R10G10B10A2_UNORM` (the plain `N*0.5+0.5` encoding, not octahedral),
+  GBufferB and GBufferC `fmt90` = `B8G8R8A8_TYPELESS`, all three at the scene-buffer extent
+  1920x1080. `rrguides::judge` accepts exactly this. **HARD.**
+
+**And one measured surprise worth keeping:** `colour 0 agree / 6603 disagree`. `SceneColorDeferred`
+as `AllocSceneColor` names it is **not** the resource the TAA pass reads at `t1`, on every frame.
+That pair was deliberately shipped with NO prediction attached (`pool_name_hook.hpp`,
+`note_taa_colour`), which is why it is a measurement rather than a bug: the post-chain scene
+colour TAA consumes is a different allocation from the base-pass one. It is also why L1 resolves
+colour as `rhi_null` and the register map remains the colour source (§36.13).
+
+### Rung 2a: `PoolNames=3 NgxRR=1` — level 3 clean, and THE PROBE PRINTED NOTHING
+
+`mode=supply discovered=1 hooked=1 faults=0 off=0`, zero ERRORs, the arming WARN verbatim, and an
+SR feature demonstrably created (`DLSS feature created: 1920x1080 -> 3840x2160, Performance,
+preset=13, flags=0x4b`). **And then no DLSSD probe line of any kind** — no result code, no
+failure, no "unavailable". `guideReads=0`, no `[rr]` line.
+
+**Two of those three absences are CORRECT by construction and were mistaken for faults:**
+`guideReads=0` because `poolhook::guide_set` is only called from `try_evaluate_rr`, which runs at
+`NgxRR=2`; and no `[rr]` line because it is gated on RR having been asked about a frame, which the
+probe never does — it creates a throwaway feature and never evaluates.
+
+**The third is a real defect, and it is the CLAUDE.md §0.2 failure in its purest form.**
+`maybe_probe_rr` had **four bare `return`s** (not armed / already probed / null command list /
+zero extent) and `ensure_feature` has **two more** upstream of it (NGX not initialised, SR not
+available). Six silent exits, and in a log none of them is distinguishable from the others, from
+"the hook point never ran", or from "DLSSD does not exist on this stack".
+
+**What source reading ELIMINATED**, so nobody re-tests it: the probe is not downstream of the
+create (`maybe_probe_rr` is the first statement of `ensure_feature`, strictly before the
+`DLSS feature created:` line); the log sink has no level filter, no dedup and no budget
+(`src/log.cpp` is 97 lines and drops nothing); and there is no `try`/SEH anywhere on the path to
+swallow an exception. **Which of the six exits fired cannot be determined from the source, and
+that is exactly the defect rather than an excuse for it.**
+
+**Fixed so silence is unreachable while `NgxRR` is non-zero:** `RRProbeState` has seven values and
+no "unknown"; it is armed in `set_rr_mode` rather than in the probe, so *never armed* and *armed
+but the hook point never ran* are different readings; each declining path logs an ERROR naming
+itself; the firing path logs BEFORE `NGX_D3D12_CREATE_DLSSD_EXT`, so even a death inside NGX
+leaves the answer; `ensure_feature` counts its entries above its own preconditions, so
+`ensureCalls>0` with `state=awaiting-feature` convicts that guard and `ngxInit=`/`srAvail=` on the
+same line name which half. The `[rrprobe]` line goes to the periodic log **and** the same values
+to `stray-dlss-status.txt` as `rr_probe_*` — two channels, because this answer has now been lost
+to one of them once.
+
+**The general rule, and it is a sharpening of §0.2:** a gate that is *correct* to be silent about
+(the `[rr]` line under `NgxRR=1`) and a gate that is *broken* and silent look the same from
+outside. Say the absence out loud too. `[rr] NOT ASKED` now does.

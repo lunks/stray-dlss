@@ -1878,7 +1878,20 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 > `FindFreeElementInternal`, and route 1 is closed — which costs this route nothing, because
 > every RR guide goes through the OUTER `FindFreeElement`. **HARD.** Level 2 has NOT run.
 >
-> **LEVEL 3 (SUPPLY) AND `NgxRR=2` ARE BUILT, 2026-09-04, and nothing on the path has run.**
+> **LEVEL 2 AND LEVEL 3 RAN ON THE BOX, 2026-09-04 (facts §56), and the inline engine hook
+> HOLDS.** 6600 frames, zero ERRORs: `ok=72636 notRegistered=0 nameBad=0 faults=0`, the name
+> argument reading back as a wide string on every call, and the map AGREEING with the two routes
+> that already answer for the same textures (`depth 6603/0`, `velocity 6603/0`, `extent 52824/0`).
+> `IPooledRenderTarget::RenderTargetItem.TargetableTexture` at **+8** and
+> `GetNativeResource` at **slot 7** are therefore **HARD on this executable**. The RR guide set
+> came back complete and in exactly the formats the recipe assumes — GBufferA `R10G10B10A2_UNORM`
+> (so the plain `N*0.5+0.5` encoding, not octahedral), B and C `B8G8R8A8_TYPELESS`, all three at
+> 1920x1080. **`rrguides::judge` accepts that set as written.** One measured surprise:
+> `SceneColorDeferred` disagrees with the TAA pass's `t1` on **every** frame (0 agree / 6603
+> disagree) — a pair shipped with no prediction attached, so it is a finding rather than a fault,
+> and it is consistent with L1 resolving colour as `rhi_null`.
+>
+> **LEVEL 3 (SUPPLY) AND `NgxRR=2` ARE BUILT, 2026-09-04, and the EVALUATE has not run.**
 > `poolhook::guide_set` hands the RR path the GBufferA/B/C triple; `src/core/rr_guides.hpp`
 > decides whether it may be used, with thirteen named refusals; `src/gbuffer_resolve.hpp` and
 > `shaders/gbuffer_resolve.hlsl` — restored from the deletion, because the FINDER was what was
@@ -1909,6 +1922,19 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 > reproducing under a correct identity; a low one says the guides are real. Nothing else in the
 > pipeline can tell those apart, and this project has already paid a round trip for not being
 > able to. **Set `NgxDumpAt` past the loading screen** (§5).
+>
+> **AND THE PROBE MUST NEVER BE SILENT (fixed 2026-09-04, facts §56).** A box run armed
+> `NgxRR=1`, created an SR feature — the probe's own precondition — and produced no probe output
+> of any kind, which reads identically to "DLSSD does not exist on this stack". `maybe_probe_rr`
+> had four bare `return`s and `ensure_feature` two more upstream: six silent exits, none
+> distinguishable in a log. Now `RRProbeState` has seven values and no "unknown", it is armed in
+> `set_rr_mode` rather than in the probe (so *never armed* and *armed but never reached* are
+> different readings), every declining path logs an ERROR naming itself, and `[rrprobe]` prints
+> every 600 frames whatever happened — with `rr_probe_*` in `stray-dlss-status.txt` as a second
+> channel. **The sharpening of §0.2 this earned: a gate that is CORRECT to be silent about and a
+> gate that is BROKEN and silent look the same from outside.** The `[rr]` line's absence under
+> `NgxRR=1` is by design — the probe never evaluates — so the absence itself is now printed as
+> `[rr] NOT ASKED`, naming why. `guideReads=0` under `NgxRR=1` is correct for the same reason.
 >
 > **Read `[rr]` before the image.** `evaluates`, `fallbacks` and every refusal by name, in the
 > log and in `stray-dlss-status.txt`. `notSupplying` means `PoolNames` is not 3; `epochSplit`
