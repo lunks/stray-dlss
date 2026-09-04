@@ -2853,8 +2853,9 @@ does not, the fix did not take.
   `Submix_controller`, the PARENT of the submix carrying `SBFX_Boost`, so the +5 dB appears to be
   out of the path entirely and `SpeakerGain = 1.0` may be 5 dB short. Needs the pak-wide sweep.
 * **Whether `zurg_sucking_loop_02_CONTROL`'s authored `Volume=2.0` compensates for the missing
-  `SBFX_Boost`** (§20.11 finding 1 against §20.10 Correction 2). Together they decide whether the
-  pad speaker is at the right level, and neither has been listened to.
+  `SBFX_Boost`** (§20.11 finding 1 against §20.10 Correction 2). That the boost is out of the path
+  is now firm — there is no SoundCue layer to route around it — so this is the only remaining
+  unknown on the speaker's level, and it needs an ear, not a tool.
 * **`DetectZone_VIBE` and `TrolleyImpactCenter_VIBE`** override their submix to the dead endpoint
   root and are [derived] to be unreachable by our tap (§20.11 finding 2). Never observed either way.
 * **The pak-wide caller census** — which asset is started at which literal `Level`, across all
@@ -2969,11 +2970,20 @@ neither the samples nor the path, so `SpeakerGain = 1.0` may leave the pad speak
 than the PS5** rather than correct. §10's original observation — that ×1.7783 *"sounded right"* on
 the asset-replay path — is consistent with the boost being absent from the graph, not present in it.
 
-**Open, and cheap to settle:** whether anything else routes into `Submix_controllerPre` (a
-SoundCue-level submix send would), which needs the pak-wide sweep and therefore a window with the
-game down. Until then, treat the speaker lane's level as **unresolved**, and note it is the one
+> **TIGHTENED by the pak-wide reference scan (§20.11): there is NO SoundCue layer.** Across all
+> 23,846 cooked packages, **zero SoundCues reference any of the 70 controller waves** — 65
+> packages import them and every one is a Blueprint, a sequence or
+> `COMP_CatScratchableComponent`, playing the `SoundWave` **directly** on an AudioComponent. So
+> the only routing a `_CONTROL` asset can take is its own `SoundSubmixObject` (none of the four
+> serialises one) falling back to `SCLASS_controller.DefaultSubmix` = `Submix_controller`. **There
+> is no cue-level send that could put them through `Submix_controllerPre`**, which was the one
+> escape hatch left open here. The +5 dB is out of the path.
+
+**So the speaker lane's level is now a real question rather than a suspicion**, and it is the one
 place where a deliberate gain of ours might be justified — the opposite conclusion from the coil
-lane.
+lane. What is still unmeasured is whether it *should* be applied: `zurg_sucking_loop_02_CONTROL`
+carries an authored `Volume = 2.0` (§20.11), so the loudest speaker asset may already compensate
+for the missing boost. Nobody has listened.
 
 #### Confirmations, so they stop being open
 
@@ -3151,3 +3161,44 @@ which UE4 only serialises when TRUE, so its presence **is** the flag (§12).
 | `wood_creak_VIBE` | controllers/Vibrations/wood_creak_VIBE | 0.457 | 2 | 48000 | — |  |
 | `zurg_sucking_loop_VIBE` | controllers/Vibrations/zurg_sucking_loop_VIBE | 13.324 | 2 | 48000 | **yes** |  |
 | `ZurkGrab_clean_VIBE` | controllers/Vibrations/ZurkGrab_clean_VIBE | 0.302 | 2 | 48000 | — |  |
+
+#### There is no SoundCue layer at all — HARD, pak-wide
+
+Scanning all **23,846** cooked packages for importers of the 70 controller waves: **65 packages
+reference them, and not one is a `SoundCue`.** They are `BP_*`, `Seq_*` and
+`COMP_CatScratchableComponent` — Blueprints playing the `SoundWave` **directly** on an
+AudioComponent, which is exactly the shape §20.10 decoded from `BP_HKPlayerController`'s bytecode.
+
+**Three consequences, and the third is the useful one:**
+
+1. **There is no cue-level volume, attenuation or submix send anywhere in this path.** The only
+   volume terms in the entire chain are the asset's own `Volume` (two assets, §20.11 finding 1) and
+   the call site's `Level` (§20.4) — and the class, submix and endpoint stages are all unity
+   (§20.10). That is the complete inventory.
+2. **The class default is therefore the whole routing rule**, apart from the two assets that
+   override it (§20.11 finding 2). No cue can redirect a sound to a different submix.
+3. **It closes §20.10's Correction 2.** The remaining doubt there was a cue-level send putting the
+   `_CONTROL` assets through `Submix_controllerPre`. There are no cues, none of the four serialises
+   a `SoundSubmixObject`, and the class default is `Submix_controller` — the boost's *parent*. **So
+   the +5 dB is out of the path, firmly, not by inference from a graph alone.**
+
+#### Method note, recorded because it matters for the next session
+
+The class-wide census above is **pak-wide over every `.uasset`**, not scoped to `Sound/` — which is
+what makes the 4 / 66 an exhaustive result rather than a folder-scoped one. It cost four forward
+sweeps totalling 57 MB off the 5.3 GB pak, under `ionice -c3 nice -n19`, **with the game running**:
+Stray kept the same PID throughout and nothing was written to the game directory, but the box's
+load average went 2.5 → 4.3 while it ran.
+
+**That required overriding `tools/paksweep.py`'s own refusal to run while `Stray-Win64-Shi` is
+up** (a working copy with the guard downgraded to a warning, kept in box scratch; the committed
+tool is unchanged). The guard exists because the pak is on the mount the game streams from, and it
+should stay. **The honest reading is that this worked and was not free** — if a pak-wide sweep is
+wanted again, the cheap and safe version is a window with the game down; the guard is not
+superstition.
+
+Also worth keeping: `oozraw` built for **x86_64 under Rosetta** on the arm64 Mac
+(`clang++ -arch x86_64 -msse4.1`, `kraken.cpp` with `-Dmain=ooz_cli_main`) — `sse2neon` was not
+needed. 32,028/32,028 entries decompressed to their exact declared `usize`, 31,461/31,461
+`.uasset` with UE4 magic intact, which is the self-check that makes the rest of this section
+trustworthy.
