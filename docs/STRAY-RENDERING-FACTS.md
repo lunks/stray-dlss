@@ -2962,3 +2962,57 @@ cheap lever left. RT reflections cost 35% (§49), correct reflection motion vect
 `pInMotionVectorsReflections` which NVIDIA places in its research-purposes block, and marking the
 pixels is what this section just tested. The honest options then are reducing SSR's contribution,
 or accepting it.
+
+## §54 The dark smear below high-contrast objects IS NR, and the guide/colour RATIO is the suspect (2026-09-04)
+
+**Reproduced and attributed on the box, user-confirmed.** In the starting apartment, camera held
+still, a soft dark band extends downward in SCREEN SPACE from each of the guitar robot's boots,
+crossing three surfaces at different depths — the tiled floor, the raised wooden ledge, and the
+foreground platform — and running to the bottom of the frame.
+
+```
+t=10s and t=40s   band already at full strength in both; it converges by ~10s and then holds
+NgxNR=0           user: "it completely disappeared"
+```
+
+**Four things this rules out, and the eliminations are the value here:**
+
+1. **Not a screen-space reflection ray-march smear**, which was my first reading from the still.
+   The user established it takes ~10 s to appear; a march failure is present on frame 1.
+2. **Not the `u0` feedback loop** (§5, "NR's output feeds the engine's temporal history"). The
+   user reports the artefact at BOTH NR hook sites, and that loop exists only at the `taa` site.
+   The 2026-09-03 move to a present stage was supposed to kill it and evidently did — the
+   artefact is something else.
+3. **Not a motion-vector reprojection error in the ordinary sense.** The camera is still, so
+   DLSS-side reprojection converges and our MVs are ~0.
+4. **Not `MVecScale`.** Scaling ~0 by any factor is still ~0, so a motion-vector scale error
+   cannot produce a still-camera artefact. (Recorded because it was my first proposed fix and it
+   does not survive the still-camera objection — the knob existing is not a reason to reach for
+   it.)
+
+**What survives: the colour/guide resolution ratio, which is 2x at BOTH sites.** Colour is
+3840x2160 either way — `u0` at the TAA site, the back buffer at present — while depth and the
+dense motion vectors are 1920x1080 at both. Our own periodic line says so and says what we do
+about it:
+
+```
+NR STAGE: colour/guide ratio=2.0000/2.0000 (REPORTED, not sent — NGX gets 1.0)
+```
+
+We send `MVecScale=1.0` and rely on the declared subrects (`DLSSNR.DepthSubrect*`,
+`DLSSNR.MVecSubrect*`, set in `src/core/nr_params.cpp`) to carry the ratio. **If the runtime does
+not honour the subrect when indexing the DEPTH guide, every depth lookup is spatially
+misaligned** — a static error, so it survives a still camera, and one whose accumulation
+converges over seconds to a stable wrong state. That matches the observed shape (colour dragged
+off a strong depth+colour discontinuity), the timing (~10 s then stable), and the both-sites
+result, which nothing else does.
+
+**The discriminating experiment, and why it is not the obvious one.** Setting screen percentage
+to 100 would make the ratio 1.0, but **no DLSS feature is created at 100%** (§5, measured), so
+the test destroys itself. **70% is the test**: the ratio becomes 1.4286 instead of 2.0 and DLSS
+demonstrably works there. If the smear weakens in proportion, the ratio is implicated and the fix
+is to supply guides at the colour resolution rather than declaring a subrect and hoping.
+
+**Mitigation available today:** `NgxNR=0` removes it completely and costs Neural Rendering
+entirely. `NgxNRIntensity` is the graded alternative and is the only strength control that does
+NOT force a `DLSSNR.Reset` (§5, the CG2R control audit), so it can be swept in one session.
