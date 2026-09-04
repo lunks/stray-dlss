@@ -7,6 +7,7 @@
 #include "backend_native/vtable_patch.hpp"
 #include "backend_native/vtable_slots.hpp"
 #include "log.hpp"
+#include "perf.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -1204,6 +1205,11 @@ bool record(IDXGISwapChain *sc, ID3D12GraphicsCommandList *list, std::uint64_t f
 	}
 	else
 	{
+		// Timed: the DLSS-G evaluate's CPU side - the ~60 DLSSG.* parameter Sets, the barriers
+		// and NVSDK_NGX_D3D12_EvaluateFeature's own recording - was the one NGX feature with no
+		// perf bucket (perf.hpp, kNgxFg). The GPU side is not measured here, as nowhere else.
+		perf::Scope _fg(perf::kNgxFg);
+		perf::count(perf::kCntFgGenerates);
 		produced = g_generator->generate(list, real_current, out, static_cast<std::uint32_t>(c.desc.Width), c.desc.Height,
 			static_cast<unsigned>(c.desc.Format), frame, &why);
 	}

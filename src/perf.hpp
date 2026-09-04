@@ -61,6 +61,12 @@ enum Bucket
 	// 2026-09-02).
 	kPresentOwner,     // ring allocator/list Reset + Close + ExecuteCommandLists + queue Signal
 	kPresentWait,      // the fence WaitForSingleObject stall (a GPU-sync wait, a hitch source)
+	// DLSS Frame Generation's NGX evaluate, recorded on the present list (fg_present.cpp's
+	// record -> Generator::generate -> ngx_fg.cpp). On the present path, NOT nested in
+	// kDispatchPath. It had NO bucket until 2026-09-04: ngx_fg.cpp re-Sets ~60 DLSSG.* parameters
+	// per generated frame and the cost of that was unmeasured, so the case for moving the
+	// session-invariant ones to creation time rested on nothing. This is the number.
+	kNgxFg,
 	// The native hooks' UNTIMED paths, per call site (the SR-only deficit hunt, facts §26/§27).
 	// These run on whatever thread UE4 records on (several RHI threads), so they are summed CPU.
 	kShadowWrite,      // Create*View hooks: entry_for (registry describe) + shadow::note_view
@@ -99,6 +105,7 @@ enum Counter
 	kCntResolves,      // resolve_compute_bindings calls
 	kCntResolveTables, // bound table parameters walked by those calls
 	kCntResolveSlots,  // descriptor slots looked up by those calls (the "~70-110 a frame" that was arithmetic)
+	kCntFgGenerates,   // Generator::generate calls that ran (kNgxFg)
 	kCounterCount,
 };
 void count(Counter c, std::uint64_t n = 1);

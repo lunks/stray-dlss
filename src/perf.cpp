@@ -222,7 +222,7 @@ void stall_check_and_reset(std::uint64_t frame_ns, std::uint64_t frame_no)
 			if (bmax > our_max) { our_max = bmax; worst_bucket = i; }
 		}
 		static const char *bn[kBucketCount] = { "dispatch", "mv", "ngx_sr", "ngx_rr", "ngx_nr",
-			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve",
+			"restore", "presentOwner", "presentWait", "ngx_fg", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve",
 			"resolveState", "resolveWalk", "resolveSlots", "resolveRootCbv" };
 		STRAY_LOG_WARN("[stall] f=%llu t=%.6f frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
 			static_cast<unsigned long long>(frame_no), wall_clock_s(),
@@ -362,9 +362,11 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 
 	const double present_ms = static_cast<double>(bucket_ns[kPresentOwner]) * per_frame_ms;
 	const double wait_ms = static_cast<double>(bucket_ns[kPresentWait]) * per_frame_ms;
-	STRAY_LOG_INFO("[perf] present owner/frame: mechanics %.3fms (%.0f%%), fence-wait %.3fms (%.0f%%) "
-		"- the native host's per-present ring work; nil under the ReShade host.",
-		present_ms, pct(present_ms), wait_ms, pct(wait_ms));
+	const double fg_ms = static_cast<double>(bucket_ns[kNgxFg]) * per_frame_ms;
+	STRAY_LOG_INFO("[perf] present owner/frame: mechanics %.3fms (%.0f%%), fence-wait %.3fms (%.0f%%), "
+		"dlss-g evaluate %.3fms (%.0f%%, %.2f/frame) - the native host's per-present ring work; nil under the ReShade host.",
+		present_ms, pct(present_ms), wait_ms, pct(wait_ms), fg_ms, pct(fg_ms),
+		static_cast<double>(cnt[kCntFgGenerates]) * (1.0 / static_cast<double>(frames)));
 
 	// The native hooks' per-call-site CPU, summed across every recording thread (UE4's RHI
 	// threads included), so a figure can exceed the single-threaded share of the frame.
