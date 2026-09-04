@@ -265,6 +265,16 @@ written to the box.
 
 ### 8.1 All 61 names are read; they land in one 0x140-byte struct
 
+> **REPRODUCED AND SLIGHTLY CORRECTED 2026-09-04 against a DIFFERENT copy of the same 310.8.0
+> runtime (`md5 5b944399…`, the pristine Blackwell2 build) — `docs/RESEARCH-DLSSNR-PARAM-AUDIT.md`.**
+> Every offset in the table below reproduces byte for byte, which is strong cross-copy evidence
+> that the `.rdata` name table and `ReadEvalParams` are the same in both. Two amendments:
+> the struct is **0x15c** bytes, not 0x140 — `ReadEvalParams` initialises fields up to `+0x158`;
+> and the table omits **`DLSS.Indicator.Invert.X.Axis` / `.Y.Axis`**, read from this same evaluate
+> block at **`+0x110` / `+0x114`** as `int`. That audit also carries the full slot→TYPE decode for
+> every name (`+0x40` `void**`, `+0x58` `int*`, `+0x60` `unsigned*`, `+0x70` `float*`), and finds
+> `ScalingRatio` clobbered to `1.0f` at `CreateFeature` as well as at evaluate.
+
 `ReadEvalParams` at **0x180019f30** (`rcx` = out struct, `rdx` = the NGX parameter block) is the
 only caller of any of them, and is itself called once, from `EvaluateFeature`
 (0x180018620..0x180019e67) at 0x1800186e4. Layout, HARD:

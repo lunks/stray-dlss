@@ -183,6 +183,21 @@ names we never did, and we write none it does not.** But only half of those 14 a
 | `DLSSNR.Output.Width` / `Output.Height` | **no** |
 | `DLSSNR.Upscaling` | **no** |
 
+> **RE-AUDITED 2026-09-04 against a DIFFERENT copy, with a method that could have overturned it:
+> all six "no" verdicts STAND. `docs/RESEARCH-DLSSNR-PARAM-AUDIT.md`.** The audit was ordered
+> because *this* table was produced by "an exhaustive null-terminated string search", and such a
+> search has three holes it cannot see: the 15 zstd-compressed NVIDIA fatbins in `.data`, UTF-16BE,
+> and a name concatenated at run time. All three are now measured shut — **zero `DLSSNR` bytes in
+> 49.1 MB of decompressed fatbin/PTX or in the 147 MB `.rsrc` weight blob**, and no bare `DLSSNR.`
+> prefix or bare suffix string from which a name could be built.
+>
+> **And the question is now closed rather than merely searched.** Lookup is by string LITERAL: the
+> snippet imports only `version`/`advapi32`/`user32`/`kernel32`, carries no `NVSDK_NGX_Parameter_*`
+> helper symbol, and every one of its **61** `DLSSNR.*` strings is referenced from exactly one
+> `lea rdx, [rip+…]` at a virtual-call site whose result is tested against `0xBAD00000`. Enumerating
+> the call sites therefore enumerates every name the runtime can consume — so absence is proof, not
+> an absence of evidence.
+
 RenoDX writes the absent names too — defensive coverage across snippet builds, harmless because
 an unknown key is simply never read. **That is exactly why the bug was invisible on our side:**
 we set `DLSSNR.Scale`, which does not exist in this runtime, so **every scaling ratio we ever
@@ -226,6 +241,28 @@ costs nothing, it is the only available reading of the callee, and being wrong i
 direction costs at most a rect the runtime ignores — which is what the unsigned form may already
 be doing.
 
+> **NOW HARD, AND IT CUTS BOTH WAYS (2026-09-04, `docs/RESEARCH-DLSSNR-PARAM-AUDIT.md` §4 and
+> §7).** The binary was disassembled here. MSVC reverses each overload group of
+> `NVSDK_NGX_Parameter`, so the slots decode as `+0x40 Get(void**)`, **`+0x58 Get(int*)`**,
+> **`+0x60 Get(unsigned int*)`**, `+0x70 Get(float*)` — confirmed three independent ways
+> (`Intensity` at `+0x70` into a `1.0f`-defaulted field, `SizeInBytes` written at `+0x38` as a
+> `ULL`, the D3D12 node masks read at `+0x60`), and corroborated by the runtime doing
+> `btr ecx, 0x1f` on what it read at `+0x58`.
+>
+> **Every `*Subrect*` is read at `+0x58` — signed. The 2026-09-02 change was right.**
+>
+> **But three of our writes do NOT match**, and the audit names them: `DLSSNR.Width` / `Height`
+> are read as **`unsigned int`** while `nrparam::signed_entry` now writes them as `int`, and
+> `UseAutoMask` / `UICorrection` / `Hint.Render.Preset` are read as **`int`** while we write
+> `unsigned`. **This is evidence that the mismatch does not matter, not that we have a bug**: on
+> a failed `Get` the create path falls back to `esi`, zeroed at `0x180017e5d`, which would mean a
+> `0x0` network extent and no feature — and NR demonstrably creates features and produces a
+> correct image with the `int` write in place. **So the NGX core's parameter block coerces between
+> the integer overloads**, which is independently consistent with the shipped DLSS SR contract
+> (`Set(ID3D12Resource*)` at `+0x08`, `Get(void**)` at `+0x40`). No code change is recommended;
+> `src/ngx_nr.cpp` already has the belt-and-braces pattern (`DepthInverted` and `Enabled` are
+> written through both overloads) if anyone ever wants it.
+
 **Fixed 2026-09-02.** The rect and extent block now comes from `src/core/nr_params.{hpp,cpp}`,
 which carries the names AND the types as data, and `tests/test_nr_params.cpp` pins that every
 subrect and extent is `Type::i32`, that the name set is exactly the runtime's, that
@@ -237,6 +274,13 @@ than wrapped into a negative the runtime would take at face value.
 `unsigned int`, and `DLSSNR.Reset` as `int`. The current configuration produces a correct image
 with those types, so they are left alone until someone reads the binary; **UNCONFIRMED** either
 way.
+
+> **AUDITED 2026-09-04.** All five are read at `+0x58`, i.e. as **signed `int`**, and `Reset` at
+> `+0x58` too — so `Reset` matches, `DepthInverted` and `Enabled` are already written both ways,
+> and only `UseAutoMask`, `UICorrection` and `Hint.Render.Preset` are written with the other
+> overload. Per the note above that is now evidence of coercion rather than an open risk.
+> `DLSSNR.Style` is the one read at `+0x60` (`unsigned`), which is what we write. **No longer
+> UNCONFIRMED.**
 
 The mapping from RenoDX's shipped `[RenoDX.DLSS5]` ini keys to runtime parameters:
 

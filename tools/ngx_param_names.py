@@ -66,13 +66,23 @@ def names_with_prefix(data, prefix):
     for m in re.finditer(rb"((?:[\x20-\x7e]\x00){2,160})\x00\x00", data):
         s = m.group(1).decode("utf-16le")
         if s.startswith(prefix):
-            found.add("U16:" + s)
+            found.add("U16LE:" + s)
+    # UTF-16BE too: its absence was one of the two real holes this tool had, found by the
+    # 2026-09-04 re-audit (docs/RESEARCH-DLSSNR-PARAM-AUDIT.md 1). The other hole -- names that
+    # exist only inside a compressed container -- cannot be closed here; see that document 2 for
+    # the fatbin extraction, and 3 for the call-site enumeration that closes the question outright.
+    for m in re.finditer(rb"((?:\x00[\x20-\x7e]){2,160})\x00\x00", data):
+        s = m.group(1).decode("utf-16be")
+        if s.startswith(prefix):
+            found.add("U16BE:" + s)
     return sorted(found)
 
 
 def check_name(data, name):
     exact = (b"\0" + name.encode() + b"\0") in data
-    fragment = name.encode() in data
+    fragment = (name.encode() in data
+                or name.encode("utf-16le") in data
+                or name.encode("utf-16be") in data)
     return exact, fragment
 
 

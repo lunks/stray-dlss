@@ -3458,6 +3458,13 @@ and is the only place skin exists.
 **`DLSSNR.ScalingRatio` is INERT** — read, then unconditionally overwritten with `1.0f` at
 `0x18001a96a`. Neither it nor the absent `DLSSNR.Scale` ever mattered.
 
+> **AND IT IS INERT AT `CreateFeature` TOO, not only at evaluate (2026-09-04,
+> `docs/RESEARCH-DLSSNR-PARAM-AUDIT.md` §0.6).** The create path reads it into `[rsp+0x60]` at
+> `0x180018000` and clobbers it with `1.0f` six bytes later at `0x180018006`, so the "network
+> extent" the runtime logs is always the requested extent. The evaluate-site reading above was
+> one of two call sites; both are now covered, which closes "can feature 18 upscale" rather than
+> leaving half of it open.
+
 **A correction to the reference's option docs:** they say that with the auto mask off the snippet
 forces `localStructureStrength` to -1 and it does nothing. **The RAW value still reaches the
 network** — when `max(skin, local) < 0` the kernel feeds the flag channel from raw
@@ -3489,16 +3496,47 @@ so a malformed input is a hang or a garbage image, never a returned error.**
    writing it** — and do not copy a name list off another *caller*, since RenoDX writes seven
    names this build does not implement. `docs/RESEARCH-RENODX-DLSS5.md` §2.2.1 carries the audit.
 
+   > **RE-AUDITED 2026-09-04 with a stronger method, and the six absent names are CONFIRMED
+   > absent — `docs/RESEARCH-DLSSNR-PARAM-AUDIT.md`.** The old method was a string search, and
+   > a string search cannot see inside the 15 zstd-compressed NVIDIA fatbins in `.data` (49.1 MB
+   > decompressed on this copy), had no UTF-16BE pattern, and could never have detected a name
+   > built at runtime. All three holes are now closed by measurement: **zero `DLSSNR` bytes in
+   > any decompressed fatbin, in the PTX, or in `.rsrc`**, and no prefix or suffix string exists
+   > from which a name could be concatenated.
+   >
+   > **And the method is now DECIDABLE rather than merely exhaustive: lookup is by string
+   > LITERAL.** Every name is a `lea rdx, [rip+…]` into `.rdata` handed to a virtual
+   > `NVSDK_NGX_Parameter` call whose result is tested against the `0xBAD00000` mask; the snippet
+   > imports only `version/advapi32/user32/kernel32`, carries no `NVSDK_NGX_Parameter_*` helper
+   > symbol, and each of its 61 `DLSSNR.*` strings is referenced from **exactly one** call site.
+   > There is no hash, no table, and no second route — so **enumerating the call sites enumerates
+   > every name the runtime can consume, and absence really is proof.**
+   >
+   > **Read the audit's §4 before writing a NEW parameter**: it carries the full HARD
+   > slot→type table (`+0x58` = `Get(int*)`, `+0x60` = `Get(unsigned int*)`, `+0x70` =
+   > `Get(float*)`, `+0x40` = `Get(void**)`, MSVC having reversed each overload group), which
+   > retires the SOFT type claims in `docs/RESEARCH-RENODX-DLSS5.md` §2.2.1 in both directions.
+
 3. **Declaring a guide's subrect AND scaling its vectors double-counts.** `MVecSubrectWidth/
    Height` already state that the motion vectors live in their own 1920x1080 rect, so
    `MVecScaleX/Y` must be **1.0**, not the output/render ratio. Reference integrations all send
    1.0 and expect motion in pixels of the guide's own subrect.
 
-**Also worth knowing before the next attempt:** the runtime exports
-`DLSSNRComputeScalingRatioCallback` and `DLSSNRGetStatsCallback` as parameter names (verified
-present in our binary) which `nvngx.dll` would normally populate with function pointers inside
-the snippet itself. We leave them unset — guessing an RVA into a leaked DLL is not a bounded
-risk — and at least one working third-party integration omits them too.
+**Also worth knowing before the next attempt:** the runtime declares
+`DLSSNRComputeScalingRatioCallback` and `DLSSNRGetStatsCallback` as parameter names, and we leave
+them unset.
+
+> **CORRECTED 2026-09-04 (`docs/RESEARCH-DLSSNR-PARAM-AUDIT.md` §5), and both halves of the old
+> sentence were wrong.** It said `nvngx.dll` would populate them and that leaving them unset was
+> a judgement call about "guessing an RVA into a leaked DLL". **The SNIPPET populates them
+> itself**, in its own `NVSDK_NGX_D3D12_PopulateParameters_Impl` (`0x180015f20`), with pointers
+> into its own `.text` — and **nowhere in the binary is either name ever read.** They are
+> OUTPUTS the runtime publishes for the application, not inputs it consults, so leaving them
+> unset costs exactly nothing; and no RVA needs guessing either, because that populating function
+> is an **export** whose only gate is the `GetModuleFileNameW` substring check our NR path already
+> patches (`NgxNRIdentity=nvngx`). `ComputeScalingRatio` reads `PerfQualityValue` and writes
+> `DLSSNR.ScalingRatio`, which is inert at both of its read sites — so it could not matter even
+> if it were installed.
 
 ### The near-black NR output has a ROOT CAUSE: we fed a display-referred network raw HDR
 
