@@ -2552,3 +2552,53 @@ whatever fringe exists, while its depth and motion guides do not.
 **Consequence: this closes the last of the four items carried as open feed gaps.** The other
 three closed as §40 (subrect bases, latent), §41 (`r.TemporalAASamples`, the premise was
 inverted) and §42 (translucency/WPO, an engine question that turned out to be a content one).
+
+## §44 NOT ONE Stray material writes translucent velocity — 316/316 (measured 2026-09-04)
+
+§42 established that UE 4.27 fully supports translucent velocity and that the gate is one
+per-material flag, `bOutputTranslucentVelocity`, with no cvar above it. It left the content
+question open and wrongly called the pak route blocked. It is not blocked — the tooling for it
+was built by this project and is in the tree.
+
+**Method, end to end:** `tools/pakextract.py --raw` over `/M_[^/]*\.uasset$` (316 base
+`UMaterial` assets; `MI_*` instances inherit the base's flag through
+`FMaterialResource::IsTranslucencyWritingVelocity`, so bases are the right target) →
+`tools/oodle_unblock.py` per entry against an `oozraw` built from `powzix/ooz` → grep the cooked
+name maps. UE serialises only NON-DEFAULT properties, so the name's presence means the flag was
+turned on.
+
+```
+extracted        316 / 316   (method 2, Oodle, one block each)
+decompressed     304 by oozraw + 12 that were plain  = 316
+bOutputTranslucentVelocity      0
+```
+
+**The sanity check is what makes the zero meaningful**, and an earlier attempt that lacked one
+produced a zero that meant nothing (it had matched TEXTURES living in `Materials/` folders, by
+directory name). The name maps are demonstrably readable and full of exactly the non-default
+material properties expected:
+
+```
+BlendMode                195 packages
+TwoSided                  56
+MaterialDomain            36
+TranslucencyLightingMode  29
+```
+
+**So every translucent surface in this game writes neither depth nor velocity.** Combined with
+§37 — our reconstruction carries 96.09% of the field and reads DEPTH — each of those pixels is
+handed the motion of whatever opaque surface is behind it. The materials this names are not
+obscure: `M_Waterfall`, `M_FX_Spawn_Vertex`, `M_holo`, `M_loupe`, and `M_eye2` — **the cat's own
+eyes**, on screen in every frame and moving with the cat while the wall behind it does not.
+
+**What this does NOT establish.** How much screen area those materials cover, and whether the
+resulting mis-guided motion is visible. A temporal consumer integrates a motion error rather
+than showing it as one bad frame (§5), so the symptom would be smearing or instability on
+exactly that content, not an obvious glitch. `mods/StrayMaterialCensus` measures the same flag
+off the LOADED set and would confirm this from the running game; it is not needed to establish
+the count, which is now complete.
+
+**The fix is content-side and not ours to make:** the flag is per-material and authored. What is
+ours is the option of marking those pixels — `pInBiasCurrentColorMask` says "the history is not
+to be believed here", which is precisely and only what we can assert about them
+(`mv-dense-reflections`' conclusion, reached independently for reflections).
