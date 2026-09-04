@@ -2357,3 +2357,29 @@ nothing until they have run in The Slums.
 | That `FindFreeElement` survives this build's LTCG rather than being inlined | **UNCONFIRMED**, and `no_candidates` with `refs_found` non-zero is what it would look like |
 | The `+8` walk yielding a resource our registry knows, on this exe | **UNCONFIRMED.** `not-registered` is what a wrong constant produces |
 | That level 2's trampoline is survivable in this process | **UNCONFIRMED.** This is the project's first inline hook into engine code |
+
+### 20.8 Windows-portability, stated per prediction
+
+The brief's constraint is that nothing may depend on vkd3d, DXVK or Wine even though the box runs
+on them. Nothing here does. Per prediction, so a reader can check rather than take the sentence:
+
+| What | Depends on |
+|---|---|
+| The UTF-16 literal scan and the `lea reg,[rip+d]` decode | the PE section table and MSVC's x86-64 encodings — the game's own image, on any host |
+| The `.pdata` function-start filter | the PE exception directory, which every x64 image carries and a Shipping build cannot strip |
+| The enclosing-function grouping | the same `.pdata` |
+| The `%d MB, NewRT %s %s` residual check | a UTF-16 literal in the game's own `.rdata` |
+| `IPooledRenderTarget +8 / +16` | the engine's own object layout |
+| `FRHITexture::GetNativeResource` slot 7 | the engine's vtable — already HARD on this exe from L1 |
+| The registry liveness and extent check | our own `ID3D12Device` creation hooks over a real `ID3D12Resource*` |
+| The trampoline | MinHook, x86-64 |
+
+The one thing the box's configuration touches at all is the guarded reader: `VirtualQuery` is a
+Win32 call and `__try`/`__except` is MSVC-only, so the mingw fast lane compiles the read without
+SEH and relies on the `VirtualQuery` guard alone — which is exactly what L1 does and why the fault
+counter names the build it is reading (§12.5). Neither is a translation-layer dependency.
+
+**And the one prediction that is NOT portable across a game patch, said plainly:** the target
+address. It is discovered per binary, every launch, and refused on ambiguity — never cached, never
+pinned. A recook that moves the function costs a rescan, which is the rule §11.8 of the replan
+asks for.
