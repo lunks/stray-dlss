@@ -490,7 +490,11 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			"deleted on 2026-09-03; the NGX side (ensure_feature_rr / evaluate_rr) is intact and "
 			"waiting for guides taken from the engine's own named G-buffer textures via the "
 			"FViewInfo that AddPasses hands us. DLSS SR runs this session, unaffected. Set NgxRR=0 "
-			"to make that the deliberate configuration and silence this line.", ngx_rr);
+			"to make that the deliberate configuration and silence this line. AND NOTE: guides are "
+			"not the only open question - whether RR has a denoising job in this title at all is "
+			"UNSETTLED, because r.RayTracing=False, r.SSGI.Enable=0 and Stray's own shipped "
+			"r.SSR.Temporal=1 may leave no noisy signal for it to denoise. Read "
+			"docs/RESEARCH-RR-REFLECTION-DENOISE.md before building a guide source for it.", ngx_rr);
 
 	// [STRAYDLSS] NgxExposure = auto (default) | texture | owned.
 	//
@@ -1656,6 +1660,19 @@ EventNeeds DlssApp::configure_events()
 {
 	EventNeeds needs;
 
+	// [STRAYDLSS] DumpShaders was DEAD UNDER THE PLUGIN HOST, silently, and the ini advertises
+	// it (mods/StrayDLSS/StrayDLSS.ini). shader_dump::initialise() was only ever called from
+	// src/backend_reshade/addon_entry.cpp's DLL_PROCESS_ATTACH; the UE4SS plugin has no such
+	// entry, so `g_enabled` stayed false and the key did nothing in the SHIPPING configuration —
+	// while `needs.pipeline_events` below already consulted shader_dump::enabled(), i.e. this
+	// function had always assumed initialise() ran first. It runs here now, for both hosts;
+	// initialise() is idempotent so the add-on's earlier call still wins the ordering.
+	//
+	// This is not housekeeping: the dispatched-shader manifest is the only instrument that says
+	// which passes are actually IN the frame, and the whole RR question turns on that
+	// (docs/RESEARCH-RR-REFLECTION-DENOISE.md §4, tools/dispatch_census.py).
+	shader_dump::initialise();
+
 	bool hash_shaders = true;
 	hash_shaders = host::cfg::get_bool("HashShaders", hash_shaders);
 
@@ -1730,6 +1747,11 @@ void DlssApp::log_final_census(bool saw_bind_pipeline, bool saw_push_descriptors
 // working directory, the same place ReShade.log lands.
 void DlssApp::shutdown()
 {
+	// The manifest's trailing count line and its fclose. The add-on calls this itself at
+	// DLL_PROCESS_DETACH before reaching here; finish() nulls g_manifest, so the second call is
+	// a no-op. Under the plugin host this is the ONLY call, and without it a session that ended
+	// cleanly still left the last flushed line unterminated by the count.
+	shader_dump::finish();
 	diff::set_enabled(false);
 	native::uninstall();
 	native::set_sink(nullptr);

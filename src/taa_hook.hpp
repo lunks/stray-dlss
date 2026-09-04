@@ -69,6 +69,11 @@ void set_stage_file(bool enabled);
 // hands us — identity from the engine, exactly as L1 does for depth and velocity.
 // `[STRAYDLSS] NgxRR` is refused loudly at startup (src/app/dlss_app.cpp) rather than silently
 // doing nothing.
+// AND BEFORE BUILDING THAT GUIDE SOURCE: docs/RESEARCH-RR-REFLECTION-DENOISE.md argues RR may
+// have no denoising job left in this title (r.RayTracing=False, r.SSGI.Enable=0, and Stray's own
+// shipped r.SSR.Temporal=1 already running a temporal filter over SSR before the composite), and
+// that reflections are the content RR is least equipped for because our motion vectors describe
+// the surface, not the reflected geometry. One launch with DumpShaders=1 settles it (§4).
 
 
 // Suppress the pinned pass without running DLSS, to establish whether that pass drives the
