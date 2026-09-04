@@ -2419,3 +2419,41 @@ deliberately not built. Two reasons, and the second is the one that decides it:
 What IS built is the loud failure: `ue4::view_rect_min_is_origin` (pure, tested in CI) and one
 WARN at claim time naming exactly what breaks. If the rect ever moves, we get a sentence in the
 log instead of every guide sampled from the wrong place with no error anywhere.
+
+## §41 `r.TemporalAASamples` is a BASE, not the phase count (2026-09-04, UE 4.27.2 source)
+
+`SceneVisibility.cpp:3193-3211`, read at 4.27/`306a7e9`:
+
+```cpp
+int32 TemporalAASamples = CVarTemporalAASamplesValue;
+{
+    if (bIsMobileTAA)            TemporalAASamples = 2;
+    else if (bTemporalUpsampling)
+        TemporalAASamples = float(TemporalAASamples)
+            * FMath::Max(1.f, 1.f / (EffectivePrimaryResolutionFraction
+                                   * EffectivePrimaryResolutionFraction));
+    else if (CVarTemporalAASamplesValue == 5) TemporalAASamples = 4;
+    TemporalAASamples = FMath::Clamp(TemporalAASamples, 1, 255);
+}
+```
+
+**The engine already implements NVIDIA's `Base × (Target/Render)²`**, unconditionally, whenever
+the pass is upsampling — which on this title is every screen percentage (§2.3.1,
+`r.TemporalAA.Upsampling=True`). The cvar is the **base**.
+
+| `r.TemporalAASamples` | screen % | multiplier | effective phases |
+|---|---|---|---|
+| 8 (stock) | 50 | 4 | **32** — NVIDIA's own number for a 2x ratio |
+| 8 (stock) | 70 | 2.04 | ~16 |
+| **16 (live `Engine.ini`)** | 50 | 4 | **64 — double the recommendation** |
+| 32 ("the fix") | 50 | 4 | **128** |
+
+**So the standing "raise it to 32 for Performance mode" guidance was wrong in both direction and
+magnitude**, and had never been checked against the source. Raising the base multiplies an
+already-multiplied number; the value that lands on NVIDIA's recommendation is the stock **8**.
+
+A longer Halton sequence is not free: it converges more slowly, and a camera in motion never
+completes it — which is the opposite of what more samples is supposed to buy. **UNCONFIRMED
+whether 64 is visibly worse than 32 here**; nothing has been A/B'd. The live ini was deliberately
+NOT changed, because it is a visible-quality change to a configuration the user is mid-way
+through evaluating.

@@ -1493,8 +1493,30 @@ Hard constraints:
 * **`r.TemporalAA.Algorithm` must stay 0.** Gen5 replaces the single dispatch with a chain of six
   shaders and breaks the hook entirely.
 * `r.TemporalAA.HistoryScreenPercentage` must stay 100 — above that switches to `MainSuperSampling`.
-* Raise `r.TemporalAASamples` for SR modes; the default 8 is enough for DLAA but Performance needs
-  32.
+* **DO NOT raise `r.TemporalAASamples`. It is a BASE the engine multiplies, not the phase count**
+  — CORRECTED 2026-09-04 against `SceneVisibility.cpp:3193-3211`, which this bullet had never
+  been checked against:
+
+  ```cpp
+  else if (bTemporalUpsampling)
+      TemporalAASamples = float(TemporalAASamples)
+          * FMath::Max(1.f, 1.f / (EffectivePrimaryResolutionFraction
+                                 * EffectivePrimaryResolutionFraction));
+  ```
+
+  **UE 4.27 already implements NVIDIA's `Base × (Target/Render)²` itself**, unconditionally,
+  whenever the pass is upsampling — which on this title is always (§2.3.1). So at 50% screen
+  percentage the multiplier is `1/0.5² = 4`, and NVIDIA's recommended 32 is what the **stock
+  default of 8** produces. The old bullet read the cvar as the final count and told you to set
+  what the engine was going to compute anyway.
+
+  **Measured consequence on the live box:** `Engine.ini` carries `r.TemporalAASamples=16`, so the
+  effective phase count is **64 — double NVIDIA's recommendation**, and "raising it to 32" as the
+  old bullet implies would have produced **128**. A phase sequence that long converges slowly and
+  a moving camera never finishes it, which is the opposite of what more samples is meant to buy.
+
+  If the sequence length is ever tuned, the value to change is the base: **8 gives 32 at 50% and
+  16 at 70%**, both NVIDIA's own numbers for those ratios.
 * **Never disable TAA via `r.DefaultFeature.AntiAliasing`.** NVIDIA's guide §8.1.3 is explicit:
   replace the TAA pass, but everything the engine does *because* TAA is on — jitter, velocity
   generation — must keep happening.
