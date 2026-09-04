@@ -11,6 +11,7 @@
 #include "ngx_nr.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
