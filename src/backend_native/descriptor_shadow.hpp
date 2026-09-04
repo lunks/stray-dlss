@@ -59,6 +59,28 @@ struct ViewEntry
 	bool dead = false;
 };
 
+// [STRAYDLSS] ShadowGraphicsHeaps, default 0 = DO NOT record RTV and DSV descriptors.
+//
+// The shadow accepts three heap types, and only CBV_SRV_UAV has a reader. The RTV and DSV
+// halves had two: the dataflow pass finder, which described a draw's bound render targets and
+// was DELETED on 2026-09-03 (docs/RESEARCH-RESHADE-SHAPE-SWEEP.md §13.6.1), and the differential
+// observer, which resolves COMPUTE tables only. So on every path, shipping or diagnostic, an
+// RTV or DSV entry is written and never looked up.
+//
+// Recording them was therefore a per-view write, a slot array per RTV/DSV heap and a
+// copy-tracking branch paid for nobody. The saving is SMALL and honestly [derived]: RTV/DSV view
+// creation is a subset of the measured `shadow-write 0.050ms (44 views)` bucket, and their
+// `CopyDescriptors` traffic is expected to be near zero because those heaps are never
+// shader-visible, so UE4 does not stream them the way it streams the online heap. One launch
+// reads it off the `[perf] native hooks/frame` line: the `views` count drops by the RTV/DSV
+// share and nothing else moves.
+//
+// The knob stays because one FUTURE reader is on record: locating Stray's custom-depth target
+// by its DSV (the DLSSNR ControlMask idea, CLAUDE.md §5 "the cat is unchanged under NR") would
+// want DSVs shadowed again. Turning it ON restores the previous behaviour exactly.
+void set_shadow_graphics_heaps(bool on);
+bool shadow_graphics_heaps();
+
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry);
 // A null view: the slot now holds a known-null entry (see ViewEntry::is_null).
 void note_null_view(icept::DescriptorId cpu);
