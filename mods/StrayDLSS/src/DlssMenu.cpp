@@ -9,6 +9,10 @@
 #include <Unreal/UFunction.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/UnrealFlags.hpp>
+#include <Unreal/Hooks.hpp>
+#include <Unreal/UnrealInitializer.hpp>
+
+#include <atomic>
 
 #include <cstdint>
 #include <cstring>
@@ -31,6 +35,20 @@ constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets
 
 int g_sel = 0;
 bool g_open = false;
+
+// THE THREAD - the second thing Lua could not express, and the cause of the null Create.
+//
+// register_keydown_event callbacks run on UE4SS's event-loop thread (UE4SSProgram.hpp:280,
+// is_event_loop_thread), never the game thread. UWidgetBlueprintLibrary::Create called from
+// there returned null with every operand valid (measured 2026-09-04, two runs). UE4SS's own
+// Lua ExecuteInGameThread drains its queue from a ProcessEvent PRE-callback (LuaMod.cpp:4094,
+// :4183) - the engine calls ProcessEvent on the game thread thousands of times a frame, so
+// the first call after a key press is the trampoline. The same shape is used here: the key
+// handler stores an action, the callback runs it once it observes Unreal::IsInGameThread().
+enum class Action : int { none = 0, toggle, left, right };
+std::atomic<int> g_pending{0};
+bool g_in_action = false;        // our own ProcessEvent calls re-enter the pre-callback
+bool g_logged_thread = false;
 UObject *g_widget = nullptr;   // rooted; see Root() below
 bool g_failed = false;
 
@@ -240,12 +258,51 @@ void set_text()
 
 } // namespace
 
-void Init()
+namespace {
+void do_toggle();
+void do_left();
+void do_right();
+} // namespace
+
+void process_event_pre(Hook::TCallbackIterationData<void> &, UObject *, UFunction *fn, void *)
 {
-	STRAY_LOG_INFO("dlss-menu: armed. F10 opens, LEFT/RIGHT choose, F10 applies.");
+	if (g_pending.load(std::memory_order_relaxed) == 0 || g_in_action)
+		return;
+	if (!IsInGameThread())
+		return;
+	g_in_action = true;
+	const int a = g_pending.exchange(0);
+	if (!g_logged_thread)
+	{
+		g_logged_thread = true;
+		STRAY_LOG_WARN("dlss-menu: first action runs on the game thread, inside ProcessEvent(%S)",
+			fn ? fn->GetName().c_str() : STR("?"));
+	}
+	switch (static_cast<Action>(a))
+	{
+	case Action::toggle: do_toggle(); break;
+	case Action::left:   do_left();   break;
+	case Action::right:  do_right();  break;
+	default: break;
+	}
+	g_in_action = false;
 }
 
-void OnToggle()
+void Init()
+{
+	Hook::RegisterProcessEventPreCallback(process_event_pre,
+		{false, false, STR("StrayDLSS"), STR("DlssMenu")});
+	STRAY_LOG_INFO("dlss-menu: armed. F10 opens, LEFT/RIGHT choose, F10 applies. "
+		"Actions run on the game thread via the ProcessEvent pre-callback.");
+}
+
+void OnToggle() { g_pending.store(static_cast<int>(Action::toggle)); }
+void OnLeft()   { g_pending.store(static_cast<int>(Action::left)); }
+void OnRight()  { g_pending.store(static_cast<int>(Action::right)); }
+
+namespace {
+
+void do_toggle()
 {
 	if (g_failed || !stray_dlss::host::cfg::get_bool("DlssMenu", true))
 		return;
@@ -328,18 +385,20 @@ void OnToggle()
 	STRAY_LOG_WARN("dlss-menu: opened");
 }
 
-void OnLeft()
+void do_left()
 {
 	if (!g_open) return;
 	g_sel = (g_sel + kPresetCount - 1) % kPresetCount;
 	set_text();
 }
 
-void OnRight()
+void do_right()
 {
 	if (!g_open) return;
 	g_sel = (g_sel + 1) % kPresetCount;
 	set_text();
 }
+
+} // namespace
 
 } // namespace stray_dlss_menu
