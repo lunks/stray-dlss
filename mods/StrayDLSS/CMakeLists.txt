@@ -85,6 +85,10 @@ add_library(StrayDLSS SHARED
     src/Mod.cpp
     src/Platform.cpp
     src/Platform.hpp
+    src/TweakState.cpp
+    src/TweakState.hpp
+    src/TweakUi.cpp
+    src/TweakUi.hpp
     src/Version.hpp)
 
 target_include_directories(StrayDLSS PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

@@ -33,7 +33,7 @@ name: StrayDLSS plugin
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise ]
+    branches: [ main, dlss-ue4ss, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, dlss-tweak-ui ]
     tags: [ 'v*' ]
     paths:
       - 'mods/StrayDLSS/**'
@@ -131,7 +131,10 @@ jobs:
             echo "--- $f.c"
             x86_64-w64-mingw32-gcc -O2 -Wall -c "$f.c" -o "/tmp/obj/$(basename $f).o"
           done
-          for f in Platform Host; do
+          # TweakState carries the whole live-tuning model and has NO ImGui in it precisely so
+          # this two-minute lane covers it; only TweakUi.cpp (which draws) and Mod.cpp (which
+          # registers the tab) need the SDK and are left to lane 2.
+          for f in Platform TweakState Host; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
               -DWIN32_LEAN_AND_MEAN -DNOMINMAX \

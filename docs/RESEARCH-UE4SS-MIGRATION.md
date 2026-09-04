@@ -1029,3 +1029,67 @@ weeks and the answer will be obvious.
 **Rollback exists at every stage through stage 3**, and stage 2 costs nothing but CPU. The only
 irreversible step is stage 4, and it is gated on a validated replacement for the one tool the
 project cannot work without.
+
+---
+
+## Stage 6 answered: the tab exists, and it is NOT an overlay (2026-09-04, branch `dlss-tweak-ui`)
+
+Everything in this section was read out of **RE-UE4SS at the pinned `UE4SS_SHA`
+68caddcf36804b7405424e03e911e6b278324f47** — the commit `.github/workflows/dlss-plugin.yml`
+builds against, and therefore the one on the box. Nothing here has run against the game.
+
+### The API — HARD
+
+| Fact | Source at 68caddcf |
+|---|---|
+| `RC_UE4SS_API auto register_tab(StringViewType, GUI::GUITab::RenderFunctionType) -> void`, `protected` on `CppUserModBase` | `UE4SS/include/Mod/CppUserModBase.hpp` |
+| `GUITab::RenderFunctionType` is **`void (*)(CppUserModBase*)`** — a plain function pointer, not a `std::function`, so the callback must be capture-less | `UE4SS/include/GUI/GUITab.hpp` |
+| Tabs registered with `register_tab` are removed by `~CppUserModBase`; `UE4SSProgram::add_gui_tab` is the manual, crash-if-you-forget alternative | `UE4SS/src/Mod/CppUserModBase.cpp:18-27,56-60` |
+| `virtual auto on_ui_init() -> void` is where `UE4SS_ENABLE_IMGUI()` belongs. It sets the mod's imgui **context AND allocator** from UE4SS's. Without it the first widget crashes | `CppUserModBase.hpp:59`, `UE4SSProgram.hpp:28-42`, and `assets/Changelog.md:549` records a crash from putting the macro in the constructor instead |
+| `virtual auto render_tab() -> void` also exists on the base, but nothing in the tree calls it for `register_tab`-registered tabs — the function pointer is what runs | `UE4SS/src/Mod/CppUserModBase.cpp` |
+| ImGui is pinned to **ocornut/imgui v1.92.1** and is linked `PUBLIC` into the `UE4SS` target, so a mod that links `UE4SS` gets both the headers and the symbols | `deps/third/CMakeLists.txt:27-33`, `UE4SS/CMakeLists.txt:147-151` |
+
+### The verdict that matters — HARD, and it is not what "overlay" means
+
+**UE4SS's debug GUI always renders into its OWN OS window. There is no in-game overlay path at
+this commit.** `DebuggingGUI::setup` unconditionally calls `m_os_backend->create_window(...)`
+(`UE4SS/src/GUI/GUI.cpp:510`), and the two backends both make a real toplevel: `Backend_DX11` +
+`Backend_Windows` calls `::CreateWindow` (`Windows.cpp:63`), `Backend_GLFW3_OpenGL3` calls
+`glfwCreateWindow` (`GLFW3_OpenGL3.cpp:38`). Nothing in `UE4SS/src/GUI/` hooks a swapchain, a
+`Present`, or a `UGameViewportClient` draw.
+
+`[Debug] RenderMode` chooses only **which thread pumps that window's loop**, never where it
+draws (`UE4SSProgram.cpp:1046-1092`):
+
+* `ExternalThread` — a `std::jthread` runs `main_loop_internal()`;
+* `EngineTick` — `RegisterEngineTickPostCallback` calls `gui_render_thread_tick()`, which calls
+  the same `main_loop_internal()`;
+* `GameViewportClientTick` — the same, off `UGameViewportClient::Tick`.
+
+So "ReShade-style overlay" is not available through UE4SS here. What IS available is a tab in a
+second window.
+
+### Opening it — HARD
+
+* `[Debug] GuiConsoleEnabled = 1` in `<UE4SS>/UE4SS-settings.ini` gates the toggle entirely
+  (`SettingsManager.cpp:150` maps that ini key onto `Debug.DebugConsoleEnabled`;
+  `UE4SSProgram.cpp:1093` wraps the whole `register_keydown_event` in it).
+* The binding is **CTRL + `[Debug] ToggleGUIKey`**, and the CONTROL modifier is hardcoded at the
+  registration site (`UE4SSProgram.cpp:1103`). `ToggleGUIKey` defaults to **`O`**
+  (`SettingsManager.hpp:92`), so **Ctrl+O** unless the box's ini says otherwise.
+* `[Debug] GraphicsAPI` selects `dx11` / `d3d11` / `opengl`, default **opengl**
+  (`assets/UE4SS-settings.ini:167-170`).
+
+### UNCONFIRMED, and it is the whole risk
+
+**Whether that second Wine toplevel is visible, focusable and renderable under gamescope's DRM
+backend has never been tested.** The relevant prior is CLAUDE.md §6's own note that gamescope
+focuses the newest toplevel, and that a Wine window which never presents leaves the compositor
+stuck on the game's last frame — read pessimistically, opening the GUI could take the screen away
+from the game rather than sit on top of it. Nothing in this tree measures it.
+
+**Consequence for the design:** the live-tuning path was built with two front ends over one
+model. `mods/StrayDLSS/src/TweakUi.cpp` draws the tab; `mods/StrayDLSS/src/TweakState.cpp` holds
+the knob registry, the setters and the ini save — and `Host::Tick` re-applies every one of those
+knobs whenever `StrayDLSS.ini` changes on disk. If the window turns out to be unusable, editing
+the ini is the same control path with no rebuild and no relaunch.

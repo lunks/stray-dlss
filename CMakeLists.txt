@@ -105,6 +105,8 @@ add_library(stray_dlss_core STATIC
     src/core/ring.hpp
     src/host/ini.cpp
     src/host/ini.hpp
+    src/host/ini_edit.cpp
+    src/host/ini_edit.hpp
     src/host/config.cpp
     src/host/config.hpp
     src/core/dxgi_format.cpp
@@ -400,6 +402,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_params.cpp
         tests/test_ring.cpp
         tests/test_ini.cpp
+        tests/test_ini_edit.cpp
         tests/test_intercept_types.cpp
         tests/test_native_core.cpp
         tests/test_fg_plan.cpp
