@@ -2390,3 +2390,32 @@ slots (ID3D12DeviceExt2)` in both, because capture is unconditional.
    is 2 files, a config key, and eight call sites across `ngx_backend`, `ngx_snippet`, `ngx_fg`,
    `ngx_nr`, `nr_hook`, `dlss_app` and `backend_native/vtable_patch` — all of it existing solely
    to undo a patch that only ReShade installs. Measured inert, not argued inert.
+
+## §40 ViewRectMin is the origin, 41/41 (2026-09-04) — so the NGX subrect bases are unnecessary
+
+We pass **no** `InColorSubrectBase` / `InDepthSubrectBase` / `InMVSubrectBase` /
+`InOutputSubrectBase` to NGX; every guide is handed over as a whole texture with an implicit
+origin of (0,0). That is correct only while UE4's view rect starts at the buffer's top-left, and
+§5's rule for this field is "read it, do not assume it".
+
+**Read across every session log on the box:**
+
+```
+41 observations, 8 session logs, every one:   ViewRectMin = 0.0 0.0
+```
+
+**So the missing subrect bases are a latent gap, not a live defect**, and the plumbing is
+deliberately not built. Two reasons, and the second is the one that decides it:
+
+1. It would be untested code guarding a case that has never occurred here — and it cannot be
+   tested, because nothing we can do makes UE4 shift the rect.
+2. **The obvious implementation is wrong.** Applying `ViewRectMin` to all four bases is the
+   natural reading and would be a bug: the motion-vector texture NGX receives is **ours**, not
+   the engine's — our resolve writes it from (0,0) regardless of where the engine's own buffers
+   are indexed. Colour, depth and output would want the offset; the motion vectors must not have
+   it. Getting that split wrong offsets the guides against each other, which is worse than the
+   uniform offset it was meant to fix.
+
+What IS built is the loud failure: `ue4::view_rect_min_is_origin` (pure, tested in CI) and one
+WARN at claim time naming exactly what breaks. If the rect ever moves, we get a sentence in the
+log instead of every guide sampled from the wrong place with no error anywhere.
