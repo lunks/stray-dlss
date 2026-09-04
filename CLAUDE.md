@@ -37,6 +37,13 @@ Depth lives in two companion documents, both of which are load-bearing:
 * **`docs/RESEARCH.md`** — verified external research: the ReShade 6.8 API, the NGX D3D12 SDK, UE
   4.27 internals, the Proton/vkd3d chain, and CI. 228 claims, each adversarially verified. **When
   this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
+* **`docs/RESEARCH-NVIDIA-PLUGIN-VALIDATION.md`** — every DLSS convention this project ships,
+  checked against **NVIDIA's own UE 4.27 DLSS and Streamline plugins** (`NvRTX/UnrealEngine`,
+  branch `dlss3/sl2-4.27-dlss-plugin`), one table row per claim with a verdict. Read it before
+  changing any NGX input. It is what upgraded jitter, pre-exposure, the motion-vector contract,
+  the RR G-buffer recipe and every frame-generation constant from `[derived]`/mirror-sourced to
+  **HARD first-party at our exact engine version** — and what found the four places we differ.
+  **That repository is private: never commit its source, only prose plus `file:line`.**
 * **`docs/RESEARCH-ENGINE-TAA-HOOK.md`** — how UE 4.27 itself says which dispatch is the TAA pass,
   and what that retires from §2.3. Read it before touching the identification path.
 * **`docs/RESEARCH-U0-IDENTITY.md`** — its §0 verdict, *"there is no engine route to the TAA
@@ -1004,6 +1011,13 @@ geometry carries nothing and its motion must be reconstructed from depth and the
 > `prev_clip.w <= 0`, and a zero tells DLSS "this pixel did not move" — a confident false
 > statement worth fixing if it happened. It measures **0.0000%**. It does not happen. Do not
 > build the fix.
+>
+> **AND NVIDIA DOES THE SAME THING — closed from the other side, 2026-09-04, HARD.**
+> `VelocityCombine.usf:189-192` falls back to `Velocity = EncodedVelocity.xy`, the **raw
+> UNORM bits**; that branch is only reachable when the validity test already failed, so for a
+> cleared texel it *is* exactly zero. Ours is the cleaner form of the vendor's own behaviour
+> (theirs would leak undecoded UNORM values out of a partially-written texel). Do not copy
+> theirs verbatim, and do not reopen the question.
 
 **[derived] A resolve pass is mandatory regardless**, because DLSS only accepts `RG16_FLOAT` or
 `RG32_FLOAT` motion vectors and `r16g16b16a16_unorm` is not an accepted format.
@@ -1032,6 +1046,16 @@ constant.** `DecodeVelocityFromTexture` takes a `float4` and returns a `float3`.
 
 **[derived] Validity test is `EncodedVelocity.x > 0.0`** — strict, red channel only, because the
 target is cleared to 0. Reproduce it exactly; never use a magnitude threshold.
+
+> **CORRECTED 2026-09-04 against NVIDIA's own UE 4.27 plugin. That is UE's TAA rule, NOT
+> NVIDIA's.** `VelocityCombine.usf:171` in `NvRTX/UnrealEngine@dlss3/sl2-4.27-dlss-plugin`
+> tests `all(EncodedVelocity.xy > 0)` — **both** components — and the sentence "never test
+> both components", which this line used to carry, attributed to NVIDIA the opposite of what
+> NVIDIA ships. Ours (`shaders/mv_resolve.hlsl:196`) still matches UE's own TAA and is the
+> defensible choice; only the attribution was wrong. The two answers diverge solely where the
+> encoded GREEN channel is exactly 0, i.e. `V.y <= -2.004` NDC, and our own census bounds that
+> whole UNORM-clamped class at **0.0129%** of engine-written pixels. No code change.
+> `docs/RESEARCH-NVIDIA-PLUGIN-VALIDATION.md` §2.2.
 
 **[derived]** The stored value is `ScreenPos - PrevScreenPos` in NDC with **both** frames' jitter
 removed — directly comparable to the `ClipToPrevClip`-derived camera motion. Both branches are
@@ -1260,6 +1284,14 @@ The negative Y factor is real — **but only in the derivation**. **[derived] Do
 
 `TemporalAAParams.zw` **is** `TemporalJitterPixels`, already in render-resolution pixels, in
 `[-0.5, +0.5]`, and NVIDIA's own UE plugin passes it to NGX unmodified.
+
+> **BOTH HALVES ARE NOW HARD AND FIRST-PARTY (2026-09-04).** `SceneRendering.cpp:1517-1521`
+> assigns `TemporalAAParams = (index, count, TemporalJitterPixels.X, TemporalJitterPixels.Y)`,
+> so `.zw` IS that vector by construction; and NVIDIA's UE **4.27** plugin reads
+> `View.TemporalJitterPixels` (`DLSSUpscaler.cpp:623`) into `InJitterOffsetX/Y`
+> (`NGXD3D12RHI.cpp:220-221`) with no transformation. The Streamline plugin does the same for
+> frame generation (`StreamlineViewExtension.cpp:560`). Read from NVIDIA's own fork of the
+> engine at our exact version, not from a mirror.
 
 **[derived]** `TemporalAAParams` is `(JitterIndex, SequenceLength, JitterPixelsX, JitterPixelsY)`;
 `TemporalAAJitter` is `(CurX, CurY, PrevX, PrevY)` in clip/NDC units.
@@ -1708,9 +1740,15 @@ answer it computed now comes from the engine, and `docs/RESEARCH-ENGINE-TAA-HOOK
   knob — it silently gates a whole input.**
 * **`InPreExposure` is `View.PreExposure`, NOT its reciprocal**, and it is independent of the
   exposure texture: the official plugin sets both, and only the texture is nulled under
-  auto-exposure (`DLSSUpscalerPrivate.h` `PreExposure(View.PreExposure)`;
-  `NGXD3D12RHI.cpp:275-276`). Guard it on the row-135 self-check — `helpers.h:507` rewrites a 0
+  auto-exposure. Guard it on the row-135 self-check — `helpers.h:507` rewrites a 0
   to **1.0**, which silently claims the buffer is not pre-exposed.
+  **CONFIRMED first-party 2026-09-04** against NVIDIA's UE **4.27** plugin
+  (`DLSSUpscaler.cpp:630` `const float PreExposure = View.PreExposure;`,
+  `NGXD3D12RHI.cpp:217-218` — the texture and only the texture is nulled under auto). The
+  old citations `DLSSUpscalerPrivate.h` and `NGXD3D12RHI.cpp:275-276` came from the **UE5**
+  8.3.0 mirror and do not resolve in the 4.27 tree, where `DLSSUpscalerPrivate.h` is a bare
+  log-category header — accurate for that version, but they read as version-independent and
+  are not. `docs/RESEARCH-NVIDIA-PLUGIN-VALIDATION.md` §5.2.
 * **`InExposureScale` is not a consume test.** NVIDIA documents it nowhere (zero prose in the
   84-page guide) and the official plugin never sets it (zero hits repo-wide). To test whether
   DLSS reads the exposure texture, change the number INSIDE the texture — which means owning it
@@ -1718,9 +1756,37 @@ answer it computed now comes from the engine, and `docs/RESEARCH-ENGINE-TAA-HOOK
 * **Motion vectors: `RG16_FLOAT`, render-resolution pixels, [0,0] upper-left, pointing BACKWARD.**
   `MV_pixels = (PrevScreen - ThisScreen) * (0.5·W, -0.5·H)`, `InMVScaleX/Y = (1,1)`. Guard with
   `PrevClipPos.w > 0`. This is NVIDIA's own `VelocityCombine.usf` math — copy it, don't invent it.
+  **VERIFIED LINE BY LINE 2026-09-04 against the vendor's own 4.27 shader, and the Streamline
+  plugin's copy of it is byte-identical in the non-dilated branch — so ONE motion-vector field
+  is correct for both SR and FG.** HARD, and previously only inferred.
+* **BUT NVIDIA'S DEFAULT IS DILATED, OUTPUT-RESOLUTION MOTION VECTORS, AND WE HAVE NEVER TRIED
+  THEM (2026-09-04).** `r.NGX.DLSS.DilateMotionVectors` defaults to **1**
+  (`DLSSUpscaler.cpp:92-97`): the combine pass then runs at `GetSecondaryViewRectSize()`, maps
+  each OUTPUT pixel back through `TemporalJitterPixels`, takes a 4-tap depth cross at ±1 texel
+  and fetches the velocity of the **nearest** sample — and `MVLowRes` is consequently CLEARED
+  (`NGXRHI.cpp:462`). NVIDIA's own help text: *"This can help with improving image quality of
+  thin details."* We ship the non-dilated path, which is legal, is what NVIDIA **forces** under
+  RR (`DLSSUpscaler.cpp:485-490`), and is what our `0x4B` flag word is correct for — but it is
+  the largest untried quality lever on the SR path, aimed at exactly the artifact class this
+  project keeps chasing. `docs/RESEARCH-NVIDIA-PLUGIN-VALIDATION.md` §2.1.
+* **`InFrameTimeDeltaInMsec` is set by NVIDIA on EVERY evaluate and by us only on RR
+  (2026-09-04).** `NGXD3D12RHI.cpp:227` feeds it from `View.Family->DeltaWorldTime * 1000`
+  through the shared `GetCommonEvalParams`, so SR gets it too; our SR evaluate leaves the
+  memzero'd 0.0 while `src/ngx_backend.cpp:923` sets it for RR from a value
+  `src/taa_hook.cpp:414` already computes. One line short. The header calls it "research
+  purposes" and then documents a real use.
+* **Subrect bases: NVIDIA anchors colour and depth at `SrcRect.Min` and the output at
+  `DestRect.Min`** (`NGXD3D12RHI.cpp:198-215`); the motion vectors alone are (0,0) because the
+  combine pass writes top-left. We send zeros for all of them. Latent while Stray's
+  `View.ViewRectMin` is (0,0) — but §5's own rule is to read it, and `mv_resolve.hlsl` does.
 * **Jitter: pass `TemporalAAParams.zw` straight through. No sign flip.**
 * **Presets: only `0, J=10, K=11, L=12, M=13` are valid** (A–D removed, E/F deprecated). Use **K**.
-  Set all five hint keys **before** `CreateFeature`; setting them after has no effect.
+  Set all **six** hint keys **before** `CreateFeature`; setting them after has no effect.
+  **CORRECTED 2026-09-04 — this said five.** `NGXRHI.cpp:569-574` sets DLAA, **UltraQuality**,
+  Quality, Balanced, Performance and UltraPerformance; `src/ngx_backend.cpp:1066-1070` omits
+  UltraQuality. Inert on this title (`src/core/dlss_quality.cpp` never selects that mode) but
+  it is a real gap. NVIDIA also sets `NVSDK_NGX_Parameter_FreeMemOnReleaseFeature`
+  (`NGXRHI.cpp:566`, cvar default 1); we never do.
 * **NGX clobbers D3D12 command-list state.** We must save and restore descriptor heaps, root
   signature, PSO, root params, topology, viewports and RTVs. ReShade does not do this for us. This
   is the number-one corruption risk.
@@ -1865,6 +1931,32 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 > into ENGINE code**, gated on ≥ 3 distinct enclosing functions and ≥ 4 distinct name literals
 > agreeing on one `.pdata` function start, with the trampoline supplied by the plugin HOST so the
 > ReShade host physically cannot install one.
+>
+> **AND BEFORE RR IS EVER JUDGED, FIX THE DEPTH GUIDE — measured against NVIDIA's own plugin
+> 2026-09-04, and it is the one place this project is demonstrably in an untested corner.**
+> `NGXRHI.cpp:460-461` sets `NVSDK_NGX_DLSS_Feature_Flags_DepthInverted` **only when the
+> denoiser is Off**, i.e. never for RR; and `DLSSUpscaler.cpp:511` replaces the depth input
+> outright with `ResolvedGBuffer.LinearDepth`, a fifth output of the G-buffer resolve carrying
+> `FGBufferData.Depth` = `CalcSceneDepth` = `ConvertFromDeviceZ` — **linear, world units**.
+> `InUseHWDepth` stays at `..._Depth_Type_Linear` by memzero. We ship the opposite corner:
+> `src/ngx_backend.cpp:835` sets `..._Depth_Type_HW`, `:859` sets `DepthInverted`, and
+> `evaluate_rr` passes the engine's device depth. Self-consistent, accepted by the enum,
+> **never validated by the vendor** — and the DLSSD parameter block validates nothing, so a
+> wrong pairing is a bad image, not an error. Add the linear-depth output (row 65,
+> `InvDeviceZToWorldZTransform`) and A/B it before drawing any conclusion about RR quality.
+>
+> **Two more RR divergences from the same audit, both ours and both inventions:**
+> `shaders/gbuffer_resolve.hlsl:136-145` special-cases the Unlit shading model (albedos 0.5,
+> roughness 1) and `:170-171` floors both albedos at 0.05. **`GBufferResolve.usf:87-103` has
+> no branch and no clamp.** The specular floor is the suspicious one: physically-correct
+> dielectric F0 is ~0.04, so 0.05 makes every non-metal's specular guide too bright. Both came
+> from the RR guide PDF and RTXPT, not from this plugin. Put them behind keys defaulting to
+> NVIDIA's behaviour before RR is judged. `docs/RESEARCH-NVIDIA-PLUGIN-VALIDATION.md` §1.
+>
+> **What DID survive the audit intact:** `EnvBRDFApproxRTG` coefficient for coefficient, the
+> NoV remap and the 0.75 scale, `Square(Roughness)`, `ComputeF0`, `DiffuseColor`, the
+> world-space normal with roughness in `.w`, the separate Unpacked roughness guide, and the
+> render-resolution top-left subrect-base-0 layout. `src/core/envbrdf.*` is right.
 > `src/core/pool_locator.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20,
 > `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5.
 >
@@ -2154,6 +2246,15 @@ is done and measured; only the FG swapchain remains.
 
 Two independent walls stand between a ReShade add-on and NGX feature 18. Both are now
 characterised, and the second is the interesting one.
+
+> **NOTHING BELOW IS TOUCHED BY NVIDIA'S UE PLUGIN, AND THAT IS WORTH STATING (2026-09-04).**
+> An exhaustive search of `NvRTX/UnrealEngine@dlss3/sl2-4.27-dlss-plugin` finds **no DLSSNR,
+> no feature 18, no CG2R, no `nvngx_dlssnr`** anywhere. Keep the two straight: **DLSSD /
+> `NVSDK_NGX_Feature_RayReconstruction` is Ray Reconstruction** and IS in that tree (§5, the
+> RR block); **DLSSNR is a different, unreleased feature and is not.** Every NR claim in this
+> file and in `docs/RESEARCH-DLSSNR-STYLES.md` remains sourced to binary analysis and to
+> third-party integrations, and is UNVERIFIABLE against the vendor — which is exactly why the
+> "confirm every parameter name by string search over the runtime binary" rule exists there.
 
 **Wall 1 — the NGX core will not route feature 18.** Asking `nvngx.dll` for it returns
 `FAIL_OutOfDate` no matter how the snippet is staged, because the core resolves only
@@ -3793,6 +3894,28 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §32. The parts that decide everything:
   > combination they never test. "More faithful to the engine" is not a virtue for a value the
   > vendor documents as not needing to match it. HARD on what NVIDIA sends; **UNCONFIRMED that
   > it changes an interpolated frame**, since `nvngx_dlssg.dll` is closed.
+  >
+  > **CONFIRMED FIRST-PARTY AT 4.27, 2026-09-04.** `StreamlineViewExtension.cpp:66-76` in
+  > `NvRTX/UnrealEngine@dlss3/sl2-4.27-dlss-plugin` carries exactly `0.01f` and `75000.0f`
+  > with that help text, and `sl_consts.h:90/198-204` confirms `INVALID_FLOAT` as the unset
+  > sentinel on a non-optional pair. Every other FG constant we ship was confirmed in the same
+  > pass — `mvecScale = 1/ViewRect` (`:565-570`), matrices copied **row for row with no
+  > transpose** (`StreamlineConversions.h:17-28`), `depthInverted=1`,
+  > `cameraMotionIncluded=1`, `motionVectors3D=0`, `cameraFOV` in radians,
+  > `cameraPinholeOffset=(0,0)`, `clipToLensClip=identity`,
+  > `minRelativeLinearDepthObjectSeparation = 40.0f` (`sl_consts.h:236`).
+* **EXCEPT ONE, AND IT IS OURS: we send the JITTER-FREE projection where NVIDIA sends the
+  JITTERED one (2026-09-04).** `SceneView.cpp:2413-2415`: `ViewToClip =
+  GetProjectionMatrix()` (jittered), `ViewToClipNoAA = GetProjectionNoAAMatrix()`, `ClipToView
+  = GetInvProjectionMatrix()` (inverse of the **jittered** one). Streamline is handed
+  `ViewToClip` and `ClipToView` (`StreamlineViewExtension.cpp:576`, `:588`) — jittered — plus
+  a separate `jitterOffset`. `src/ngx_fg.cpp:379-381` sends `view_to_clip_no_aa` (View row 32)
+  and its computed inverse, plus the same `jitterOffset`. So DLSS-G gets a projection that
+  disagrees with the depth and MV buffers by one frame's jitter while also being told what
+  that jitter is. Note the asymmetry we get RIGHT for the opposite reason: `ClipToPrevClip` is
+  built from NoAA matrices **by the engine**, and is the same row NVIDIA sends — the jitter
+  convention is per-matrix, not global. One row's change (28 instead of 32) with an obvious
+  A/B; **UNCONFIRMED that it changes a frame**, since the snippet is closed.
 * **Reflex goes through DXVK-NVAPI's `NvAPI_D3D_*` by function id** (`src/backend_native/
   fg_reflex.cpp`), never `sl.reflex`; every status is logged and nothing gates on it. On the
   box all five entry points exist and `SetSleepMode`/`Sleep`/`SetLatencyMarker` return
