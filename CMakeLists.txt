@@ -217,8 +217,6 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/nr_stage.hpp
         src/nr_mask.cpp
         src/nr_mask.hpp
-        src/ext_unhook.cpp
-        src/ext_unhook.hpp
         src/input_dump.cpp
         src/input_dump.hpp
         src/mv_resolve.cpp
