@@ -31,6 +31,98 @@ constexpr std::size_t kNeedleLen = sizeof(kNeedle) / sizeof(kNeedle[0]);
 bool g_done = false;
 int g_attempts = 0;
 
+// THE WATCH, and it is deliberately ONE object and ONE range.
+//
+// Offline analysis of the game's own UHT descriptors (docs/RESEARCH-STRAY-MENU-SCREENPCT.md)
+// bounds the non-reflected region of GraphicsSettingsWidget to 0x4B0..0x530 - class size minus
+// the last reflected property, so it is arithmetic rather than a guess. That analysis and this
+// file's own runtime scan agree independently on sizeof = 1488 and on m_screenPercentages at
+// +0x580, which is why both numbers are trusted.
+//
+// The scan answered "where are the sixteen values" with "nowhere reflected". This answers what
+// that leaves: WHICH BYTES MOVE when the row is operated. Sample once a second; the bytes that
+// change when the user presses left/right are the row's index.
+//
+// SCOPED DOWN ON PURPOSE. An earlier draft also watched three ListBoxWidget rows, which meant
+// looking each one up by property NAME - and UE4SS's own docs give conflicting answers for
+// whether FProperty::GetName() returns FName or FString at this SHA. One object and one range
+// needs no name lookup at all, so that ambiguity cannot bite. If the page's region turns out
+// not to hold the index, adding the rows is a second, informed step.
+//
+// THREADING, stated honestly rather than assumed away: on_update is UE4SS's own ~200 Hz
+// jthread, NOT the game thread (Mod.cpp, from UE4SSProgram.cpp:1205,1322-1341). Reading a live
+// UObject from it can give a TORN sample. For a diagnostic that is a spurious log line, not a
+// wrong conclusion - we are looking for bytes that change consistently across a button press.
+// The real hazard is the widget being freed when the menu closes, and the SEH guard turns that
+// into a caught fault that drops the watch rather than taking the process down. This would NOT
+// be acceptable in a path that ACTED on the result.
+constexpr std::uint32_t kPageWatchBegin = 0x4B0, kPageWatchEnd = 0x530;
+
+// Defined below, next to the other guarded read; poll_watch calls it.
+bool copy_object_bytes(const void *base, std::size_t size, std::vector<std::uint8_t> &out);
+
+const void *g_watch_base = nullptr;
+std::vector<std::uint8_t> g_watch_last;
+bool g_watch_primed = false;
+int g_poll_divider = 0;
+int g_changes = 0;
+
+std::string hex_of(const std::vector<std::uint8_t> &b, std::size_t from, std::size_t len)
+{
+	static const char *d = "0123456789ABCDEF";
+	std::string s;
+	s.reserve(len * 3);
+	for (std::size_t i = from; i < from + len && i < b.size(); ++i)
+	{
+		s.push_back(d[b[i] >> 4]);
+		s.push_back(d[b[i] & 0xF]);
+		s.push_back(' ');
+	}
+	return s;
+}
+
+// One sample, diffed against the last. Only the runs that actually moved are printed: a full
+// 128-byte dump every second would bury the one line that matters.
+void poll_watch()
+{
+	if (g_watch_base == nullptr)
+		return;
+	const std::size_t len = kPageWatchEnd - kPageWatchBegin;
+	std::vector<std::uint8_t> now;
+	if (!copy_object_bytes(static_cast<const std::uint8_t *>(g_watch_base) + kPageWatchBegin,
+			len, now))
+	{
+		STRAY_LOG_WARN("menu-scan: watch read FAULTED (the page was probably freed when the menu "
+			"closed). Watch dropped; reopen Options -> Graphics to re-arm.");
+		g_watch_base = nullptr;
+		g_watch_primed = false;
+		return;
+	}
+	if (!g_watch_primed)
+	{
+		g_watch_last = now;
+		g_watch_primed = true;
+		STRAY_LOG_WARN("menu-scan: watch primed over 0x%X..0x%X. Press LEFT/RIGHT on Screen "
+			"Percentage now.", kPageWatchBegin, kPageWatchEnd);
+		return;
+	}
+	if (now == g_watch_last)
+		return;
+
+	++g_changes;
+	for (std::size_t i = 0; i < len;)
+	{
+		if (now[i] == g_watch_last[i]) { ++i; continue; }
+		std::size_t j = i;
+		while (j < len && now[j] != g_watch_last[j]) ++j;
+		STRAY_LOG_WARN("menu-scan CHANGE #%d at +0x%X (%zu bytes): %s-> %s", g_changes,
+			static_cast<unsigned>(kPageWatchBegin + i), j - i,
+			hex_of(g_watch_last, i, j - i).c_str(), hex_of(now, i, j - i).c_str());
+		i = j;
+	}
+	g_watch_last = now;
+}
+
 // Reading a live object's bytes cannot fault on a correct size, but "correct" here rests on
 // GetPropertiesSize() being the real instance size, which is an assumption about a shipped
 // game's reflection data. SEH costs nothing and turns a wrong assumption into a logged refusal
@@ -69,10 +161,17 @@ bool read_u32_array(std::uint64_t addr, std::uint32_t count, std::vector<std::ui
 
 void Tick()
 {
-	if (g_done)
-		return;
 	if (!stray_dlss::host::cfg::get_bool("MenuScan", false))
 		return;
+
+	if (g_done)
+	{
+		if (++g_poll_divider < 200)
+			return;
+		g_poll_divider = 0;
+		poll_watch();
+		return;
+	}
 
 	using namespace RC::Unreal;
 
@@ -182,7 +281,11 @@ void Tick()
 				: "");
 	}
 
-	STRAY_LOG_WARN("menu-scan: done. It changed nothing; it only looked.");
+	g_watch_base = page;
+	g_watch_primed = false;
+	STRAY_LOG_WARN("menu-scan: scan done, it changed nothing. WATCH ARMED on the page's "
+		"non-reflected region 0x%X..0x%X, sampling once a second.",
+		kPageWatchBegin, kPageWatchEnd);
 	g_done = true;
 }
 
