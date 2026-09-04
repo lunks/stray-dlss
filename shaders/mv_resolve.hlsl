@@ -145,10 +145,10 @@ float2 NdcToOutputPixels(float2 velocity_ndc)
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
-	// The bounds test used to be an early `return`. It is a flag now because the census needs
-	// two GroupMemoryBarrierWithGroupSync calls around the body, and a barrier that only some
-	// lanes of a group reach is undefined. `StatsEnable` comes from the constant buffer and is
-	// therefore uniform across the group, so both barriers are reached by all lanes or none.
+	// The bounds test used to be an early `return`. It is a FLAG now, and that change is the
+	// only structural edit this instrument makes to the shipping path: the census needs two
+	// group-wide barriers around the body, and lanes that returned early would not reach them.
+	// The work each in-bounds lane does, and the value it writes, are unchanged.
 	const bool inside = (tid.x < (uint)RenderSize.x) && (tid.y < (uint)RenderSize.y);
 	const bool stats = (StatsEnable != 0.0f);
 
