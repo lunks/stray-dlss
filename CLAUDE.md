@@ -30,6 +30,16 @@ Depth lives in two companion documents, both of which are load-bearing:
 * **`docs/RESEARCH.md`** — verified external research: the ReShade 6.8 API, the NGX D3D12 SDK, UE
   4.27 internals, the Proton/vkd3d chain, and CI. 228 claims, each adversarially verified. **When
   this file and `docs/RESEARCH.md` disagree, RESEARCH.md wins** — it carries the citations.
+* **`docs/RESEARCH-ENGINE-TAA-HOOK.md`** — how UE 4.27 itself says which dispatch is the TAA pass,
+  and what that retires from §2.3. Read it before touching the identification path.
+* **`docs/RESEARCH-U0-IDENTITY.md`** — its §0 verdict, *"there is no engine route to the TAA
+  output UAV's identity"*, is **CORRECTED by its own §10 (2026-09-04)**: the seven mechanisms it
+  refused were all ways of reading RDG's state, and the RHI is the consumer RDG hands the binding
+  to — `IRHIComputeContext::RHISetUAVParameter(shader, 0, uav)` fires on the RHI thread
+  immediately before the D3D12 dispatch we intercept, with the register as an argument. Built as
+  `[STRAYDLSS] U0Hook` (§2.9, §5); measured in facts §37. Read §0-§9 for why the enumeration
+  looked complete, and still read it before assuming `u0` is a "graph-allocated transient" — in
+  4.27 every RDG texture is a pooled render target.
 
 ---
 
@@ -486,6 +496,70 @@ Observed swapchains from `IDXGISwapChain::ResizeBuffers`:
 **[derived]** Each output-resolution change requires a full NGX `ReleaseFeature` + `CreateFeature`.
 Guard Evaluate to no-op when observed sizes differ from creation sizes.
 
+> **AND THE DISTINCTION INSIDE THAT SENTENCE IS LOAD-BEARING (2026-09-03, report §17, facts
+> §36.21).** A **render**-rect change within one output needs NO recreate — DLSS takes it per
+> evaluate through `InRenderSubrectDimensions`, which `ngx_backend::evaluate` has always set. An
+> **output**-rect change does, because NGX has no output-subrect DIMENSIONS: the eval params
+> carry only `InOutputSubrectBase`, a base coordinate, and the target extent is fixed at
+> `CreateFeature` (**HARD**, `nvsdk_ngx_helpers.h:377-398`).
+>
+> **The user's second defect lives exactly there.** *"During some script scene transitions, the
+> NR kinda pops up/slows down as if there was something off."* Measured: a cinematic-bar
+> animation walks the view rect `3840x2160 -> 3840x2073` and back, aspect **1.778 -> 1.85**, in
+> runs of **6 to 10 consecutive feature creations** — 31 of one session's 88. Both operands move
+> together, so it is the engine genuinely upscaling into a shrinking rect, and every step
+> destroyed DLSS's temporal accumulation (the pop) and paid a full `CreateFeature` (the hitch;
+> the same session carries 164 stalls, recent ones 57-79 ms against a 16-18 ms median).
+>
+> **So the fix is not to recreate faster, it is to stop CHASING.** `src/core/feature_recreate.hpp`
+> debounces RE-creation: a differing rect must be asked for `[STRAYDLSS] NgxRecreateStableFrames`
+> (default 8) frames running before anything is torn down, and meanwhile `ensure_feature` returns
+> false so the engine's own TAA renders the frame. Against the measured sequence that is **zero
+> creations per transition**, and because the primary feature is never released **DLSS's history
+> survives the whole cinematic** — so the pop at the END goes too. The FIRST creation is never
+> debounced; a genuine resolution change settles at once and costs 8 frames. `=0` restores the old
+> behaviour for an A/B. Read `[recreate] deferred= restarts=`, and
+> `dlss_recreate_deferred/restarts` in the status file.
+>
+> **The general shape, which this project keeps meeting: a value that is still moving is not a
+> value to build against.** The same reasoning that says do not force a `DLSSNR.Reset` on a
+> continuously varying codec scale (§5) says do not rebuild a feature for a rect mid-animation.
+>
+> **AND NOT REBUILDING IS NOT THE SAME AS NOT RUNNING — the debounce alone turned DLSS OFF for
+> every cinematic (2026-09-04, report §18).** USER-REPORTED: *"I think DLSS NR was deactivated on
+> the scene transitions, so it should probably support it?"*, and *"it's a letterbox animation,
+> it slowly slides back to 100% frame."* `RecreateAction::wait` **declines the frame**, and NR
+> consumes the guides the TAA hook publishes on a successful SR evaluate — so SR *and* NR were
+> both off for the whole slide. Removing the hitch was real; leaving DLSS off through every
+> cinematic was not the end state.
+>
+> **The fix is to hold `InRenderSubrectDimensions` at the extent the feature was CREATED with**,
+> and it is exact rather than approximate. The eval params have no output size — `OutWidth`/
+> `OutHeight` are create-time (`nvsdk_ngx_helpers.h:437-440`) and the six `*SubrectBase` fields
+> including `InOutputSubrectBase` are **base coordinates only** (`:377-398`) — so DLSS always
+> upscales the render subrect to the created target. Feed it the engine's shrinking subrect and
+> you get a **non-uniform stretch that animates** (1920x1037 into 3840x2160 is 2.000x across,
+> 2.083x down). Feed it the created extent and the scale never moves; and because UE anchors both
+> rects at the origin, **the engine's shrunken output rect is precisely the image of its shrunken
+> input rect** — it renders rows 0..1036, DLSS maps them to output rows 0..2073, it reads
+> 0..2072, its own `OutputViewRect`. The rows below are computed from input it did not render and
+> nothing displays them.
+>
+> **Two clauses of `core::plan_letterbox_hold` are the load-bearing ones**, and neither is an
+> assumption: `originMoved` re-reads `View.ViewRectMin` every frame, because the prefix mapping
+> is false the moment a title centres its shrinking rect instead of anchoring it top-left; and
+> `outputTooSmall` asks whether the UAV can still hold the created target, which is what stops a
+> genuine resolution change — **1280x720 -> 2560x1440 has the SAME 2.0 scale, so no ratio test
+> can tell it from a slide** — from becoming an out-of-bounds write that vkd3d-proton has no
+> debug layer to object to. That hole was found by the tests, not by reading.
+>
+> **Also fixed, and it was a defect in the debounce as shipped: SR had no reset after a gap.**
+> `ei.reset` was the camera-cut OR alone, so resuming after a declined run reprojected a
+> second-old history across one frame of motion — §5's compounding class exactly. A forced reset
+> is now latched on a decline and on a fresh feature and counted as `forcedResets`.
+>
+> `[STRAYDLSS] NgxLetterboxHold=0` restores the decline. Read `[hold] held= ... notHeld: ...`.
+
 ### 2.2 Filesystem layout
 
 ```
@@ -510,6 +584,238 @@ Config and saves live in the **Proton prefix**:
   ~6.1 MB skeleton that is **not read**.
 
 ### 2.3 The TAA pass — our interception point
+
+> **EVERYTHING IN THIS SECTION IS A BEHAVIOURAL IDENTIFICATION, AND THE ENGINE HAS A BETTER ONE
+> (2026-09-03).** The hash, the depth+stencil-SRV-over-one-resource signature, the dispatch-rect
+> arithmetic, the aspect-ratio gate, the permutation pin — all of it exists because this project
+> began as an out-of-process ReShade add-on that could see nothing but D3D12 descriptors. As a
+> UE4SS plugin we are inside the engine, and UE 4.27's `ITemporalUpscaler::AddPasses` is the ONE
+> call site of the primary temporal upscale (`PostProcessing.cpp:559`). **Every look-alike this
+> section documents — and three it does not — reaches `FTAAStandaloneCS` through a call to
+> `AddTemporalAAPass` that never touches the interface**: DiaphragmDOF, LightShaftRendering,
+> IndirectLightRendering (SSR/SSGI), SingleLayerWaterRendering, `FPostProcessing::ProcessPlanarReflection`
+> (which runs a full `Main`-config TAA on a planar reflection — the pass `kGateNotPrimaryView`
+> exists to exclude), and the `DVSM_RayTracingDebug` view. Being called through the interface IS
+> the identification.
+>
+> `docs/RESEARCH-ENGINE-TAA-HOOK.md` is the feasibility report, the provenance ledger and the
+> demotion map for everything below. **MEASURED ON THE BOX 2026-09-03 (facts §36):** the scan found
+> the `ITemporalUpscaler` vtable with one candidate at every stage and validated all three
+> constants; the `AddPasses` stand-in installed, forwarded, and changed nothing; and over 8570
+> announcements `orphans=0` while the structural signature below accepted TWO dispatches the
+> engine never announced (`0xe3ddca4be9830076` at 240x135 groups, `0x42af595f8ff91038` at
+> 120x68) — only the cooked-hash whitelist stopped DLSS running on them. **`[STRAYDLSS]
+> EngineSeam=3` is therefore the DEFAULT: the engine's announcement gates DLSS SR, and the hash
+> table and the signature below are ASSERTIONS (`ENGINE SEAM ASSERTION`, once per pass), never
+> gates.** Levels 0-2 keep the heuristic in charge; a level-3 session with no live seam runs the
+> heuristic only if `EngineSeamFallback=1` and says so at ERROR level. The whole verdict is
+> readable from the main menu — the seam fires on frame 0 — and the periodic `[seam]` line's
+> `unclaimed` must stay 0 (`preSkipped` is expected to grow: that is the two passes above being
+> turned away every frame — since 2026-09-04 BEFORE the descriptor resolve, by the ledger's own
+> group counts (`seam::pre_gate_decide`), so `lookalikesRefused` now counts only the ones that
+> got as far as a claim). Nothing below is deleted yet; under level 3 it is bypassed.
+>
+> **AND LEVEL 3 EXPOSED THE OTHER HALF (2026-09-03, facts §36.6-36.8).** Identity was solved and
+> the frames still flipped: `unclaimed` ~ NR `guides-stale` ~ NR `frame-gap` resets at every
+> checkpoint, accelerating, because the heuristic still gated **acceptance of the INPUTS** — the
+> register walk for the roles and ReShade's `view->resource` map for liveness — on a dispatch the
+> engine had already named. The one refusal logged for the real pass was *"depth or velocity SRV
+> missing or not known live"*, printed **once by design**, so the rate was invisible. **L1 fixes
+> it**: `AddPasses` hands us `FPassInputs`, and those three `FRDGTexture*` are resolved at CLAIM
+> time (`ResourceRHI`@16 -> the `FRHITexture` vptr -> `GetNativeResource` at slot 7 ->
+> `ID3D12Resource*`) and REPLACE the role guesses and the liveness verdict — a resource the engine
+> is about to bind is alive by construction. The heuristic stays as an assertion and as a counted
+> fallback (`[STRAYDLSS] EngineSeamInputs`, default 1). The `[seam]` line now carries
+> continuous per-reason counters (`notClaimed` / `claimedButNoSR` / `evaluated` / `l1:`) — the
+> WARN says *which* gate, the counters say *how often*, and conflating them cost a round trip.
+>
+> **BOTH OFFSETS ARE NOW HARD, AND L1 STILL CRASHED THE GAME (2026-09-03, facts §36.9, report
+> §12).** The first resolve returned all three pointers `(ok, registered=1)` — three independent
+> hits in our own resource registry, which chance does not produce — so `ResourceRHI@16` and slot
+> 7 are right. The game then died at frame ~600 with `EXCEPTION_ACCESS_VIOLATION reading
+> 0x0000021c000003c0`, seven frames deep in `l1_read_u64`'s own `memcpy`. That address is two
+> int32s, **960 and 540** — an `FIntPoint`, a half-res extent — sitting where `ResourceRHI` was
+> expected, i.e. **recycled RDG arena memory**. A bisect on `EngineSeamInputs` alone confirmed
+> it: `0` ran 16 200 frames clean (and gave back `unclaimed=159`), `1` crashed at 600.
+>
+> **The lesson, and it generalises past this feature: the ledger claims IDENTITY with deliberate
+> slack, and L1 read POINTERS through it.** `Ledger::claim` returns the oldest unconsumed rect
+> match and `retire_stale` keeps an announcement for 4 newer announcements or 8 presents — right
+> for correlation, because a late dispatch still names the right pass and `unclaimed` stays
+> honest. But `FRDGTexture` is allocated from the frame's `FRDGAllocator`, which the builder
+> resets at the end of `Execute`, so the moment a newer graph exists the pointer addresses
+> somebody else's allocation. One frame whose dispatch misses `claim()` — which is the exact
+> failure L1 exists to work around — puts the ledger permanently one graph behind, invisibly:
+> `claimed` still increments and `unclaimed` stays 0. **An identity that survives a frame
+> boundary is not a lifetime.** Ask which one you are relying on before dereferencing anything
+> the engine handed you.
+>
+> **Fixed by:** `seam::announcement_is_fresh` — dereference only the newest announcement, and
+> only before the frame has turned over — leaving `claim()` and every correlation counter
+> untouched; a `VirtualQuery` readability check where `plausible_heap_ptr` was only ever a numeric
+> RANGE test; **SEH around both the read and the `GetNativeResource` call**, explicitly and by
+> name, because those two sites dereference and call through offsets no test outside the engine
+> can prove; and a fault latching L1 off for the session at ERROR rather than re-rolling every
+> frame. Read `l1: stale=` and `faults=` in the `[seam]` line first — `stale=` is the counter
+> whose absence cost this round trip.
+>
+> **AND THE FIRST FIX SHIPPED A THIRD CONDITION — same thread — WHICH WAS WRONG AND MADE L1
+> INERT (2026-09-03, facts §36.10, report §12.8).** The crash stayed fixed (`faults=0 off=0`,
+> 4200+ frames), and `stale=4147` of 4147 claims with `resolved=0`: the build behaved as
+> `EngineSeamInputs=0` while every other counter said L1 was on, and the blips came back. **HARD,
+> and new: `AddPasses` announces on one thread and the D3D12 `Dispatch` is recorded on another**
+> — 1400 and 1152 on this build, stable all session, because UE 4.27 runs RDG graph SETUP and
+> graph EXECUTION separately.
+>
+> **The reasoning error is the durable part, and it is a sibling of the one above. THREAD
+> IDENTITY GOVERNS OWNERSHIP, NOT VALIDITY.** "`FRDGBuilder` is a stack object" means the
+> announcing thread's frame must not have returned; it does not mean only that thread may read
+> what its allocator holds. Memory held by a live stack frame is readable from any thread — and
+> the engine itself reads `ResourceRHI` on the recording thread in order to bind the texture. The
+> lifetime argument only ever needed *newest announcement* and *the frame has not turned over*,
+> each independently sufficient.
+>
+> **And the process lesson, which this file has now paid for twice in one day: a defensive
+> condition needs the same HARD / SOFT / UNCONFIRMED discipline as a functional one.** A wrong
+> guard does not fail loudly — it silently never fires the thing it guards, and reads as "the
+> feature does not help" rather than "the feature never ran". The same-thread test was
+> UNCONFIRMED, presented as reasoning, and shipped as a gate; only the fact that the decline was
+> COUNTED and NAMED turned it into a one-line diagnosis instead of another bisect. The thread
+> pair is now latched and reported — one INFO, and one WARN if it ever moves — and gated on
+> nothing.
+>
+> **THEN THE NARROWER GATE MADE L1 INERT TOO, AND THAT FINALLY NAMED THE REAL BUG: THE SITE
+> (2026-09-03, facts §36.11, report §12.9).** `resolved` froze at 164 while `stale` grew every
+> frame — the claim is **one announcement and one frame behind, in steady state**. Two source
+> facts explain it and end the argument: **`FRDGBuilder::Execute()` ends with `Clear()` →
+> `Allocator.ReleaseAll()`**, freeing every `FRDGTexture`, and it neither flushes nor waits for
+> the RHI thread; while **`FRHICommandList` is "definitions for queueing up & executing later"**
+> and a pass lambda's `DispatchComputeShader` does `ALLOC_COMMAND` rather than calling the RHI.
+> **So the D3D12 dispatch we intercept happens on another thread AFTER the arena is freed, and
+> resolving there reads freed memory by construction.** No gate on the claim side could ever have
+> worked; the two inert builds were empirically proving that.
+>
+> **The fix is the SITE.** The chain walk moved into `AddPasses`, on the render thread, inside the
+> builder's own setup, where the textures are provably alive — and `GetSceneTextureParameters`
+> registers depth and velocity with `RegisterExternalTexture`, which calls `SetRHI` immediately,
+> so exactly the two guides that matter resolve there. The announcement now carries plain
+> `ID3D12Resource*` that no allocator owns; the claim only checks them against our registry.
+> `announcement_is_fresh` is demoted to a pipeline-depth diagnostic.
+>
+> **The rule to carry: when a guard keeps having to be narrowed, the guard is not the problem —
+> the placement is.** This file already learned that once, from NR growing 4,900 lines of
+> machinery to survive `u0`. L1 rediscovered it in three builds. **And the corollary that saved
+> `claim()`: with the RHI thread a frame behind, returning the OLDEST rect match returns the
+> announcement the dispatch actually belongs to — the correlation was right the whole time, and
+> only the pointer was dead.** Ask which of identity and lifetime you are relying on, and then ask
+> where each is still true.
+>
+> **CONFIRMED ON THE BOX, frame 16800, 53.3 fps, no crash (facts §36.13).** `partial == claimed`
+> exactly — every claimed dispatch takes depth and velocity from the engine — with
+> **`deadInputs=0`**, `fellBack=0`, `faults=0`, `off=0`. Colour comes back `rhi_null` exactly as
+> predicted (it is the graph-allocated post-chain texture), so `resolved` stays 0 by design and
+> **`partial` is the success state, not a degraded one**. `ResourceRHI @16` and
+> `GetNativeResource` slot 7 are **HARD**.
+>
+> **And L1 caught a real defect on its first frame, which is the reason it was worth building:**
+> `ENGINE SEAM L1 ASSERTION: the engine's velocity is …5323DD00 and the heuristic's register walk
+> says …52FB62F0.` The register walk was feeding DLSS SR a velocity resource **the engine did not
+> bind**. A wrong velocity is a motion-vector error, and §5's rule is that those compound through
+> the accumulation and read as drift and instability rather than as a motion-vector bug — so this
+> is a real defect, and L1 replaces it with the engine's answer.
+>
+> **IT IS NOT THE FLICKER (retracted 2026-09-03, facts §36.13.1).** This line called it the
+> leading candidate; the user has since judged the image with the engine's velocity in use and
+> the flicker persists. **`unclaimed` is the flicker** — see the note below on it.
+>
+> **`unclaimed` (~1.2%, all `noDispatch`) IS THE VISIBLE FLICKER**, on the user's own judgement
+> and corroborated by arithmetic: 204 events over ~317 s is **0.64/s, one every ~1.6 s**, which is
+> the cadence they have reported since before the seam existed. On such a frame the engine's own
+> TAA runs instead of DLSS SR, so the image changes hands for one frame. **Success is
+> `unclaimed = 0`, judged by eye, not by reading the counter.**
+>
+> **ROOT-CAUSED 2026-09-03 (facts §36.18), and it was NOT the gate.** `nearMiss` tracks
+> `unclaimed` exactly, so the real dispatch — the announced 480x270 groups — IS arriving and our
+> matcher refuses it with *"dispatch covers less than the view rect"*. The enriched line said
+> why: **the matcher was reading a render rect of 4088x4088, from a View CB at b3**, while the
+> healthy frames read b4. On ~1.2% of frames a DIFFERENT view's buffer — a shadow or capture
+> view — is bound on a lower register, and the search **walks slot order and keeps the FIRST
+> plausible hit**, so it stops before reaching the real one.
+>
+> **The obvious reading was wrong and would have made things worse.** "A heuristic still gating
+> what the engine answered, the same shape as `trust_registers`" is seductive, and bypassing the
+> gate would have run DLSS with a 4088x4088 view's jitter, `ClipToPrevClip` and `CameraCut` —
+> and §5's rule is that bad motion inputs compound through the accumulation rather than costing
+> one frame. **The matcher was right; it was fed the wrong view. Fix the input, not the check.**
+>
+> The search now skips a candidate that describes a different view than this dispatch:
+> `OutputViewRect >= InputViewRect` always and the dispatch covers the output rect, so a view
+> larger than the dispatch covers cannot be this one (`ue4::view_fits_dispatch`, inclusive so
+> DLAA passes, and 200% downsampling still rejected). Read **`wrongView=`** on the `[view]` line.
+>
+> **CONFIRMED ON THE BOX (facts §36.19): `announced=9003 claimed=9003 unclaimed=0 orphans=0
+> nearMiss=0`**, every refusal reason zero, 53.0 fps, no errors. Two downstream counters agree
+> independently: NR's `frame-gap` resets fell **23 -> 1**, and `l1: stale` fell from ~90% of
+> claims to **0** — which refines §12.9's account of the lag (it was mostly the refusal backlog
+> rolling the ledger one behind, not pure RHI-thread pipelining) without touching the
+> announce-time argument, which rests on `Execute()` freeing the allocator and on the two
+> threads, neither of which is expressed in presents. **Whether the flicker is gone is for the
+> user's eyes; `unclaimed = 0` is met.**
+>
+> **And it narrows row 135.** §36.14's `ok=64044 bad=0` was read as exonerating the CB search;
+> it does not. Row 135 proves the buffer IS a View uniform buffer — a shadow view satisfies all
+> three predictions, because it is one. **A self-validating check tells you what KIND of thing
+> you have, never WHICH one.** Identity needs something that separates the candidates, and here
+> that was the dispatch, available at that point all along.
+>
+> **AND THE SEARCH IS STILL PICKING THE WRONG VIEW — MEASURED, AND IT REACHED THE SCREEN
+> (2026-09-03, report §16).** The user, playing: *"some textures are popping up on the whole
+> screen when we walk around… at Antvillage you see a carpet pattern full screen."* In that
+> session's own log, **37 of 62 `DLSS feature created:` lines name a render rect that cannot be
+> the primary view** — `64x34` through `64x52`, `128x109`, `128x126`, `256x240`, `1024x1024`, a
+> portrait `1064x2128` — every one of them upscaling to the engine's announced `3840x2160`.
+> `64x41 -> 3840x2160` is a **60x** upscale.
+>
+> **`view_fits_dispatch` bounds the view only from ABOVE**, so a SMALL impostor passes
+> plausibility, row 135 and the fit bound alike; the `[view]` line's own `suspectSmall=162`
+> counts them and gates nothing. And **`f947ee4`, the commit that made `EngineSeam=3` the
+> default, removed the create-site aspect + 3.5x gate** that would have caught the consequence,
+> reasoning *"under the engine's gate the shape test is moot: a cubemap face or a reflection
+> capture never reaches `AddPasses`"*.
+>
+> **THE ENGINE WARRANTS THE DISPATCH AND THE OUTPUT RECT. IT DOES NOT WARRANT THE RENDER RECT** —
+> that comes from the View CB search and the seam has no opinion about it. Two operands, one
+> covered. So DLSS was created `64x41 -> 3840x2160` and told to read a `64x41` subrect of the
+> real 1920x1080 scene colour: **it magnifies the TOP-LEFT CORNER of the frame over the whole
+> screen**, and at floor level that corner is the carpet. `primary_view_shape_ok` restores the
+> gate under both authorities, using UE 4.27's own `kMinTAAUpsampleResolutionFraction = 0.5`; a
+> refusal costs one frame of the engine's TAA, since `suppress_engine_dispatch` is set only after
+> a successful evaluate. Read **`badRenderRect`** on the `[seam]` line.
+>
+> **The general rule: when an authority replaces a heuristic, check which of the compared
+> quantities the authority actually covers.** A gate whose operands come from two sources is
+> moot only if the new authority supplies BOTH.
+>
+> **And the remedy is still the search, not the gate** — gate `ue4::view_fraction_plausible`
+> (already written, already measured, deliberately ungated) so the wrong candidate is SKIPPED and
+> the real view found, rather than the frame declined. Report §16.5.
+>
+> **BOTH HALVES ARE NOW SHIPPED, AND THE FIX IS WORTH MORE THAN §16 THOUGHT (2026-09-03, report
+> §17, facts §36.21).** `view_fraction_plausible` is GATED inside the search — a candidate below
+> the engine's 0.5 minimum is skipped and the search continues to the real view — with
+> `primary_view_shape_ok` / `colour_input_acceptable` / `badRenderRect` kept as the create-site
+> backstop. `suspectSmall` becomes **`tooSmall=`** on the `[view]` line and now counts the fix
+> firing, not a frame we got wrong.
+>
+> **Measured over a longer session of the same build: 88 DLSS feature creations, and the
+> SEQUENCE is what settles the value.** Each of the 26 impossible-rect creations is a LONE
+> excursion (`…C A C…`), so it also costs the primary-view recreation that follows it:
+> **52 of 88, 59%, are this bug.** §36.20's `suspectSmall=0` was **the menu**, where no shadow,
+> capture or planar-reflection view exists to be offered — a counter reading 0 where the
+> phenomenon cannot occur is not a refutation, and that retraction is the §2.4 menu/load trap in
+> a new place.
+>
+> **The other 31 creations are REAL and are the user's second defect** — see §2.1.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -630,6 +936,15 @@ confirmed by the game's own settings**, independently of the bytecode and bindin
 
 The only user-added override in the live `Engine.ini` is `r.BasePassOutputsVelocity=1`, which is
 redundant since the game already ships it as True.
+
+**The cat's fur material, read the same way 2026-09-03.** `M_Fur_2sidedshading_backpackON` is
+a `MaterialInstanceConstant` over `M_Base_GFur_2sidedshading`; both are **`BLEND_Masked`**, the
+instance overrides the shading model to `MSM_SubsurfaceProfile` (parent `MSM_TwoSidedFoliage`),
+and the base sets `bUsedWithSkeletalMesh`. Masked is what puts the ~48 gFur shell layers in the
+**opaque base pass**, which is what makes them write `GBufferVelocity` — see "The cat is unchanged
+under NR, and the fur is NOT a motion-vector hole" in §5 for the full chain and for the extraction
+procedure (these assets are Oodle-compressed, so `pakextract.py --raw` + `oodle_unblock.py` is
+required).
 
 **Reading the pak.** It is version 11, **unencrypted**, 5.3 GiB, 55,120 entries.
 `tools/paklist.py` lists it and `tools/pakextract.py` extracts by regex, both reading only the
@@ -796,6 +1111,123 @@ menu, camera cut and gameplay. That is a ~95x swing, and it is independent suppo
 `NgxNRTrackExposure` on with a long time constant: no fixed codec scale can be right across
 that range.
 
+#### THE VIEW CB IS FOUND BY SEARCH, AND UNTIL 2026-09-03 NOTHING CHECKED WHICH BUFFER IT WAS
+
+`taa_hook` tries every bound constant buffer and keeps the first that `view_params_plausible`
+accepts — and that is a **shape** test the WRONG buffer can satisfy. A wrong View means wrong
+jitter, wrong `ClipToPrevClip` and a wrong `CameraCut`, fed to every temporal consumer we have:
+DLSS SR, feature 18, and the engine's own accumulation. **That is what flicker looks like**, and
+this file's own rule already applies — *bad motion vectors do not produce one bad frame, they
+compound through the accumulation* (§5).
+
+Measured in the menu (facts §36.12): `View CB: NOT READABLE or implausible (cb valid=0 reg=b0)`,
+then `View CB at b4, offset 4921600`, with `NearPlane` exactly `1.0000`, `DeltaTime` exactly
+`0.000000` and `PreExposure` jumping `1.0 -> 32.1`. Consistent with a wrong buffer; proof of
+nothing either way.
+
+**Row 135 settles it for free, and the check already shipped** — it just was not being printed.
+The row must read `(denormal, P, 1/P, 0.0)` and `y*z == 1.0` is true BY CONSTRUCTION, so it
+cannot survive a wrong buffer or a slipped offset. All four components from one read, the three
+predictions and a verdict now print beside the `View CB at b…` line, with a running `ok=/bad=`
+tally on the periodic `[view]` line.
+
+> **MEASURED THE SAME DAY: `ok=64044 bad=0`. THE SEARCH IS RIGHT (facts §36.14).** So
+> `NearPlane` exactly `1.0000` and `DeltaTime` exactly `0.000000` in the menu are the engine's
+> real values, not a wrong buffer, and the `1.0 -> 32.1` PreExposure swing is the menu's genuine
+> exposure range. **The flicker is not a wrong View CB** — look at the velocity disagreement in
+> §2.3's L1 note instead. And the View-CB-by-identity idea
+> (`FSceneView::ViewUniformBuffer` matched against the bound CBV) is demoted from a correctness
+> fix to a **performance** change: it is what would let the descriptor shadow leave the hot path.
+> No urgency, and no reason to take risk for it.
+>
+> > **BOTH HALVES OF THAT PARAGRAPH ARE WRONG, AND THE SAME DAY OVERTURNED THEM (2026-09-03).**
+> > Kept verbatim because reading a correct measurement too broadly is the mistake worth seeing.
+> >
+> > **"The search is right" was too broad.** Row 135 proves the buffer IS **a** View uniform
+> > buffer; a shadow or capture view satisfies all three predictions, *because it is one*. The
+> > search was then measured taking a 4088x4088 view's buffer on ~1.2% of frames — and that WAS
+> > the flicker (facts §36.18-36.19). **A self-validating check tells you what KIND of thing you
+> > have, never WHICH one.**
+> >
+> > **"A performance change" was wrong too, and it was repeated as the justification for weeks.**
+> > `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §1.3 ranked the CB search as what keeps the descriptor
+> > shadow's 2.287 ms write side alive; read against `native_backend.cpp:174-308` it holds **one of
+> > nine root hooks and none of `shadow-copy`'s 1.644 ms**, which is the SRV/UAV table walk that
+> > colour-by-register and the output UAV `u0` still require. Replacing the search would save well
+> > under 0.5 ms of 2.9 ms. That document is corrected in place; the arithmetic is
+> > `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15.4.
+> >
+> > **So the justification is purely CORRECTNESS, and the open question is narrow:**
+> > `view_fits_dispatch` catches an impostor whose rect is LARGER than the dispatch covers; one
+> > that is SMALLER passes plausibility, row 135 and the fit bound alike and still wins on a lower
+> > root parameter. That subset is being counted now. **Zero means the search's answer was forced
+> > and there is nothing to fix. Non-zero means slot order has been choosing a temporal consumer's
+> > jitter, `ClipToPrevClip` and `CameraCut`** — §5's compounding-error class — and the
+> > replacement is worth building.
+> >
+> > **And the replacement is not the obvious one.** `FRHIUniformBuffer` has **no**
+> > `GetNativeResource` virtual (unlike `FRHITexture`, which is why L1 was cheap), and
+> > `FD3D12UniformBuffer`'s `ResourceLocation` offset is gated on `USE_STATIC_ROOT_SIGNATURE`, a
+> > build define we cannot observe. Two nested layout derivations with no self-validating constant
+> > is what §9 of the seam report forbids. The one defensible route DISCOVERS both offsets and
+> > validates them against five independent predictions — including the engine's own
+> > `OffsetFromBaseOfResource` matching our resource registry's bit for bit — exactly as the
+> > vtable scan validates against 0.5 and 2.0. Full design, guards and ladder:
+> > `docs/RESEARCH-ENGINE-TAA-HOOK.md` §15. **Nothing of it is built.**
+> >
+> > > **SUPERSEDED 2026-09-04, and BUILT — by a different route (`docs/RESEARCH-ENGINE-AWARE-REPLAN.md`
+> > > §2, `src/core/view_cached.hpp`, `src/view_params_hook.cpp`, `[STRAYDLSS] EngineSeamViewParams`).**
+> > > The counted subset came back NON-ZERO — `ambClaimed=36` of ~10 800 (facts §36.20), and its
+> > > shape was not a foreign view at all but a **STALE RING COPY of the same view**: two bound
+> > > buffers, both the real render rect, differing only in `ClipToPrevClip`, jitter and `CameraCut`.
+> > > Nothing structural can separate those, so the answer had to be identity — and §15's two-offset
+> > > route through `FD3D12UniformBuffer` was never built, because the engine offers a far better
+> > > one: **`FViewInfo::CachedViewUniformShaderParameters`** (`SceneRendering.h`, right after
+> > > `ViewRect`), a `TUniquePtr` to the CPU struct `View.ViewUniformBuffer` is created from
+> > > (`SceneRendering.cpp`, `FViewInfo::InitRHIResources`) and TAA binds (`TemporalAA.cpp:767`),
+> > > sitting in the `const FViewInfo&` `AddPasses` already hands us. It is per-`FViewInfo`, rebuilt
+> > > per frame, so it cannot be a stale ring copy; its only other writer, `UpdateLateLatchData`, is
+> > > VR late-latching and copies the struct INTO the buffer, never the reverse (HARD, mirror).
+> > >
+> > > **The row reads above do not change** — the struct IS the 2448-byte prefix, at the same rows,
+> > > and row 135 still validates every read from ONE memcpy. What changes is the SOURCE: at
+> > > announce the render thread reads the struct and carries it, decoded plus raw, in the
+> > > announcement; at claim it is compared **byte for byte** against what the search read from the
+> > > bound buffer for that dispatch. The offset into `FViewInfo` is DISCOVERED, never derived
+> > > (`sizeof(FSceneView)` is unobservable): a bounded scan whose survivor must parse, pass row 135,
+> > > fit the announcement's own output rect from above and below, carry L1's depth extent at row
+> > > 132 — and then match the bound bytes `kLatchAgreements` announcements running. After the
+> > > latch a byte disagreement is the SEARCH reading a stale copy (`disagree=` on the
+> > > `[viewParams]` line), never a demotion. Level 1 changes nothing and reports; level 2 makes
+> > > the struct the source and `ambClaimed` reads 0 by construction; level 3 (delete the search)
+> > > is declared, not built.
+> > >
+> > > **MEASURED THE SAME DAY, and the offset is HARD: `FViewInfo+5768` (facts §36.22).** Level 1,
+> > > main menu, one launch. **Exactly one** candidate survived the scan; its 2448 bytes were
+> > > **byte-IDENTICAL** to what the search read from the bound buffer on the first comparison and
+> > > then on eight claimed announcements running (`preDisagree=0`); `faults=0 off=0 ambiguous=0
+> > > empty=0 uncompared=0 unverified=0`. **And `disagree=4` matched the search's own
+> > > `ambClaimed=4` EVENT FOR EVENT**, with every assertion WARN naming jitter / `PreExposure` /
+> > > `ClipToPrevClip` at row 0 — §36.20's stale-ring shape, confirmed rather than inferred.
+> > >
+> > > **LEVEL 2 IS THE DEFAULT SINCE 2026-09-04**, and it is safe by construction rather than by
+> > > optimism: substitution requires the latch, the latch requires eight byte-exact agreements
+> > > with a buffer the engine BOUND, and where no latch forms the search supplies the View
+> > > exactly as at level 0 — so the worst case of shipping 2 is the behaviour of 1. The default
+> > > is `viewcached::kDefaultLevel` and is pinned by a test.
+> > >
+> > > **Still UNCONFIRMED, and it needs GAMEPLAY:** that the substitution drives `ambClaimed` to 0
+> > > and moves those frames under `disagree=`. The menu has no shadow, capture or planar-
+> > > reflection view, and §36.21 records a sibling counter going 0 → 171 across that boundary —
+> > > this file's own menu/load trap, for the fourth time. And whether removing a stale
+> > > `ClipToPrevClip` from ~0.3-0.7% of frames changes the picture is §5's compounding class:
+> > > for the user's eyes, not for a counter.
+
+**The method is the transferable part, and it cost nothing.** The predicate already existed; only
+the log line was missing. One line settled a question that would otherwise have justified a new
+[derived] offset into `FViewInfo`. **Reach for the check the data already contains before
+building the identity path.**
+
 
 Traps:
 
@@ -865,6 +1297,29 @@ The same resource can also appear as this frame's **scene-colour input**; the tw
 distinguishable **only by which register it turns up on**. Track by register, never by identity
 alone.
 
+> **THE ENGINE NAMES `u0` — AND EVERY OTHER REGISTER OF THE PASS — ON THE RHI THREAD, AND WE
+> NOW LISTEN (2026-09-04, `[STRAYDLSS] U0Hook`, branch `u0-rhi-uav`).** `RESEARCH-U0-IDENTITY.md`
+> §10: `FTAAStandaloneCS` is `SHADER_USE_PARAMETER_STRUCT` (`TemporalAA.cpp:149`), so its pass
+> lambda binds every parameter through `IRHIComputeContext` virtuals with the register as an
+> argument (`ShaderParameterStruct.h:185-283` — `RHISetShaderTexture` for t0/t1/t2/t3/t5,
+> `RHISetShaderResourceViewParameter` for t4, `RHISetUAVParameter(shader, 0, uav)` for `u0` at
+> `:157`, `RHISetShaderUniformBuffer` for the View CB's `b` slot), on the RHI thread, right
+> before `FD3D12CommandContext::RHIDispatchComputeShader` issues the `Dispatch` our hook already
+> intercepts (`D3D12Commands.cpp:120`). The `FRDGTexture` being freed by then is irrelevant.
+>
+> **How it is found without a name literal:** our Dispatch hook's own return address, resolved
+> through the exe's `.pdata` to the start of `RHIDispatchComputeShader`, is `IRHIComputeContext`
+> slot 3; the read-only qword holding it names the vtable, and the candidate must have 38 code
+> slots and six predicted empty-body slots beginning with `ret`. **The UAV slot is measured, not
+> counted** — MSVC reverses adjacent overloads, so both 16 and 17 are hooked with a five-argument
+> forwarding thunk and classified by the objects they are handed. **The resource hop needs no
+> D3D12RHI layout:** the `FRHIUnorderedAccessView*` is scanned for a CPU descriptor handle our
+> own `CreateUnorderedAccessView` hook recorded, two bookkeepers agreeing on one 64-bit value;
+> `t0..t5` resolve through `FRHITexture::GetNativeResource` (slot 7, HARD since L1). Level 2
+> ASSERTS all of it against the descriptor walk (`[u0]` line: `assert:`, `regs:`, `viewReg:`
+> disagree must stay 0); level 3 (the walk and the View-CB search replaced) is declared, not built.
+> Windows-portable throughout: PE, the game's `.rdata`, opaque handle keys, real device hooks.
+
 ### 2.10 Stability observations
 
 Environment facts, independent of any add-on — useful when triaging so we do not chase our own tail:
@@ -897,6 +1352,14 @@ Environment facts, independent of any add-on — useful when triaging so we do n
   screenshot channel for visual verification.**
 * gamescope's `SIGUSR2` screenshot produced no file. `ffmpeg`'s `kmsgrab` cannot read its
   framebuffer (`XB30`, 10-bit HDR).
+  **CORRECTED 2026-09-02:** `SIGUSR2` does write a file — an **AVIF** at
+  `/tmp/gamescope_<date>.avif` (`TakeScreenshot(bAVIF=true)`), which is why a PNG search found
+  nothing. The reliable channel that needs **no ReShade** is gamescope's own console command
+  through `gamescopectl screenshot <path.png> <type>` (type 4 = the on-screen buffer 1:1, 1 =
+  the game's base plane at render resolution), run as `deck` with the compositor's
+  `XDG_RUNTIME_DIR` (uid **1001** on this box, socket `gamescope-0`); measured: a 3840x2160
+  PNG within ~3 s. `tools/screenshot-gamescope.sh` wraps it and reads both variables from
+  Steam's live environment.
 
 
 ### Driving the game unattended, rewritten 2026-09-02: the probe, the safe launcher, the bench
@@ -985,6 +1448,11 @@ Four stages, each testable in isolation as far as CI allows:
 
 1. **Identify** — hash every compute shader's DXBC at `init_pipeline`; confirm with binding
    signature and dispatch size; never select `0x901e041a7cadc9db`; never hook `0x52101a15e1a0c5cc`.
+   **This whole stage is ReShade-era, and since 2026-09-03 it is BYPASSED by default**:
+   `[STRAYDLSS] EngineSeam=3` (`src/core/engine_seam.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md`
+   §10, facts §36) takes the answer from the engine's own `ITemporalUpscaler::AddPasses` and
+   gates DLSS on it; the hash and the signature are assertions. The matcher still runs to
+   EXTRACT the register roles. Levels 0-2 put the heuristic back in charge.
 2. **Capture** — record bound SRVs/UAVs/CB **by register** and read the View CB rows.
 3. **Resolve** — our compute pass turning sparse velocity + depth + `ClipToPrevClip` into the dense
    `RG16_FLOAT` field DLSS requires, in DLSS's units and sign.
@@ -1102,6 +1570,60 @@ never carried the swapchain's back buffers, so a liveness set fed by them calls 
 dead. **The native backend (`[STRAYDLSS] NativeMode=drive`) is the one that survives all three
 hazards; the ReShade backend remains the default only until Stage 4.**
 
+**DO WE STILL NEED THE DESCRIPTOR SHADOW? Audited consumer by consumer 2026-09-03 — YES, and for
+exactly one reason (`docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §13).** It costs **2.913 ms/frame, 14% of
+a 20.2 ms frame**, and that has repeatedly been treated as a debt the engine seam would pay off. It
+will not. Three separate mechanisms get called "the shadow" and their consumers are almost disjoint:
+
+* **The descriptor shadow proper — `shadow-write` + `shadow-copy`, 1.694 ms, 58% of the total — has
+  exactly ONE reader on the shipping path**: the SRV/UAV table walk that names the output UAV `u0`
+  and scene colour by register. The differential observer needs `NativeMode=observe`; **the
+  dataflow pass finder is DELETED** (see below), which leaves the RTV and DSV halves of the
+  shadow with no reader at all.
+* **`restore_game_compute_state` does NOT touch it.** It calls `root::snapshot` and replays opaque
+  table handles, so it keeps the **root** shadow (0.681 ms) alive and none of the 1.694 ms. That
+  correction matters because the restore was assumed to be the biggest consumer; the table walk is.
+* **`u0` has no engine route.** `AddPasses` writes `*OutSceneColorTexture`, but it is the
+  graph-allocated post-chain scene colour, so its `ResourceRHI` is assigned inside
+  `FRDGBuilder::Execute` — the window `docs/RESEARCH-ENGINE-TAA-HOOK.md` §14.2 enumerates and finds
+  to have no hookable point. The two things that would work are `r.RHICmdBypass=1` (disables the RHI
+  thread process-wide) and authoring our own RDG pass (§4.3: a template over shader-parameter
+  metadata, no ABI). **Both refused.**
+  > **WRONG, 2026-09-04.** The enumeration was of RDG's publication points; the RHI context the
+  > pass lambda binds through is a virtual interface with the register as an argument, and it is
+  > hooked (`[STRAYDLSS] U0Hook`, §2.9, `RESEARCH-U0-IDENTITY.md` §10). The shadow's expensive
+  > half keeps its one reader for now — level 2 is an ORACLE beside the walk, not a replacement —
+  > but its job is no longer irreducible: every answer the walk gives for the TAA pass now has
+  > an engine-sourced twin, counted on the `[u0]` line. Deleting the walk is level 3, a separate
+  > decision after the assertion has run clean across GAMEPLAY (facts §37).
+* **And the SR path cannot move to our own command list the way the NR stage did.** Present is the
+  wrong point in the frame (post, tonemap and next frame's SSR all read `u0` before it), and a
+  mid-frame `ExecuteCommandLists` of our own list would run BEFORE the game's still-unsubmitted
+  work, since one queue executes in submission order. **Ordering, and it is decisive.**
+
+**What can still be done, today and without the box:** stop shadowing RTV/DSV heaps (with the pass
+finder deleted, nothing reads them), and add a read-bit per slot so the derived claim that **~2% of
+the 4059 descriptors copied per frame are ever looked up** becomes a measurement.
+**What must NOT be done:** storing dst→src and resolving lazily at lookup. That is ReShade's design
+and facts §16 convicted it over 137 811 slots — D3D12 copies descriptors by value, and a shadow that
+does the same is right.
+
+**THE DATAFLOW PASS FINDER IS DELETED (2026-09-03).** `src/pass_finder.{cpp,hpp}` and
+`src/core/pass_walk.{cpp,hpp}` reconstructed the TAA pass's identity by walking one frame's
+recorded dispatches, draws and copies BACKWARDS from the tonemapper, anchored on the only 3D SRV
+in an Unreal frame. It was a good idea and it is exactly the class of reconstruction the engine
+seam retired: `ITemporalUpscaler::AddPasses` now NAMES the primary temporal upscale
+(`EngineSeam=3`, the default), and a walk that infers what the engine states is a second oracle to
+debug. Three facts made it a clean cut, each checked rather than assumed: `[STRAYDLSS] PassFinder`
+defaulted **OFF**; the native backend's `resolve_graphics_srvs` was **never implemented**, so it
+could not run at all under the shipping host even when enabled; and every entry point was a
+`g_enabled` bool test, so **it cost nothing measurable at runtime** — the deletion buys code, not
+frame time. What went with it, and this is the interesting part: `resolve_graphics_srvs` off
+`icept::Backend` (its only caller), and `on_render_targets` / `on_draw` / `on_copy` / `on_execute`
+off `icept::Sink` — **four events only the ReShade host ever raised, which the native host never
+produced.** A leftover `PassFinder=1` logs a WARN and is ignored. **Do not rebuild it**: the
+answer it computed now comes from the engine, and `docs/RESEARCH-ENGINE-TAA-HOOK.md` is where.
+
 ### ReShade 6.8 add-on API
 
 * **Pin headers to tag `v6.8.0`.** `RESHADE_API_VERSION` is **20**; ReShade rejects anything newer
@@ -1136,6 +1658,22 @@ hazards; the ReShade backend remains the default only until Stage 4.**
 
 * **Feature flags for Stray: `IsHDR | MVLowRes | DepthInverted | AutoExposure` = `0x4B`.** Never set
   `DoSharpening` (deprecated, does nothing).
+* **Application-supplied exposure is PRESET-GATED.** Programming Guide 310.6.0 §3.9: *"Only
+  supported by Presets J and K. Preset L always uses AutoExposure."* `Preset_Default` resolves to
+  **M at Performance** (this title's shipped 50% screen percentage) and **L at UltraPerf**
+  (`nvsdk_ngx_defs.h:82-85`), so `NgxExposure=texture|owned` needs an explicit `NgxPreset=11`.
+  The add-on logs `presetSupportsExposureInput=` at feature creation and warns when the pair is
+  self-defeating. **Corollary worth keeping: `NgxPreset` is no longer only an image-quality
+  knob — it silently gates a whole input.**
+* **`InPreExposure` is `View.PreExposure`, NOT its reciprocal**, and it is independent of the
+  exposure texture: the official plugin sets both, and only the texture is nulled under
+  auto-exposure (`DLSSUpscalerPrivate.h` `PreExposure(View.PreExposure)`;
+  `NGXD3D12RHI.cpp:275-276`). Guard it on the row-135 self-check — `helpers.h:507` rewrites a 0
+  to **1.0**, which silently claims the buffer is not pre-exposed.
+* **`InExposureScale` is not a consume test.** NVIDIA documents it nowhere (zero prose in the
+  84-page guide) and the official plugin never sets it (zero hits repo-wide). To test whether
+  DLSS reads the exposure texture, change the number INSIDE the texture — which means owning it
+  (`NgxExposure=owned` + `NgxExposureValue`).
 * **Motion vectors: `RG16_FLOAT`, render-resolution pixels, [0,0] upper-left, pointing BACKWARD.**
   `MV_pixels = (PrevScreen - ThisScreen) * (0.5·W, -0.5·H)`, `InMVScaleX/Y = (1,1)`. Guard with
   `PrevClipPos.w > 0`. This is NVIDIA's own `VelocityCombine.usf` math — copy it, don't invent it.
@@ -1184,6 +1722,51 @@ absorb the screen-space denoiser's job; SSR/SSGI noise shimmers straight through
 "suppress the denoiser and let SR handle it" is dead, and DLSS Ray Reconstruction is the only
 candidate for replacing UE's denoiser — with a quantified 3.4x stability gap as its target.
 
+> **BOUNDED 2026-09-04, and the 3.4x is NOT a reflections number.** Two things narrow it, both
+> from `docs/RESEARCH-RR1-DENOISER-CONFIG.md` §1/§3/§4 reading UE 4.27.2:
+> `FSSDTemporalAccumulationCS` in this title is the **ScreenSpaceDiffuseIndirect (SSGI)**
+> denoiser — reflections and AO do not route through it here — and the configuration it was
+> measured in is gone (`r.RayTracing=False`, and the live ini now carries `r.SSGI.Enable=0`).
+> So this number describes a subsystem that may no longer be in the frame at all. **Nobody has
+> measured what actually dispatches under the current configuration**, and `DumpShaders=1` plus
+> `tools/dispatch_census.py` answers it in one launch and one offline command. Do not quote the
+> 3.4x as RR's target for reflections until that census exists —
+> `docs/RESEARCH-RR-REFLECTION-DENOISE.md` §1.2, §4.
+
+### Stray SHIPS `r.SSR.Temporal=1`, so the SSR reaching our hook is already denoised (2026-09-04)
+
+`docs/game-config/Hk_project_Config_DefaultEngine.ini:63`, inside
+`[/Script/Engine.RendererSettings]`, is the game's own cooked setting — extracted from the pak,
+not a user override:
+
+```ini
+r.SSR.Temporal=1.0
+```
+
+Under TAA that makes `IsSSRTemporalPassRequired` true, so `bTemporalFilter` is true and SSR runs
+through `AddTemporalAAPass` with `ETAAPassConfig::ScreenSpaceReflections` — **a full temporal
+accumulation over the SSR buffer, before the composite into scene colour**. Stray also ships
+`r.SSR.HalfResSceneColor=1` (`Hk_project_Config_Windows_WindowsEngine.ini:12`), so that pass runs
+at 960x540 = **120x68 groups**, which is exactly one of the two TAA look-alikes the engine seam
+caught on the box (`0x42af595f8ff91038`, RESEARCH-ENGINE-TAA-HOOK §10.2). Arithmetic, not a name;
+`tools/dispatch_census.py --cache` names it.
+
+**This retires `docs/RESEARCH-RR1-DENOISER-CONFIG.md` §3's conclusion**, which reasoned from the
+stock default `r.SSR.Temporal=0` and concluded raw SSR already reaches our hook so "reflections
+need no change for RR-1". That doc stated the condition — *"conditional on Stray not overriding
+`r.SSR.Temporal`"* — and Stray overrides it. **The consequences are the interesting part:**
+
+* **There is no raw reflection noise at our hook to denoise.** "RR as the SSR denoiser" cannot
+  mean "denoise what arrives"; it can only mean turning the engine's own filter OFF and
+  substituting a network for it.
+* **The half-res trace, not the denoiser, is the reflection-quality lever here.**
+  `r.SSR.HalfResSceneColor=0` and `r.SSR.Quality` are resolution and sample-count deficits, which
+  no denoiser fixes.
+* **The general trap, and it has now cost two documents:** a shipped `[/Script/Engine.RendererSettings]`
+  value silently beats every "engine default is N" argument. `docs/game-config/` holds the game's
+  own inis — **grep them before reasoning from a stock default**, and when a conclusion has to be
+  written as conditional, that condition is the thing to check first, not last.
+
 ### r.RayTracing=True is the single biggest problem in this game — 3x the frame rate AND the noise (measured 2026-08-31)
 
 **Setting `r.RayTracing=False` in `Engine.ini [SystemSettings]` nearly TRIPLED the frame rate and
@@ -1217,6 +1800,33 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
   needs), and **DLSS SR does not need RT** — SR is the configuration to ship.
 * **RR WITHOUT RT IS THE UNTESTED COMBINATION, AND IT IS THE INTERESTING ONE.**
 
+> **RR IS NOT WIRED AS OF 2026-09-03, so everything below is a plan rather than a switch.** Its
+> guide source — the heuristic G-buffer finder and the resolve pass that fed it — was **deleted**
+> (report §13): it identified GBufferA-E by descriptor SHAPE, the same class of guessing the
+> engine seam retired for the TAA pass, and nothing on the SR, NR or FG path referenced it.
+> `[STRAYDLSS] NgxRR` now **refuses loudly at startup** rather than silently doing nothing, and
+> `perf::kNgxRr` reads a permanent zero.
+>
+> **The NGX side is intact and untouched** — `ensure_feature_rr` / `evaluate_rr` /
+> `release_feature_rr` all take raw `ID3D12Resource*` — so what RR needs is a GUIDE SOURCE, and
+> the intended one is the engine's own **named RDG G-buffer textures**, reachable from the
+> `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already hands us. Identity from the
+> engine, exactly as L1 does for depth and velocity (§2.3). **Do not resurrect the finder.**
+>
+> **AND THE ROUTE IS BUILT, 2026-09-04: the render-target pool NAMES them.** UE 4.27 passes every
+> pooled target's debug name to `FRenderTargetPool::FindFreeElement` as a live `const TCHAR*`
+> argument, used unconditionally in Shipping (`RenderTargetPool.cpp:415`, outside any `#if`) —
+> which is how `praydog/UEVR` names render targets in hundreds of shipping UE titles, and which
+> corrects `docs/RESEARCH-U0-IDENTITY.md` §4.1/§4.2 (they asked what is STORED when the question
+> is what is PASSED, and looked for an anchor inside the function when the anchor is in its 25
+> callers). `[STRAYDLSS] PoolNames`, default **1 = discover and log, install nothing**; 2
+> installs a forwarding recorder into the game's own code — **this project's first inline hook
+> into ENGINE code**, gated on ≥ 3 distinct enclosing functions and ≥ 4 distinct name literals
+> agreeing on one `.pdata` function start, with the trampoline supplied by the plugin HOST so the
+> ReShade host physically cannot install one. Level 3 (feeding RR) is declared, not built.
+> `src/core/pool_locator.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20,
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5. **Nothing has run against the game.**
+
 > **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
 > so RR is not independently usable here" and treated it as concluded. **That was never
 > verified.** It came from a single passing remark, not a measurement or a source, and it was
@@ -1224,7 +1834,7 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 >
 > **Nothing requires it.** `NVSDK_NGX_DLSSD_Create_Params` carries a denoise mode, a roughness
 > mode and a depth type, and no ray-tracing anything. Our own RR path takes its guides from the
-> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E, `src/gbuffer_finder.cpp`), which is
+> **base-pass G-buffer** (SceneColor + GBufferA/B/C/D/E), which is
 > UE4's ordinary deferred output and is present with RT fully off. `grep -rn RayTracing src/`
 > finds nothing that gates it.
 
@@ -1503,6 +2113,251 @@ to compensate for where it runs, the placement is the bug.** This project spent 
 diagnosing the codec, the exposure loop and the feedback node as properties of NR, and every one
 of them was a property of `u0`.
 
+### The cat is unchanged under NR, and the fur is NOT a motion-vector hole (2026-09-03)
+
+**The observation, the user's:** with NR running as a present stage, *"the rest of the world is
+100% perfect"* — and **the cat looks unchanged.** Global controls at the time:
+`NgxNRLocalStructure=1.61`, `NgxNRSkinStructure=2`, `NgxNRIntensity=1`, `NgxNRStyle=2`,
+`NgxNRAutoMask=1`. Fine fur is exactly the content a detail network should act on, so "the
+strength is too low" does not explain it at 1.61.
+
+**Nothing below has run in the game.** Every claim is read out of the UE 4.27.2 source, out of the
+fur plugin's source, out of Stray's own shipped executable, or out of **Stray's own cooked
+material**. Nothing was written to the box; the game was running throughout and was not touched.
+
+#### The leading hypothesis was that the fur shells write no velocity. It is REFUTED, and every link is HARD.
+
+The cat is drawn by **gFur PRO** (`GiM-GamesInMotion/gFurPro`, branch `4.27` @ `d5238a4` — the
+plugin is **open source**; `GFur.uplugin` reads `"FriendlyName": "GFur PRO"`, and Stray's own
+material references `/GFur/GFurPRO/gFur/Textures/...`). The proposed mechanism was that ~48 shell
+layers write nothing into `GBufferVelocity`, so every fur pixel would fall into
+`mv_resolve.hlsl`'s else-branch and be handed the motion of a **static world point at that
+depth** — precisely wrong for the one object always moving relative to the camera.
+
+Stray ships `r.BasePassOutputsVelocity=True` (§2.3.1), so the route is the **base pass**, and the
+separate velocity pass is correctly excluded for gFur (`VelocityRendering.cpp:417-443`:
+`PrimitiveCanHaveVelocity` returns false exactly when the base pass can output velocity, and
+gFur's VFs declare `bSupportsStaticLighting = false`). **The base pass has three gates and
+nothing else. All three pass:**
+
+| Gate | Where | For the fur | Status |
+|---|---|---|---|
+| **Blend mode**, at PREPROCESSOR level | `BasePassCommon.ush:52-54` — `WRITES_VELOCITY_TO_GBUFFER` needs `MATERIALBLENDING_SOLID \|\| MATERIALBLENDING_MASKED`, and so does `USES_GBUFFER` (`:41`), which is the other operand of its `\|\|` | **`BLEND_Masked`** | **HARD** — from the game's own asset, below |
+| `OutputVelocity > 0` | `BasePassVertexShader.usf:225` / `BasePassPixelShader.usf:985`; fed by `bOutputVelocity \|\| AlwaysHasVelocity()` (`PrimitiveSceneProxy.cpp:385`) | `FurComponent.cpp:42` sets **`bAlwaysHasVelocity = true`**, so it is 1 unconditionally | **HARD** |
+| `DrawsVelocity != 0` | `BasePassPixelShader.usf:997` zeroes the result otherwise; `DrawsVelocity()` is `return IsMovable();` (`PrimitiveSceneProxy.h:571-575`) | the cat's fur component is movable | **HARD** |
+
+**The full `WRITES_VELOCITY_TO_GBUFFER` expression has two further terms and both are satisfied**,
+which is worth spelling out because one of them looks alarming at first: it is
+`(SUPPORTS_WRITING_VELOCITY_TO_BASE_PASS || USES_GBUFFER) && GBUFFER_HAS_VELOCITY &&
+(!SELECTIVE_BASEPASS_OUTPUTS || !(STATICLIGHTING_TEXTUREMASK || STATICLIGHTING_SIGNEDDISTANCEFIELD
+|| HQ_TEXTURE_LIGHTMAP || LQ_TEXTURE_LIGHTMAP || WATER_MESH_FACTORY))`. `GBUFFER_HAS_VELOCITY` is
+`IsUsingBasePassVelocity` (`ShaderCompiler.cpp:4708`), i.e. `r.BasePassOutputsVelocity`, which
+Stray ships True. The static-lighting term is disarmed twice over: `r.SelectiveBasePassOutputs`
+defaults to 0, and the lightmap defines come from the vertex factory's lightmap policy while
+gFur's VFs declare `bSupportsStaticLighting = false`. **So `bUsedWithStaticLighting` appearing in
+the fur material's own name table (§34.4) is not a problem** — it is a material USAGE flag, not a
+vertex-factory capability, and it cannot reach these defines.
+
+And the previous position the VS fetches is real, not a stand-in for the current one:
+`GFurFactory.ush:722-726` implements `VertexFactoryGetPreviousWorldPosition` → `SkinPreviousPosition`
+(`:390-416`), which uses `CalcPreviousBoneMatrix`, `Primitive.PreviousLocalToWorld`, the previous
+frame's **fur physics offsets**, and ends `return Position + ResolvedView.PrevPreViewTranslation;`
+— the required previous-frame translated-world convention. The bone matrices are explicitly
+double-buffered *for this purpose* (`FurSkinData.cpp:218`: *"double buffered bone
+positions+orientations to support normal rendering and velocity (new-old position) rendering"*),
+bound at `:791-810` as `PreviousBoneMatrices` **and** `PreviousBoneFurOffsets`, with a
+discontinuity collapse on LOD change or a skipped frame (`:235-248`).
+
+**Stray's own binary carries all of that machinery**, which is what makes the plugin reading apply
+to *this* build rather than to a repo. Exhaustive printable-run extraction of
+`Stray-Win64-Shipping.exe` (85 MB, ASCII and UTF-16LE, unanchored) finds
+`/Plugin/gFur/Private/GFurFactory.ush`, `/Plugin/gFur/Private/GFurStaticFactory.ush`,
+`FFurSkinVertexFactory`, `FPhysicsFurSkinVertexFactory`, `FMorphPhysicsFurSkinVertexFactory`,
+`FFurSkinVertexFactoryShaderParameters<Physics>` — and **`PreviousBoneFurOffsets`,
+`PreviousFurPosition`, `PreviousFurLinearOffset`, `PreviousFurAngularOffset`** with their
+`*Parameter` binding counterparts. Those names exist in a vertex factory for exactly one purpose.
+**HARD.**
+
+**The blend mode was the one live gate, and Stray's own pak settles it.** The material
+`M_Fur_2sidedshading_backpackON` is a `MaterialInstanceConstant` whose `Parent` is
+`M_Base_GFur_2sidedshading`. Both name tables were read (method below), and in **both** the only
+`BLEND_*` name present is **`BLEND_Masked`** — alongside `BlendMode`, `EBlendMode` and (on the
+instance) `BasePropertyOverrides`. `BLEND_Translucent` appears in neither. **The parent alone
+settles it**, which matters because the instance's table carries `bOverride_ShadingModel` but no
+`bOverride_BlendMode`, so its override may well be inactive and the effective blend mode inherited
+— and the inherited one is Masked too. The instance also
+overrides the shading model to `MSM_SubsurfaceProfile` (parent: `MSM_TwoSidedFoliage`) with
+`SubsurfaceProfile = SSS_profil_cat` — both deferred G-buffer shading models, which a translucent
+material cannot use, so the asset corroborates itself.
+
+Two-sidedness excludes nothing: `grep IsTwoSided` over `BasePassCommon.ush`,
+`BasePassPixelShader.usf`, `BasePassVertexShader.usf` and `BasePassRendering.{h,cpp}` returns
+**zero** hits, and every `IsTwoSided()` call site in `Runtime/Renderer/Private` is a cull-mode or
+default-material-swap decision. `MSM_TwoSidedFoliage` appears in exactly one define,
+`WRITES_CUSTOMDATA_TO_GBUFFER` (`BasePassCommon.ush:44`), and in no velocity define.
+`ShouldIncludeMaterialInDefaultOpaquePass` excludes only `IsSky()` and `MSM_SingleLayerWater`.
+
+**So the fur writes velocity, the vectors are right, and the fix is not about motion vectors.**
+Recorded at this length because the hypothesis was good, cheap to state, and would have redirected
+the whole feature — and because this file has twice paid for the opposite mistake (the
+`ClipToPrevClip` transposition, `MVecScale`): *bad motion vectors do not produce one bad frame,
+they compound through the accumulation*, so any temporal artefact on one object reads like a
+motion-vector bug whether or not it is one. The lesson cuts both ways.
+
+**Three traps found on the way, all worth keeping:**
+
+* **`bPrecisePrevWorldPos` is DEAD METADATA in 4.27.2.** gFur declares it true
+  (`IMPLEMENT_VERTEX_FACTORY_TYPE(FFurSkinVertexFactory, "…/GFurFactory.ush", true, false, true,
+  **true**, false)`, `FurSkinData.cpp:551-558`, 4th bool), and it is tempting to read that as the
+  thing that enables velocity. It is not: `SupportsPrecisePrevWorldPos()` has **zero call sites in
+  the entire engine** — only the declaration (`VertexFactory.h:347/385/457`) and the constructor
+  store (`VertexFactory.cpp:81/100`). It is evidence of the author's intent and of nothing else.
+  The only VF property the velocity code actually reads is `SupportsStaticLighting()`.
+* **`BLEND_Masked` does not always compile to `MATERIALBLENDING_MASKED`.**
+  `MaterialShared.cpp:1871-1888` emits `MATERIALBLENDING_SOLID` instead when the material
+  `WritesEveryPixel()`. Harmless for velocity — both are in the define — but "the shader says
+  SOLID" is not evidence the asset is set to Opaque.
+* **`FPrimitiveViewRelevance`'s constructor is not a plain memset.** After zeroing itself it sets
+  `bOpaque = true` and `bRenderInMainPass = true` (`PrimitiveViewRelevance.h:85-100`, under the
+  comment *"only exceptions (bugs we need to fix?)"*). A read that stops at the memset concludes
+  gFur's `bVelocityRelevance = IsMovable() && Result.bOpaque && Result.bRenderInMainPass`
+  (`FurComponent.cpp:296`) is always false — and that conclusion cost one agent a whole section
+  before the fuller quote retired it. Moot here (the separate pass is off), but the shape is the
+  lesson: **asserting a negative from a truncated quote is the failure the HARD label exists to
+  prevent.**
+
+#### `r.BasePassForceOutputsVelocity=1` is a live, restart-free discriminator — keep it in the kit
+
+`SceneRendering.cpp:330-335`, default 0, flags **`ECVF_RenderThreadSafe` only** — *not*
+`ECVF_ReadOnly`, unlike `r.BasePassOutputsVelocity` — so it can be changed live. It reaches the
+shader as `View.ForceDrawAllVelocities` (`SceneRendering.cpp:1524`, `SceneView.h:667`) and appears
+in no C++ branch at all. **It bypasses exactly two gates** — `OutputVelocity` and `DrawsVelocity`,
+at `BasePassVertexShader.usf:225`, `BasePassPixelShader.usf:985` and `:997`. **It cannot bypass
+the blend mode**, because `#if WRITES_VELOCITY_TO_GBUFFER` *wraps* all three sites and resolves at
+shader-compile time: a translucent permutation contains neither the branch nor the cvar test. So
+for any future "does this thing write velocity?" question: flip it, and if the velocity appears
+the fault was a per-primitive gate; if it does not, the fault is the blend mode and no cvar will
+fix it.
+
+#### Reading a cooked material out of Stray's pak, which is now a solved procedure
+
+The fur materials are Oodle-compressed at the pak level, so `tools/pakextract.py` alone reports
+`Error -3 while decompressing`. The full chain, run entirely read-only against the box while the
+user was playing (`nice -n 19 ionice -c3`, no writes outside `/tmp`):
+
+```
+pakextract.py --raw <pak> rawout 'Cat/Fur/M_Fur_2sidedshading_backpackON\.u'
+oodle_unblock.py <entry>.json <entry>.raw out.uasset /tmp/scepad/oozraw
+python3 -c 'print sorted printable runs of out.uasset'
+```
+
+`/tmp/scepad/oozraw` is an existing ooz build on the box (`usage: oozraw <uncompressed_size> <
+block`). **The `.uasset` alone is enough for a property question**: UE4 serialises a
+`TEnumAsByte<EBlendMode>` UPROPERTY as a ByteProperty whose *value* is an FName, so the enum
+literal (`BLEND_Masked`) lands in the package's name table and the whole 146-name table fits on
+one screen — no property-tag walk, no `.uexp`, no CUE4Parse. The same trick reads shading models
+(`MSM_*`), material usage flags (`bUsedWith*`) and every parameter name.
+
+#### What is still open, cheapest test first
+
+1. **FRAME GENERATION IS ON, AND IT IS THE CHEAPEST CONFOUND TO REMOVE.** The live session that
+   produced the report had `fg_enabled=1`, `fg_generated_presented=6563` against
+   `fg_game_presents=6750` — so **roughly half of every frame the user judged was a DLSS-G
+   interpolation.** The ordering is right (**HARD**, `present_owner.cpp`: `pc.back_buffer` is the
+   FG replacement, `sk->on_present(pc)` runs the NR stage over it, and only then `fg::record`
+   generates from `c.replacement[c.mirror.current()]` — the same, already-NR'd resource), so this
+   is *not* "NR skips half the frames". But an interpolated frame is a **warp**, and a warp
+   preserves fine structure on static content far better than on the fastest-moving thing on
+   screen — which is the cat, close to the camera and moving relative to it. **"World perfect, cat
+   unchanged" is the exact shape that predicts.** UNCONFIRMED, and it costs one config flip:
+   **judge NR with `NgxFG=0` before building anything.**
+2. **A shell-fur pixel's guides describe one shell; its colour is a composite of several.** 48
+   alpha-masked layers write one depth and one velocity sample per pixel — the frontmost shell
+   that survived the mask — while the visible colour accumulates whatever showed through the
+   layers behind it. A temporal network reprojecting with those guides fetches history for a
+   surface that is only partly the pixel it is correcting, and over fur the depth guide is a dense
+   field of shell-to-shell discontinuities rather than a surface. That is a structural
+   shell-fur/temporal mismatch of the same family as "temporal network + screen-space
+   reflections", and — like that one — **it is not fixable from the velocity side, because the
+   velocity is correct.** UNCONFIRMED, and there is no cheap test for it.
+3. **The network may simply not read fur as structure.** The strengths are not multipliers on an
+   output: the binary audit ("DLSSNR's structure controls") found they are broadcast
+   bit-identically into the input tile as five of sixteen channels, so they tell the network *how
+   much* local structure to apply and the trained weights decide *where* structure exists. Fur may
+   read as noise. **Probe this with `NgxNRIntensity` and nothing else** — it is the only strength
+   knob NOT in `CG2R_ResetTemporalHistoryOnControlChange`, so it is the only one that can be moved
+   without wiping the accumulation; every structure slider holds `Reset = 1` while it is dragged
+   and changes the whole screen for reasons unrelated to its meaning.
+
+#### The instrument: `NgxDumpInputs` now dumps the engine's own velocity, and `NgxDumpAt` moves it
+
+Built, CI-green, **never fired**. `mv_resolve.hlsl` writes a plausible vector for every pixel —
+decoded object motion where `EncodedVelocity.x > 0`, reconstructed camera motion everywhere else
+— so **the branch a pixel took is invisible in the resolved field**, and a pixel handed the wrong
+branch looks exactly like a pixel handed the right one. The engine's raw `R16G16B16A16_UNORM`
+buffer is the only resource in the frame that records which pixels UE4 actually wrote a velocity
+for. It is now captured as `straydlss_velocity_raw_<n>.bin` beside the colour/depth/output dumps,
+with our resolved `RG16_FLOAT` field as `straydlss_mv_<n>.bin`.
+
+`tools/rawdump2png.py` grows two formats. `rgba16unorm` writes **two** images: the decoded object
+velocity, and `<stem>_mask.png` — UE's own strict `EncodedVelocity.x > 0` test, white where the
+engine wrote a velocity — plus the coverage percentage. Open the mask beside the colour dump of
+the same evaluate. **The refutation above predicts a WHITE cat.** A black one would overturn a
+chain every link of which is HARD, including the game's own asset, and would be the finding of the
+session. `rg16f` renders the resolved field's magnitude and prints its component ranges.
+
+**`[STRAYDLSS] NgxDumpAt` moves the capture points** (default 0 = the shipped 600/900; a
+configured value is the first point and the second follows 300 evaluates later; pure and pinned in
+`src/core/dump_plan.hpp`). The shipped points were chosen for a session that reached gameplay
+quickly. `NR CODEC LUMINANCE` has already been wasted once by firing on a black loading frame, and
+a dump costs a whole round trip — set it past the loading screen.
+
+#### `DLSSNR.ControlMask` — reachable, and not yet worth it
+
+The idea: tag the cat with UE4's custom depth/stencil (`bRenderCustomDepth` on the pawn's
+components, which **StrayFur already reaches by reflection**, plus `r.CustomDepth=3`), turn that
+into `DLSSNR.ControlMask` — an RGB per-pixel control texture, **R = final blend weight, G scales
+local tone, B scales local structure** (HARD, from the disassembly) — and raise structure on the
+cat alone. It is reachable in principle. It should not be built yet, and the reasons are worth
+writing down so the next session does not re-derive them:
+
+* **It costs the skin term outright.** Binding a mask forces `UseAutoMask = 0`, which drives both
+  resolved values to `-1.0f`, and **the mask has no skin channel** — skin exists only on the auto
+  path. The user currently runs `NgxNRAutoMask=1` with `NgxNRSkinStructure=2` over a world that
+  "looks 100% perfect". C trades that away to fix one subject.
+* **Four unknowns, none of them free.** Does gFur render into the custom-depth pass at all (its
+  VFs declare `bSupportsPositionOnly = false`, so the depth pass would use the full VS; the
+  permutations are UNCONFIRMED)? Is the target's content still valid at Present — it is a
+  persistent `FSceneRenderTargets` entry rather than a transient RDG allocation, so it should
+  survive the frame, but that is SOFT? What extent does `ControlMask` want — it has `Subrect`
+  fields but, unlike `MVec`, **no `ScaleX/Y`**, so whether a render-res mask is legal against an
+  output-res colour grid is UNCONFIRMED, and if it is not the upscale needs **the first compute
+  dispatch we have ever recorded on the present list**. And do `G`/`B` scale ABOVE 1, or only
+  damp? If only damp, the design inverts: raise the global and attenuate the world, which changes
+  the half that is already right.
+* **Finding the target is NOT one of the unknowns**, contrary to the first instinct. The native
+  backend hooks `ID3D12Device::CreateDepthStencilView` and shadows every DSV with its resource
+  (`backend_native/d3d12_hooks.cpp:454-467`), so a custom-depth target is observable the moment
+  it is created — and the discriminator is two-way rather than a search: exactly two resources
+  in the frame carry a DSV at the scene-buffer extent, and we already know which one is
+  `SceneDepthZ` because it is the TAA pass's own depth SRV. The other one is custom depth. This
+  is not the TAA identification problem.
+* **It is not free at runtime either.** `r.CustomDepth=3` re-draws the tagged primitives, and with
+  `LAYERS=48` that is 48 extra shell draws per frame on a title already at ~55 fps with FG on.
+
+**If it is ever built, the first step is not the mask.** Bind a CONSTANT ControlMask — uniform
+1.0, then uniform 0.5 — and confirm from the log and the screen that the runtime reads it and that
+`UseAutoMask` dropping to 0 does not by itself wreck the look. That separates "can we drive this
+input" from "is our mask right", which is the `NgxPaint` ladder that cracked "DLSS runs but
+nothing changes".
+
+**And there is a free mask hiding in the answer to A.** Because the fur DOES write velocity, the
+engine's own `EncodedVelocity.x > 0` is already an approximate moving-subject mask, at render
+resolution, in a texture `mv_resolve` reads every frame — one extra UAV and no engine change, no
+custom-depth pass, no new identification problem. It is not exact (it catches every mover and
+loses the cat when the cat is still), but it is the cheap path, and it exists only because A came
+back negative.
+
 ### DLSS Neural Rendering WORKS — the missing piece was an HDR colour codec (2026-09-01)
 
 **Confirmed on the user's machine: a correct image.** Feature 18 initialises, creates, evaluates
@@ -1663,6 +2518,129 @@ geometry's motion, which the velocity buffer does not carry. The reference does 
 because its guides come from a path tracer that writes dense, correct vectors. **Treat
 "temporal network + screen-space reflections" as a structural mismatch, not an open bug** — the
 available moves are reducing NR's strength on that content, disabling SSR, or accepting it.
+
+> **THERE IS A FOURTH MOVE, and NVIDIA's own header settles the argument for it (2026-09-04,
+> branch `mv-dense-reflections`).** `NVSDK_NGX_D3D12_DLSS_Eval_Params::pInBiasCurrentColorMask`
+> (`nvsdk_ngx_helpers.h:391`, `"DLSS.Input.Bias.Current.Color.Mask"` at `nvsdk_ngx_defs.h:815`)
+> is DLSS SR's per-pixel *"do not trust the history here"* channel, and we have never sent one.
+> It does not claim to know where the reflection went — it says the history is not to be
+> believed for these pixels, which is **precisely and only what we can honestly assert about
+> them**. Built as `[STRAYDLSS] MvMask`, default OFF, constant fill for now.
+>
+> **CORRECTING the sentence above it: "correct reflection motion vectors would need the
+> reflected geometry's motion, which the velocity buffer does not carry" understates the
+> problem.** Four things block the correction, and only the first is about UE 4.27:
+>
+> 1. **The hit distance is not in any buffer.** SSR's ray march knows how far along the
+>    reflected ray it landed and throws that away; UE 4.27's SSR output carries colour and a
+>    fade, not a distance. Without it there is no reflected point to reproject.
+> 2. **The previous frame's NORMALS are not retained.** A mirror's virtual image position needs
+>    the surface's previous position *and* its previous orientation. UE 4.27 keeps no
+>    previous-frame G-buffer, so even a perfect hit distance leaves the reprojection
+>    underdetermined the moment the reflecting surface rotates.
+> 3. **A reflective pixel is a BLEND, so no single vector can be right.** SSR is composited into
+>    scene colour with a fresnel/roughness weight, so the pixel is `(1-w)·diffuse + w·reflection`.
+>    Stray's wet ground is not a mirror; a vector correct for the reflection half is wrong for
+>    the diffuse half, and the motion-vector field has one slot per pixel. This is the decisive
+>    one, and it is not a UE 4.27 limitation — it is arithmetic.
+> 4. **A rough reflection has no single reflected point** (the lobe is wide), and a ray that
+>    missed falls back to a reflection capture, which moves differently again. Coverage varies
+>    per pixel and per frame.
+>
+> **Provenance, because these four are not equal.** (3) and (4) are HARD and need no source:
+> they are arithmetic and geometry, and no better engine input touches them — a blended pixel
+> has one motion-vector slot and two motions whatever you feed the shader. (1) and (2) are
+> **SOFT**: they are read off UE 4.27's structure as this project understands it, NOT verified
+> against the 4.27.2 source in the session that wrote this. **Verify them before anyone builds
+> on them** — but note that verifying them the other way would not rescue option (1), because
+> (3) alone is fatal.
+>
+> **NVIDIA agrees, and says so in the struct.** The same header carries
+> `pInMotionVectorsReflections` — *"motion vectors of reflected objects like for mirrored
+> surfaces"* — a **separate texture**, not a corrected single field, which is the header
+> conceding that one field cannot express both. It sits in the `/*** OPTIONAL - only for
+> research purposes ***/` block beside `GBufferSurface` and `pInMotionVectors3D`. Note the
+> contrast that makes this readable: NVIDIA marked `pInTransparencyMask` *"Unused/Reserved for
+> future use"* and left the bias mask unmarked, so they do label the dead ones.
+>
+> **So option (1), correcting the vector, is not soundly computable from what UE 4.27 gives us,
+> and the honest treatment is to MARK the pixels instead.** That is a conclusion from the data
+> available, not a preference — and the argument survives the G-buffer arriving, because (3)
+> and (4) are untouched by better inputs.
+>
+> **What is NOT yet known, and it gates everything:** whether this runtime honours the mask at
+> all. An NGX parameter block is an unvalidated string map (§5, three times over), so a name
+> being in the header proves nothing about the shipped `nvngx_dlss.dll`, and DLSS's own
+> `ControlMask` sibling in feature 18 turned out to have **two of its three channels dead**.
+> The test is one launch and costs no theory: bind a full-strength constant mask, alternate it
+> against neutral inside one session (`MvMaskAlternate`), and look. A full-strength mask that
+> changes nothing on screen kills the whole idea cleanly — which is worth far more than a
+> content-driven mask that changes nothing, because that would be indistinguishable from a
+> content signal that found nothing.
+>
+> **And the content signal is level 3, deliberately unbuilt.** Roughness (`GBufferB.b`) needs
+> G-buffer access this tree does not have — the heuristic finder was deleted 2026-09-03 and
+> `pool-name-hook` is what would supply the named textures. A better signal than roughness may
+> exist: **the SSR pass's own output alpha** is the actual per-pixel SSR contribution and hit
+> confidence, which accounts for failed rays and the composite weight that roughness alone
+> cannot. Whether UE 4.27's `ScreenSpaceReflections` RDG texture is reachable by name through
+> the outer `FindFreeElement` the pool hook targets is **UNCONFIRMED** and is the first thing
+> to check when that lands.
+>
+> **AND THE CENSUS MAY HAND LEVEL 3 ITS FIRST SIGNAL FOR FREE, with no G-buffer at all.** The
+> camera branch emits an **exact zero** whenever `prev_clip.w <= 0`, and a zero vector tells a
+> temporal accumulator *"this pixel did not move"* — a confident false statement, which is
+> strictly worse than an admission of ignorance. Those pixels are known per-pixel inside
+> `mv_resolve.hlsl` already; marking them is one extra UAV write in a shader that now has the
+> UAV. **If `w<=0 rejected` comes back non-trivial in the census, that is a correct content
+> signal available immediately, and it is not the reflection one** — it is a second, unrelated
+> class of pixel we have been lying to DLSS about since the resolve was written. Read that
+> counter before deciding what to build.
+
+### The motion-vector density has never been measured — `[STRAYDLSS] MvStats` (2026-09-04)
+
+`shaders/mv_resolve.hlsl` has had two branches since it was written, and **nobody has ever
+measured the split.** That number bounds everything downstream of it: if UE 4.27 writes 95% of
+the field, the quality of our camera reconstruction barely matters; if it writes 40%, it matters
+a great deal. Stray ships `r.BasePassOutputsVelocity=True` (§2.3.1), which broadens coverage
+beyond stock UE4 by an amount that **cannot be reasoned out — only counted**, because the
+per-primitive gates (§5, the fur section) decide it and they are content-dependent.
+
+`MvStats=1` adds sixteen per-pixel counters, reduced through LDS into a **root UAV** (not a
+descriptor-table slot: that would have widened the per-frame slice from three to four and moved
+every offset the shipping path reads). The vector written to `OutMV` is **bit-identical** either
+way. `src/core/mv_census.hpp` is pure, CI-tested, and **refuses to print percentages when its own
+invariants fail** — a broken instrument that prints plausible numbers anyway is worse than one
+that stops, because the numbers get quoted.
+
+Four counters beyond the split are the interesting ones, and each answers a question that could
+not previously be asked:
+
+* **`genuinely moving`** — engine-written pixels whose vector differs from what the camera branch
+  would have produced by more than half a pixel. This separates real movers from *static geometry
+  the base pass merely happened to write a velocity for*, which is the distinction
+  `r.BasePassOutputsVelocity=True` makes and nothing else can see.
+* **`w<=0 rejected`** — the camera branch emits an **exact zero** when `prev_clip.w <= 0`, and
+  DLSS reads a zero as *"this pixel did not move"*, not as *"unknown"*. Every one of those is a
+  lie told to a temporal accumulator. Watch it against `far/sky` in particular: points at
+  infinity under an infinite reversed-Z projection are where `w` is numerically worst, and sky
+  under camera rotation genuinely does move.
+* **`UNORM-clamped`** — the engine's `R16G16B16A16_UNORM` velocity encodes to `V*0.2495 + 0.49999`,
+  so it represents roughly ±2.004 NDC and **clamps** outside that. A clamped value decodes to a
+  wrong vector rather than to nothing, and a `y` that hit the low rail is indistinguishable from
+  "not written" as far as the `x`-channel validity test is concerned.
+* **`non-finite`** — must be 0. If it is not, nothing else on the line is worth reading.
+
+**It complements the velocity dump rather than duplicating it.** `NgxDumpInputs` already writes
+the engine's raw velocity plus a coverage mask PNG (§5, the fur section) — that is two frames with
+a *picture*, which is what shows you *where* the coverage is. The census is a distribution over
+hundreds of frames with the branch health broken out, and it needs no file transfer. **Set
+`NgxDumpAt` past the loading screen and run both in the same launch.**
+
+**And there is a free upper bound available for the same price.**
+`r.BasePassForceOutputsVelocity=1` (§5) bypasses the two per-primitive gates but not the blend
+mode, so a second census arm with it set says exactly how much coverage is lost to per-primitive
+gating versus to translucency. That is the control the raw number wants.
 
 ### The SSR fade and most of the flicker: resolved, cause not fully isolated (2026-09-01)
 
@@ -2153,10 +3131,60 @@ not decode. One `NR codec scale` line reports the decomposition, so "0.1 looks b
 off as "tracking has made 1.0 the new correct value".
 
 **The asymmetry, so it is not re-litigated:** the SR path's exposure goes through NGX
-(`InPreExposure`, the exposure texture, the AutoExposure flag) and is at the runtime's mercy — the
-texture mode measured INERT for us, and the NR codec reportedly ignores `DLSS.Pre.Exposure`
-outright. **The codec's scale is our own shader arithmetic and cannot be ignored by the runtime**,
+(`InPreExposure`, the exposure texture, the AutoExposure flag) and is at the runtime's mercy,
+while **the codec's scale is our own shader arithmetic and cannot be ignored by the runtime** —
 which is why this is expected to work where the SR exposure attempt did not.
+
+> **CORRECTED 2026-09-03.** This paragraph used to assert that the SR "texture mode measured
+> INERT for us", and that sentence has been repeated as settled ever since, including in
+> `docs/RESEARCH-OFFICIAL-DLSS-UE-PLUGIN.md`. **What was actually measured is narrower, and the
+> explanation was in NVIDIA's documentation the whole time.**
+>
+> Measured (`5d848d3`, live): with `NgxExposure=texture` the create flags really were `0x0b`, one
+> feature was created, the eye-adaptation finder never missed, a non-null `pInExposureTexture`
+> rode every evaluate, and the texel was healthy (1x1 RGBA32F, `.x` ≈ 0.45, stable). And yet the
+> indicator read "Auto Exposure: ON" in BOTH modes and the image was unchanged. **Never
+> measured:** the consume test. `NgxExposureScale` was built in `17265f2` to settle it and there
+> is no record of the sweep ever being run. "Inert" was a null result from an instrument whose
+> sensitivity was never established.
+>
+> **THE GATE, and it is HARD.** DLSS Programming Guide, revision 310.6.0
+> (`NVIDIA/DLSS@main:doc/DLSS_Programming_Guide_Release.pdf`), §3.9 "Exposure", first line:
+> *"Only supported by Presets J and K. Preset L always uses AutoExposure."* — added by the
+> v310.5.0 changelog entry *"Exposure input is only supported by Presets J and K."* So on any
+> preset outside {J, K} the runtime auto-exposes whatever the flag says and whatever texture is
+> passed, which is precisely the symptom. **And this title defaults onto the wrong side:**
+> `Preset_Default` resolves per quality mode (`nvsdk_ngx_defs.h:82-85`) — K for
+> DLAA/Quality/Balanced, L for UltraPerf, **M for Perf** — and Stray ships
+> `ScreenPercentage=50` (§2.3.1), a 2.0x ratio, i.e. Performance. M excludes exposure input.
+> (`g_preset` defaults to K, so a session that sets no `NgxPreset` is fine; but the deploy
+> tooling writes only the keys it is passed and **stale `[STRAYDLSS]` keys persist across
+> deploys** (§5) — and the preset J/K/M sweep happened the SAME DAY as the exposure runs. That a
+> stale `NgxPreset=13` was live is a hypothesis, not a fact, and the log has never carried the
+> preset next to the exposure mode. It does now.)
+>
+> **The rest of the audit came back CLEAN**, verified against the official UE plugin at a pinned
+> commit (`moumee/ProjectS@563205ea`, `8.3.0-NGX310.4.0`) and the guide:
+> `InPreExposure = View.PreExposure`, **not** its reciprocal (`DLSSUpscalerPrivate.h`,
+> `PreExposure(View.PreExposure)`); pre-exposure and the exposure texture are **independent**,
+> both set unconditionally at the call site with only the texture nulled in the RHI backend
+> (`NGXD3D12RHI.cpp:275-276`); RGBA32F is a legal exposure texture (§3.9, "Only the first channel
+> is sampled"); and `NON_PIXEL_SHADER_RESOURCE` is the required state (§3.4). **Two things did
+> change.** The plugin never sets `InExposureScale` at all — zero hits repo-wide — so sweeping
+> it was never going to test the texture. And the plugin **transitions** the exposure texture
+> rather than assuming its state, which we cannot do for a resource the game owns; hence
+> `NgxExposure=owned`, our own 1x1 R32_FLOAT that we write and barrier, with
+> `[STRAYDLSS] NgxExposureValue` as the sound consume test.
+>
+> **Also fixed in the same change, and it was a real hole:** the SR path forwarded View row 135.y
+> to `InPreExposure` with no plausibility check while the NR path has always gated the same row,
+> so a misread reached DLSS silently — and a misread of 0 becomes a literal 1.0 at
+> `nvsdk_ngx_helpers.h:507`, telling DLSS the buffer carries no pre-exposure when it carries
+> ~0.45. Both SR and RR now send a deliberate 1.0 when the self-check fails, and log it.
+>
+> **What the NR half of the sentence claimed is separately CONFIRMED** — see the NR section: an
+> exhaustive string search over `nvngx_dlssnr.dll` finds no exposure parameter of any kind, so
+> feature 18 genuinely cannot be told about exposure and `NgxNRTrackExposure` is the only lever.
 
 ### The NR luminance diagnostic must not run during a loading screen
 
@@ -2280,6 +3308,32 @@ scales local tone, B scales local structure. **It has no skin channel**, so skin
 expressible per-pixel. The explicit path is per-pixel with no skin term; the auto path is global
 and is the only place skin exists.
 
+> **CORRECTED 2026-09-03 from the runtime's own compiled kernels: G AND B ARE DEAD.** The mask is
+> fetched once, by `cc_tinlayout_fused_post_block_swin_1h_32_control_mask` and
+> `cg2r_post_process_kernel`, with a single `tex.2d.v4.f32.f32`, and the arithmetic that follows is
+> `w = saturate(DLSSNR.Intensity * mask.x)` then `out.rgb = saturate(lerp(original, network, w))`.
+> The `.y`/`.z`/`.w` registers that same instruction produces appear **exactly once each in 9.9 MB
+> of decompressed PTX** — as its own destinations — and are never read. R is the blend weight as
+> recorded; nothing else in the texture does anything in 310.8.0. "No skin channel" stands.
+>
+> Three more facts from the same pass, each of which changes what is buildable. **The cubins are
+> not where this document implied**: `.rsrc` is the weight blob, and the code is 15 NVIDIA fatbins
+> in `.data` (~57 MB decompressed, with real sm_89 cubins carrying the sm_120 symbol set). **The
+> format is not validated at all** — `GetInputTextureViewHandle64` (0x18005d640) canonicalizes a
+> caller's `DXGI_FORMAT` and builds a TEXTURE2D SRV with no whitelist and no rejection, so UNORM
+> and FLOAT are both correct and only `*_UINT`/`*_SINT` is broken (a float fetch against an integer
+> texture: undefined values, no error). And **the mask is sampled POINT/CLAMP at LOD 0 in
+> normalised coordinates through its own guide rect**, so any resolution "works" and a mismatched
+> one is silently nearest-neighbour resampled.
+>
+> **`DLSSNR.BidirectionalDistortionField` is INERT** in this build — parsed into the input struct
+> and then touched exactly once more, to set a presence bit in the stats record. **And
+> `DLSSNR.UICorrection`, which we have written as 1 for months, cannot arm without a
+> `DLSSNR.Backbuffer`**, which we do not bind — so it has never done anything.
+>
+> Full addresses, method and the honest SOFT/UNCONFIRMED items: `docs/RESEARCH-DLSSNR-STYLES.md`
+> §8, and `src/core/nr_mask_plan.hpp` for the part the code depends on.
+
 **`DLSSNR.ScalingRatio` is INERT** — read, then unconditionally overwritten with `1.0f` at
 `0x18001a96a`. Neither it nor the absent `DLSSNR.Scale` ever mattered.
 
@@ -2342,6 +3396,33 @@ noise on screen is what an out-of-domain input looks like, not a broken runtime.
 null-terminated string search over `nvngx_dlssnr.dll`), so the conversion has to happen in OUR
 pixels, on both sides of the evaluate. Two compute dispatches now wrap the NGX call:
 
+> **RE-CHECKED 2026-09-03, and it stands. Feature 18 has NO exposure parameter — do not go
+> looking again.** This was a DOCUMENTARY re-verification, not a fresh binary search: the DLL
+> lives on the box and the box was in use. The evidence is three independent lines pointing the
+> same way. (1) The original exhaustive null-terminated string search over
+> `nvngx_dlssnr.dll` 310.8.0 (md5 `eea91faf…`), ASCII **and** UTF-16, case-insensitive, found
+> none of `isHDR`, `ColorSpace`, `PaperWhite`, `Exposure`, `Pre.Exposure`,
+> `Feature.Create.Flags`. (2) `docs/RESEARCH-RENODX-DLSS5.md` §2.2.1 enumerates every
+> `DLSSNR.*` name the runtime actually knows, from the same search — colour, depth, MVec,
+> output, their subrects, `MVecScaleX/Y`, `DepthInverted`, `Reset`, `Intensity`,
+> `LocalToneStrength`, `LocalStructureStrength`, `SkinStructureStrength`, `UseAutoMask`,
+> `Style`, `UICorrection`, `Hint.Render.Preset`, `Enabled`, `ScalingRatio` — and **nothing
+> exposure-shaped is in it**. RenoDX *reads* `DLSS.Pre.Exposure` off the game's SR block and
+> re-emits the whole block under `DLSSNR.*`, where no such key exists, so that value goes
+> nowhere. (3) The reverse check, which is the one that keeps this honest: RenoDX also writes
+> six names this build does **not** implement (`DLSSNR.Scale`, `InputWidth/Height`,
+> `OutputWidth/Height`, `Output.Width/Height`, `Upscaling`), so **a name being written by
+> another integration proves nothing** — an NGX parameter block is an unvalidated string map
+> and a stale key is indistinguishable from an accepted one.
+>
+> Independent corroboration from a *different* integration: OptiScaler's DLSSNR fork solves NR
+> exposure entirely in its own codec white point (`DlssNrWhitePointFromExposure`,
+> `docs/RESEARCH-DLSSNR-STYLES.md` §4.3), not through any NGX parameter. If one existed, they
+> would use it.
+>
+> **Consequence: `NgxNRTrackExposure` is the whole lever and there is nothing to add.** No code
+> was written for NR in the 2026-09-03 exposure work, deliberately.
+
 ```
 encode:  proxy  = SrgbEncode(SoftClip(max(image,0) * s))      -> DLSSNR.Color = the PROXY
 evaluate:                                                        -> our neural texture
@@ -2401,6 +3482,18 @@ cast) and `NgxNRTransferStrength` (0 is an EXACT bit-for-bit bypass, so it is th
 
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
+**TWO HOSTS, ONE INIT PATH: a config key can be advertised and inert (found 2026-09-04).**
+`shader_dump::initialise()` had exactly one caller — `src/backend_reshade/addon_entry.cpp`'s
+`DLL_PROCESS_ATTACH`. The **UE4SS plugin, which is the shipping host, has no such entry**, so
+`[STRAYDLSS] DumpShaders` did nothing there while `mods/StrayDLSS/StrayDLSS.ini` advertised it.
+Worse, `DlssApp::configure_events()` already read `shader_dump::enabled()` — it had always
+assumed an initialise that never ran on that path. **When a subsystem has per-host setup, the
+add-on's entry point is the one that is easy to remember and the plugin's is the one that
+ships**; put the call somewhere BOTH hosts reach (`configure_events`) and make it idempotent.
+Fixed, and the audit was run: `grep -rn "void initialise" src/**/*.hpp` finds **exactly one**
+such entry point in the tree, so `shader_dump` was the only instance and there is no second one
+waiting. Re-run that grep whenever a subsystem grows a host-time setup call.
+
 **Diagnosing "DLSS runs but nothing changes":** the debugging ladder that finally worked, in
 order, each step decisive where the previous was blind:
 
@@ -2424,7 +3517,21 @@ a frozen image and fog" symptom. Post-fix, evaluates track dispatches at 99.7%.
 
 **The menu runs the TAA pass too**, at uncapped fps, and its scene colour is
 `R11G11B10_FLOAT` where gameplay's is `R16G16B16A16_FLOAT` — the colour format is NOT an
-invariant; trust the §2.3 register map, not a format check. Menu depth reads ~0 everywhere
+invariant; trust the §2.3 register map, not a format check.
+
+> **REFINED 2026-09-03, and the distinction matters.** "Not a format check" means never pick
+> the colour input BY format — the register is the identity. It never meant the register's
+> answer should go to NGX unexamined, and until today it did: `reg_colour` took whatever was
+> live at t1 with no format, extent or dimensionality test, the only DLSS input with no shape
+> check at all. `colour_input_acceptable` (`src/core/taa_signature.hpp`) is an ASSERTION over
+> the register's answer, not a replacement for it — and it is format-family-agnostic exactly
+> because of this paragraph: any HDR float colour format passes, and the extra pairing is
+> against **the output UAV's own format**, which moves with the scene colour (menu and gameplay
+> alike). What it refuses is a resource that cannot be `InputSceneColor` under either: a buffer,
+> a 3D texture, the 1x1 `BlackDummy`, something smaller than the render subrect, or a
+> BC-compressed streamed material texture. See report §14.4 for why the engine cannot
+> cross-check this one and why "colour has never been misidentified" was an artifact of an
+> assertion that structurally could not fire. Menu depth reads ~0 everywhere
 (the §2.4 gameplay gate), which is how a dump run that never left the menu was identified
 after the fact.
 

@@ -136,6 +136,15 @@ fi
 
 # ------------------------------------------------------------------ launch
 rm -f "$PROBE" "$STATUS" "$VERDICT"
+
+# ARM THE PROBE FOR THIS LAUNCH ONLY. mods/StrayProbe does nothing unless it finds this flag,
+# and it DELETES the flag as it reads it — so a session the user starts from Steam finds none
+# and schedules no loops at all. The probe costs a file write plus one game-thread engine read
+# every second, which is the same shape as the ~1 Hz frame-time blip; it should exist while a
+# script needs to tell gameplay from the title screen, and not otherwise.
+: > "$GAME_DIR/stray-probe-armed"
+chown deck:deck "$GAME_DIR/stray-probe-armed" 2>/dev/null || true
+log "Armed mods/StrayProbe for this launch (one-shot flag; a Steam launch leaves it idle)"
 log "Asking Steam to launch $APPID (cef-eval output shown, never hidden)"
 OUT=$(su - deck -c "cd '$STAGE_DIR' && python3 cef-eval.py 'SteamClient.Apps.RunGame(\"$APPID\", \"\", -1, 100)'" 2>&1); RC=$?
 printf '%s\n' "$OUT" | tail -n 3 | sed 's/^/    /'
@@ -201,7 +210,7 @@ fi
 log "Pressing Enter on /dev/input/$KBD every 0.7 s until the probe reports ingame=1 (budget ${TIMEOUT}s)"
 # A MUTE ORACLE IS NOT A SLOW ONE (measured 2026-09-04). A stray-probe-quiet left behind the
 # previous day made the probe stop writing pawn/pc/map/ingame while still writing seq/t, so this
-# loop pressed Enter for the full 420 s against a probe that could not answer - and the game had
+# loop drove the menu for the full 420 s against a probe that could not answer - and the game had
 # been sitting in gameplay the whole time. Name it before driving, rather than timing out on it.
 if [ "$(field "$PROBE" quiet)" = "1" ] && [ -z "$(field "$PROBE" ingame)" ]; then
     fail "the probe is in QUIET mode and is not reporting gameplay state, so no amount of driving \
