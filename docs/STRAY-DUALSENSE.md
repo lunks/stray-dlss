@@ -24,7 +24,17 @@ Same conventions as `CLAUDE.md`: **HARD** = read out of a binary or measured on 
   submix too.** `Submix_controllerMaster` gets the identical reroute + tap as the vibration
   master and lands on FL/FR of the one stream that carries the coils on RL/RR; the asset
   replay path, its extraction tooling, `HapticSource` and its fallback, and the HID
-  speaker-route claim are all deleted. **The speaker lane is UNCONFIRMED — never run.** See §18.
+  speaker-route claim are all deleted. See §18.
+* **THE SPEAKER LANE HAS NOW RUN, AND IT IS CONTAMINATED — 2026-09-03, §20.** Both masters were
+  re-parented under the SAME `Submix_unused`, and UE 4.27 hands a buffer listener the PARENT's
+  accumulation buffer (`AudioMixerSubmix.cpp:1364-1380`), so the second sibling processed reads
+  both. Measured in the running game: over 2,483 reporting periods the two lanes' `peak` AND
+  `rms` are **bit-identical in 95.2 %**, speaker-greater in 4.7 %, vibration-greater in 0.08 %.
+  **Every `_VIBE` the engine mixes is emitted on the pad SPEAKER as well as the coils** — the
+  user's "bumps going into the controller speaker", and it is ours, not Stray's design. The
+  AC-3 fold is innocent (per-lane, no shared state) and `Level` is already applied by the engine
+  upstream of the tap (measured linear, ratio constant to 0.3 % over a 3.5x range). Remedies in
+  §20.8; **none built**.
 * **Lightbar: NEVER driven by any shipped content — now measured, not inferred (§19.1).** Zero
   hits across all **23,846** cooked packages for `SetControllerLightColor`,
   `ResetControllerLightColor`, `SonyLightColor`, `SetDeviceProperty`, `LightBar`, `PadLight` and
@@ -2461,3 +2471,355 @@ Failure modes of (a), in the order they would bite:
 * libScePad ABI reconstructions: <https://github.com/WujekFoliarz/duaLib> and the public OS_SDK
   `pad.h` port at <https://pastebin.com/VLHUeyX5>.
 * DualSense wire format: `drivers/hid/hid-playstation.c`, mainline Linux.
+
+---
+
+## 20. The two lanes are ONE buffer — the scratch verdict, the fold audit, and where `Level` really lands — 2026-09-03
+
+Asked by the user: *"Look into all the vibration sounds — which ones have volume and which ones
+don't. Also meowing. Reason I ask is that some bumps that should go into the coils are also going
+into the controller speaker."* Then, narrowing it: *"Make sure the scratch one is getting only in
+the coils, not the speakers. Maybe the AC-3 thing we're doing is not exactly what we should do."*
+
+**The scratch is NOT getting only into the coils. The AC-3 fold is not why.** Both answers are
+measured, in the session the user was playing while this was written.
+
+### 20.1 THE SCRATCH VERDICT — scratch audio IS on the speaker lane, and it is our reroute
+
+`Scratch_VIBE` is the right test case exactly as the user chose it: it is on
+`SCLASS_controllerVibration`, it has **no `_CONTROL` counterpart** (the speaker class holds four
+assets and they are `cat_purr_loop_01`, `cat_backpack_01`, `cat_backpack_removed_01`,
+`zurg_sucking_loop_02` — §13, pak-wide by class), and **no authored route can put it on the pad
+speaker**. So any scratch content on the speaker lane is ours.
+
+It is there. Not by inference — the two lanes are reading **the same buffer**, and our own meters
+say so.
+
+#### The mechanism, read from the engine — HARD
+
+`FMixerSubmix::ProcessAudio(AlignedFloatBuffer& OutAudioBuffer)`, UE 4.27.2
+(`Engine/Source/Runtime/AudioMixer/Private/AudioMixerSubmix.cpp`, mirror
+`AlexMercer-MA/UnrealEngine-4.27`):
+
+```cpp
+:1085   InputBuffer.Reset(NumSamples);
+:1086   InputBuffer.AddZeroed(NumSamples);            // OUR OWN scratch, zeroed ONCE
+        ...
+:1101       ChildSubmix->ProcessAudio(InputBuffer);   // children accumulate into OUR scratch
+        ... sources, effect chain, output volume — all on InputBuffer ...
+:1364   Audio::MixInBufferFast(InputBuffer, OutAudioBuffer);   // accumulate into the PARENT
+:1367   if (const USoundSubmix* SoundSubmix = Cast<const USoundSubmix>(OwningSubmixObject))
+        {
+:1380       BufferListener->OnNewSubmixBuffer(SoundSubmix, OutAudioBuffer.GetData(),
+                                              OutAudioBuffer.Num(), NumChannels, ...);
+        }
+```
+
+Three facts, and together they are the whole defect:
+
+1. **The listener is handed `OutAudioBuffer` — the PARENT's buffer — not this submix's
+   `InputBuffer`.**
+2. **The mix into the parent (`:1364`) happens BEFORE the listener call (`:1380`).**
+3. **The parent zeroes that buffer once, at `:1085-1086`, before its child loop — never between
+   siblings.**
+
+So for children processed in order `C1, C2, …`:
+
+```
+C1's listener sees   { C1 }
+C2's listener sees   { C1 + C2 }
+```
+
+**§14 recorded this correctly on 2026-09-02** — *"after the mix into the parent — so the buffer we
+see is the parent's accumulation, not this submix alone"* — a day before 0.4.0 gave two taps one
+parent. The fact was written down and then not applied. `Config.hpp:87-88` keeps the harmless half
+of it (*"listeners run after the submix's own volume (1.0) and before the parent's (0)"*) and drops
+the half that bites.
+
+#### What 0.4.0 does
+
+`Runtime.cpp:365-367` submits one reroute for three objects and `Config.hpp:91-93` gives the two
+masters **one** parent:
+
+```
+submixPath          = …/Submix_vibrationMaster    -> parent Submix_unused   + Tap "vibration" -> RL/RR
+submixSpeakerPath   = …/Submix_controllerMaster   -> parent Submix_unused   + Tap "speaker"   -> FL/FR
+submixRerouteParent = …/Submix_unused
+```
+
+The two masters are now **siblings**, both carry a listener, and the second one processed reads a
+buffer that already holds the first one's audio.
+
+#### The measurement — HARD, from the running game
+
+`stray-dualsense.log`, build **0.4.0**, session of 2026-09-03 22:25 onward. The two lanes' meters
+are **independent objects** (`Runtime.hpp:75` `float peakEver`, one per `Lane`; `Runtime.cpp:851-852`
+updates `lane.peakEver`), so agreement between them is a fact about the audio, not the reporting.
+
+Every reporting period in which a `vibration` line was followed by a `speaker` line — **2,483
+pairs across the session**:
+
+| relation between the lanes | periods | share |
+|---|---|---|
+| **`peak` AND `rms` bit-identical** | **2,365** | **95.2 %** |
+| speaker strictly greater | 116 | 4.7 % |
+| vibration strictly greater | **2** | 0.08 % |
+
+Two taps on two different submixes agreeing to five decimal places on **both** statistics, in 95 %
+of periods, is only possible if they read the same memory. The relation is **one-way**:
+`speaker ⊇ vibration`, never the reverse. (The 2 reversed periods are a meter-read race — the two
+lines share a timestamp and the two `Take()`s are sequential, so a callback can land between them.)
+
+Individual periods show it, including the exception that proves the rule:
+
+```
+SUBMIX vibration peak=0.69725 rms=0.41718     <- only a _VIBE playing:
+SUBMIX speaker   peak=0.69725 rms=0.41718        identical — the speaker lane IS the coil mix
+
+SUBMIX vibration peak=0.24563 rms=0.11227     <- a _VIBE and a _CONTROL together:
+SUBMIX speaker   peak=0.45871 rms=0.11584        speaker = vibration + speaker
+```
+
+And the all-time peaks agree while the last-signal times do not — exactly what a superset predicts,
+since the speaker lane additionally sees every speaker-only sound:
+
+```
+SUBMIX vibration … peakEver=2.73318 lastSignal=97.2s ago
+SUBMIX speaker   … peakEver=2.73318 lastSignal=36.1s ago
+```
+
+**So during a scratch, the speaker lane's meter moves with the coil lane, and `Scratch_VIBE` is
+emitted on FL/FR at `speakerGain = 1.0` as well as on RL/RR.** That is the user's report, in full,
+and it is ours.
+
+#### The part that makes this urgent rather than cosmetic
+
+**Which lane is contaminated is decided by processing order, and we do not control it.** Today the
+vibration lane is registered first and is clean. `Submix_unused`'s `ChildSubmixes` is a `TMap`
+keyed by submix id, repopulated by `RebuildSubmixLinks` on every re-registration — and the reroute
+is **re-submitted by the watchdog on every level load** (§17). If that order ever inverts, the
+**coils** receive the pad speaker's content: the purr loop and the zurg suck would be felt in the
+grips. Nothing prevents it and nothing would report it.
+
+### 20.2 THE FOLD AUDIT — the AC-3 fold is innocent, on all three counts
+
+The user suspected the fold. It is not the cause, and each of the three ways it could have been is
+separately excluded.
+
+**1. Can the fold cross lanes? NO — structurally impossible. HARD, from our own code.**
+`DownmixToStereo` (`SubmixDsp.cpp:9-61`) is a **pure function**: it reads `interleaved`, writes
+`out`, and holds no static or global state. It is called from exactly one place —
+`Tap::OnBuffer` (`SubmixTap.cpp`) — on `m_scratch`, which is a **per-`Tap` member**
+(`SubmixTap.hpp`, `std::vector<float> m_scratch`), and there is one `Tap` per lane. Each lane then
+writes its own `SubmixRing`. `InterleaveLanes` (`SubmixDsp.cpp:76-113`) takes the two lanes as
+separate pointers and writes them to **disjoint channel indices** (`kEndpointChannelFL/FR = 0/1`,
+`kEndpointChannelRL/RR = 2/3`, `SubmixDsp.hpp:138-141`) with no path between them. **There is no
+shared buffer anywhere on the fold path.** The fold is downstream of the contamination, not its
+source: what it folds is already wrong when it arrives.
+
+**2. Is the fold even the right thing for a haptic lane? YES against the reference — and that is
+worth knowing, because it is not obvious.** `RESEARCH-UE-PAD-AUDIO-ENDPOINT.md` established the
+contract from the speaker side, and the same document answers it for the vibration side:
+`ProcessAudioAndSendToEndpoint` renders the subtree at the **device** channel count and then folds
+to the **endpoint's declared** count (`:2130-2139`, `Get2DChannelMap` → `DownmixBuffer`), and the
+endpoint dictates that count (`IAudioEndpoint.h:97`). Epic's `WinDualShock` delivers **stereo**
+blocks for the pad (§2, §3 there), and the pad's stream is `[speakerL, speakerR, vibL, vibR]` (§4)
+— i.e. **each port is a stereo pair, and the engine folds 8→2 with the same `ToStereoMatrix` for
+the vibration port as for the speaker port.** So our fold matches the reference for both lanes.
+
+> **The caveat the user's instinct was pointing at is real, though, and it is a DESIGN question
+> rather than a bug.** A "surround" channel has no physical meaning on a grip, and folding
+> `C + SL + BL` into the left coil at 0.707 is a loudspeaker convention applied to an actuator.
+> Epic does exactly this, so we are faithful — but faithful to a rule written for a speaker pair.
+> If the coils ever feel wrong in a *directional* way, this is the knob, and the honest framing is
+> "we chose the engine's fold over a haptic-specific one", not "the fold is correct".
+> **UNCONFIRMED** whether any alternative feels better; nobody has compared.
+
+**3. Could the fold have made a vibration audible that previously was not? YES, and this is the
+one true thing in the suspicion.** The fold landed recently (§18): the previous code kept channels
+0/1 and **dropped** `C/SL/SR/BL/BR`. Stray's haptic sends are spatialised
+(`PS5VibrationAttenuation`, HARD from the pak), so content the panner had placed behind or beside
+the cat used to reach the coils as **exactly zero** and now reaches them at −3 dB. **So the
+character and loudness of haptics genuinely changed with that commit, with no cross-talk
+involved.** If the user is comparing against memory of an older build, some of what they hear is
+this — and it is the fold working as intended, not a defect. It does **not** explain content on
+the *speaker* lane, which §20.1 does.
+
+### 20.3 The explanation that involves no bug — ruled IN, partially, and it changes what a fix buys
+
+**The DualSense has no rumble motors.** Both "haptics" are voice coils driven with an audio
+waveform (§12), and a coil driven at audio rate **makes audible sound**. A hard scratch is meant to
+be felt and *will* also be heard, from the grips, on a real PS5 too. So "the scratch is audible
+from the pad" is partly correct behaviour.
+
+**It is separable from the cross-talk, and both are happening:**
+
+* **Sound from the coils** is real and expected. It stops when the **coil** lane is silent.
+* **Sound from the speaker** is the defect. It is proven by §20.1's meters — our own numbers, taken
+  in-process, before a sample reaches the pad. That is not a perceptual claim and no amount of
+  "coils are audible" explains it.
+
+**Consequence to state plainly: fixing §20.1 will NOT make the pad silent during bumps.** It will
+remove the copy coming out of the speaker; the coils will still sing. If the user's real objection
+is "the pad is noisy during impacts", the fix helps but does not finish it, and the remaining path
+is the coil lane's own level — a preference, not a correctness question.
+
+### 20.4 Where `Level` lands, relative to our tap — it is applied UPSTREAM, and the coil path must not apply it again
+
+> **This corrects a reading taken from the log mid-investigation** — that `Scratch_VIBE` starting
+> at `Level=0.000` and mixing at peak 0.39–0.64 "proves `Level` is not a gain applied before our
+> tap". It does not, and the direct measurement says the opposite. The scratch anomaly is real but
+> is a separate open question (below).
+
+#### The measurement: one asset, four levels, a constant ratio
+
+`Repel_clean_02_VIBE` is played on the plain `StartPS5Vibration` path at a different level each
+time, and its `submix watch` line reports what the engine put in `Submix_vibrationMaster`:
+
+| time | `Level` at the call site | tap peak | peak ÷ level |
+|---|---|---|---|
+| 22:37:28 | 0.143 | 0.10101 | **0.7064** |
+| 22:37:57 | 0.301 | 0.21329 | **0.7086** |
+| 22:31:29 | 0.500 | 0.35396 | **0.7079** |
+| 22:32:53 | 0.750 | 1.02433 | 1.366 — busy window, see below |
+
+**Three independent events of the same asset, over a 3.5× range of `Level`, give a constant ratio
+of 0.7076 ± 0.3 %.** That is linear gain applied before we see it. The constant is
+`kFoldCentreAndSurround` (0.707, `SubmixDsp.hpp:104`): the asset peaks near full scale, the engine
+scales it by `Level`, the panner puts it in a centre/surround channel, and our fold multiplies by
+0.707. The 0.750 row is the one window with other content in it — `submix watch` reports the
+**lane's** peak over three seconds, not the asset's, so a busy window reads high. That is precisely
+why the other three matter: they are quiet windows.
+
+#### And `Level = 0` really is silence
+
+Measured at 22:44:46, with **no other `StartPS5Vibration` call in the window** and the scratch
+demonstrably running — both adaptive triggers engaged 2.1 s in:
+
+```
+22:44:46.334  StartPS5Vibration … Scratch_VIBE FadeInTime=0.000 Level=0.000
+22:44:46.725  SUBMIX vibration … peak=0.00000 rms=0.00000
+22:44:47.727  SUBMIX vibration … peak=0.00000 rms=0.00000
+22:44:48.396  SetPS5TriggerActivated state=1 side=0(Left)      <- the scratch IS running
+22:44:48.430  SetPS5TriggerActivated state=1 side=1(Right)
+22:44:48.729  SUBMIX vibration … peak=0.00000 rms=0.00000
+22:44:49.731  submix watch [vibration] 'Scratch_VIBE': the engine mixed NOTHING -
+              peak 0.00000 over 3.0s (4 window(s), 192512 frames). The tap WAS delivering audio.
+```
+
+**Three seconds of exact silence at `Level=0.000`, with the tap live and delivering.**
+
+> **OPEN, and not smoothed over.** A *different* `Scratch_VIBE` start, also `Level=0.000` and also
+> with no other start in its window, ramped to `peak=0.13303` then `0.63949` about two seconds in
+> (22:45:38–41). So a level-0 scratch is sometimes silent and sometimes not.
+> **`SetPS5VibrationLevel` is not the explanation**: it was hook-registered successfully at startup
+> (`fields of SetPS5VibrationLevel: Level:float[4]@0`) and called **zero times** in the whole
+> session — which also means §9's *"`SetPS5VibrationLevel` at ~60 Hz, 0.0 idle, ~0.47–0.52 while
+> scratching"* did not reproduce on this build and should be re-read as a shim-era measurement.
+> Leading hypothesis: the asset's own envelope, since `Scratch_VIBE` loops (§12) and a scratch held
+> long enough reaches a louder part of the loop. **Unresolved.**
+
+#### Therefore the plugin is already right here
+
+* **`Runtime::OnSetVibrationLevel` is a no-op (`Runtime.cpp:1076-1080`) and that is correct.** Its
+  comment — *"applied by the engine upstream of the tap"* — is now measured rather than asserted.
+* **`submixGain = 1.0` and `speakerGain = 1.0` are correct.** Any gain we add is a gain the engine
+  already applied.
+* **There is no lost level to recover.** The competing reading — that the level rides the send into
+  `VibrationEndpointSubmix`, the link the platform kills — is refuted by the linearity: if the
+  level lived on that dead send, our tap would see every sound at full scale and the ratio column
+  would be noise instead of 0.7076 ± 0.3 %.
+
+#### The reading that `Level` is the pad SPEAKER's volume is REFUTED
+
+* **`Repel_clean_02_VIBE` has no `_CONTROL` twin.** It is on the coil class, no authored route
+  reaches the speaker, and its `Level` linearly scales what lands in `Submix_vibrationMaster`. A
+  speaker volume for a sound that cannot reach the speaker would be meaningless — and would not
+  scale the coil mix.
+* **The varying parameter is on the vibration path; the constant one is on the speaker path.** All
+  28 `StartPS5ControllerSound` calls this session passed `level=1.000`, fadeIn 0.20. The vibration
+  calls span 0.000 → 1.000 continuously.
+* **The speaker has its own setter.** `SetPS5ControllerSoundLevel` exists alongside
+  `SetPS5VibrationLevel`; both were hook-registered this session with their field layouts logged.
+  Two paths, two level APIs.
+
+### 20.5 Which vibration sounds carry a level
+
+Measured over one ~40-minute session, 0.4.0, `BaseMap` through the Sewers. This is **call-site**
+behaviour — `Level` is a property of the call, never of the asset (§15) — so one asset appears at
+several levels.
+
+| class | assets | reading |
+|---|---|---|
+| **Fixed at 1.000** | `ZurkGrab_clean_VIBE` (50 calls), `WaterWave_VIBE` (20), `zurg_sucking_loop_VIBE` (12), `Pushable1_VIBE` (10), `CounterWeight_VIBE` (10), `metal_bucket_loop_VIBE` (5), `SewerDoor_VIBE` (3), `SwitchWithJump_Slide_VIBE` (2), `SwitchWithJump_ON_VIBE` (2), `JailCage_loop_VIBE`, `BigEye_VIBE`, `strongLight_refilled` | scripted events; the authored waveform amplitude is the whole level (§9) |
+| **Continuously modulated** | `Repel_clean_02_VIBE` (0.143, 0.301, 0.500, 0.750), `generic_hit_03_VIBE` (0.026 → 0.669, 8 distinct values), `generic_hit_01_VIBE` (0.454, 0.729), `generic_hit_02_VIBE`, `EndingDoorA_VIBE` (0.000, 0.278, 1.000) | **per-event intensity** — the impact library scaled by how hard the thing was hit. This is the design's expressive channel, and it is what proves `Level` belongs to the coils |
+| **Fixed and low** | `lower_noise_stereo_loop_01_VIBE` at 0.100 | a cinematic shake, deliberately subtle |
+| **Zero** | `Scratch_VIBE` (3), `CounterWeight_loop_VIBE` (5), `WaterWave_VIBE` component-path (6), `EndingDoorA_VIBE` (1) | on the **plain** path a genuine zero, honoured as silence. On the **component** path a 0 means *unset* — the level rides the submix send (`PS5VibrationAttenuation`, `bAttenuate=False`, constant 1.0, §15) — which is why `Runtime` lifts a component-path zero to 1.0 and must **not** lift a plain-path one |
+
+Levels **above 1.0 exist** in content — `overheat_clean_02_VIBE` at 2.0, `drone_explosion_alt01_VIBE`
+at 4.0 (earlier sessions; not seen in this one). They are amplification, and because the engine
+applies them upstream they arrive at the tap already 4× and meet our `SoftClip` (knee 0.75,
+`SubmixDsp.cpp:63-73`) rather than the engine's limiter. That is the one place a level interacts
+with something of ours.
+
+### 20.6 Meowing — there is no meow asset, on either path
+
+**HARD, unchanged from §7/§13.** The pak-wide class census finds no meow SoundWave on
+`SCLASS_controller` or `SCLASS_controllerVibration`. The four speaker assets are the purr, the two
+backpack sounds and the zurg suck. A meow heard from the pad is **not** a pad-speaker asset, and
+"press Circle to meow" remains a useless test event here. The purr is still the only event
+exercising both families at once (`CatPurr2_VIBE` + `cat_purr_loop_01_CONTROL`).
+
+### 20.7 The design, as Stray built it
+
+* **Two families, two classes, two trees — and the CLASS is the routing truth, not the suffix.**
+  `SCLASS_controllerVibration` (66 SoundWaves, stereo 48 kHz) → `Submix_vibration` →
+  `Submix_vibrationMaster` → `VibrationEndpointSubmix`. `SCLASS_controller` (4, mono 44.1 kHz) →
+  `Submix_controllerPre` (`SBFX_Boost`, +5 dB) → `Submix_controller` → `Submix_controllerMaster` →
+  `ControllerEndpointSubmix`. `strongLight_refilled` has neither suffix and is on the coil class
+  (§13).
+* **The two trees never meet.** Separate classes, separate chains, separate endpoints, separate
+  Blueprint APIs, separate level setters. **Any mixing between them is ours.**
+* **Level is per call, applied at the source, and the engine owns it.** Scripted events pass 1.0;
+  the impact library passes a computed intensity; a loop that will be driven later starts at 0.
+  Every stage below the source is unity gain (§9), so the waveform's own amplitude carries the rest.
+* **Every speaker sound has a coil twin of identical duration** (§13) — backpack on/off, purr, zurg.
+  The pad is designed as **one event felt and heard at once**, which is exactly why this cross-talk
+  is easy to miss: a purr is *supposed* to be on both.
+* **On PC both endpoint roots are dead** — no `IAudioEndpointFactory` for `"Vibration Output"` or
+  `"Pad Speaker Output"`, so the mixer skips both subtrees (§14). Everything the plugin does exists
+  to put back the two streams the platform never produced. **That is also why this cross-talk is
+  possible at all: the game's own graph never has these two trees sharing a parent, and ours does.**
+
+### 20.8 Ways out — NOT BUILT, the choice is the user's
+
+| option | what changes | consequence |
+|---|---|---|
+| **A. Tap the CHILD, not the master** — listen on `Submix_vibration` and `Submix_controller` instead of the two masters | one config string per lane; **no reroute change, no new submix** | each listener then receives its own master's `InputBuffer`, holding only that master's subtree — clean by construction, and each master has exactly one child so nothing is lost. **Cost:** the master's own `OutputVolume` and effect chain leave the signal. Both masters measured `OutputVolume 1.0, no effects` (§14 probe), so today that is a no-op — but it becomes a silent wrong level if that ever changes. `SBFX_Boost` is unaffected: it sits on `Submix_controllerPre`, *below* `Submix_controller`, so it stays in the signal |
+| **B. Two parents** — one rendered, volume-0 parent per master | `submixRerouteParent` becomes two keys, and a second unused submix must be found | fully general; keeps each master's volume and effects. **Cost:** `Submix_unused` is the only submix known unused (§14, and that on the strength of its name). Re-parenting one the game *does* use is a real audio bug |
+| **C. Subtract the earlier lane** | the second listener subtracts the first's snapshot | **do not.** Depends on processing order, on both listeners running in one pass, and on sample alignment — three assumptions with no way to detect a violation, buying nothing A does not |
+| **D. Be the endpoint** (`RESEARCH-UE-PAD-AUDIO-ENDPOINT.md` §8 #2) | register a real `IAudioEndpointFactory` for both types | structurally correct: the dead endpoint submixes come alive, each tree is separate by construction, and the engine folds and resamples for us — deleting `DownmixToStereo` **and** the reroute. Never built; by far the largest change |
+
+**A is the cheapest thing that is also correct.** Whatever is chosen, the existing meters already
+verify it with no new code: **after the fix the two lanes' `peak`/`rms` must stop agreeing.** That
+95.2 % should collapse to the fraction of periods in which both lanes are genuinely silent. If it
+does not, the fix did not take.
+
+**And on honouring volume**, given §20.4, the answer is shorter than the question:
+
+| option | consequence |
+|---|---|
+| **Nothing (status quo)** | **already correct** — the engine applies `Level` at the source and we pass the mix at unity. The linearity and the 3 s of silence at `Level=0` are the evidence. This is the recommendation |
+| Apply `Level` ourselves on the coil lane | **wrong — double-applies.** A 0.143 event would reach the coils at 0.020 |
+| A user intensity scale (`SubmixGain` ≠ 1.0) | legitimate as a *preference*, and the key exists. It overrides the game's level uniformly rather than honouring it, and it pushes the >1.0 events further into the soft-clip knee |
+| Remove the soft clip | **do not.** §12: the coils are wideband and square corners buzz. It is the only thing between a `Level=4.0` explosion and a hard-clipped grip |
+
+### 20.9 UNVERIFIED / open
+
+* **Every remedy in §20.8.** None of A–D is built or run; the diagnosis is measured, the fix is not.
+* **Which child of `Submix_unused` is processed first** is [derived] from registration order
+  (`Runtime.cpp:365-367`: parent, vibration, speaker) plus `TMap` insertion order. That the
+  *speaker* lane is the contaminated one is HARD from the meters; *why it is that way round* is not.
+* **The `Scratch_VIBE` level-0 ramp** (§20.4) is unexplained.
+* **Whether the engine's loudspeaker fold is the right fold for an actuator** (§20.2) is a design
+  question nobody has tested.
