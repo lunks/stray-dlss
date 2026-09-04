@@ -33,7 +33,7 @@ name: StrayDualSense plugin
 
 on:
   push:
-    branches: [ main, dualsense, dualsense-submix, dualsense-thin ]
+    branches: [ main, dualsense, dualsense-submix, dualsense-thin, fix-submix-aliasing ]
     paths:
       - 'mods/StrayDualSense/**'
       - '.github/workflows/dualsense.yml'
