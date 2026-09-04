@@ -2,13 +2,12 @@ cmake_minimum_required(VERSION 3.21)
 
 project(stray-dlss
     VERSION 0.1.0
-    DESCRIPTION "DLSS Super Resolution ReShade add-on for Stray (UE 4.27.2, D3D12)"
+    DESCRIPTION "NVIDIA DLSS for Stray (UE 4.27.2, D3D12), as a UE4SS plugin"
     LANGUAGES C CXX)
 
 # The add-on itself is Windows/MSVC only and is never built locally — CI is the only build.
 # The pure-logic core and its tests are deliberately platform-independent so they also build
 # and run on a Linux runner, which is where the fast feedback comes from.
-option(STRAY_DLSS_BUILD_ADDON "Build the ReShade add-on (requires Windows + MSVC)" ${WIN32})
 option(STRAY_DLSS_BUILD_TESTS "Build the unit tests" ON)
 option(STRAY_DLSS_WERROR "Treat warnings as errors" ON)
 # Linking NVIDIA's static NGX library runs its global constructors during
@@ -62,7 +61,7 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------------------
-# Pure logic. No Windows, no D3D, no ReShade. Everything here is unit-testable.
+# Pure logic. No Windows, no D3D. Everything here is unit-testable.
 # ---------------------------------------------------------------------------------------
 add_library(stray_dlss_core STATIC
     src/core/ue4_view.cpp
@@ -138,35 +137,8 @@ endif()
 # ---------------------------------------------------------------------------------------
 # Vendored third-party headers, all version-pinned. See docs/RESEARCH.md for why each pin
 # matters — a drift in any of the three silently breaks loading rather than the build.
-#   ReShade  v6.8.0   RESHADE_API_VERSION 20; ReShade refuses anything newer than its own
-#   Dear ImGui v1.92.5-docking  IMGUI_VERSION_NUM 19250, enforced by #error in
-#            reshade_overlay.hpp. It MUST be the docking branch: ReShade's imgui function
-#            table references ImGuiDockNodeFlags and ImGuiWindowClass, which exist only
-#            there. The plain v1.92.5 tag reports the same version number and then fails to
-#            compile, so the #error is not enough to catch this.
-#   NGX      v310.7.0
-# ---------------------------------------------------------------------------------------
-add_library(reshade_sdk INTERFACE)
-target_include_directories(reshade_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade/include)
 
-add_library(imgui_headers INTERFACE)
-target_include_directories(imgui_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
-
-add_library(reshade_utils_headers INTERFACE)
-target_include_directories(reshade_utils_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade_utils)
-
-# ReShade's own descriptor and state tracking, copied verbatim from its examples/utils at tag
-# v6.8.0. Reimplementing these is how people get descriptor tracking subtly wrong, so they are
-# kept pristine — which means they cannot be held to our /W4 /WX (they have unreferenced
-# parameters). Isolating them in their own target keeps our code strict without touching theirs.
 if(WIN32)
-    add_library(reshade_utils STATIC
-        third_party/reshade_utils/descriptor_tracking.cpp
-        third_party/reshade_utils/state_tracking.cpp)
-    target_link_libraries(reshade_utils PUBLIC reshade_sdk reshade_utils_headers imgui_headers)
-    target_compile_definitions(reshade_utils PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    if(MSVC)
-        target_compile_options(reshade_utils PRIVATE /W3 /wd4100)
     endif()
 endif()
 
@@ -181,7 +153,7 @@ set(STRAY_DLSS_NGX_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/lib"
 # ---------------------------------------------------------------------------------------
 # The native library: everything that is Windows/D3D12 but framework-free. The application
 # (src/app), the NGX path, the resolve passes, the hooks and the shaders. Built ONCE per
-# configure with whichever CRT this configure chose, and linked by both hosts: the ReShade
+# configure with whichever CRT this configure chose, and linked by the plugin host: the
 # add-on below (/MT) and the UE4SS plugin (mods/StrayDLSS, /MD, its own configure).
 # ---------------------------------------------------------------------------------------
 option(STRAY_DLSS_BUILD_NATIVE "Build the framework-free native library (Windows + MSVC)" ${WIN32})
@@ -331,64 +303,7 @@ if(STRAY_DLSS_BUILD_NATIVE)
 endif()
 
 # ---------------------------------------------------------------------------------------
-# The ReShade add-on: the native library plus the ReShade host.
 # ---------------------------------------------------------------------------------------
-if(STRAY_DLSS_BUILD_ADDON)
-    if(NOT WIN32)
-        message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires Windows.")
-    endif()
-    if(NOT STRAY_DLSS_BUILD_NATIVE)
-        message(FATAL_ERROR "STRAY_DLSS_BUILD_ADDON requires STRAY_DLSS_BUILD_NATIVE.")
-    endif()
-    if(STRAY_DLSS_DYNAMIC_CRT)
-        message(FATAL_ERROR
-            "The ReShade add-on must be /MT (see the CRT note at the top of this file); "
-            "STRAY_DLSS_DYNAMIC_CRT is for the UE4SS plugin build only.")
-    endif()
-
-    add_library(stray-dlss SHARED
-        # The ReShade host: the ONLY directory that includes ReShade's headers (CI enforces).
-        src/backend_reshade/addon_entry.cpp
-        src/backend_reshade/reshade_all.hpp
-        src/backend_reshade/reshade_backend.cpp
-        src/backend_reshade/reshade_backend.hpp
-        src/backend_reshade/reshade_bindings.cpp
-        src/backend_reshade/reshade_bindings.hpp
-        src/backend_reshade/reshade_config.cpp
-        src/backend_reshade/reshade_log.cpp
-        src/backend_reshade/reshade_host.hpp
-        src/version.rc)
-
-    # ReShade discovers add-ons by extension, not by name.
-    set_target_properties(stray-dlss PROPERTIES
-        OUTPUT_NAME "stray-dlss"
-        PREFIX ""
-        SUFFIX ".addon64")
-
-    # reshade_all.hpp and the backend's own headers are found relative to their directory.
-    target_include_directories(stray-dlss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/backend_reshade)
-
-    target_link_libraries(stray-dlss PRIVATE
-        stray_dlss_native
-        reshade_sdk
-        reshade_utils
-        reshade_utils_headers
-        imgui_headers)
-
-    # /Z7, not /Zi — same reasoning as stray_dlss_native above: sccache (now wired into
-    # ci.yml's build-windows job) refuses to cache a /Zi compile whose /Fd is shared, and
-    # CMake+Ninja gives every object of this target the same /Fd. /DEBUG below still emits
-    # the full PDB from the embedded per-object records, so nothing downstream changes.
-    target_compile_options(stray-dlss PRIVATE
-        /W4 /permissive- /Z7
-        $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)
-
-    # Keep symbols for field crash triage, but do not pay for them in the binary.
-    target_link_options(stray-dlss PRIVATE /DEBUG /OPT:REF /OPT:ICF)
-
-    install(TARGETS stray-dlss RUNTIME DESTINATION .)
-    install(FILES $<TARGET_PDB_FILE:stray-dlss> DESTINATION . OPTIONAL)
-endif()
 
 # ---------------------------------------------------------------------------------------
 # WARP harness
@@ -424,9 +339,6 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         # present_owner.cpp now times its per-present work with perf::Scope (frame-pacing work,
         # 2026-09-02), so the harness that links present_owner must also link perf.
         src/perf.cpp
-        # The real ReShade bindings, so the ReShade-facing half of the restore is the code
-        # under test rather than a reimplementation of it.
-        src/backend_reshade/reshade_bindings.cpp
         # The native backend, hooked onto the harness's own WARP device (warp_native_backend.inc).
         src/backend_native/native_backend.cpp
         src/backend_native/d3d12_hooks.cpp
@@ -453,13 +365,9 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
 
     target_include_directories(stray_dlss_warp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/backend_reshade
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/warp)
     target_link_libraries(stray_dlss_warp PRIVATE
         stray_dlss_core
-        reshade_sdk
-        reshade_utils
-        reshade_utils_headers
         d3d12 dxgi d3dcompiler)
     target_compile_definitions(stray_dlss_warp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(stray_dlss_warp PRIVATE /W4 $<$<BOOL:${STRAY_DLSS_WERROR}>:/WX>)

@@ -21,7 +21,6 @@
 //       ERROR and runs 2.
 //
 // THE ESCALATION, STATED PLAINLY. Level 2 writes an inline trampoline into the GAME'S CODE.
-// This project has patched vtables (ext_unhook, the seam, u0hook) and never engine code, and a
 // wrong target is a crash rather than a wrong number. Three things stand between here and that:
 // the static bar (>= 3 distinct enclosing functions AND >= 4 distinct name literals agreeing on
 // one .pdata function start, runner-up strictly beaten — pool::locate); the install is refused

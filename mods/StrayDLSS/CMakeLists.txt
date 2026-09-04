@@ -73,7 +73,6 @@ endif()
 
 # The shared application + native backend, from the repository root, configured ONCE with the
 # dynamic CRT (the UE4SS ABI contract below) and with nothing else the add-on builds.
-set(STRAY_DLSS_BUILD_ADDON OFF CACHE BOOL "" FORCE)
 set(STRAY_DLSS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(STRAY_DLSS_BUILD_WARP_TESTS OFF CACHE BOOL "" FORCE)
 set(STRAY_DLSS_BUILD_NATIVE ON CACHE BOOL "" FORCE)
@@ -107,7 +106,7 @@ target_compile_definitions(StrayDLSS PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
     _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
 # DYNAMIC CRT (/MD), and it is an ABI CONTRACT, not a style choice — the opposite of the
-# ReShade add-on in this repo, which is /MT for its own good reasons.
+# ReShade add-on this repo used to carry, which was /MT for its own good reasons.
 #
 # CppUserModBase.hpp says it outright: "C++ mods will break if UE4SS and the mod don't use the
 # same C Runtime library version. This includes them being compiled in different

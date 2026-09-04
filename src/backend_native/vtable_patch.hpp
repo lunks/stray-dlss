@@ -1,5 +1,4 @@
 // The whole hooking engine for COM vtable slots: VirtualProtect -> write -> restore, the
-// dance src/ext_unhook.cpp already does on this exact target. A patch is installed ONCE per
 // (slot, replacement), chains to the original it found there, and is NEVER restored
 // (assessment §1.2: a contested slot restored to a stale pointer is how another component's
 // hook gets torn out from under it).

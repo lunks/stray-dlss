@@ -377,7 +377,6 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	bool applied = false;
 	{
 		perf::Scope scope(perf::kNgxNr);
-		// ext_unhook::repair() is called inside nr::apply and ensure_feature — the ReShade
 		// ext-vtable patch can be reinstalled by any QueryInterface at any time, so the repair is
 		// re-applied before every NGX call rather than once (CLAUDE.md §1).
 		applied = nr::apply(device, cmd, ni);

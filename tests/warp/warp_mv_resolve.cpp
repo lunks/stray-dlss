@@ -14,9 +14,7 @@
 #include "core/ring.hpp"
 #include "core/view_params.hpp"
 #include "d3d12_restore.hpp"
-#include "reshade_bindings.hpp"
 
-#include "fake_reshade_command_list.hpp"
 
 #include <state_tracking.hpp>
 #include "mv_resolve.hpp"
@@ -34,6 +32,18 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+// True when the d3d12.dll we bound to is ReShade's proxy — it exports the add-on entry points.
+// The ReShade host is gone, so nothing drops ReShade in beside this exe any more and this is
+// expected to be false everywhere; it is KEPT because every call site already has a correct
+// non-ReShade branch, and because a harness that silently assumed "no ReShade" would be wrong
+// the moment someone did put it back.
+static bool running_under_reshade()
+{
+	HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
+	return d3d12 != nullptr && ::GetProcAddress(d3d12, "ReShadeRegisterAddon") != nullptr;
+}
+
 
 using Microsoft::WRL::ComPtr;
 
@@ -82,21 +92,6 @@ struct Gpu
 // NVIDIA driver — the layer WARP cannot model.
 bool g_use_hardware = false;
 
-// Set by --expect-reshade. When ReShade's DLL is dropped in beside this exe as d3d12.dll, our
-// D3D12CreateDevice goes through its proxy, so EVERY test in this file then runs against
-// ReShade's real device and command-list proxies — its descriptor-heap wrappers and its
-// handle conversion — rather than straight at the runtime. That is the one part of the add-on's
-// environment we otherwise cannot reach offline, so CI asserts it really happened rather than
-// silently testing the plain runtime.
-bool g_expect_reshade = false;
-
-// True when the d3d12.dll we bound to is ReShade's proxy. It exports the add-on entry points;
-// the real runtime does not.
-bool running_under_reshade()
-{
-	const HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
-	return d3d12 != nullptr && ::GetProcAddress(d3d12, "ReShadeRegisterAddon") != nullptr;
-}
 
 bool create_gpu(Gpu &gpu)
 {
@@ -1257,7 +1252,6 @@ bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
 	return true;
 }
 
-// Exercises the ReShade-facing half of restore_game_compute_state.
 //
 // The native half has a golden-output test; this half only had comments. It is also where the
 // suspected on-screen corruption lives, so the rules it claims to follow are asserted here:
@@ -1272,89 +1266,6 @@ bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
 //
 // get_native() hands the restore the harness's real WARP command list, so the native calls it
 // emits genuinely execute and the debug layer judges them.
-bool test_reshade_restore_call_pattern(Gpu &gpu)
-{
-	std::printf("\n[test] the ReShade half of restore issues the right calls, in order\n");
-
-	Probe p;
-	if (!build_probe(gpu, p))
-		return false;
-	drain_validation(gpu, "reshade-restore-setup");
-
-	stray_dlss::test::FakeCommandList fake;
-	fake.native = reinterpret_cast<std::uint64_t>(gpu.list.Get());
-
-	// A layout whose parameter 1 is NOT a descriptor table. state_tracking represents that as
-	// a zero handle, and the restore must skip it rather than bind a table there.
-	state_tracking st;
-	const reshade::api::pipeline_layout layout = {
-		reinterpret_cast<std::uint64_t>(p.rs.Get()) };
-	st.descriptor_tables[reshade::api::shader_stage::all_compute] = { layout,
-		{ reshade::api::descriptor_table{ p.table.ptr },
-		  reshade::api::descriptor_table{ 0 },
-		  reshade::api::descriptor_table{ p.table.ptr } } };
-	st.descriptor_tables[reshade::api::shader_stage::all_graphics] = { layout,
-		{ reshade::api::descriptor_table{ p.table.ptr } } };
-	st.pipelines[reshade::api::pipeline_stage::all] = reshade::api::pipeline{
-		reinterpret_cast<std::uint64_t>(p.pso.Get()) };
-	fake.put_private_data(&st);
-
-	stray_dlss::rsb::restore_game_compute_state(&fake);
-
-	const auto &b = fake.binds;
-	check(!b.empty(), "the restore called into ReShade at all");
-	if (b.empty())
-		return false;
-
-	check(b[0].count == 0 && b[0].first == 0,
-		"the first call is the count==0 resync that re-issues heaps and root signature");
-	check(b[0].layout.handle == layout.handle, "the resync names the game's own layout");
-
-	bool all_single = true, bound_zero_handle = false;
-	for (std::size_t i = 1; i < b.size(); ++i)
-	{
-		if (b[i].count != 1)
-			all_single = false;
-		for (const auto t : b[i].tables)
-			if (t.handle == 0)
-				bound_zero_handle = true;
-	}
-	check(all_single, "every later call binds exactly one table, never a whole vector");
-	check(!bound_zero_handle, "no zero handle is ever bound (that would hit a root CBV)");
-
-	// Parameter 1 is not a table, so only 0 and 2 may be restored for compute.
-	int compute_binds = 0, graphics_binds = 0;
-	bool touched_param_1 = false;
-	for (std::size_t i = 1; i < b.size(); ++i)
-	{
-		const bool is_compute = (static_cast<std::uint32_t>(b[i].stages) &
-			static_cast<std::uint32_t>(reshade::api::shader_stage::all_compute)) != 0;
-		if (is_compute)
-		{
-			++compute_binds;
-			if (b[i].first == 1)
-				touched_param_1 = true;
-		}
-		else
-		{
-			++graphics_binds;
-		}
-	}
-	check(compute_binds == 2, "exactly the two compute parameters that are tables were bound");
-	check(!touched_param_1, "the non-table parameter was skipped");
-	check(graphics_binds == 1, "the graphics table was restored as well");
-
-	// The native calls really ran on the WARP list; the debug layer gets the final word.
-	const int errors = drain_validation(gpu, "reshade-restore");
-	check(errors == 0, "no D3D12 validation errors from the native half of the restore");
-
-	gpu.list->Close();
-	gpu.allocator->Reset();
-	gpu.list->Reset(gpu.allocator.Get(), nullptr);
-	stray_dlss::rsb::forget_all_command_lists();
-	drain_validation(gpu, "reshade-restore-teardown");
-	return true;
-}
 
 // Does ReShade's vkd3d extension hook reach descriptors we mint on the ORIGINAL device?
 //
@@ -1382,89 +1293,6 @@ bool test_reshade_restore_call_pattern(Gpu &gpu)
 // This probe answers only that, and deliberately never calls the CUDA functions: it reads the
 // vtable slot from the original device's interface, forces the patch by querying the proxy, and
 // reads the slot again.
-bool test_vkd3d_ext_hook_reachability(Gpu &gpu)
-{
-	std::printf("\n[test] whether ReShade's vkd3d ext hook reaches the original device\n");
-
-	if (!running_under_reshade())
-	{
-		std::printf("  SKIP: not running under ReShade, so there is no hook to observe\n");
-		return true;
-	}
-
-	// {7F2C9A11-3B4E-4D6A-812F-5E9CD37A1B42} - ReShade's "give me the original object".
-	constexpr GUID kUnwrapped = { 0x7f2c9a11, 0x3b4e, 0x4d6a,
-		{ 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
-	// {11EA7A1A-0F6A-49BF-B612-3E30F8E201DD} / {E859C4AC-BA8F-41C4-8EAC-1137FDE6158D}
-	constexpr GUID kDeviceExt = { 0x11ea7a1a, 0x0f6a, 0x49bf,
-		{ 0xb6, 0x12, 0x3e, 0x30, 0xf8, 0xe2, 0x01, 0xdd } };
-	constexpr GUID kDeviceExt2 = { 0xe859c4ac, 0xba8f, 0x41c4,
-		{ 0x8e, 0xac, 0x11, 0x37, 0xfd, 0xe6, 0x15, 0x8d } };
-
-	ComPtr<IUnknown> original;
-	if (FAILED(gpu.device->QueryInterface(kUnwrapped, reinterpret_cast<void **>(original.GetAddressOf()))))
-	{
-		std::printf("  SKIP: could not unwrap ReShade's proxy device\n");
-		return true;
-	}
-
-	// Take the extension interface from the ORIGINAL device. This goes through vkd3d's own
-	// QueryInterface, so it installs nothing.
-	ComPtr<IUnknown> ext_via_original;
-	if (FAILED(original->QueryInterface(kDeviceExt, reinterpret_cast<void **>(ext_via_original.GetAddressOf()))))
-	{
-		std::printf("  SKIP: no ID3D12DeviceExt on this device (expected off vkd3d-proton)\n");
-		return true;
-	}
-
-	const auto vtable_slot = [](IUnknown *obj, int slot) -> void * {
-		return (*reinterpret_cast<void ***>(obj))[slot];
-	};
-	void *const before_get_cuda_surface = vtable_slot(ext_via_original.Get(), 8);
-
-	// Now force the patch, the way any component that queries the PROXY would.
-	ComPtr<IUnknown> ext_via_proxy;
-	const HRESULT hr = gpu.device->QueryInterface(kDeviceExt2,
-		reinterpret_cast<void **>(ext_via_proxy.GetAddressOf()));
-	if (FAILED(hr))
-	{
-		// Fall back to the base interface; only slots 7/8 get patched then.
-		gpu.device->QueryInterface(kDeviceExt, reinterpret_cast<void **>(ext_via_proxy.GetAddressOf()));
-	}
-
-	void *const after_get_cuda_surface = vtable_slot(ext_via_original.Get(), 8);
-	const bool patched = before_get_cuda_surface != after_get_cuda_surface;
-
-	std::printf("  GetCudaSurfaceObject slot: before=%p after=%p\n",
-		before_get_cuda_surface, after_get_cuda_surface);
-
-	if (patched)
-	{
-		// Confirm the new pointer really lives inside ReShade's module rather than being
-		// coincidental churn.
-		HMODULE owner = nullptr;
-		::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			reinterpret_cast<LPCWSTR>(after_get_cuda_surface), &owner);
-		wchar_t path[MAX_PATH] = {};
-		if (owner != nullptr)
-			::GetModuleFileNameW(owner, path, MAX_PATH);
-		std::printf("  patched entry belongs to: %ls\n", path[0] ? path : L"<unknown>");
-
-		std::printf("  REACHABLE: querying ReShade's proxy patched the vtable that the ORIGINAL\n");
-		std::printf("             device's interface uses. NGX descriptors minted per CLAUDE.md\n");
-		std::printf("             would be run through convert_to_original_cpu_descriptor_handle.\n");
-	}
-	else
-	{
-		std::printf("  NOT REACHABLE: the original device's interface is unaffected.\n");
-	}
-
-	// Deliberately not a pass/fail assertion. Both answers are legitimate findings, and which
-	// one holds is exactly what we did not know; failing CI on it would be asserting the
-	// conclusion rather than measuring it.
-	std::printf("  (recorded, not asserted - this probe measures rather than judges)\n");
-	return true;
-}
 
 // Is copying FROM a shader-visible heap what kills us?
 //
@@ -1768,8 +1596,6 @@ int main(int argc, char **argv)
 		const std::string arg = argv[i];
 		if (arg == "--hardware")
 			g_use_hardware = true;
-		else if (arg == "--expect-reshade")
-			g_expect_reshade = true;
 	}
 
 	std::printf("D3D12 harness for the motion-vector resolve pass (%s)\n",
@@ -1779,15 +1605,6 @@ int main(int argc, char **argv)
 	std::printf("d3d12.dll is %s\n",
 		under_reshade ? "ReShade's proxy - every test below runs through it"
 		              : "the plain runtime");
-	if (g_expect_reshade)
-		check(under_reshade, "we are running through ReShade's D3D12 proxy, as required");
-
-	Gpu gpu;
-	if (!create_gpu(gpu))
-	{
-		std::printf("could not create a WARP device\n");
-		return 1;
-	}
 	std::printf("device up, info queue %s\n", gpu.info ? "active" : "UNAVAILABLE");
 
 	test_validation_catches_wrong_root_parameter_type(gpu);
@@ -1795,8 +1612,6 @@ int main(int argc, char **argv)
 	test_no_allocation_churn(gpu);
 	test_camera_branch_matrix_orientation(gpu);
 	test_restore_preserves_game_state(gpu);
-	test_reshade_restore_call_pattern(gpu);
-	test_vkd3d_ext_hook_reachability(gpu);
 	test_copy_from_shader_visible_source(gpu);
 	test_static_vtables(gpu);
 	test_private_data_release_on_destroy(gpu);

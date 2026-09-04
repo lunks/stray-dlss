@@ -1,6 +1,6 @@
 // The configuration seam. Every [STRAYDLSS] key is read through these getters, and WHERE the
-// value comes from is one installable Source: ReShade's ini while the add-on is the host
-// (src/backend_reshade/reshade_config.cpp), our own hot-reloaded StrayDLSS.ini when UE4SS is.
+// value comes from is one installable Source. Only one remains: our own hot-reloaded
+// StrayDLSS.ini under the UE4SS plugin host. The ReShade ini source went with the add-on.
 //
 // The getters coerce the way ReShade's typed get_config_value did — bool from 0/1/true/false,
 // int via strtol (so 0x-prefixed hex works), float via strtod — so a key reads the same value

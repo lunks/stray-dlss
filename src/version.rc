@@ -1,4 +1,4 @@
-// ReShade reports this in its "Registered add-on ... vX.Y.Z.W" log line, which is how we
+// UE4SS and a UE4 crash dump report this, which is how we
 // tell which build the user is actually running. (docs/RESEARCH.md §2.1)
 
 #include <winver.h>
@@ -20,7 +20,7 @@ BEGIN
             VALUE "FileDescription",  "DLSS Super Resolution add-on for Stray"
             VALUE "FileVersion",      "0.1.0.0"
             VALUE "InternalName",     "stray-dlss"
-            VALUE "OriginalFilename", "stray-dlss.addon64"
+            VALUE "OriginalFilename", "StrayDLSS.dll"
             VALUE "ProductName",      "Stray DLSS"
             VALUE "ProductVersion",   "0.1.0.0"
         END

@@ -1,7 +1,6 @@
 #include "ngx_fg.hpp"
 
 #include "core/fg_plan.hpp"
-#include "ext_unhook.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
 
@@ -180,7 +179,6 @@ void release_feature(ID3D12CommandQueue *queue)
 	if (g_feature != nullptr)
 	{
 		wait_idle(queue);
-		ext_unhook::repair();
 		const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_ReleaseFeature(g_feature);
 		STRAY_LOG_INFO("fg/ngx: ReleaseFeature 0x%08x (%s)", static_cast<unsigned>(r), ngx::result_name(static_cast<unsigned>(r)));
 		g_feature = nullptr;
@@ -221,7 +219,6 @@ bool create_feature(ID3D12GraphicsCommandList *list, ID3D12CommandQueue *queue, 
                     std::uint32_t w, std::uint32_t h, unsigned format, const FrameConstants &c)
 {
 	release_feature(queue);
-	ext_unhook::repair();
 	NVSDK_NGX_Result r = NVSDK_NGX_D3D12_AllocateParameters(&g_params);
 	if (NVSDK_NGX_FAILED(r) || g_params == nullptr)
 	{
@@ -378,7 +375,6 @@ public:
 		}
 
 		// ---- the evaluate ----
-		ext_unhook::repair();
 		const FrameConstants &c = g->constants;
 		std::memcpy(g_m_view_to_clip, c.view_to_clip_no_aa, sizeof(g_m_view_to_clip));
 		std::memcpy(g_m_clip_to_prev, c.clip_to_prev_clip, sizeof(g_m_clip_to_prev));

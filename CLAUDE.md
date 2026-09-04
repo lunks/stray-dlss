@@ -6,14 +6,21 @@ replaces the engine's own temporal AA compute dispatch with an NGX evaluation; F
 present time. It loads inside the game process and installs its own D3D12 hooks
 (`src/backend_native/`); it needs no ReShade.
 
-> **CORRECTED 2026-09-03.** This line read "A ReShade **add-on**" until today, long after the
-> plugin became how the project runs. The ReShade add-on still exists as a second host
-> (`src/backend_reshade/`, built as `stray-dlss.addon64`) and is still built and tested, but it
-> is not the shipping configuration and the two must never be run together — that is two drivers
-> of one TAA pass. **Do not read "Config A/B" as "plugin/add-on":** both are *plugin*
-> configurations, and they differ only in whether ReShade is also loaded as `dxgi.dll`
-> (`mods/StrayDLSS/README.md`). ReShade being present under the plugin is supported, so "the
-> plugin host" never implies "no ReShade in the process".
+> **THE RESHADE HOST IS GONE, 2026-09-04.** `src/backend_reshade/`, the `stray-dlss.addon64`
+> target, the vendored ReShade/imgui headers, `ext_unhook`, the `NgxDevice`/`NativeTarget`
+> proxy choices and both ReShade CI lanes were deleted. The plugin is the only host.
+>
+> **Config B — ReShade loaded alongside the plugin — is no longer supported, and it now fails
+> WORSE than before rather than better.** ReShade 6.8 patches vkd3d's single static
+> `ID3D12DeviceExt` vtable process-wide (§1), and `ext_unhook` was the repair; with the repair
+> deleted, NGX's descriptors run through `convert_to_original_cpu_descriptor_handle` and are
+> corrupted with no error reported. The plugin detects the patch and logs an ERROR naming this,
+> which is the only thing left protecting that case.
+>
+> Sections 3 and 5 below still describe the add-on's event model in places. §3 was rewritten
+> for the plugin on 2026-09-04; §5's "ReShade 6.8 add-on API" block is now HISTORY, kept because
+> the descriptor and lifetime hazards it records were measured against this title and are the
+> reason several of our own rules exist.
 >
 > The stale self-definition was load-bearing: two research documents inherited ReShade-era
 > FEASIBILITY judgements from it — "we cannot reach X", "that would need the engine" — which were

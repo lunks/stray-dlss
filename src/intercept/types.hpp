@@ -1,6 +1,6 @@
 // The interception seam's plain data. Buildable on Linux: no d3d12.h, no ReShade, no UE4SS.
 //
-// Two backends produce these — the ReShade add-on (src/backend_reshade/) and the native
+// One backend produces these now — the native
 // vtable-hook layer (src/backend_native/) — and one framework-free application consumes them
 // (src/app/). Identity types are integers on purpose: a ResourceId is never dereferenced by a
 // consumer, and a DescriptorId is always a REAL D3D12_CPU_DESCRIPTOR_HANDLE.ptr (ReShade
@@ -40,7 +40,7 @@ struct BufferRange
 };
 
 // What a backend knows about a resource, captured WITHOUT dereferencing it at query time in
-// the native backend (creation-time snapshot) and liveness-checked first in the ReShade one.
+// the native backend, from its creation-time snapshot.
 struct ResourceInfo
 {
 	bool is_buffer = false;

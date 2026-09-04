@@ -134,7 +134,6 @@ DWORD __stdcall hooked_GetModuleFileNameW(HMODULE module, LPWSTR out, DWORD size
 }
 
 // Walks the snippet's import descriptors and swaps the GetModuleFileNameW thunk for ours.
-// Mirrors ext_unhook's discipline: every failure is named, with the address and the OS error.
 bool patch_identity_import()
 {
 	auto *base = reinterpret_cast<unsigned char *>(g_module);

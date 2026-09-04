@@ -9,7 +9,6 @@
 // Why we are better placed than that addon: it Detours the NGX exports process-wide to graft
 // itself onto a game-created DLSS feature (and in Stray reaches "HOOKS ARMED - NO DLSS CREATE
 // SEEN" and does nothing, §0.3). We already OWN a working native-device NGX integration, so we
-// create feature 18 directly, and ext_unhook already defuses the ReShade vtable trap that breaks
 // descriptor handles on this stack.
 //
 // NO RR-style guide buffers are required: DLSS 5 infers materials from the frame itself

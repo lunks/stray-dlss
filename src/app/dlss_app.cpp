@@ -14,7 +14,6 @@
 #include "core/taa_hashes.hpp"
 #include "core/exposure_plan.hpp"
 #include "core/feature_recreate.hpp"
-#include "ext_unhook.hpp"
 #include "exposure_texture.hpp"
 #include "host/config.hpp"
 #include "input_dump.hpp"
@@ -164,8 +163,10 @@ bool report_vkd3d_ext_hook(ID3D12Device *native, const char *when)
 			when, path[0] ? path : "<unknown>");
 		STRAY_LOG_ERROR("  NGX descriptors minted on the native device will be run through "
 			"convert_to_original_cpu_descriptor_handle and CORRUPTED.");
-		STRAY_LOG_ERROR("  ext_unhook restores the pristine pointers before every NGX call "
-			"(disable with ExtUnhook=0). See CLAUDE.md \"The native-device rule has a trap\".");
+		STRAY_LOG_ERROR("  THIS CONFIGURATION IS NO LONGER SUPPORTED. The repair that used to "
+			"undo the patch (ext_unhook) was removed with the ReShade host, so nothing corrects "
+			"these handles now: DLSS will sample the wrong textures and report no error. Remove "
+			"ReShade's dxgi.dll, or run a build from before the ReShade host was dropped.");
 	}
 	else
 	{
@@ -321,7 +322,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	report_vkd3d_ext_hook(native, "init_device");
 	// Save the pristine extension vtable NOW — the game's stack installs ReShade's patch by
 	// frame ~120, and once installed the originals are unrecoverable from inside the process.
-	ext_unhook::capture(native);
 
 	if (native != nullptr)
 	{
@@ -854,13 +854,6 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			ngx_preset);
 	}
 
-	bool ext_unhook_enabled = true;
-	ext_unhook_enabled = host::cfg::get_bool("ExtUnhook", ext_unhook_enabled);
-	ext_unhook::set_enabled(ext_unhook_enabled);
-	if (!ext_unhook_enabled)
-		STRAY_LOG_WARN("ExtUnhook=0: ReShade's vkd3d ext-vtable patch will NOT be undone before "
-			"NGX calls; expect the frozen-output failure while anything queries the proxy.");
-
 	bool dump_inputs = false;
 	dump_inputs = host::cfg::get_bool("NgxDumpInputs", dump_inputs);
 	input_dump::set_enabled(dump_inputs);
@@ -924,25 +917,8 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 			// instead: only the game's calls, in ReShade's minted handle space. MEASURED 2026-09-01:
 			// `real` crashes the game at the device recreate with device-only, list-only and
 			// sentinel-off alike; `proxy` is the stacking bisection.
-			char target[16] = "real";
-			host::cfg::get_string("NativeTarget", target, sizeof(target));
+			// NativeTarget=proxy is gone with the ReShade host: there is no proxy to install on.
 			ID3D12Device *install_on = native;
-			if (std::strcmp(target, "proxy") == 0)
-			{
-				ID3D12Device *proxy = reshade_proxy_device(native);
-				if (proxy != nullptr)
-				{
-					install_on = proxy;
-					STRAY_LOG_WARN("NativeTarget=proxy: installing the native hooks on ReShade's PROXY device %p "
-						"(vkd3d's real device is %p). Descriptor identities in the shadow are ReShade-minted.",
-						static_cast<void *>(proxy), static_cast<void *>(native));
-				}
-				else
-				{
-					STRAY_LOG_ERROR("NativeTarget=proxy requested but ReShade's proxy device could not be recovered; "
-						"installing on the real device instead.");
-				}
-			}
 			// The hooks deliver to this application in drive mode; harmless otherwise.
 			native::set_sink(this);
 			const bool ok = native::install(install_on, mode, native::install_scope_from_string(scope),
@@ -1581,39 +1557,16 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 
 			// [STRAYDLSS] NgxDevice: auto (default), native, or proxy.
 			//
-			// The automatic choice follows the measured ext-hook state, which is the reasoning
-			// in CLAUDE.md §1. But the crash we are chasing faults inside d3d12core.dll —
-			// vkd3d-proton itself — with registers holding packed handle-shaped values rather
-			// than pointers, which is what an unconverted descriptor handle reaching vkd3d
-			// looks like. That makes the device choice worth testing rather than assuming, so
-			// it can be forced either way from the ini.
-			char device_pref[16] = "auto";
-			host::cfg::get_string("NgxDevice", device_pref, sizeof(device_pref));
-			const bool force_native = std::strcmp(device_pref, "native") == 0;
-			const bool force_proxy = std::strcmp(device_pref, "proxy") == 0;
-
+			// ONE DEVICE NOW. The proxy branch existed because §1's truth table had two
+			// self-consistent rows; with the ReShade host gone only the native row is
+			// reachable, and `hooked` no longer selects a path — it reports an unsupported
+			// process, loudly, above.
 			ID3D12Device *device = native;
-			if (force_native)
+			if (hooked)
 			{
-				STRAY_LOG_WARN("NGX forced onto the NATIVE device by [STRAYDLSS] NgxDevice; the "
-					"ext hook is %s, so this is %s.", hooked ? "INSTALLED" : "absent",
-					hooked ? "the combination CLAUDE.md calls broken" : "safe");
-			}
-			else if (hooked || force_proxy)
-			{
-				if (ID3D12Device *proxy = reshade_proxy_device(native))
-				{
-					device = proxy;
-					STRAY_LOG_INFO("NGX will use ReShade's PROXY device (%p): the ext hook is "
-						"installed, so descriptors must be ReShade-minted for its conversion "
-						"to be correct.", static_cast<void *>(proxy));
-				}
-				else
-				{
-					STRAY_LOG_ERROR("The ext hook is installed but ReShade's proxy device could "
-						"not be recovered. Falling back to the native device — this is the "
-						"BROKEN combination and the image is expected to be wrong.");
-				}
+				STRAY_LOG_ERROR("NGX will use the NATIVE device while ReShade's ext-vtable patch "
+					"is INSTALLED. This is CLAUDE.md's broken row and there is no longer a "
+					"repair for it: expect wrong textures with no error reported.");
 			}
 			else
 			{

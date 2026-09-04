@@ -2,7 +2,6 @@
 
 #include "core/dlss_quality.hpp"
 #include "core/feature_recreate.hpp"
-#include "ext_unhook.hpp"
 
 #include "log.hpp"
 
@@ -347,7 +346,6 @@ Status initialise(ID3D12Device *device)
 	}
 
 	// Undo ReShade's ext-vtable patch before NGX first touches the extension interface.
-	ext_unhook::repair();
 
 	NVSDK_NGX_LoggingInfo logging_info = {};
 	logging_info.LoggingCallback = ngx_log_callback;
@@ -655,7 +653,6 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 	// Same preconditions and repair as the SR ensure. Availability is deliberately NOT a
 	// gate: the capability key can be a false negative under Proton (the SR precedent),
 	// so a create attempt decides — once, then the latch.
-	ext_unhook::repair();
 	if (!g_status.initialised || cmd == nullptr)
 		return false;
 	if (desc.render_width == 0 || desc.output_width == 0)
@@ -752,7 +749,6 @@ bool ensure_feature_rr(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 
 bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 {
-	ext_unhook::repair();
 	if (g_rr_feature == nullptr || g_rr_params == nullptr || cmd == nullptr)
 		return false;
 	if (in.base.color == nullptr || in.base.depth == nullptr ||
@@ -839,8 +835,6 @@ bool evaluate_rr(ID3D12GraphicsCommandList *cmd, const EvaluateInputsRR &in)
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 {
 	// CreateFeature builds NGX's cubin descriptor objects; undo ReShade's ext-vtable patch
-	// first or they are built against mangled handles. (src/ext_unhook.hpp)
-	ext_unhook::repair();
 	if (!g_status.initialised || !g_status.super_sampling_available || cmd == nullptr)
 		return false;
 	if (desc.render_width == 0 || desc.render_height == 0 ||
@@ -1009,8 +1003,6 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc)
 bool evaluate(ID3D12GraphicsCommandList *cmd, const EvaluateInputs &in)
 {
 	// The game can re-install the patch with a single QueryInterface at any time; repair
-	// immediately before NGX resolves its descriptors. (src/ext_unhook.hpp)
-	ext_unhook::repair();
 	if (g_feature == nullptr || g_feature_params == nullptr || cmd == nullptr)
 		return false;
 	if (in.color == nullptr || in.depth == nullptr || in.motion_vectors == nullptr ||

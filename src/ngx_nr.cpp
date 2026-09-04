@@ -1,6 +1,5 @@
 #include "ngx_nr.hpp"
 
-#include "ext_unhook.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
 #include "ngx_snippet.hpp"
@@ -551,7 +550,6 @@ void release_feature_now(const char *why)
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
                     std::uint32_t render_h, std::uint32_t out_w, std::uint32_t out_h)
 {
-	ext_unhook::repair();
 
 	const bool same = g_feature != nullptr && g_feature_render_w == render_w &&
 		g_feature_render_h == render_h && g_feature_out_w == out_w &&
@@ -1159,7 +1157,6 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		return refuse_pre_evaluate(kRefCreateFailed, "feature 18 could not be created.");
 	}
 
-	ext_unhook::repair();
 
 	// Colour rect: the back buffer's own rect, which the caller passes as output_*. The network
 	// consumes the already-upscaled, already-tonemapped image, so there is no render rect here.
