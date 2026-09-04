@@ -618,7 +618,10 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	perf::Scope perf_dispatch(perf::kDispatchPath);
 
 	std::uint64_t hash = 0;
-	bool reported_twice = false; // both once-per-hash reports (first sighting, first steady) done
+	// Every once-per-hash report for this hash is in the log: the first sighting and the first
+	// steady (non-cut) frame - or the first sighting alone for a hash the matcher EXCLUDES by
+	// identity, which never gets a steady report because `want_steady` refuses `excluded`.
+	bool reports_done = false;
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		++g_diag.large_dispatches;
@@ -672,8 +675,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// anything downstream depends on seeing the pass.
 		const bool dry_running = g_dry_run_hash_count != 0 || g_ngx_dry_run != 0 ||
 			g_ngx_pass_override != 0 || g_ngx_evaluate;
-		reported_twice = g_report_count[hash] >= 2;
-		if (!dry_running && reported_twice && !is_known_taa_hash(hash))
+		{
+			const std::uint32_t reports = g_report_count[hash];
+			reports_done = reports >= 2 ||
+				(reports >= 1 && g_stats[hash].verdict == MatchVerdict::excluded);
+		}
+		if (!dry_running && g_report_count[hash] >= 2 && !is_known_taa_hash(hash))
 		{
 			// Still track the output resource each frame: the history round-trip (this
 			// frame's u0 reappearing as an SRV next frame) is the decisive test for which
@@ -691,11 +698,13 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// search (a 2448-byte read per bound root CBV) and the structural matcher - which is where
 	// the 7 resolves a frame of the `resolve 0.539ms (7.0)` line went, six of them to be told
 	// `not-announced`. Every counter keeps its meaning (seam::pre_gate_decide says how), and the
-	// once-per-hash diagnostics still see each pass twice first: a hash is only skipped after
-	// both of its DISPATCH REPORTs are in the log. The bisection instruments need the full path
+	// once-per-hash diagnostics still see each pass first: a hash is only skipped after both of
+	// its DISPATCH REPORTs are in the log (one, for a hash the matcher excludes by identity -
+	// the two SSD passes, which are exactly the look-alikes that ask every frame). The
+	// bisection instruments need the full path
 	// for every dispatch and turn this off outright: a named dry-run hash, a dry-run mode, or an
 	// explicitly named pass.
-	if (reported_twice && g_dry_run_hash_count == 0 && g_ngx_dry_run == 0 && g_ngx_pass_override == 0 &&
+	if (reports_done && g_dry_run_hash_count == 0 && g_ngx_dry_run == 0 && g_ngx_pass_override == 0 &&
 		seamhook::pre_gate(x, y) == seam::PreGate::skip)
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
