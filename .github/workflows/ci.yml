@@ -34,7 +34,7 @@ jobs:
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
-                    -DSTRAY_DLSS_BUILD_TESTS=ON
+          -DSTRAY_DLSS_BUILD_TESTS=ON
           -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 
       - name: Build
