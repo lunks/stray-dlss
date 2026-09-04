@@ -151,6 +151,8 @@ bool Config::Load(const std::wstring& path)
         else if (key == "submixpath")             submixPath             = val;
         else if (key == "submixspeakerpath")      submixSpeakerPath      = val;
         else if (key == "submixrerouteparent")    submixRerouteParent    = val;
+        else if (key == "submixtappath")          submixTapPath          = val;
+        else if (key == "submixspeakertappath")   submixSpeakerTapPath   = val;
         else if (key == "submixregistersoundsubmixslot") submixRegisterSoundSubmixSlot = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "submixregisterslot")     submixRegisterSlot     = std::clamp(std::atoi(val.c_str()), 0, 31);
         else if (key == "submixdevicesource")     submixDeviceSource     = Lower(val);
@@ -205,6 +207,8 @@ bool Config::ReloadIfChanged(const std::wstring& path)
     // function exists to refuse.
     if (fresh.submixPath != submixPath || fresh.submixSpeakerPath != submixSpeakerPath ||
         fresh.submixRerouteParent != submixRerouteParent ||
+        fresh.submixTapPath != submixTapPath ||
+        fresh.submixSpeakerTapPath != submixSpeakerTapPath ||
         fresh.submixRegisterSlot != submixRegisterSlot ||
         fresh.submixRegisterSoundSubmixSlot != submixRegisterSoundSubmixSlot ||
         fresh.submixDeviceSource != submixDeviceSource ||
@@ -259,12 +263,15 @@ void Config::LogSummary(const char* what) const
                  SceAudioOutPathName(padSpeakerPath), padSpeakerGain,
                  static_cast<double>(padSpeakerReassertSeconds), endpointMatch.c_str(),
                  padUserId, GlyphName(), glyphControllerType);
-    SDS_LOG_INFO("config %s: submix vibration='%s' speaker='%s' parent='%s' slots=%d/%d "
+    SDS_LOG_INFO("config %s: submix vibration='%s' speaker='%s' parent='%s' tap='%s'/'%s' slots=%d/%d "
                  "deviceSource=%s scan=0x%X dump=%d probeMaster=%d gain=%.3f queueAhead=%dms "
                  "ring=%dms status=%.1fs watch=%.1fs liveThreshold=%.5f warnEvery=%.1fs "
                  "watchdog=%.1fs",
                  what, submixPath.c_str(), submixSpeakerPath.c_str(),
-                 submixRerouteParent.c_str(), submixRegisterSlot, submixRegisterSoundSubmixSlot,
+                 submixRerouteParent.c_str(),
+                 submixTapPath.empty() ? "(master)" : submixTapPath.c_str(),
+                 submixSpeakerTapPath.empty() ? "(master)" : submixSpeakerTapPath.c_str(),
+                 submixRegisterSlot, submixRegisterSoundSubmixSlot,
                  submixDeviceSource.c_str(), static_cast<unsigned>(submixScanBytes),
                  submixDumpWords, submixProbeMaster ? 1 : 0, static_cast<double>(submixGain),
                  submixQueueAheadMs, submixRingMs, static_cast<double>(submixStatusSeconds),

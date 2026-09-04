@@ -33,7 +33,7 @@ name: StrayDualSense plugin
 
 on:
   push:
-    branches: [ main, dualsense, dualsense-submix, dualsense-thin ]
+    branches: [ main, dualsense, dualsense-submix, dualsense-thin, fix-submix-aliasing ]
     paths:
       - 'mods/StrayDualSense/**'
       - '.github/workflows/dualsense.yml'
@@ -120,8 +120,8 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/obj
           for f in AssetName Config HidMode Log PadAudio Platform Runtime ScePad \
-                   SubmixChoice SubmixDiscovery SubmixDsp SubmixSink SubmixTap SubmixWatch \
-                   TriggerEffect Triggers Wasapi; do
+                   SubmixChoice SubmixDiscovery SubmixDsp SubmixRouting SubmixSink SubmixTap \
+                   SubmixWatch TriggerEffect Triggers Wasapi; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror \
               -Isrc -c "src/$f.cpp" -o "/tmp/obj/$f.o"
@@ -153,9 +153,12 @@ jobs:
               sds::Rt().OnHapticGate(true, true);
               // The tap's entry point. Nulls everywhere: BindSubmixTap must refuse an
               // unresolved submix rather than register with a null one, which the engine
-              // reads as the MASTER submix.
+              // reads as the MASTER submix. NINE arguments since 0.4.1 - the two masters the
+              // reroute re-parents AND the two children the listeners go on are now different
+              // submixes (docs §20.1), and passing a master where a tap belongs is the bug.
               if (sds::Rt().SubmixWantsBinding())
-                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0);
+                  sds::Rt().BindSubmixTap(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                          nullptr, nullptr, 0);
               sds::Rt().Shutdown();
           }
           BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }

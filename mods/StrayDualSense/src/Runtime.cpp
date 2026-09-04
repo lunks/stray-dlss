@@ -152,6 +152,17 @@ void Runtime::StartSubmix()
     m_speaker.tag   = "speaker";
     m_speaker.owner = "SPEAKER";
 
+    // WHERE EACH LISTENER GOES, decided once (docs §20.1, src/SubmixRouting.hpp). The reroute
+    // still re-parents the two MASTERS; the taps go on their children, because two listeners
+    // on two siblings of one parent are handed the same buffer by UE 4.27.
+    m_coils.plan   = submix::PlanTap(m_config.submixTapPath, m_config.submixPath);
+    m_speaker.plan = submix::PlanTap(m_config.submixSpeakerTapPath, m_config.submixSpeakerPath);
+    if (!m_coils.plan.tappingChild && !m_speaker.plan.tappingChild)
+        SDS_LOG_WARN("submix: BOTH lanes are configured to tap their reroute target, which is "
+                     "the pre-0.4.1 arrangement that ALIASES - every haptic will also be "
+                     "emitted on the pad speaker (docs §20.1). That is a legitimate A/B, and "
+                     "the 'submix alias' line will report it; it is not a good default.");
+
     const std::wstring dir = m_gameDir.empty() ? m_modDir : m_gameDir;
     m_submixStatusFile = dir + Widen(m_config.submixStatusFile);
     m_submixStatusPath = Narrow(m_submixStatusFile);
@@ -277,6 +288,7 @@ void Runtime::RerouteWatchdog(uint64_t now)
 
 bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
                             void* vibrationMasterObject, void* speakerMasterObject,
+                            void* vibrationTapObject, void* speakerTapObject,
                             void* rerouteParentObject, const void* imageBase,
                             std::size_t imageSize)
 {
@@ -299,15 +311,18 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     // first and every master after it, so binding one lane now and the other later would
     // re-init the parent underneath the first lane's link.
     if (vibrationMasterObject == nullptr || speakerMasterObject == nullptr ||
+        vibrationTapObject == nullptr || speakerTapObject == nullptr ||
         rerouteParentObject == nullptr)
     {
         if (attempt == 1 || attempt % 20 == 0)
-            SDS_LOG_WARN("submix: not every submix has loaded yet (attempt %d): '%s'=%p "
-                         "'%s'=%p parent '%s'=%p. NOT registering with a null submix - the "
-                         "engine reads that as the MASTER submix and the whole soundtrack "
-                         "would go to the pad.",
+            SDS_LOG_WARN("submix: not every submix has loaded yet (attempt %d): master '%s'=%p "
+                         "'%s'=%p, tap '%s'=%p '%s'=%p, parent '%s'=%p. NOT registering with a "
+                         "null submix - the engine reads that as the MASTER submix and the "
+                         "whole soundtrack would go to the pad.",
                          attempt, m_config.submixPath.c_str(), vibrationMasterObject,
                          m_config.submixSpeakerPath.c_str(), speakerMasterObject,
+                         m_coils.plan.target.c_str(), vibrationTapObject,
+                         m_speaker.plan.target.c_str(), speakerTapObject,
                          m_config.submixRerouteParent.c_str(), rerouteParentObject);
         return false;
     }
@@ -409,19 +424,31 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     }
 
     const char* whyNot = nullptr;
+    // THE LISTENERS GO ON THE TAP OBJECTS, NOT THE MASTERS (docs §20.1, src/SubmixRouting.hpp).
+    // Registering both on the two re-parented masters is what made them siblings sharing one
+    // accumulation buffer, and every _VIBE the engine mixed came out of the pad speaker too.
     SDS_LOG_WARN("submix: about to call vtable slot %d as "
-                 "FAudioDevice::RegisterSubmixBufferListener(listener=%p, submix=%p) for '%s', "
-                 "then (listener=%p, submix=%p) for '%s'. The slot is derived from stock "
-                 "UE 4.27.2 (see src/SubmixDiscovery.hpp); Stray is a LICENSEE build, so if the "
-                 "game dies HERE, that derivation is the suspect - read the vtable dump above "
-                 "and set SubmixRegisterSlot.",
+                 "FAudioDevice::RegisterSubmixBufferListener(listener=%p, submix=%p) for '%s' "
+                 "on '%s', then (listener=%p, submix=%p) for '%s' on '%s'. The slot is derived "
+                 "from stock UE 4.27.2 (see src/SubmixDiscovery.hpp); Stray is a LICENSEE "
+                 "build, so if the game dies HERE, that derivation is the suspect - read the "
+                 "vtable dump above and set SubmixRegisterSlot.",
                  m_config.submixRegisterSlot, m_coils.tap->ListenerPointer(),
-                 vibrationMasterObject, m_coils.tag, m_speaker.tap->ListenerPointer(),
-                 speakerMasterObject, m_speaker.tag);
+                 vibrationTapObject, m_coils.tag, m_coils.plan.target.c_str(),
+                 m_speaker.tap->ListenerPointer(), speakerTapObject, m_speaker.tag,
+                 m_speaker.plan.target.c_str());
+    for (const Lane* lane : { &m_coils, &m_speaker })
+        SDS_LOG_INFO("submix: lane '%s' taps '%s' - %s%s", lane->tag,
+                     lane->plan.target.c_str(), lane->plan.why,
+                     lane->plan.givesUpMasterVolume
+                         ? ". The master's own OutputVolume and effect chain are NOT in these "
+                           "samples; both masters measured unity with no effects, so this is a "
+                           "no-op today (docs §20.10)"
+                         : "");
 
     if (!submix::CallRegisterSubmixBufferListener(
             d.device, m_config.submixRegisterSlot, m_coils.tap->ListenerPointer(),
-            vibrationMasterObject, imageBase, imageSize, &whyNot))
+            vibrationTapObject, imageBase, imageSize, &whyNot))
     {
         SDS_LOG_ERROR("submix: REFUSED to call the register slot: %s. The taps are dead for this "
                       "session and the pad is SILENT.", whyNot != nullptr ? whyNot : "no reason recorded");
@@ -434,7 +461,7 @@ bool Runtime::BindSubmixTap(const void* worldObject, const void* engineObject,
     // and says so.
     if (!submix::CallRegisterSubmixBufferListener(
             d.device, m_config.submixRegisterSlot, m_speaker.tap->ListenerPointer(),
-            speakerMasterObject, imageBase, imageSize, &whyNot))
+            speakerTapObject, imageBase, imageSize, &whyNot))
     {
         SDS_LOG_ERROR("submix: the '%s' listener was refused AFTER the '%s' one was accepted: "
                       "%s. The speaker lane is dead for this session; the coils are not.",
@@ -738,7 +765,20 @@ void Runtime::ReportWatch(const Lane& lane, const WatchVerdict& v)
 {
     const double secs = static_cast<double>(v.ms) / 1000.0;
     const bool   isCoils = &lane == &m_coils;
-    const char*  path = isCoils ? m_config.submixPath.c_str() : m_config.submixSpeakerPath.c_str();
+    const char*  path = lane.plan.target.c_str();
+
+    // SILENT BY CONSTRUCTION, and it must not be reported as a fault (docs §20.11). Two assets
+    // override their own SoundSubmixObject onto the DEAD endpoint root, so they bypass
+    // Submix_vibration and land on the one submix UE 4.27 never processes on Windows. Without
+    // this branch the lines below blame the Blueprint gate, the level or the reroute - three
+    // wrong answers to a question that has a known right one.
+    if (v.result != WatchResult::Mixed && submix::RoutesToDeadEndpoint(v.asset))
+    {
+        SDS_LOG_WARN("submix watch [%s] '%s': silent, AND THAT IS EXPECTED - %s. Nothing to "
+                     "fix here; do not read the REROUTE or the gate from this line.",
+                     lane.tag, v.asset.c_str(), submix::DeadEndpointReason());
+        return;
+    }
     if (v.result == WatchResult::Mixed)
     {
         SDS_LOG_INFO("submix watch [%s] '%s': the engine MIXED it - peak %.5f over %.1fs "
@@ -801,10 +841,11 @@ void Runtime::StartLaneAtHandover(Lane& lane, float peak)
 // listener that was never called and a submix that is genuinely silent produce identical
 // audio, so they must not produce identical text.
 void Runtime::LaneStatus(Lane& lane, double seconds, uint64_t nowMs, char* line,
-                         std::size_t lineSize)
+                         std::size_t lineSize, submix::LevelReading& outLevel)
 {
     const submix::TapStats     stats = lane.tap->Stats();
     const submix::LevelReading level = lane.tap->TakeLevels();
+    outLevel = level;
     const uint64_t deltaCallbacks =
         stats.callbacks >= lane.lastCallbacks ? stats.callbacks - lane.lastCallbacks : 0;
     lane.lastCallbacks = stats.callbacks;
@@ -901,8 +942,31 @@ void Runtime::SubmixStatus()
 
     char coils[1200];
     char speaker[1200];
-    LaneStatus(m_coils,   seconds, nowMs, coils,   sizeof(coils));
-    LaneStatus(m_speaker, seconds, nowMs, speaker, sizeof(speaker));
+    submix::LevelReading coilLevel;
+    submix::LevelReading speakerLevel;
+    LaneStatus(m_coils,   seconds, nowMs, coils,   sizeof(coils), coilLevel);
+    LaneStatus(m_speaker, seconds, nowMs, speaker, sizeof(speaker), speakerLevel);
+
+    // THE REGRESSION DETECTOR (docs §20.1). Two listeners on sibling submixes under one parent
+    // are handed the same buffer by UE 4.27, and the tell is that both lanes report the same
+    // float twice over. Fed here because these are the readings the lines just printed, and
+    // TakeLevels() has already reset the meters.
+    if (m_alias.Observe(coilLevel.peak, coilLevel.rms, speakerLevel.peak, speakerLevel.rms,
+                        LiveThreshold()))
+    {
+        const AliasVerdict v = m_alias.Verdict();
+        SDS_LOG_ERROR("submix: THE TWO LANES ARE READING ONE BUFFER. %u of %u non-silent status "
+                      "periods had bit-identical peak AND rms (%.1f%%), which two independent "
+                      "meters on two submixes cannot do by chance. Every haptic is also being "
+                      "emitted on the pad SPEAKER. Cause: both listeners are on submixes that "
+                      "are SIBLINGS under '%s', and UE 4.27 hands a buffer listener the "
+                      "PARENT's accumulation (AudioMixerSubmix.cpp:1364,:1380). Fix: point "
+                      "SubmixTapPath / SubmixSpeakerTapPath at each master's CHILD. Currently "
+                      "tapping '%s' and '%s'. See docs/STRAY-DUALSENSE.md §20.1.",
+                      v.identical, v.pairs, static_cast<double>(v.rate) * 100.0,
+                      m_config.submixRerouteParent.c_str(), m_coils.plan.target.c_str(),
+                      m_speaker.plan.target.c_str());
+    }
 
     char master[220] = "";
     if (m_tapMaster != nullptr)
@@ -918,10 +982,21 @@ void Runtime::SubmixStatus()
                           : "");
     }
 
-    char rest[400];
+    // The alias numbers ride on the coil line so one pasted status answers §20.1 without
+    // anyone having to know the question. `identical` must stay near 0 once the child taps are
+    // in; ~95% is the broken arrangement.
+    const AliasVerdict alias = m_alias.Verdict();
+    char aliasField[200];
+    std::snprintf(aliasField, sizeof(aliasField),
+                  " | alias pairs=%u identical=%u (%.1f%%) spkOnly=%u coilOnly=%u%s",
+                  alias.pairs, alias.identical, static_cast<double>(alias.rate) * 100.0,
+                  alias.speakerOnly, alias.coilsOnly,
+                  alias.aliasing ? "  <- ALIASING, see the ERROR above" : "");
+
+    char rest[640];
     std::snprintf(rest, sizeof(rest),
-                  "%s | rerouted=%d | sink open=%d '%s' %uch %uHz frames=%llu fail=%llu",
-                  master, m_submixRerouted.load() ? 1 : 0,
+                  "%s%s | rerouted=%d | sink open=%d '%s' %uch %uHz frames=%llu fail=%llu",
+                  master, aliasField, m_submixRerouted.load() ? 1 : 0,
                   m_submixSink.StreamOpen() ? 1 : 0, m_submixSink.EndpointName().c_str(),
                   m_submixSink.EndpointChannels(), m_submixSink.EndpointRate(),
                   static_cast<unsigned long long>(m_submixSink.FramesWritten()),

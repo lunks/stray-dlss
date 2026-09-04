@@ -3,6 +3,17 @@
 // Bumped by hand. It appears in the first line of stray-dualsense.log, which is how a pasted
 // log is matched to a build — this project's only feedback loop is a user pasting a log back.
 //
+// 0.4.1: THE TWO LANES STOP SHARING A BUFFER. Both listeners were on the two submixes the
+//        reroute re-parents, which made them SIBLINGS under one Submix_unused - and UE 4.27
+//        hands a buffer listener the PARENT's accumulation (AudioMixerSubmix.cpp:1364,:1380),
+//        zeroed once per callback rather than once per child, so the second sibling processed
+//        read BOTH lanes. Measured in the game: the lanes' peak AND rms were bit-identical in
+//        95.2% of 2,483 non-silent status periods, and every haptic was emitted on the pad
+//        speaker too. Each lane now taps its master's CHILD (SubmixTapPath /
+//        SubmixSpeakerTapPath), which is clean by construction. Plus the detector that found
+//        it, kept as a regression alarm ('alias' on the SUBMIX line), and a named verdict for
+//        the two assets that route themselves to the dead endpoint and can never be tapped.
+//        NO gain changed: Level is applied by the engine upstream of the tap (docs §20.4).
 // 0.4.0: THE THIN SHIM. The speaker comes from Submix_controllerMaster through the same tap
 //        and sink as the coils (FL/FR beside RL/RR of one stream); the asset replay path, the
 //        loop lists, the fades, HapticSource and its fallback, the HID speaker-route claim and
@@ -19,5 +30,5 @@
 //        stops, fades. 0.1.0 was the envelope-over-scePadSetVibration design (§9), now dead.
 #define SDS_VERSION_MAJOR 0
 #define SDS_VERSION_MINOR 4
-#define SDS_VERSION_PATCH 0
-#define SDS_VERSION_STRING "0.4.0"
+#define SDS_VERSION_PATCH 1
+#define SDS_VERSION_STRING "0.4.1"
