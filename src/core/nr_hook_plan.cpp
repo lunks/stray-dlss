@@ -88,6 +88,42 @@ bool latch_guide_extent(GuideExtentLatch &latch, std::uint32_t width, std::uint3
 }
 
 
+bool feature_needs_recreate(const core::FeatureRect &created, const core::FeatureRect &want)
+{
+	// THE COLOUR RECT AND NOTHING ELSE. See the header for why the guide rect is not identity:
+	// it is not an argument to CreateFeature, it is a per-evaluate subrect parameter, and a move
+	// in it is answered by latch_guide_extent's single DLSSNR.Reset.
+	return created.output_w != want.output_w || created.output_h != want.output_h;
+}
+
+const char *validation_verdict_name(ValidationVerdict v)
+{
+	switch (v)
+	{
+	case ValidationVerdict::pass:         return "pass";
+	case ValidationVerdict::degenerate:   return "degenerate";
+	case ValidationVerdict::inconclusive: return "inconclusive";
+	case ValidationVerdict::undecodable:  return "undecodable";
+	}
+	return "?";
+}
+
+ValidationVerdict judge_validation(const ValidationCrop &input, const ValidationCrop &neural,
+                                   double floor)
+{
+	// Nothing to judge: the neural crop is the one the verdict rests on.
+	if (!neural.decoded)
+		return ValidationVerdict::undecodable;
+	// Light in the answer is the whole test, and it is checked FIRST so a working runtime is
+	// never held up by anything the input crop did or did not do.
+	if (neural.luma > floor)
+		return ValidationVerdict::pass;
+	// Black answer. Was it a black question? core::fg::CropVerdict::dark, applied here.
+	if (input.decoded && input.luma <= floor)
+		return ValidationVerdict::inconclusive;
+	return ValidationVerdict::degenerate;
+}
+
 void note_evaluate_gap(EvaluateGapLatch &latch) { latch.reset_pending = true; }
 
 bool take_evaluate_reset(EvaluateGapLatch &latch)

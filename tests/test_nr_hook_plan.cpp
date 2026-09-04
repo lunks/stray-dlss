@@ -14,6 +14,7 @@
 // libstdc++; libc++ happens to pull it in transitively, which is exactly the kind of difference
 // the Linux lane exists to catch.
 #include <initializer_list>
+#include <string>
 
 using namespace stray_dlss::nrplan;
 
@@ -310,4 +311,127 @@ TEST_CASE("the frame boundary only ever ARMS - it never clears a pending reset")
 	note_evaluate_gap(latch); // the evaluate failed and re-armed
 	note_frame_boundary(latch, /*evaluated_this_frame=*/true);
 	CHECK(take_evaluate_reset(latch)); // still armed
+}
+
+// ---------------------------------------------------------------------------------------
+// THE FEATURE'S IDENTITY: the colour rect, and not the guide rect.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("DLAA: the guide grid doubling at a fixed output does NOT rebuild feature 18")
+{
+	// The measured shape, from stray-dlss-plugin.log.pre-dlaaclean: the session ran
+	// 1920x1080 -> 3840x2160 and then DLAA at 3840x2160 -> 3840x2160. The BACK BUFFER never
+	// moved, so nothing CreateFeature was given moved either; only the guides did, and the guide
+	// rect is a per-evaluate DLSSNR.MVecSubrect* parameter.
+	const stray_dlss::core::FeatureRect created{ 1920, 1080, 3840, 2160 };
+	const stray_dlss::core::FeatureRect dlaa{ 3840, 2160, 3840, 2160 };
+	CHECK(feature_needs_recreate(created, dlaa) == false);
+}
+
+TEST_CASE("a screen-percentage change at a fixed output does NOT rebuild feature 18")
+{
+	// 50% -> 70%, both of which this project runs. Same argument as DLAA.
+	const stray_dlss::core::FeatureRect fifty{ 1920, 1080, 3840, 2160 };
+	const stray_dlss::core::FeatureRect seventy{ 2688, 1512, 3840, 2160 };
+	CHECK(feature_needs_recreate(fifty, seventy) == false);
+	CHECK(feature_needs_recreate(seventy, fifty) == false);
+}
+
+TEST_CASE("a letterbox slide, which moves BOTH rects, still rebuilds only on the colour one")
+{
+	// The engine walks the view rect 3840x2160 -> 3840x2073 during a cinematic (CLAUDE.md §2.1).
+	// At the present stage the COLOUR rect is the back buffer's, which a letterbox does not
+	// touch — so even the slide the SR hold declines costs NR nothing but a reset.
+	const stray_dlss::core::FeatureRect created{ 1920, 1080, 3840, 2160 };
+	const stray_dlss::core::FeatureRect mid_slide{ 1920, 1037, 3840, 2160 };
+	CHECK(feature_needs_recreate(created, mid_slide) == false);
+}
+
+TEST_CASE("a real resolution change DOES rebuild feature 18")
+{
+	// The back buffer genuinely moving is the one case CreateFeature has to be re-run for:
+	// DLSSNR.Width/Height are create-time and there is no per-evaluate output EXTENT.
+	const stray_dlss::core::FeatureRect created{ 1920, 1080, 3840, 2160 };
+	CHECK(feature_needs_recreate(created, stray_dlss::core::FeatureRect{ 1920, 1080, 2560, 1440 }));
+	CHECK(feature_needs_recreate(created, stray_dlss::core::FeatureRect{ 1920, 1080, 3840, 2159 }));
+	// And it is decided by the colour rect ALONE: identical guides, moved output.
+	CHECK(feature_needs_recreate(stray_dlss::core::FeatureRect{ 0, 0, 3840, 2160 },
+		stray_dlss::core::FeatureRect{ 0, 0, 2560, 1440 }));
+}
+
+TEST_CASE("nothing moving needs nothing rebuilt")
+{
+	const stray_dlss::core::FeatureRect r{ 1920, 1080, 3840, 2160 };
+	CHECK(feature_needs_recreate(r, r) == false);
+}
+
+// ---------------------------------------------------------------------------------------
+// THE VALIDATION VERDICT: a black answer to a black question convicts nobody.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("a lit neural output passes, whatever the input crop did")
+{
+	const double floor = 1e-5;
+	CHECK(judge_validation(ValidationCrop{ 0.42, true }, ValidationCrop{ 0.37, true }, floor)
+		== ValidationVerdict::pass);
+	// A working runtime is never held up by a failed input capture.
+	CHECK(judge_validation(ValidationCrop{ 0.0, false }, ValidationCrop{ 0.37, true }, floor)
+		== ValidationVerdict::pass);
+	// Nor by a black input: brighter than black is brighter than black.
+	CHECK(judge_validation(ValidationCrop{ 0.0, true }, ValidationCrop{ 0.37, true }, floor)
+		== ValidationVerdict::pass);
+}
+
+TEST_CASE("a black neural output over a LIT input is degenerate, and stays so")
+{
+	// This is the real defect the gate exists for: the network was shown an image and answered
+	// black. Latch NR off for the session, loudly. Unchanged behaviour.
+	CHECK(judge_validation(ValidationCrop{ 0.5, true }, ValidationCrop{ 0.0, true }, 1e-5)
+		== ValidationVerdict::degenerate);
+	CHECK(judge_validation(ValidationCrop{ 0.5, true }, ValidationCrop{ 1e-5, true }, 1e-5)
+		== ValidationVerdict::degenerate);
+}
+
+TEST_CASE("a black neural output over a BLACK input is INCONCLUSIVE, not degenerate")
+{
+	// A loading screen, a fade, a cinematic letterbox, or the menu before the first render. The
+	// black answer is the CORRECT answer, so it says nothing about the runtime — and the old
+	// verdict latched NR off for the whole session on exactly this. Same family as
+	// core::fg::CropVerdict::dark (CLAUDE.md §5, the FG crop gate's 3 325 refused presents).
+	const double floor = 1e-5;
+	CHECK(judge_validation(ValidationCrop{ 0.0, true }, ValidationCrop{ 0.0, true }, floor)
+		== ValidationVerdict::inconclusive);
+	CHECK(judge_validation(ValidationCrop{ 1e-9, true }, ValidationCrop{ 1e-9, true }, floor)
+		== ValidationVerdict::inconclusive);
+	// Exactly AT the floor is black on both sides — the comparison is strict on the neural side
+	// and inclusive on the input side, which is the only pairing that leaves no gap.
+	CHECK(judge_validation(ValidationCrop{ floor, true }, ValidationCrop{ floor, true }, floor)
+		== ValidationVerdict::inconclusive);
+}
+
+TEST_CASE("an undecodable neural crop fails safe and is not confused with black")
+{
+	// "We could not read it" and "we read it and it was black" want different log lines and
+	// different verdicts; collapsing them is how a format problem gets diagnosed as a runtime one.
+	CHECK(judge_validation(ValidationCrop{ 0.5, true }, ValidationCrop{ 0.0, false }, 1e-5)
+		== ValidationVerdict::undecodable);
+	CHECK(judge_validation(ValidationCrop{ 0.0, false }, ValidationCrop{ 0.9, false }, 1e-5)
+		== ValidationVerdict::undecodable);
+}
+
+TEST_CASE("a black neural output with NO input evidence stays degenerate, deliberately")
+{
+	// The conservative leg. The input crop's capture is best-effort and must never block
+	// validation, so its absence is an allocation failure rather than a scene — and latching off
+	// on it is the behaviour that shipped before judge_validation existed.
+	CHECK(judge_validation(ValidationCrop{ 0.0, false }, ValidationCrop{ 0.0, true }, 1e-5)
+		== ValidationVerdict::degenerate);
+}
+
+TEST_CASE("every verdict has a name, because a number in a log is not a diagnosis")
+{
+	CHECK(std::string(validation_verdict_name(ValidationVerdict::pass)) == "pass");
+	CHECK(std::string(validation_verdict_name(ValidationVerdict::degenerate)) == "degenerate");
+	CHECK(std::string(validation_verdict_name(ValidationVerdict::inconclusive)) == "inconclusive");
+	CHECK(std::string(validation_verdict_name(ValidationVerdict::undecodable)) == "undecodable");
 }

@@ -13,6 +13,8 @@
 // is no mode to choose: what remains is the per-frame admission decision for that site.
 #pragma once
 
+#include "core/feature_recreate.hpp"
+
 #include <cstdint>
 
 namespace stray_dlss::nrplan {
@@ -141,6 +143,100 @@ struct GuideExtentLatch
 // (latched != 0)`): there is no history to invalidate before the first evaluate, and treating the
 // first frame as a change would put a spurious reset into every session.
 bool latch_guide_extent(GuideExtentLatch &latch, std::uint32_t width, std::uint32_t height);
+
+
+// WHAT ACTUALLY IDENTIFIES A LIVE FEATURE 18, and what merely moved underneath it.
+//
+// THE DEFECT THIS EXISTS TO CLOSE (2026-09-04). ngx_nr.cpp's ensure_feature keyed the live
+// feature on FOUR numbers - the guide rect AND the colour rect - and tore the feature down when
+// any of them moved. Only two of them are real:
+//
+//   * nrparam::build_create writes DLSSNR.Width / DLSSNR.Height / DLSSNR.ScalingRatio and
+//     nothing else, and ngx_nr.cpp passes `in_w = out_w, in_h = out_h` into it. The GUIDE rect
+//     is never an argument to CreateFeature. (HARD: src/core/nr_params.cpp build_create, and
+//     ngx_nr.cpp's `const std::uint32_t in_w = out_w;`.)
+//   * The guide rect IS sent, but PER EVALUATE, through nrparam::build_rects ->
+//     DLSSNR.DepthSubrectWidth/Height and DLSSNR.MVecSubrectWidth/Height. A moved guide grid is
+//     therefore expressed by writing different numbers into the same live feature.
+//
+// So a guide-grid move needed no recreate at all - it needed exactly the single DLSSNR.Reset
+// that latch_guide_extent above already forces. Recreating instead cost, every time:
+//
+//   * feature 18's ENTIRE temporal accumulation, where one reset frame was the documented and
+//     already-implemented remedy;
+//   * a run of frames refused as `recreating`, because the release is deferred to the present
+//     boundary and the GPU fence has to pass the last evaluate first; and
+//   * a CreateFeature, which on the SR path has been measured at 57-79 ms against a 16-18 ms
+//     median (CLAUDE.md §2.1).
+//
+// MEASURED SHAPE, from the box's own log (stray-dlss-plugin.log.pre-dlaaclean): the session ran
+// `1920x1080 -> 3840x2160` and then DLAA at `3840x2160 -> 3840x2160`. The COLOUR rect never
+// moved - the back buffer stayed 3840x2160 the whole time - while the guide grid doubled. Under
+// the old key that one event paid the whole list above; under this one it costs a reset frame.
+// The same shape recurs wherever the render rect moves at a fixed output: a screen-percentage
+// change (1920x1080 guides at 50%, 2688x1512 at 70%, both of which this project runs), and every
+// letterbox slide the hold declines (CLAUDE.md §2.1).
+// The rects are core::FeatureRect, the SAME four numbers the SR path is keyed on — deliberately
+// the same type, because they are the same four numbers and a second struct shaped like it would
+// invite the two to drift. What differs is the RULE over them, and that is the whole content of
+// this function: core::operator== treats all four as identity, which is right for SR (its render
+// rect is `InRenderSubrectDimensions`, a real create-time-bounded input), and wrong for feature
+// 18 (whose `render_*` here is the GUIDE grid, a per-evaluate subrect parameter).
+//
+// True only when the live feature must be DESTROYED and rebuilt. `created` is what the live
+// feature was created with; `want` is what this frame asks for.
+bool feature_needs_recreate(const core::FeatureRect &created, const core::FeatureRect &want);
+
+// ---- the validation verdict ----
+//
+// Until validation passes, NR evaluates but its result never reaches the screen: a leaked
+// pre-release runtime that answers black must not be able to show a black frame (CLAUDE.md
+// §0.2). The verdict is taken ONCE per session from a 128x128 centre crop of the neural output.
+//
+// THE DEFECT THIS EXISTS TO CLOSE (2026-09-04): that verdict read ONLY the neural crop, and a
+// neural crop at or below the luminance floor latched NR off PERMANENTLY for the session, with
+// one ERROR line. A frame that is BLACK ON THE INPUT - a loading screen, a fade, a cinematic
+// letterbox, the menu before the first render - produces a black neural output because that is
+// the CORRECT answer, and it convicted the runtime on it.
+//
+// This project has already met and fixed exactly this, on the frame-generation path: "the crop
+// gate must treat a black REAL crop as a neutral look, or every loading screen revokes FG and
+// re-validates three looks later (3 325 refused presents in one session)" (CLAUDE.md §5), which
+// is core::fg::CropVerdict::dark. NR reads BOTH crops already - the colour input crop is
+// captured beside the neural one and printed in the NR LUMINANCE line - and simply did not use
+// the input half in the verdict. It does now.
+enum class ValidationVerdict
+{
+	// The network answered with light. NR may reach the screen.
+	pass,
+	// The network answered black over an input that was NOT black. That is a real defect in the
+	// runtime and it latches NR off for the session, loudly, exactly as before.
+	degenerate,
+	// BOTH crops are black, so the black answer is the correct one and proves nothing about the
+	// runtime. Try again on a later frame rather than convicting on no evidence.
+	inconclusive,
+	// The neural crop could not be read back or decoded at all. Fails safe: NR stays off.
+	undecodable,
+};
+
+const char *validation_verdict_name(ValidationVerdict v);
+
+// One crop's measured maximum luminance, and whether it was decodable at all.
+struct ValidationCrop
+{
+	double luma = 0.0;
+	bool decoded = false;
+};
+
+// `floor` is the luminance below which a crop counts as black.
+//
+// NOTE the one deliberately conservative leg: if the NEURAL crop decoded but the INPUT crop did
+// not (its capture is best-effort and must never block validation), we know nothing about what
+// the network was shown, and the verdict stays `degenerate` - i.e. the behaviour before this
+// function existed. Latching off on thin evidence is wrong, but so is never latching off at all,
+// and this leg is an allocation failure rather than a scene the game is showing.
+ValidationVerdict judge_validation(const ValidationCrop &input, const ValidationCrop &neural,
+                                   double floor);
 
 
 

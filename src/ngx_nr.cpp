@@ -286,6 +286,11 @@ CropReadback g_crop_neural; // what it answered
 // same handoff as the readback fields themselves.
 std::uint32_t g_validate_crop_w = 0, g_validate_crop_h = 0;
 int g_validate_presents_left = 0;
+// How many times the verdict came back INCONCLUSIVE — both crops black, so the black answer
+// proved nothing (nrplan::judge_validation). Counted rather than merely retried: a number that
+// climbs without ever resolving says the session never reached a lit frame, which is a
+// completely different diagnosis from a runtime that answers black.
+std::uint32_t g_validate_inconclusive = 0;
 
 std::atomic<std::uint64_t> g_applied{ 0 };
 std::atomic<std::uint64_t> g_refused{ 0 };
@@ -551,11 +556,34 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
                     std::uint32_t render_h, std::uint32_t out_w, std::uint32_t out_h)
 {
 
-	const bool same = g_feature != nullptr && g_feature_render_w == render_w &&
-		g_feature_render_h == render_h && g_feature_out_w == out_w &&
-		g_feature_out_h == out_h;
-	if (same)
+	// WHAT IDENTIFIES THE LIVE FEATURE IS THE COLOUR RECT, and only that.
+	//
+	// The guide rect is carried for the log and for latch_guide_extent's reset; it is NOT an
+	// argument to CreateFeature (`in_w = out_w` below, and nrparam::build_create takes nothing
+	// else), and a moved guide grid is expressed per evaluate through DLSSNR.MVecSubrectWidth /
+	// Height. Keying on it destroyed feature 18's whole accumulation, refused a run of frames as
+	// `recreating` and paid a CreateFeature every time the render rect moved at a fixed output —
+	// which is DLAA engaging, a screen-percentage change, and every letterbox slide. The full
+	// argument, the measurement it came from, and the tests are in src/core/nr_hook_plan.hpp.
+	const core::FeatureRect created{ g_feature_render_w, g_feature_render_h, g_feature_out_w,
+		g_feature_out_h };
+	const core::FeatureRect want{ render_w, render_h, out_w, out_h };
+	if (g_feature != nullptr && !nrplan::feature_needs_recreate(created, want))
+	{
+		// The guides moved under a feature that stays. Keep the record honest so the next
+		// "rects moved" line and every diagnostic reads the grid actually in use.
+		if (g_feature_render_w != render_w || g_feature_render_h != render_h)
+		{
+			STRAY_LOG_INFO("NR: the guide grid moved %ux%u -> %ux%u under a live feature 18 whose "
+				"colour rect (%ux%u) is unchanged. NOT rebuilding: the guide rect is a "
+				"per-evaluate DLSSNR.MVecSubrect* parameter, and the one reset this needs is "
+				"forced by the guide-extent latch. (src/core/nr_hook_plan.hpp)",
+				g_feature_render_w, g_feature_render_h, render_w, render_h, out_w, out_h);
+			g_feature_render_w = render_w;
+			g_feature_render_h = render_h;
+		}
 		return true;
+	}
 	if (g_create_latched)
 		return false;
 
@@ -569,10 +597,12 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 		if (!g_release_feature_requested)
 		{
 			g_release_feature_requested = true;
-			STRAY_LOG_WARN("NR: the feature's rects moved (%ux%u -> %ux%u in, %ux%u -> %ux%u "
-				"out). Release is DEFERRED to the present boundary and NR declines until then.",
-				g_feature_render_w, g_feature_render_h, render_w, render_h,
-				g_feature_out_w, g_feature_out_h, out_w, out_h);
+			STRAY_LOG_WARN("NR: the COLOUR rect moved (%ux%u -> %ux%u out; guides %ux%u -> "
+				"%ux%u). DLSSNR.Width/Height are create-time and there is no per-evaluate output "
+				"extent, so this one genuinely needs a rebuild. Release is DEFERRED to the "
+				"present boundary and NR declines until then.",
+				g_feature_out_w, g_feature_out_h, out_w, out_h,
+				g_feature_render_w, g_feature_render_h, render_w, render_h);
 		}
 		return false;
 	}
@@ -1640,6 +1670,7 @@ void on_present(ID3D12CommandQueue *queue)
 			g_nr_width = g_nr_height = 0;
 			g_nr_format = DXGI_FORMAT_UNKNOWN;
 			g_validation.store(Validation::pending, std::memory_order_release);
+			g_validate_inconclusive = 0;
 			g_teardown_requested = false;
 			STRAY_LOG_WARN("NR: teardown complete. Re-enabling NgxNR rebuilds the feature and the "
 				"textures from scratch; the old ones are freed as their fences pass.");
@@ -1665,30 +1696,59 @@ void on_present(ID3D12CommandQueue *queue)
 		input.raw, input.known ? "" : " (NOT DECODED)",
 		neural.raw, neural.known ? "" : " (NOT DECODED)", neural.linear);
 
-	if (!neural.known)
+	// THE VERDICT IS TAKEN FROM BOTH CROPS, and that is the whole of the 2026-09-04 fix. A black
+	// answer to a black question — a loading screen, a fade, a cinematic letterbox, the menu
+	// before the first render — is the CORRECT answer and used to latch NR off for the entire
+	// session on one ERROR line. Rules, provenance and tests: src/core/nr_hook_plan.hpp.
+	const nrplan::ValidationVerdict verdict = nrplan::judge_validation(
+		nrplan::ValidationCrop{ input.raw, input.known },
+		nrplan::ValidationCrop{ neural.raw, neural.known }, kLumaFloor);
+
+	switch (verdict)
 	{
+	case nrplan::ValidationVerdict::undecodable:
 		g_validation.store(Validation::failed, std::memory_order_release);
 		STRAY_LOG_ERROR("NR: could not read back or decode the neural output (format %d), so NR "
 			"stays OFF rather than risk a black frame. The SR/RR image is kept.",
 			static_cast<int>(g_nr_format));
 		return;
-	}
 
-	if (max_luma > kLumaFloor)
-	{
+	case nrplan::ValidationVerdict::pass:
 		g_validation.store(Validation::ok, std::memory_order_release);
 		STRAY_LOG_WARN("NR VALIDATED [present stage]: neural output max luminance %.6f over the "
-			"centre crop (> %.0e). The result will now reach the screen as a copy over the "
-			"back-buffer image.", max_luma, kLumaFloor);
-	}
-	else
-	{
+			"centre crop (> %.0e), after %u inconclusive attempt(s). The result will now reach "
+			"the screen as a copy over the back-buffer image.",
+			max_luma, kLumaFloor, g_validate_inconclusive);
+		return;
+
+	case nrplan::ValidationVerdict::inconclusive:
+		// BACK TO PENDING, so the next apply() re-arms begin_validation on a later frame. The
+		// crops are already released by drain_crop, so a retry costs one 128x128 copy and one
+		// map — and NR simply stays off in the meantime, which is what it was doing anyway.
+		++g_validate_inconclusive;
+		g_validation.store(Validation::pending, std::memory_order_release);
+		// Logged on the first attempt and then sparsely: a run of these during a long load is
+		// expected and must not bury the log, but a count that never stops climbing means the
+		// game never showed this session a lit frame, which is a different problem.
+		if (g_validate_inconclusive == 1 || (g_validate_inconclusive % 100) == 0)
+			STRAY_LOG_WARN("NR validation INCONCLUSIVE (attempt %u): the neural output is black "
+				"(%.8f) but so is the COLOUR INPUT it was shown (%.8f) — a loading screen, a "
+				"fade or a letterbox. A black answer to a black question convicts nothing, so "
+				"the verdict is retried on a later frame rather than latching NR off for the "
+				"session. (Same rule as the FG crop gate's `dark` verdict, CLAUDE.md §5.)",
+				g_validate_inconclusive, max_luma, input.raw);
+		return;
+
+	case nrplan::ValidationVerdict::degenerate:
 		g_validation.store(Validation::failed, std::memory_order_release);
 		STRAY_LOG_ERROR("NR DEGENERATE: the neural output is black (max luminance %.8f <= "
-			"%.0e over the centre crop). Read the NR LUMINANCE line above before changing "
-			"anything: it says whether the network was shown a usable image at all. NR stays OFF "
+			"%.0e over the centre crop) while the colour input it was shown was NOT (%.6f%s). "
+			"Read the NR LUMINANCE line above before changing anything. NR stays OFF "
 			"permanently this session; the SR/RR image is kept. Nothing black reached the "
-			"screen.", max_luma, kLumaFloor);
+			"screen.", max_luma, kLumaFloor, input.raw,
+			input.known ? "" : ", NOT DECODED — no input evidence, so this convicts on the "
+				"conservative leg");
+		return;
 	}
 }
 
