@@ -2762,6 +2762,11 @@ demonstrably running — both adaptive triggers engaged 2.1 s in:
 
 ### 20.5 Which vibration sounds carry a level
 
+> *"Which ones have volume and which ones don't"* has **two** answers, because volume lives in two
+> places. This section is the **call site** — the `Level` the game passes per event, which is where
+> essentially all of the variation is. §20.11 is the **asset**, where exactly two SoundWaves carry
+> a `Volume` property and **both are speaker assets**, not vibrations.
+
 Measured over one ~40-minute session, 0.4.0, `BaseMap` through the Sewers. This is **call-site**
 behaviour — `Level` is a property of the call, never of the asset (§15) — so one asset appears at
 several levels.
@@ -2847,6 +2852,11 @@ does not, the fix did not take.
 * **The pad speaker's level** (§20.10, Correction 2). `SCLASS_controller` routes into
   `Submix_controller`, the PARENT of the submix carrying `SBFX_Boost`, so the +5 dB appears to be
   out of the path entirely and `SpeakerGain = 1.0` may be 5 dB short. Needs the pak-wide sweep.
+* **Whether `zurg_sucking_loop_02_CONTROL`'s authored `Volume=2.0` compensates for the missing
+  `SBFX_Boost`** (§20.11 finding 1 against §20.10 Correction 2). Together they decide whether the
+  pad speaker is at the right level, and neither has been listened to.
+* **`DetectZone_VIBE` and `TrolleyImpactCenter_VIBE`** override their submix to the dead endpoint
+  root and are [derived] to be unreachable by our tap (§20.11 finding 2). Never observed either way.
 * **The pak-wide caller census** — which asset is started at which literal `Level`, across all
   23,846 cooked packages — is BLOCKED while the game runs (`tools/paksweep.py` refuses by design).
   §20.5's table is one session's observed calls, not the content's full authored set.
@@ -2991,3 +3001,153 @@ session"*, on the strength of a grep of the log. **`CbSetVibrationLevel` (`Mod.c
 contains no log statement** — deliberately, because it fires at ~60 Hz. The calls were there all
 along and were invisible by design. **A silent hook is not a hook that did not fire; check the
 callback before drawing a negative from a grep.** §9's ~60 Hz measurement never needed defending.
+
+### 20.11 The full asset census, per asset — and it overturns §9's "no Volume anywhere"
+
+All 70 controller-audio SoundWaves, selected **by sound class pak-wide** (never by folder, never by
+filename suffix), extracted with `tools/pakextract.py` + an arm64 `oozraw` and parsed from the
+cooked bytes. **HARD** unless marked.
+
+**The class census reproduces §13 exactly and independently: 4 `SCLASS_controller` (2 looping) and
+66 `SCLASS_controllerVibration` (23 looping).** The folder-scoped view finds only 68 and misses
+`character/sentinel/TazerElectricity_VIBE` and `gpe/window/window_oneWay_squeak_VIBE`; both are
+here, and `strongLight_refilled` is on the coil class with no `_VIBE` suffix, as §13 warned.
+
+#### The four findings that change something
+
+**1. TWO ASSETS DO CARRY A `Volume`, AND BOTH ARE SPEAKER ASSETS.** This is the literal answer to
+*"which ones have volume and which ones don't"* at the asset level, and it **refutes §9**, which
+states *"no `Volume` on any SoundWave (the name does not appear in their name tables at all)"*:
+
+| asset | class | `Volume` |
+|---|---|---|
+| `cat_purr_loop_01_CONTROL` | `SCLASS_controller` | **0.8** |
+| `zurg_sucking_loop_02_CONTROL` | `SCLASS_controller` | **2.0** |
+
+**No `_VIBE` asset carries one** — so §9's conclusion still holds for the *coil* path, which is what
+it was written about, and the plugin's "one global scale is the faithful normalisation" reasoning
+is unaffected there. But it is false as stated, and it is false in the direction that matters for
+the speaker lane: the two looping speaker assets are authored at 0.8 and **2.0**, and
+`zurg_sucking_loop_02_CONTROL` — at 2× — is the only asset the game played through the speaker in
+the whole measured session. **That is worth holding next to §20.10's Correction 2**: the pad
+speaker appears to miss `SBFX_Boost`'s +5 dB entirely, and the loudest speaker asset carries a 2×
+asset gain of its own. Whether the second compensates for the first is **UNCONFIRMED** and would
+be a real answer to "is the pad speaker at the right level".
+
+**2. TWO COIL ASSETS ROUTE THEMSELVES TO THE DEAD ENDPOINT, AND CAN NEVER REACH OUR TAP.**
+`DetectZone_VIBE` and `TrolleyImpactCenter_VIBE` carry an explicit
+`SoundSubmixObject = VibrationEndpointSubmix` — an asset-level override of the class default. That
+names the `UEndpointSubmix` root, which on PC has no factory, gets the dummy endpoint, and is
+skipped before its children are touched (§14). So those two bypass `Submix_vibration` entirely and
+**land on the one submix in the tree the mixer never processes.** [derived] from the override plus
+§14's HARD mechanism: **they will be silent on the coils under this plugin, and nothing reports
+it** — the `submix watch` line would say `the engine mixed NOTHING`, which currently reads as "the
+gate or the level", not "this asset is routed somewhere we cannot see". Worth a named refusal
+reason if either ever shows up in a log.
+
+**3. THE SPEAKER ASSETS SEND THEMSELVES TO THE VIBRATION ENDPOINT — the game crosses the two trees
+deliberately, in the OPPOSITE direction to our bug.** Three of the four `_CONTROL` assets carry
+`AttenuationSettings = PS5VibrationAttenuation`, whose `SubmixSendSettings[0]` is a constant unity
+send to `VibrationEndpointSubmix` (§20.10). So on PS5 a backpack or purr **speaker** sound also
+feeds the **coils** — which is the "one event felt and heard at once" design (§20.7) implemented in
+content rather than by pairing two assets. Inert on PC, because the target is the dead root.
+`cat_backpack_01_VIBE`, `cat_backpack_removed_01_VIBE` and `drone_explosion_alt01_VIBE` carry the
+same attenuation.
+
+**Note the asymmetry, because it is the point:** the content's own cross-route runs
+**speaker → coils**. Our defect runs **coils → speaker** (§20.1). They are not the same thing and
+the game's design does not excuse ours.
+
+**4. THE COIL ASSETS ARE NOT ALL 48 kHz.** §12's table reads *"`*_VIBE` (haptic) — stereo, 48 kHz"*.
+**11 of the 66 are 44.1 kHz**: `generic_clic_02`, `generic_hit_01`, `generic_hit_02`,
+`generic_hit_03`, `generic_kicklike_hit_stereo_01`, `generic_kicklike_hit_stereo_02`,
+`generic_sine_hit_stereo_01`, `JailCage_Impact`, `lower_noise_stereo_loop_01`, `overheat_clean_02`,
+`TrolleyImpactCenter`. **Stereo is invariant (66/66); the rate is not.** It does not matter on the
+submix path — the engine resamples to the mixer rate before the tap, so we see 48 kHz either way —
+but it did matter on the deleted asset-replay path, and any future code that reads an asset
+directly must not assume 48 kHz. The whole impact library is in that 44.1 kHz set.
+
+#### The table
+
+Durations run 0.100 s (`Pushable1_VIBE`) to 38.400 s (`Rain_Loop_VIBE`). "loops" is `bLooping`,
+which UE4 only serialises when TRUE, so its presence **is** the flag (§12).
+
+**Speaker — `SCLASS_controller` (4)**
+
+| asset | path under `Sound/SFX/` | dur (s) | ch | rate | loops | notable |
+|---|---|---|---|---|---|---|
+| `cat_backpack_01_CONTROL` | controllers/sounds/cat_backpack_01_CONTROL | 1.967 | 1 | 44100 | — | attenuation=PS5VibrationAttenuation |
+| `cat_backpack_removed_01_CONTROL` | controllers/sounds/cat_backpack_removed_01_CONTROL | 1.914 | 1 | 44100 | — | attenuation=PS5VibrationAttenuation |
+| `cat_purr_loop_01_CONTROL` | controllers/sounds/cat_purr_loop_01_CONTROL | 19.383 | 1 | 44100 | **yes** | **Volume=0.8**; attenuation=PS5VibrationAttenuation; streamed |
+| `zurg_sucking_loop_02_CONTROL` | controllers/sounds/zurg_sucking_loop_02_CONTROL | 13.324 | 1 | 44100 | **yes** | **Volume=2.0** |
+
+**Coils — `SCLASS_controllerVibration` (66)**
+
+| asset | path under `Sound/SFX/` | dur (s) | ch | rate | loops | notable |
+|---|---|---|---|---|---|---|
+| `B12_Upload_Loop_VIBE` | controllers/Vibrations/B12_Upload_Loop_VIBE | 1.000 | 2 | 48000 | **yes** |  |
+| `B12Hack_Ending_VIBE` | controllers/Vibrations/B12Hack_Ending_VIBE | 0.627 | 2 | 48000 | — |  |
+| `barrel_roll_loop_VIBE` | controllers/Vibrations/barrel_roll_loop_VIBE | 8.352 | 2 | 48000 | **yes** |  |
+| `BigEye_VIBE` | controllers/Vibrations/BigEye_VIBE | 2.657 | 2 | 48000 | — |  |
+| `cat_backpack_01_VIBE` | controllers/Vibrations/cat_backpack_01_VIBE | 1.967 | 2 | 48000 | — | attenuation=PS5VibrationAttenuation |
+| `cat_backpack_removed_01_VIBE` | controllers/Vibrations/cat_backpack_removed_01_VIBE | 1.914 | 2 | 48000 | — | attenuation=PS5VibrationAttenuation |
+| `Cat_InjuredWalk_VIBE` | controllers/Vibrations/Cat_InjuredWalk_VIBE | 0.670 | 2 | 48000 | **yes** |  |
+| `CatInjured_Lick_VIBE` | controllers/Vibrations/CatInjured_Lick_VIBE | 1.700 | 2 | 48000 | — |  |
+| `CatIntro_2_Frottable_VIBE` | controllers/Vibrations/CatIntro_2_Frottable_VIBE | 1.660 | 2 | 48000 | — |  |
+| `CatIntro_2_VIBE` | controllers/Vibrations/CatIntro_2_VIBE | 4.000 | 2 | 48000 | — |  |
+| `CatIntro_3_Lick_VIBE` | controllers/Vibrations/CatIntro_3_Lick_VIBE | 3.040 | 2 | 48000 | — |  |
+| `CatIntro_3_player_VIBE` | controllers/Vibrations/CatIntro_3_player_VIBE | 5.000 | 2 | 48000 | — |  |
+| `CatIntro_3_VIBE` | controllers/Vibrations/CatIntro_3_VIBE | 1.640 | 2 | 48000 | — |  |
+| `CatPurr2_VIBE` | controllers/Vibrations/CatPurr2_VIBE | 19.383 | 2 | 48000 | **yes** |  |
+| `CatScratch_VIBE` | controllers/Vibrations/CatScratch_VIBE | 2.800 | 2 | 48000 | — |  |
+| `CatSlip_VIBE` | controllers/Vibrations/CatSlip_VIBE | 1.123 | 2 | 48000 | **yes** |  |
+| `CounterWeight_loop_VIBE` | controllers/Vibrations/CounterWeight_loop_VIBE | 11.417 | 2 | 48000 | **yes** |  |
+| `CounterWeight_VIBE` | controllers/Vibrations/CounterWeight_VIBE | 2.682 | 2 | 48000 | — |  |
+| `Defluxor_clean_VIBE` | controllers/Vibrations/Defluxor_clean_VIBE | 1.291 | 2 | 48000 | **yes** |  |
+| `Defluxor_VIBE` | controllers/Vibrations/Defluxor_VIBE | 1.291 | 2 | 48000 | **yes** |  |
+| `DetectZone_VIBE` | controllers/Vibrations/DetectZone_VIBE | 0.221 | 2 | 48000 | — | **submix override -> VibrationEndpointSubmix** |
+| `drink_VIBE` | controllers/Vibrations/drink_VIBE | 0.265 | 2 | 48000 | — |  |
+| `drone_explosion_alt01_VIBE` | controllers/Vibrations/drone_explosion_alt01_VIBE | 3.084 | 2 | 48000 | — | attenuation=PS5VibrationAttenuation |
+| `Elevator_loop_VIBE` | controllers/Vibrations/Elevator_loop_VIBE | 30.000 | 2 | 48000 | — |  |
+| `EndingDoorA_VIBE` | controllers/Vibrations/EndingDoorA_VIBE | 12.000 | 2 | 48000 | **yes** |  |
+| `EndingDoorB_VIBE` | controllers/Vibrations/EndingDoorB_VIBE | 15.978 | 2 | 48000 | **yes** |  |
+| `EndingDoorStop_VIBE` | controllers/Vibrations/EndingDoorStop_VIBE | 4.045 | 2 | 48000 | — |  |
+| `EndingRooftop_VIBE` | controllers/Vibrations/EndingRooftop_VIBE | 5.565 | 2 | 48000 | **yes** |  |
+| `generic_clic_02_VIBE` | controllers/Vibrations/generic_clic_02_VIBE | 0.196 | 2 | 44100 | — |  |
+| `generic_hit_01_VIBE` | controllers/Vibrations/generic_hit_01_VIBE | 0.247 | 2 | 44100 | — |  |
+| `generic_hit_02_VIBE` | controllers/Vibrations/generic_hit_02_VIBE | 0.194 | 2 | 44100 | — |  |
+| `generic_hit_03_VIBE` | controllers/Vibrations/generic_hit_03_VIBE | 0.140 | 2 | 44100 | — |  |
+| `generic_kicklike_hit_stereo_01_VIBE` | controllers/Vibrations/generic_kicklike_hit_stereo_01_VIBE | 1.400 | 2 | 44100 | — |  |
+| `generic_kicklike_hit_stereo_02_VIBE` | controllers/Vibrations/generic_kicklike_hit_stereo_02_VIBE | 1.079 | 2 | 44100 | — |  |
+| `generic_sine_hit_stereo_01_VIBE` | controllers/Vibrations/generic_sine_hit_stereo_01_VIBE | 1.022 | 2 | 44100 | — |  |
+| `JailCage_Impact_VIBE` | controllers/Vibrations/JailCage_Impact_VIBE | 1.067 | 2 | 44100 | — |  |
+| `JailCage_loop_VIBE` | controllers/Vibrations/JailCage_loop_VIBE | 13.742 | 2 | 48000 | **yes** |  |
+| `Keyboard_VIBE` | controllers/Vibrations/Keyboard_VIBE | 11.000 | 2 | 48000 | **yes** |  |
+| `keys_loop_VIBE` | controllers/Vibrations/keys_loop_VIBE | 5.399 | 2 | 48000 | **yes** |  |
+| `lower_noise_stereo_loop_01_VIBE` | controllers/Vibrations/lower_noise_stereo_loop_01_VIBE | 8.775 | 2 | 44100 | **yes** |  |
+| `metal_bucket_loop_VIBE` | controllers/Vibrations/metal_bucket_loop_VIBE | 7.918 | 2 | 48000 | **yes** |  |
+| `overheat_clean_02_VIBE` | controllers/Vibrations/overheat_clean_02_VIBE | 2.301 | 2 | 44100 | — |  |
+| `Pushable1_VIBE` | controllers/Vibrations/Pushable1_VIBE | 0.100 | 2 | 48000 | — |  |
+| `Pushable2_VIBE` | controllers/Vibrations/Pushable2_VIBE | 0.150 | 2 | 48000 | — |  |
+| `Rain_Loop_VIBE` | controllers/Vibrations/Rain_Loop_VIBE | 38.400 | 2 | 48000 | **yes** |  |
+| `Repel_clean_02_VIBE` | controllers/Vibrations/Repel_clean_02_VIBE | 1.083 | 2 | 48000 | — |  |
+| `rotating_beam_VIBE` | controllers/Vibrations/rotating_beam_VIBE | 2.800 | 2 | 48000 | — |  |
+| `Scratch_VIBE` | controllers/Vibrations/Scratch_VIBE | 2.170 | 2 | 48000 | **yes** |  |
+| `sentinel_ImpactCat_VIBE` | controllers/Vibrations/sentinel_ImpactCat_VIBE | 0.838 | 2 | 48000 | — |  |
+| `SewerDoor_VIBE` | controllers/Vibrations/SewerDoor_VIBE | 10.477 | 2 | 48000 | — |  |
+| `strongLight_refilled` | controllers/Vibrations/strongLight_refilled | 0.195 | 2 | 48000 | — |  |
+| `SwitchWithJump_ON_VIBE` | controllers/Vibrations/SwitchWithJump_ON_VIBE | 0.367 | 2 | 48000 | — |  |
+| `SwitchWithJump_Slide_VIBE` | controllers/Vibrations/SwitchWithJump_Slide_VIBE | 1.179 | 2 | 48000 | — |  |
+| `TazerElectricity_VIBE` | character/sentinel/TazerElectricity_VIBE | 0.706 | 2 | 48000 | — |  |
+| `TrolleyImpactCenter_VIBE` | controllers/Vibrations/TrolleyImpactCenter_VIBE | 2.269 | 2 | 44100 | — | **submix override -> VibrationEndpointSubmix** |
+| `TrolleyImpactRight_VIBE` | controllers/Vibrations/TrolleyImpactRight_VIBE | 2.263 | 2 | 48000 | — |  |
+| `TrolleyMove_VIBE` | controllers/Vibrations/TrolleyMove_VIBE | 8.352 | 2 | 48000 | — |  |
+| `Truck_Idle_VIBE` | controllers/Vibrations/truck_Idle_VIBE | 14.508 | 2 | 48000 | **yes** |  |
+| `Wagon_door_opening_VIBE` | controllers/Vibrations/Wagon_door_opening_VIBE | 2.465 | 2 | 48000 | — |  |
+| `wagon_Ending_Move_VIBE` | controllers/Vibrations/wagon_Ending_Move_VIBE | 18.949 | 2 | 48000 | **yes** |  |
+| `WagonEndingStop_VIBE` | controllers/Vibrations/WagonEndingStop_VIBE | 28.312 | 2 | 48000 | — |  |
+| `WaterWave_VIBE` | controllers/Vibrations/WaterWave_VIBE | 1.950 | 2 | 48000 | **yes** |  |
+| `window_oneWay_squeak_VIBE` | gpe/window/window_oneWay_squeak_VIBE | 0.338 | 2 | 48000 | **yes** |  |
+| `wood_creak_VIBE` | controllers/Vibrations/wood_creak_VIBE | 0.457 | 2 | 48000 | — |  |
+| `zurg_sucking_loop_VIBE` | controllers/Vibrations/zurg_sucking_loop_VIBE | 13.324 | 2 | 48000 | **yes** |  |
+| `ZurkGrab_clean_VIBE` | controllers/Vibrations/ZurkGrab_clean_VIBE | 0.302 | 2 | 48000 | — |  |
