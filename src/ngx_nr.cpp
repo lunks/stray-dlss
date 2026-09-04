@@ -599,7 +599,23 @@ bool ensure_feature(ID3D12GraphicsCommandList *cmd, std::uint32_t render_w,
 		apply_entries(g_params, entries, n);
 	}
 	// Reversed-Z: UE 4.27 throughout, same flag SR carries. (CLAUDE.md §2.4)
+	//
+	// WRITTEN BOTH WAYS ON PURPOSE. `Set(name, 1u)` and `Set(name, 1)` are DIFFERENT virtual
+	// overloads and an NGX parameter block reports no error when the reader's type differs from
+	// the writer's — the same hazard that made every subrect silently ignored until they were
+	// changed to signed (see nrparam::signed_entry, pinned in CI). This one was never pinned,
+	// and the flags disagreed with each other: kReset is written SIGNED (the ternary yields int)
+	// while this and kEnabled were UNSIGNED.
+	//
+	// If the snippet reads this as signed, an unsigned write means it never saw the flag and fell
+	// back to "depth is NOT inverted" — and UE 4.27 is reversed-Z, so near and far would be
+	// exactly backwards for every depth-driven decision feature 18 makes. That is
+	// resolution-independent, survives a still camera and is identical at both hook sites, which
+	// is what the smear under high-contrast objects turned out to be (facts §54, §55).
+	//
+	// Writing both costs two map entries and removes the question rather than arguing it.
 	g_params->Set(kDepthInverted, 1u);
+	g_params->Set(kDepthInverted, 1);
 	g_params->Set(kEnabled, 1u);
 	g_params->Set(kIntensity, g_intensity);
 	g_params->Set(kLocalTone, g_local_tone);
@@ -1281,9 +1297,13 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	g_params->Set(kMVecScaleX, scale_x);
 	g_params->Set(kMVecScaleY, scale_y);
+	// Both overloads — see the create site for why. kReset below is already written signed,
+	// which is the inconsistency that made this worth suspecting in the first place.
 	g_params->Set(kDepthInverted, 1u);
+	g_params->Set(kDepthInverted, 1);
 	g_params->Set(kReset, reset ? 1 : 0);
 	g_params->Set(kEnabled, 1u);
+	g_params->Set(kEnabled, 1);
 	g_params->Set(kIntensity, g_intensity);
 	g_params->Set(kLocalTone, g_local_tone);
 	g_params->Set(kLocalStruct, g_local_structure);
