@@ -3202,3 +3202,52 @@ Also worth keeping: `oozraw` built for **x86_64 under Rosetta** on the arm64 Mac
 needed. 32,028/32,028 entries decompressed to their exact declared `usize`, 31,461/31,461
 `.uasset` with UE4 magic intact, which is the self-check that makes the rest of this section
 trustworthy.
+
+#### Why the table is trustworthy, and why the old one was not
+
+**The self-check that validates every row: `Duration × SampleRate == TotalSamples` for all 70, zero
+mismatches.** That is what pins the `FPropertyTag` value offset at **+25**, because reading the same
+tags at `+28` yields denormals around 8.7e-42 — implausible rather than merely wrong, which is the
+only reason such an error is ever caught (§10 records the identical trap producing
+`Ratio = 0.000` for `SBFX_Boost`). Shown byte-for-byte on the purr:
+`29000000 00000000 | 15000000 00000000 | 04000000 | 00000000 | 00 | cdcc4c3f` → `Volume = 0.8` at
+tag+25. The Kraken round-trip is separately proven: 32,028/32,028 entries decompressed to their
+exact declared `usize` and 31,461/31,461 `.uasset` carried UE4 magic `0x9E2A83C1`.
+
+**And the old `Volume` claim failed for two independent reasons, both worth knowing.**
+`tools/dualsense/uasset_props.py` globbed a work directory whose files are prefixed
+`Hk_project_Content_Sound_SFX_controllers_Vibrations_`, so **it never looked at the four speaker
+assets at all** — they live under `.../controllers/sounds/`. And it carried the same `+28`
+off-by-3, so even had it seen them it would have reported denormals rather than 0.8 and 2.0.
+**A tool scoped to the folder you expect the answer in cannot tell you the answer is elsewhere** —
+which is the same lesson §13 already learned when a folder-scoped extraction missed two coil
+assets.
+
+#### CAUTION: the import map UNDERCOUNTS — proven by the live log
+
+65 packages import one of the 70 waves, covering 60 of them; **10 have no importing package at
+all**. It is tempting to read those as unused. **They are not.** `zurg_sucking_loop_02_CONTROL` is
+in that list of 10 — and it is the asset the game played through the pad speaker **28 times** in
+the measured session (§20.4). So it is referenced by a **soft path** or from C++, not by a package
+import, and the map cannot see that.
+
+**Consequence: absence from `references.json` is not evidence of anything.** The other nine —
+`CatIntro_2_VIBE`, `CatIntro_3_VIBE`, `CatIntro_3_player_VIBE`, `Defluxor_clean_VIBE`,
+`ZurkGrab_clean_VIBE`, `generic_hit_02_VIBE`, `overheat_clean_02_VIBE`, `strongLight_refilled`,
+`zurg_sucking_loop_VIBE` — must be treated the same way, and indeed `ZurkGrab_clean_VIBE` was the
+single most-played asset of the session (50 calls) and `zurg_sucking_loop_VIBE` played 12 times.
+**Three of the ten are demonstrably live.** The map is useful for finding call sites, and useless
+for proving something has none.
+
+#### Small traps in the table
+
+* **`Truck_Idle_VIBE`'s pak file is `truck_Idle_VIBE`** — the export name and the on-disk name
+  differ in case. Anything matching names across the two must fold case.
+* **`bLooping` is present-and-`true` in all 25 looping cases and never present-and-false**, which
+  confirms §12's rule that its presence *is* the flag rather than merely being consistent with it.
+* Three speaker assets carry a `ConcurrencySet` (`SCONC_UI`+`SCONC_global` twice,
+  `SCONC_cat`+`SCONC_global` on the purr), and `cat_purr_loop_01_CONTROL` alone is streamed
+  (`bStreaming`, `bSeekableStreaming`, `StreamingPriority=1`) — consistent with §10's finding that
+  it is the ADPCM asset split across a `.uexp` and a `.ubulk`.
+* **No `SubmixSendSettings` on any of the 70.** Every send in this design lives on the attenuation
+  asset, not on the waves.
