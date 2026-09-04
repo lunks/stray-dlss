@@ -44,6 +44,7 @@ u0::FunctionTable g_table{};
 bool g_mapped = false;
 
 pool::Locate g_locate{};
+bool g_scanned = false;   // the module does not change under us; scan ONCE per process
 bool g_discovered = false;
 bool g_hooked = false;
 void *g_target = nullptr;
@@ -612,6 +613,13 @@ void log_locate(const pool::Locate &v)
 
 void run_discovery()
 {
+	// The game destroys and recreates its first D3D12 device at startup (facts §14), so
+	// configure() runs more than once per process. The image is the same image; re-scanning it
+	// would be a second multi-hundred-millisecond stall on the device-creation thread and a
+	// second copy of every verdict line in the log.
+	if (g_scanned)
+		return;
+	g_scanned = true;
 	const char *why = "";
 	if (!g_mapped && !map_own_module(why))
 	{
