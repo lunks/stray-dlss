@@ -1686,7 +1686,14 @@ at ERROR. The default is `viewcached::kDefaultLevel` and is pinned by a test, so
 is a deliberate edit rather than a one-character change (the discipline
 `tests/test_nr_history_plan.cpp` applies to `NgxNRRestoreHistory`).
 
-### 19.4 What one menu launch prints, in order
+### 19.4 What one launch prints, in order — and this is what the level-1 launch DID print
+
+**This is the LEVEL 1 shape**, kept as written because it is what the box actually produced on
+2026-09-04 (facts §36.22) — every `<O>` came back **5768** and every ellipsis was filled. At the
+shipped default the first line reads `authoritative ... EngineSeamViewParams=2`, the
+`[viewParams]` line reads `mode=authoritative` with `used=` counting up, and `disagree=` is where
+the stale frames land instead of `ambClaimed`. Everything between is identical, because level 2
+changes what is DONE with the answer and not how it is found.
 
 ```
 ENGINE SEAM VIEW PARAMS: discover ([STRAYDLSS] EngineSeamViewParams=1). ...
@@ -1706,8 +1713,13 @@ ENGINE SEAM VIEW PARAMS LATCHED after 8 claimed announcements: FViewInfo+<O> is
     unverified=0 ambiguous=0 empty=0 faults=0 off=0 used=0 fellBack=0
 ```
 
-`<O>` is the number to paste. `disagree` at level 1 should track `ambClaimed` on the `[view]`
-line event for event — the same stale frames counted from both sides. The readings that are a
+`<O>` is the number to paste; on this executable it is **5768**. `disagree` at level 1 should
+track `ambClaimed` on the `[view]` line event for event — the same stale frames counted from both
+sides, and it did (4 and 4). **At level 2 that relationship INVERTS and is the acceptance
+criterion:** `ambClaimed` must read **0**, because the search no longer chooses on an
+engine-supplied dispatch, and the same events must appear under `disagree=`. `ambClaimed` falling
+to 0 while `disagree` also reads 0 is not success — it is the latch never forming, which the
+`latch=` field says outright. The readings that are a
 round trip rather than a thing to keep running on: `survivors=0` with the stage counts naming the
 refusing prediction (a `bufferSize` refusal means the row-132 derivation is wrong on this
 executable); `MORE THAN ONE` (ambiguous, terminal); `DIFFERENT` on every comparison with no latch
