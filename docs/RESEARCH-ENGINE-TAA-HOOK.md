@@ -1787,3 +1787,119 @@ engine TAA.
 | Group B is cinematic letterboxing rather than dynamic resolution | **SOFT.** The aspect change 1.778 -> 1.85 and the run structure say so; no engine-side confirmation was sought |
 | The debounce produces zero creations per transition | **HARD in CI** against the measured rects; **UNCONFIRMED live** |
 | 8 frames is the right threshold | **[derived]** from the ~3-frame step cadence the runs imply. A knob for that reason |
+
+
+---
+
+## 18. Keeping SR — and therefore NR — alive across the letterbox slide (2026-09-04)
+
+§17 stopped the `CreateFeature` bursts by refusing to chase an animating rect. It was right about
+what it claimed and wrong about what it left behind.
+
+**The user, on the deployed build:** *"I think DLSS NR was deactivated on the scene transitions,
+so it should probably support it?"* — and, on the mechanism, *"it's a letterbox animation, it
+slowly slides back to 100% frame."*
+
+**They are describing `RecreateAction::wait`.** It declines the frame; `nrhook::note_guides` is
+called only on a successful SR evaluate; NR declines a frame whose guides did not advance
+(`guides-stale`). So one debounce decision turned off two features for the length of every
+cinematic. **A remedy that removes a hitch by removing the feature is half a fix.**
+
+### 18.1 The three candidates, settled against the header
+
+| # | behaviour | verdict |
+|---|---|---|
+| 1 | **Decline** (what shipped) | works, costs DLSS + NR for ~1 s per transition |
+| 2 | **Keep evaluating at the engine's shrinking subrect** | **REFUTED** |
+| 3 | **Write a smaller region of the target** | **NOT EXPRESSIBLE** |
+
+**On (2).** `NGX_D3D12_CREATE_DLSS_EXT` writes `InTargetWidth/Height` into
+`NVSDK_NGX_Parameter_OutWidth` / `OutHeight` (`nvsdk_ngx_helpers.h:437-440), and
+`NVSDK_NGX_D3D12_DLSS_Eval_Params` has no output size at all. So DLSS always upscales
+`InRenderSubrectDimensions` **to the create-time target**. Render 1920x1037 into a 3840x2160
+target is 2.000x horizontally and 2.083x vertically — and the ratio *moves as the bars slide*.
+The coordinator's reading is confirmed: this is worse than declining, because a stretch that
+animates is exactly the artefact a player notices. **HARD.**
+
+**On (3), and this answers the `InOutputSubrectBase` question directly.** The eval params carry
+six `NVSDK_NGX_Coordinates` fields — `InColorSubrectBase`, `InDepthSubrectBase`,
+`InMVSubrectBase`, `InTranslucencySubrectBase`, `InBiasCurrentColorSubrectBase`,
+`InOutputSubrectBase` (`nvsdk_ngx_helpers.h:377-398`). They are **base coordinates**. There is no
+output-subrect *dimensions* anywhere in the API, so **DLSS cannot be asked to write less than the
+created target**, and `InOutputSubrectBase` is not the tool for this. **HARD.**
+
+### 18.2 What works is (3) turned around, and it is exact
+
+**Hold `InRenderSubrectDimensions` at the extent the feature was CREATED with** and let DLSS
+write the whole created target.
+
+* The scale never moves — it stays exactly the 2.0 the feature was built for.
+* UE anchors both rects at the origin (`FTAAPassParameters::SetupViewRect`; and `View.ViewRectMin`,
+  which we **read**), so a shrinking rect is a **prefix** of the created one on both axes:
+
+```
+engine renders input rows 0..1036   ->   DLSS maps them to output rows 0..2073
+engine reads output rows 0..2072    ==   its own OutputViewRect
+```
+
+So nothing needs placing and `InOutputSubrectBase` stays at (0,0), where it already was. This is
+not "ignore the animation and hope" — with a fixed scale and a shared origin the engine's rect
+lands exactly where the engine expects it.
+
+**The cost, stated honestly.** DLSS also computes the rows below the engine's rect, from input
+rows it did not render this frame (stale by a frame or two — the scene buffer is pooled and the
+view rect is what shrank, not the allocation). Nothing displays them. Two consequences follow and
+neither is zero: the temporal history for those rows accumulates from stale input, so when the
+bars finish retracting there is a brief, self-healing convergence at the very bottom of the
+frame; and reconstruction near the boundary draws on a few input rows either side of it, so the
+bottom few pixels of the visible image can be touched during the slide. Against DLSS being off
+for the whole second, that is the better trade — and if it turns out not to be,
+`NgxLetterboxHold=0` restores the decline without a rebuild.
+
+### 18.3 The gate, and the hole the tests found
+
+`core::plan_letterbox_hold`. Every clause is a measurement:
+
+| refusal | what it protects |
+|---|---|
+| **`originMoved`** | `View.ViewRectMin` re-read **every frame**. The prefix mapping is false the moment a title CENTRES its shrinking rect instead of anchoring it top-left — so this single clause is what makes the rest sound, and it is read rather than assumed. It also answers "how does Stray produce the bars?" *for our purposes*: we do not need to know, because the only property we depend on is one the View CB states outright |
+| **`outputTooSmall`** | **THE HOLE THE TESTS FOUND.** `1280x720 -> 2560x1440` has the **same 2.0 scale** as `1920x1080 -> 3840x2160`, so no ratio test can separate a genuine resolution change from a slide — and the engine reallocates its buffers, so holding would write a 3840x2160 target into a 2560x1440 UAV, out of bounds, with no debug layer on this stack to object. The physical clause asks whether the UAV can still hold the created target; unknown extent refuses |
+| `ratioMoved` | the created scale no longer carries this render rect onto this output rect |
+| `largerThanFeature` | outside DLSS's dynamic range and outside what was validated |
+| `tooSmall` | below 0.75 of the created extent; the measured slide bottoms out at 1037/1080 = **0.96** |
+
+All 22 distinct slide rects from the live log are held; every impossible rect from §16 and every
+genuine resolution change is refused. `tests/test_feature_recreate.cpp`.
+
+### 18.4 A separate defect the same investigation exposed
+
+**SR had no reset after a gap.** `ei.reset` was the camera-cut OR alone (§2.8), so when the
+debounce declined a run of frames and SR resumed, DLSS reprojected a second-old history across
+*one frame* of motion. That is the error class §5 records compounding through the accumulation
+rather than costing one frame, and it would have shown as a smear when each cinematic ended —
+attributable to the debounce, not to the letterbox. A forced reset is now latched on a decline
+and on a fresh feature, consumed by the next evaluate, and counted as `forcedResets`.
+
+### 18.5 What one launch shows
+
+| read | pass |
+|---|---|
+| `[hold] held=` | **counting up during a transition.** This is the whole point: each one is a frame SR and NR ran instead of being declined |
+| `[hold] … originMoved=` | **0.** Non-zero means Stray centres its shrinking rect and the hold is wrong for this title — turn `NgxLetterboxHold=0` and report it |
+| `NR STAGE:` / NR's `guides-stale` | **not rising across a transition** — the direct measure of the user's complaint |
+| `DLSS feature created:` | still one per resolution actually used |
+| `[hold] … forcedResets=` | small, and rising only around loads and genuine changes |
+
+### 18.6 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| No per-evaluate output size exists; `OutWidth`/`OutHeight` are create-time | **HARD**, `nvsdk_ngx_helpers.h:437-440` |
+| `InOutputSubrectBase` and the other five are base COORDINATES, with no dimensions counterpart | **HARD**, `nvsdk_ngx_helpers.h:377-398` |
+| Therefore option 2 stretches non-uniformly and option 3 is inexpressible | **HARD**, from the two above |
+| `View.ViewRectMin` is readable per frame and is (0,0) in the measured sessions | **HARD** — it is parsed today (`view_params.cpp:62`) and consumed by `mv_resolve` |
+| The engine's OUTPUT rect also starts at (0,0) | **[derived]**, and already load-bearing for the shipping path: the image is correct today with `InOutputSubrectBase` at (0,0). The seam announces extents only, so this is not separately measured |
+| How Stray actually draws the bars | **UNKNOWN, and deliberately not depended on.** The hold needs only the origin clause, which is measured |
+| The stale rows below the rect reach no display | **[derived]** from every downstream pass using the view rect |
+| The bottom-edge convergence cost | **[derived], not seen.** This is what the user's eyes settle |
+| All 22 measured slide rects pass the gate | **HARD in CI** |

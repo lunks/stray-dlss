@@ -9,6 +9,7 @@
 
 #include "intercept/types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace stray_dlss::taa_hook {
@@ -120,6 +121,17 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale);
 // than having its answer forced. Split by whether the ENGINE claimed the dispatch, because
 // look-alikes outnumber real upscales here and an undifferentiated count cannot answer the only
 // question that matters: was DLSS SR itself ever fed a view we had to guess at?
+// [STRAYDLSS] NgxLetterboxHold (default ON). When a scripted transition shrinks the view rect,
+// evaluate at the LIVE feature's extent instead of rebuilding or declining - which is what keeps
+// DLSS SR, and therefore NR, running through the slide. Off restores the decline.
+void set_letterbox_hold(bool on);
+
+// `held` counts frames that took that path. `refused_by_reason` is indexed by
+// `core::HoldRefusal` and says why the others did not - read `originMoved` first, because a
+// non-zero count there means this title does NOT anchor its shrinking rect at the top left and
+// the whole mechanism is wrong for it.
+void hold_counters(std::uint64_t &held, std::uint64_t *refused_by_reason, std::size_t count);
+
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
                           std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
                           std::uint64_t &amb_other);
