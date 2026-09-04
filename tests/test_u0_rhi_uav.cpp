@@ -528,3 +528,28 @@ TEST_CASE("judge: every refusal in order, and none of them reaches a comparison"
 	CHECK(judge(true, ScanStatus::ok, 0x10, 0x10, small, 3840, 2160).verdict == Verdict::desc_mismatch);
 	CHECK(judge(true, ScanStatus::ok, 0x10, 0, good, 3840, 2160).verdict == Verdict::walk_absent);
 }
+
+// ---------------------------------------------------------------------------------------
+// The rest of the bind stream
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("judge_register: the five verdicts, in refusal order")
+{
+	CHECK(judge_register(false, 0, 0x10) == RegVerdict::engine_absent);
+	CHECK(judge_register(false, 0x10, 0x10) == RegVerdict::engine_absent);
+	CHECK(judge_register(true, 0, 0x10) == RegVerdict::unresolved);
+	CHECK(judge_register(true, 0x10, 0) == RegVerdict::walk_absent);
+	CHECK(judge_register(true, 0x10, 0x10) == RegVerdict::agree);
+	CHECK(judge_register(true, 0x10, 0x20) == RegVerdict::disagree);
+}
+
+TEST_CASE("judge_view_register: exactly one bound uniform buffer names the View register")
+{
+	CHECK(judge_view_register(0, true, 4) == ViewRegVerdict::none_bound);
+	CHECK(judge_view_register((1u << 3) | (1u << 4), true, 4) == ViewRegVerdict::multiple_bound);
+	CHECK(judge_view_register(1u << 4, false, 4) == ViewRegVerdict::walk_absent);
+	CHECK(judge_view_register(1u << 4, true, 4) == ViewRegVerdict::agree);
+	// The measured bug (facts §36.18): the search took b3, the engine bound View at b4.
+	CHECK(judge_view_register(1u << 4, true, 3) == ViewRegVerdict::disagree);
+	CHECK(judge_view_register(1u << 1, true, 1) == ViewRegVerdict::agree);
+}

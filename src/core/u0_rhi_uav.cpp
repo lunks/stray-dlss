@@ -424,4 +424,59 @@ Judgement judge(bool bind_present, ScanStatus chain, std::uint64_t rhi_u0,
 	return j;
 }
 
+// ---------------------------------------------------------------------------------------
+// The rest of the bind stream
+// ---------------------------------------------------------------------------------------
+
+const char *reg_verdict_name(RegVerdict v)
+{
+	switch (v)
+	{
+	case RegVerdict::agree: return "agree";
+	case RegVerdict::disagree: return "DISAGREE";
+	case RegVerdict::engine_absent: return "engineAbsent";
+	case RegVerdict::walk_absent: return "walkAbsent";
+	case RegVerdict::unresolved: return "unresolved";
+	default: return "?";
+	}
+}
+
+RegVerdict judge_register(bool engine_bound, std::uint64_t engine_res, std::uint64_t walk_res)
+{
+	if (!engine_bound)
+		return RegVerdict::engine_absent;
+	if (engine_res == 0)
+		return RegVerdict::unresolved;
+	if (walk_res == 0)
+		return RegVerdict::walk_absent;
+	return engine_res == walk_res ? RegVerdict::agree : RegVerdict::disagree;
+}
+
+const char *view_reg_verdict_name(ViewRegVerdict v)
+{
+	switch (v)
+	{
+	case ViewRegVerdict::agree: return "agree";
+	case ViewRegVerdict::disagree: return "DISAGREE";
+	case ViewRegVerdict::none_bound: return "noneBound";
+	case ViewRegVerdict::multiple_bound: return "multipleBound";
+	case ViewRegVerdict::walk_absent: return "walkAbsent";
+	default: return "?";
+	}
+}
+
+ViewRegVerdict judge_view_register(std::uint32_t ub_mask, bool walk_valid, unsigned walk_reg)
+{
+	if (ub_mask == 0)
+		return ViewRegVerdict::none_bound;
+	if ((ub_mask & (ub_mask - 1u)) != 0)
+		return ViewRegVerdict::multiple_bound;
+	if (!walk_valid)
+		return ViewRegVerdict::walk_absent;
+	unsigned reg = 0;
+	while (((ub_mask >> reg) & 1u) == 0)
+		++reg;
+	return reg == walk_reg ? ViewRegVerdict::agree : ViewRegVerdict::disagree;
+}
+
 } // namespace stray_dlss::u0

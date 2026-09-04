@@ -967,13 +967,20 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			// every engine-announced dispatch and count the verdict (src/u0_rhi_hook.hpp). The
 			// walk stays authoritative here; a disagreement is one WARN per pass and the first
 			// line to read if the image is wrong.
-			std::uint64_t walk_u0 = 0;
+			u0hook::WalkAnswer walk;
 			for (const auto &u : b.uavs)
 			{
 				if (u.slot == m.output_uav && icept::backend()->is_resource_live(u.resource))
-					walk_u0 = u.resource;
+					walk.u0 = u.resource;
 			}
-			u0hook::assert_at_claim(walk_u0, seam_verdict.out_width, seam_verdict.out_height, hash);
+			for (const auto &t : b.srvs)
+			{
+				if (t.slot < u0::kMaxTexRegs && icept::backend()->is_resource_live(t.resource))
+					walk.t[t.slot] = t.resource;
+			}
+			walk.view_cb_valid = b.view_cb_valid;
+			walk.view_cb_register = b.view_cb_register;
+			u0hook::assert_at_claim(walk, seam_verdict.out_width, seam_verdict.out_height, hash);
 		}
 
 		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)

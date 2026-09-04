@@ -373,4 +373,50 @@ Judgement judge(bool bind_present, ScanStatus chain, std::uint64_t rhi_u0,
                 std::uint64_t walk_u0, const DescFacts &d,
                 std::uint32_t out_width, std::uint32_t out_height);
 
+// ---------------------------------------------------------------------------------------
+// The rest of the bind stream: the SRV registers and the View constant buffer's register
+// ---------------------------------------------------------------------------------------
+//
+// The same bracket - RHISetComputeShader ... RHIDispatchComputeShader - carries every other
+// parameter of the pass with its register attached (docs/RESEARCH-ENGINE-AWARE-REPLAN.md §1):
+// for FTAAStandaloneCS, t0 EyeAdaptation, t1 colour, t2 depth, t3 velocity and t5 history
+// arrive at RHISetShaderTexture as bare FRHITexture* (SHADER_PARAMETER_RDG_TEXTURE,
+// TemporalAA.cpp:188-203), t4 stencil at RHISetShaderResourceViewParameter as an
+// FRHIShaderResourceView* (:206), and the View uniform buffer at RHISetShaderUniformBuffer
+// with its `b` register (:207, SHADER_PARAMETER_STRUCT_REF). That is CLAUDE.md §2.3's register
+// map, from the engine. Each is asserted against the descriptor walk's answer for the same
+// register; the walk stays authoritative.
+
+constexpr unsigned kMaxTexRegs = 8; // t0..t7 recorded; TAA uses t0..t5
+constexpr unsigned kMaxUavRegs = 4; // u0..u3 recorded; TAA uses u0 (u1 in one config)
+constexpr unsigned kMaxCbRegs = 16; // b0..b15 as a bitmask
+
+enum class RegVerdict : std::uint8_t
+{
+	agree = 0,
+	disagree,
+	engine_absent, // the engine bound nothing at this register in the bracket
+	walk_absent,   // the descriptor walk resolved nothing at this register
+	unresolved,    // the engine bound an object we could not resolve to a live resource
+	count
+};
+const char *reg_verdict_name(RegVerdict v);
+RegVerdict judge_register(bool engine_bound, std::uint64_t engine_res, std::uint64_t walk_res);
+
+// The View constant buffer's register. FTAAStandaloneCS references exactly ONE uniform buffer
+// struct (ViewUniformBuffer), so a bracket with exactly one RHISetShaderUniformBuffer names
+// the View CB's `b` register outright - which is what the slot-order View-CB search has been
+// guessing at (CLAUDE.md §2.6). Two or more bound is a bracket this rule does not cover.
+enum class ViewRegVerdict : std::uint8_t
+{
+	agree = 0,
+	disagree,
+	none_bound,     // no uniform buffer was bound in the bracket
+	multiple_bound, // more than one; the rule cannot pick
+	walk_absent,    // the walk found no plausible View CB this dispatch
+	count
+};
+const char *view_reg_verdict_name(ViewRegVerdict v);
+ViewRegVerdict judge_view_register(std::uint32_t ub_mask, bool walk_valid, unsigned walk_reg);
+
 } // namespace stray_dlss::u0
