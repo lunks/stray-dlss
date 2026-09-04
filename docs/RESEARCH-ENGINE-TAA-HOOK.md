@@ -2252,7 +2252,14 @@ function fails); a plausible name we have no `Target` for (`unknown-name`, censu
 null (`out-null` — expected for `SceneDepthZ`, which is asked for with
 `bDeferTextureAllocation`); the chain unreadable; the `GetNativeResource` slot not in code; and
 the one that matters — **`not-registered`: the resolved `ID3D12Resource*` is not one our own
-registry calls live.** A wrong offset yields that, never a plausible lie. Guards are L1's
+registry calls live.** A wrong offset yields that, never a plausible lie.
+
+**One expected transient, so it is not read as a fault:** a target the engine allocated before our
+D3D12 creation hooks were armed is unknown to the registry, so its first records read
+`not-registered`. It self-heals — the keep-current path re-requests the same name every frame, and
+the registry registers a resource either at creation or at the first view created over it, which a
+G-buffer gets every frame. **A `not-registered` rate that does not fall to zero is the finding**;
+a handful at session start is the hooks coming up. Guards are L1's
 verbatim (§12.5): `VirtualQuery` before every read, SEH around the read and the one engine call,
 a fault latching the whole mechanism off for the session at ERROR with the address and both
 `[derived]` constants by name.
