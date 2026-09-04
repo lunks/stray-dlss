@@ -2592,6 +2592,14 @@ SUBMIX speaker   … peakEver=2.73318 lastSignal=36.1s ago
 emitted on FL/FR at `speakerGain = 1.0` as well as on RL/RR.** That is the user's report, in full,
 and it is ours.
 
+**And the obvious rival explanation — that both taps landed on the SAME submix through a discovery
+bug — is excluded three ways.** The reroute line names three distinct live objects
+(`parent=…4A79A240`, `vibration=…41B2F1C0`, `speaker=…43EFF100`); each lane's own watch and refusal
+lines name its own path (`Submix_vibrationMaster` versus `Submix_controllerMaster`); and the two
+lanes' `lastSignal` timers **differ** (97.2 s versus 36.1 s in the same status pair), which two
+listeners on one submix could not do. They are two taps on two submixes, reading one buffer —
+which is precisely what UE 4.27's listener contract hands sibling submixes.
+
 **And it reaches the pad, not just our meters.** The speaker lane reported `live=1` — handed over,
 its ring attached and being drained by the sink into the one 4-channel WASAPI stream — in **2,993**
 reporting periods of this session, with `sink open=1 'Speakers (DualSense Wireless Controller)'
