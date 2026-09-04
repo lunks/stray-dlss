@@ -2592,6 +2592,11 @@ SUBMIX speaker   … peakEver=2.73318 lastSignal=36.1s ago
 emitted on FL/FR at `speakerGain = 1.0` as well as on RL/RR.** That is the user's report, in full,
 and it is ours.
 
+**And it reaches the pad, not just our meters.** The speaker lane reported `live=1` — handed over,
+its ring attached and being drained by the sink into the one 4-channel WASAPI stream — in **2,993**
+reporting periods of this session, with `sink open=1 'Speakers (DualSense Wireless Controller)'
+4ch 48000Hz`. There is no gate between the contaminated buffer and the physical speaker.
+
 #### The part that makes this urgent rather than cosmetic
 
 **Which lane is contaminated is decided by processing order, and we do not control it.** Today the
