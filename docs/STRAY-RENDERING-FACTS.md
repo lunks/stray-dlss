@@ -2602,3 +2602,72 @@ the count, which is now complete.
 ours is the option of marking those pixels — `pInBiasCurrentColorMask` says "the history is not
 to be believed here", which is precisely and only what we can assert about them
 (`mv-dense-reflections`' conclusion, reached independently for reflections).
+
+## §45 RT reflections + RR instead of RTGI: the config, and the trap in it (2026-09-04)
+
+The user's proposal: the reflection motion-vector mismatch (§5, "temporal network + screen-space
+reflections is a structural mismatch") is the biggest remaining image problem, so trace
+reflections for real and let DLSS Ray Reconstruction denoise them — reflections only, no RTGI.
+
+**The cost objection is not per-effect, and that is the part to understand first.** The measured
+2.9x frame-rate loss from `r.RayTracing=True` (32.4 -> 95.4 fps, §5) came from UE 4.27 building
+BLAS/TLAS **every frame for scene geometry whether or not any effect consumes them**, skinned
+meshes included. "Reflections only" does not avoid it; the price is for enabling RT at all.
+
+**The escape hatch, verified in 4.27 source:** `r.RayTracing.Geometry.SkeletalMeshes`
+(`SkeletalMesh.cpp:117-120`, default **1**). Static-mesh acceleration structures are built once
+and reused; skinned ones are rebuilt per frame, and the measurement named them specifically.
+Reflections in this title mostly want static geometry — architecture and neon over wet ground —
+so excluding skinned meshes is cheap where it counts.
+
+**THE TRAP, and it would have cost a whole launch.** `r.RayTracing.Reflections=1` is NOT
+sufficient. `ShouldRenderRayTracingReflections` (`RayTracingReflections.cpp:396-407`) also
+requires `GetRayTracingReflectionsSamplesPerPixel(View) > 0`, and that cvar defaults to **-1 =
+driven by the post-process volume**. Stray ships no ray tracing, so its volumes have no reason
+to carry a non-zero value — meaning the naive config pays the full acceleration-structure cost
+and renders **no reflections at all**, which reads as "RT reflections are free" or "they do not
+work" depending on which way you squint. `MaxRoughness` defaults to -1 the same way.
+
+Verified cvars and defaults (`RayTracingReflections.cpp:28-60`):
+
+| cvar | default | note |
+|---|---|---|
+| `r.RayTracing.Reflections` | -1 | -1 = post-process volume, 0 = SSR, 1 = ray traced |
+| `r.RayTracing.Reflections.SamplesPerPixel` | **-1** | **must resolve > 0 or the pass never runs** |
+| `r.RayTracing.Reflections.MaxRoughness` | -1 | volume-driven; a 0 here disqualifies every surface |
+| `r.RayTracing.Reflections.ScreenPercentage` | 100 | the obvious cost lever |
+| `r.RayTracing.Geometry.SkeletalMeshes` | 1 | set 0 to keep skinned meshes out of the per-frame AS |
+
+So the cost experiment is:
+
+```ini
+r.RayTracing=True
+r.RayTracing.Geometry.SkeletalMeshes=0
+r.RayTracing.Reflections=1
+r.RayTracing.Reflections.SamplesPerPixel=1
+r.RayTracing.Reflections.MaxRoughness=0.6
+r.SSR.Quality=0
+```
+
+**Order: cost first, quality second.** The bench needs no RR and no code, and cost is what killed
+RT here before. If skeletal exclusion does not bring it back to tolerable, the idea dies without
+any image work being wasted.
+
+**What RT reflections do NOT fix, stated so it is not assumed:** our motion-vector texture still
+describes SURFACE motion, and reflections are composited into scene colour before our hook, so
+DLSS and RR still reproject those pixels with the wrong vectors. NVIDIA's own answer is a
+separate `pInMotionVectorsReflections` input, which their header places in the
+`/*** OPTIONAL - only for research purposes ***/` block. RT changes what is *in* the reflection,
+not what we say about its motion. Where RR genuinely fits is denoising the stochastic result —
+that is its actual job — at the cost that RR replaces SR, and SR is the path with a confirmed
+correct image here while RR has never had one.
+
+## §46 Applied to the live box 2026-09-04
+
+* `r.TemporalAASamples` **16 -> 8**. Per §41 the cvar is a base the engine multiplies by
+  `1/fraction^2`, so 8 gives NVIDIA's recommended 32 phases at 50% screen percentage where 16
+  was giving 64. Backup: `Engine.ini.bak-before-taa-ao`.
+* `r.SSGI.Enable` **1 -> 0**, GTAO kept (`r.AmbientOcclusion.Method=1` and its three GTAO knobs).
+  The user prefers the ground-truth AO, and SSGI's AO mask REPLACES `SceneContext.ScreenSpaceAO`
+  whenever it runs (docs/RESEARCH-AMBIENT-OCCLUSION.md), so every AO setting in that ini had been
+  invisible while SSGI was on.
