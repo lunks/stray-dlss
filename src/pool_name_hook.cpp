@@ -77,6 +77,7 @@ Assertion g_assert_depth;      // SceneDepthZ vs L1's FPassInputs.SceneDepthText
 Assertion g_assert_velocity;   // GBufferVelocity vs L1's FPassInputs.SceneVelocityTexture
 Assertion g_assert_colour;     // SceneColorDeferred vs the TAA bind stream's t1 (OBSERVATION)
 Assertion g_assert_extent;     // every extent-predicted name vs View row 132
+bool g_extent_logged[pool::kNameCount] = {}; // ...but the WARN is per NAME, not per session
 
 // THE NAME CENSUS. UEVR logs every name it has never seen once (RenderTargetPoolHook.cpp's
 // m_seen_names + SPDLOG_INFO_ONCE) and the replan's §11.7 asks for the same: one session
@@ -345,7 +346,7 @@ bool read_wide_ascii(std::uint64_t va, char *out, std::size_t cap)
 	// The string may end near a page boundary, so take the largest readable window rather than
 	// insisting on one size.
 	std::size_t want = 2u * cap;
-	unsigned char buf[2 * 64] = {};
+	unsigned char buf[2 * 96] = {};
 	if (want > sizeof(buf))
 		want = sizeof(buf);
 	while (want >= 4 && !committed_and_readable(va, want))
@@ -434,7 +435,12 @@ bool hk_find_free_element(void *self, void *cmd_list, const void *desc, void **o
 		? original(self, cmd_list, desc, out, name, transience, defer)
 		: false;
 
-	char ascii[64] = {};
+	// 96 is not arbitrary: UE 4.27's longest pooled name in the renderer is
+	// "TranslucencyLightingVolumeAmbient0" (34), and a name we cannot read to its terminator
+	// is counted as `name-unreadable` - the counter that says the hook is on the wrong
+	// function. Leaving it tight would put a long but perfectly legitimate name in that bucket
+	// and turn the one validator that matters into a liar.
+	char ascii[96] = {};
 	std::lock_guard<std::mutex> lock(g_mutex);
 	++g_calls;
 	if (g_disabled)
@@ -671,7 +677,7 @@ void install()
 }
 
 void judge(Assertion &a, pool::AssertVerdict v, const char *what,
-           std::uint64_t ours, std::uint64_t theirs, bool predicted)
+           std::uint64_t ours, std::uint64_t theirs, bool predicted, bool *logged = nullptr)
 {
 	switch (v)
 	{
@@ -679,9 +685,10 @@ void judge(Assertion &a, pool::AssertVerdict v, const char *what,
 	case pool::AssertVerdict::disagree: ++a.disagree; break;
 	default: ++a.absent; return;
 	}
-	if (v != pool::AssertVerdict::disagree || a.logged)
+	bool *seen = logged != nullptr ? logged : &a.logged;
+	if (v != pool::AssertVerdict::disagree || *seen)
 		return;
-	a.logged = true;
+	*seen = true;
 	if (predicted)
 	{
 		STRAY_LOG_WARN("POOL NAMES ASSERTION: %s - the pool says %#llx and the other engine "
@@ -819,7 +826,7 @@ void note_engine_frame(std::uint64_t depth_res, std::uint64_t velocity_res,
 		char what[128];
 		std::snprintf(what, sizeof(what), "%s's extent %ux%u against View row 132's %ux%u",
 			pool::kNames[i].text, r.width, r.height, buffer_width, buffer_height);
-		judge(g_assert_extent, v, what, r.width, buffer_width, true);
+		judge(g_assert_extent, v, what, r.width, buffer_width, true, &g_extent_logged[i]);
 	}
 
 	for (Record &r : g_records)
@@ -904,7 +911,7 @@ int format_report(char *buffer, std::size_t size)
 
 void log_report(const char *when)
 {
-	char line[1024] = {};
+	char line[2048] = {};
 	if (format_report(line, sizeof(line)) > 0)
 		STRAY_LOG_INFO("%s %s", when != nullptr ? when : "", line);
 }

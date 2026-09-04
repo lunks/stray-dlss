@@ -1325,7 +1325,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 					std::fprintf(f, "%s\n", u0line);
 				// And the pool-name map beside it, so automation can read `assert:` and the
 				// per-name status without the log ([STRAYDLSS] PoolNames).
-				char poolline[1024] = {};
+				char poolline[2048] = {};
 				if (poolhook::format_report(poolline, sizeof(poolline)) > 0)
 					std::fprintf(f, "%s\n", poolline);
 			}
