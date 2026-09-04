@@ -722,12 +722,13 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
-	// INVESTIGATION ONLY (facts §36.20). Nothing below changes which CB is picked; it counts
-	// what the current filter cannot see. `view_fits_dispatch` catches an impostor whose rect is
-	// LARGER than the dispatch; one that is SMALLER passes silently and would feed DLSS another
-	// view's jitter, ClipToPrevClip and CameraCut. These two numbers say whether that subset is
-	// empty, occasional or constant — which is the whole question, and it decides the fix.
-	// `distinct_rival` is the number that matters, and it is NOT "how many candidates survived".
+	// THE LOOP RUNS TO THE END even after a winner is accepted, and for two different reasons.
+	// The first is a GATE: a candidate too large for the dispatch (facts §36.18) or below the
+	// engine's own 0.5 minimum fraction (§36.21) is skipped and the search CONTINUES, so the
+	// real view on a higher root parameter is found. The second is a MEASUREMENT of what is
+	// left: `distinct_rival` counts a survivor that would hand DLSS DIFFERENT motion, which is
+	// the only kind of ambiguity a slot-order search can get wrong.
+	// It is NOT "how many candidates survived".
 	// Two root parameters can point at one suballocation, or hold byte-identical copies of the
 	// same view - neither is a choice the search can get wrong. Only a survivor that would hand
 	// DLSS DIFFERENT ClipToPrevClip / jitter / CameraCut is ambiguity.
