@@ -8,9 +8,8 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
-#include <Unreal/UClass.hpp>
-#include <Unreal/FProperty.hpp>
-#include <Unreal/FField.hpp>
+#include <Unreal/CoreUObject/UObject/Class.hpp>
+#include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 
 #include <windows.h>
 
@@ -72,7 +71,7 @@ void Tick()
 {
 	if (g_done)
 		return;
-	if (!host::cfg::get_bool("MenuScan", false))
+	if (!stray_dlss::host::cfg::get_bool("MenuScan", false))
 		return;
 
 	using namespace RC::Unreal;
