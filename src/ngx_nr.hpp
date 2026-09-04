@@ -70,6 +70,13 @@ void set_mvec_scale_override(float scale);
 // it changes.
 void set_style(unsigned int style);
 
+// [STRAYDLSS] NgxNRDepthInverted, default 1. UE 4.27 is reversed-Z so 1 is the TRUE value; 0 is
+// a deliberate lie, and it exists to answer one question no amount of reading can: does the
+// runtime use our depth AT ALL? Telling feature 18 the opposite of the truth must change the
+// image if depth informs anything it does. If it does not, depth is inert here and every
+// depth-shaped hypothesis about NR is dead.
+void set_depth_inverted(unsigned int inverted);
+
 // [STRAYDLSS] NgxNRPreload (default ON): LoadLibrary the staged nvngx_dlssnr.dll, resolve its
 // exports and patch its GetModuleFileNameW import, at device init. This is the CHEAP half only
 // — it never calls Init_Ext and never touches the GPU. It matches RenoDX's own description,
