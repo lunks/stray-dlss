@@ -213,12 +213,17 @@ void stall_check_and_reset(std::uint64_t frame_ns, std::uint64_t frame_no)
 		int worst_bucket = 0;
 		for (int i = 0; i < kBucketCount; ++i)
 		{
+			// The resolve's sub-buckets are inside `resolve` already; adding them here would
+			// count that time twice in the sum and let a part outrank its whole as worst-call.
+			if (i >= kResolveState && i <= kResolveRootCbv)
+				continue;
 			our_sum += static_cast<double>(g_fr_bucket_sum[i].load());
 			const double bmax = static_cast<double>(g_fr_bucket_max[i].load());
 			if (bmax > our_max) { our_max = bmax; worst_bucket = i; }
 		}
 		static const char *bn[kBucketCount] = { "dispatch", "mv", "ngx_sr", "ngx_rr", "ngx_nr",
-			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve" };
+			"restore", "presentOwner", "presentWait", "shadowWrite", "shadowCopy", "heapBind", "rootBind", "resolve",
+			"resolveState", "resolveWalk", "resolveSlots", "resolveRootCbv" };
 		STRAY_LOG_WARN("[stall] f=%llu t=%.6f frame %.2f ms (median %.2f, %.1fx) #%llu | PSO created=%llu (compute=%llu) origCompile sum=%.2f max=%.2f ms | eval=%llu | res +%llu -%llu heaps +%llu | fenceWait=%.2f ms | orig exec=%.2f present=%.2f ms | ourCPU sum=%.2f ms worst-call=%.2f ms (%s) | dispatchPath=%.2f resolve=%.2f rootBind=%.2f shadowCopy=%.2f restore=%.2f ms",
 			static_cast<unsigned long long>(frame_no), wall_clock_s(),
 			frame_ns * ms, median * ms, static_cast<double>(frame_ns) / static_cast<double>(median),
@@ -375,6 +380,16 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 		static_cast<double>(cnt[kCntCopyDescs]) * pf, h_ms, static_cast<double>(cnt[kCntHeapBinds]) * pf,
 		r_ms, static_cast<double>(cnt[kCntRootBinds]) * pf, v_ms, static_cast<double>(cnt[kCntResolves]) * pf,
 		w_ms + c_ms + h_ms + r_ms + v_ms, pct(w_ms + c_ms + h_ms + r_ms + v_ms), avg_frame_ms);
+	// The resolve's breakdown (perf.hpp, kResolveState). Nested inside `resolve` above, so the
+	// four parts sum to it (minus the loop overhead between them) and are NOT in the total.
+	// `state` is the two copies a per-root-signature cache would remove; `walk` the re-walk;
+	// `slots` the registry lookups a cache would not touch. Read this before building the cache.
+	STRAY_LOG_INFO("[perf]   resolve breakdown/frame: state %.3fms (snapshot + layout copy), walk %.3fms (%.1f tables), "
+		"slots %.3fms (%.1f slots), root-cbv %.3fms",
+		static_cast<double>(bucket_ns[kResolveState]) * per_frame_ms,
+		static_cast<double>(bucket_ns[kResolveWalk]) * per_frame_ms, static_cast<double>(cnt[kCntResolveTables]) * pf,
+		static_cast<double>(bucket_ns[kResolveSlots]) * per_frame_ms, static_cast<double>(cnt[kCntResolveSlots]) * pf,
+		static_cast<double>(bucket_ns[kResolveRootCbv]) * per_frame_ms);
 }
 
 } // namespace stray_dlss::perf

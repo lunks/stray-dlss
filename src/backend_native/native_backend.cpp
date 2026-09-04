@@ -176,14 +176,19 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 	perf::Scope _ps(perf::kResolve);
 	perf::count(perf::kCntResolves);
 	g_resolves.fetch_add(1, std::memory_order_relaxed);
+	// The sub-buckets below split kResolve so the candidate fix - caching the layout and its
+	// walk per root signature - is sized before it is built (perf.hpp, kResolveState).
 	root::ListState st;
-	if (ctx.native == nullptr || !root::snapshot(ctx.native, st))
-		return false;
 	core::RootLayout layout;
-	if (st.compute_root_signature == nullptr || !hooks::layout_for(st.compute_root_signature, layout))
 	{
-		g_resolves_no_layout.fetch_add(1, std::memory_order_relaxed);
-		return false;
+		perf::Scope _state(perf::kResolveState);
+		if (ctx.native == nullptr || !root::snapshot(ctx.native, st))
+			return false;
+		if (st.compute_root_signature == nullptr || !hooks::layout_for(st.compute_root_signature, layout))
+		{
+			g_resolves_no_layout.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
 	}
 	const std::uint32_t inc = hooks::descriptor_increment();
 
@@ -193,8 +198,11 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 		if (base == 0)
 			continue;
 		core::WalkResult walk;
+		{
+		perf::Scope _walk(perf::kResolveWalk);
 		if (!core::walk_table(layout, param, walk))
 			continue;
+		perf::count(perf::kCntResolveTables);
 
 		// The heap this table lives in — the oracle reports the heaps its tables resolved
 		// into, so the same rule here (any range type, the table's base handle).
@@ -226,10 +234,14 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 			}
 		}
 
+		} // kResolveWalk
+
+		perf::Scope _slots(perf::kResolveSlots);
 		for (const core::TableSlot &s : walk.slots)
 		{
 			if (s.kind == core::RangeKind::sampler)
 				continue;
+			perf::count(perf::kCntResolveSlots);
 			const std::uint64_t gpu = base + static_cast<std::uint64_t>(s.table_index) * inc;
 			icept::DescriptorId cpu = 0;
 			shadow::ViewEntry e;
@@ -286,6 +298,7 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 
 	// Root descriptors, keyed by ROOT PARAMETER as the oracle keys them. Root SRV/UAV carry
 	// only an address and contribute nothing to srvs/uavs — exactly as the oracle treats them.
+	perf::Scope _cbv(perf::kResolveRootCbv);
 	for (const auto &cbv : st.compute_root_cbv)
 	{
 		icept::BufferRange br;
