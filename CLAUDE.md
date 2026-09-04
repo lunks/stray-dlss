@@ -699,6 +699,38 @@ Config and saves live in the **Proton prefix**:
 > three predictions, because it is one. **A self-validating check tells you what KIND of thing
 > you have, never WHICH one.** Identity needs something that separates the candidates, and here
 > that was the dispatch, available at that point all along.
+>
+> **AND THE SEARCH IS STILL PICKING THE WRONG VIEW — MEASURED, AND IT REACHED THE SCREEN
+> (2026-09-03, report §16).** The user, playing: *"some textures are popping up on the whole
+> screen when we walk around… at Antvillage you see a carpet pattern full screen."* In that
+> session's own log, **37 of 62 `DLSS feature created:` lines name a render rect that cannot be
+> the primary view** — `64x34` through `64x52`, `128x109`, `128x126`, `256x240`, `1024x1024`, a
+> portrait `1064x2128` — every one of them upscaling to the engine's announced `3840x2160`.
+> `64x41 -> 3840x2160` is a **60x** upscale.
+>
+> **`view_fits_dispatch` bounds the view only from ABOVE**, so a SMALL impostor passes
+> plausibility, row 135 and the fit bound alike; the `[view]` line's own `suspectSmall=162`
+> counts them and gates nothing. And **`f947ee4`, the commit that made `EngineSeam=3` the
+> default, removed the create-site aspect + 3.5x gate** that would have caught the consequence,
+> reasoning *"under the engine's gate the shape test is moot: a cubemap face or a reflection
+> capture never reaches `AddPasses`"*.
+>
+> **THE ENGINE WARRANTS THE DISPATCH AND THE OUTPUT RECT. IT DOES NOT WARRANT THE RENDER RECT** —
+> that comes from the View CB search and the seam has no opinion about it. Two operands, one
+> covered. So DLSS was created `64x41 -> 3840x2160` and told to read a `64x41` subrect of the
+> real 1920x1080 scene colour: **it magnifies the TOP-LEFT CORNER of the frame over the whole
+> screen**, and at floor level that corner is the carpet. `primary_view_shape_ok` restores the
+> gate under both authorities, using UE 4.27's own `kMinTAAUpsampleResolutionFraction = 0.5`; a
+> refusal costs one frame of the engine's TAA, since `suppress_engine_dispatch` is set only after
+> a successful evaluate. Read **`badRenderRect`** on the `[seam]` line.
+>
+> **The general rule: when an authority replaces a heuristic, check which of the compared
+> quantities the authority actually covers.** A gate whose operands come from two sources is
+> moot only if the new authority supplies BOTH.
+>
+> **And the remedy is still the search, not the gate** — gate `ue4::view_fraction_plausible`
+> (already written, already measured, deliberately ungated) so the wrong candidate is SKIPPED and
+> the real view found, rather than the frame declined. Report §16.5.
 
 Stray uses UE 4.27's `FTAAStandaloneCS`. **[derived]** that is
 `/Engine/Private/TemporalAA/TAAStandalone.usf`, entry `MainCS` — **`PostProcessTemporalAA.usf` does
@@ -3103,7 +3135,21 @@ a frozen image and fog" symptom. Post-fix, evaluates track dispatches at 99.7%.
 
 **The menu runs the TAA pass too**, at uncapped fps, and its scene colour is
 `R11G11B10_FLOAT` where gameplay's is `R16G16B16A16_FLOAT` — the colour format is NOT an
-invariant; trust the §2.3 register map, not a format check. Menu depth reads ~0 everywhere
+invariant; trust the §2.3 register map, not a format check.
+
+> **REFINED 2026-09-03, and the distinction matters.** "Not a format check" means never pick
+> the colour input BY format — the register is the identity. It never meant the register's
+> answer should go to NGX unexamined, and until today it did: `reg_colour` took whatever was
+> live at t1 with no format, extent or dimensionality test, the only DLSS input with no shape
+> check at all. `colour_input_acceptable` (`src/core/taa_signature.hpp`) is an ASSERTION over
+> the register's answer, not a replacement for it — and it is format-family-agnostic exactly
+> because of this paragraph: any HDR float colour format passes, and the extra pairing is
+> against **the output UAV's own format**, which moves with the scene colour (menu and gameplay
+> alike). What it refuses is a resource that cannot be `InputSceneColor` under either: a buffer,
+> a 3D texture, the 1x1 `BlackDummy`, something smaller than the render subrect, or a
+> BC-compressed streamed material texture. See report §14.4 for why the engine cannot
+> cross-check this one and why "colour has never been misidentified" was an artifact of an
+> assertion that structurally could not fire. Menu depth reads ~0 everywhere
 (the §2.4 gameplay gate), which is how a dump run that never left the menu was identified
 after the fact.
 

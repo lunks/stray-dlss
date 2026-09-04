@@ -1309,6 +1309,34 @@ here so the idea is not rediscovered as clever.
 
 ### 14.4 Why colour-by-register is a good end state, not a compromise
 
+> **CORRECTED 2026-09-03, and the first bullet was circular.** "Nothing has ever suggested
+> colour was misidentified" rested on L1's cross-check having flagged only velocity — but
+> **that cross-check cannot fire for colour, by construction.**
+> `seamhook::note_input_disagreement("scene colour", …)` sits inside
+> `if (engine_inputs.colour_ok())`, and `FPassInputs.SceneColorTexture` is the post-chain scene
+> colour whose `ResourceRHI` is assigned inside `FRDGBuilder::Execute()` — so it resolves
+> `rhi_null` at announce every time, which is the same fact §14.2 spends a whole table on. The
+> live log says so outright: **`l1: resolved=0 partial=103402`** — depth and velocity on every
+> one of 103,402 claims, colour on none. The colour assertion has never once executed.
+>
+> **Absence of evidence, from an instrument that is wired shut.** And the consequence was
+> concrete: `reg_colour` took whatever was live at register t1 and handed it to NGX as
+> `pInColor` with **no format, no extent and no dimensionality test** — the only DLSS input with
+> no shape check at all, while depth, stencil, velocity and the output UAV are each
+> format-matched in `match_taa_dispatch`. `colour_input_acceptable`
+> (`src/core/taa_signature.hpp`) is the assertion that should have existed: a Tex2D, an HDR
+> float colour format, the output UAV's format when known, and **at least** the render subrect
+> (not equality — UE4 allocates the scene buffer at the scene-buffer extent, and dynamic
+> resolution makes the view rect strictly smaller). A failing t1 is now refused and named once
+> per pass instead of used.
+>
+> **The rule, and this file has now earned it twice in two days.** §36.14 already records
+> "a self-validating check tells you what KIND of thing you have, never WHICH one". This is its
+> sibling: **a cross-check that structurally cannot run is not a clean bill of health, and a
+> counter that has only ever read zero must be shown to be capable of reading non-zero before it
+> is cited.** Ask what would have to happen for the check to fire before quoting the fact that
+> it has not.
+
 * **Colour was never the ambiguous input.** L1's own cross-check has flagged a disagreement
   exactly once, and it was **velocity** (§36.13.1) — the heuristic naming a resource the engine
   never bound. Nothing has ever suggested colour was misidentified.
@@ -1526,3 +1554,130 @@ result arrives rather than after:
 | The shadow's `shadow-copy` 1.644 ms is driven by the SRV/UAV table walk, not the CB search | **HARD** by inspection, `native_backend.cpp:174-308` + `perf.cpp:373-374`'s live line |
 | `docs/RESEARCH-RESHADE-SHAPE-SWEEP.md` §1.3's ranking of the CB search as the shadow's blocker | **REFUTED**, see §15.4 and the correction in that file |
 | Anything in §15.2 working on this executable | **UNCONFIRMED.** Not built, not run |
+
+---
+
+## 16. The engine warrants the DISPATCH, not the RENDER RECT — and the gap put a magnified corner of the frame on screen (2026-09-03)
+
+**The report, the user's, while playing the `seam-l1-crash` build:** *"some textures are popping
+up on the whole screen when we walk around"*, and, concretely, *"one texture that happens often is
+at Antvillage — you see a carpet pattern full screen."*
+
+**The evidence, from that session's own live log** (one session, 114,000 frames, `EngineSeam=3`,
+`announced=113954 claimed=103402 evaluated=103281`). Of the 62 `DLSS feature created:` lines,
+**37 name a render rect that cannot be the primary view**:
+
+```
+     25 DLSS feature created: 1920x1080 -> 3840x2160, Performance          <- correct
+      5 DLSS feature created:   64x41  -> 3840x2160, UltraPerformance
+      4 DLSS feature created:   64x51  -> 3840x2160, UltraPerformance
+      2 DLSS feature created:   64x45 / 64x39 -> 3840x2160
+      1 each: 64x52, 64x49, 64x47, 64x42, 64x34, 256x240, 128x126, 128x109,
+              1024x1024, and a PORTRAIT 1064x2128           -> 3840x2160
+      2 DLSS feature created: 1920x1070 -> 3840x2140, Performance          <- dynamic res, fine
+```
+
+`64x41 -> 3840x2160` is a **60x linear upscale**. Nothing DLSS does is 60x.
+
+### 16.1 The chain, each link from source or from that log
+
+1. **`fd.render_width/height` come from `View.ViewSizeAndInvSize`** (`taa_hook.cpp`, the block
+   commented "The RENDER rect comes from the View constant buffer, not from a texture extent" —
+   and that reasoning is right: the depth SRV is at the scene-buffer extent, not the view size).
+2. **The View constant buffer is located by SEARCH**, not by the engine: every bound constant
+   buffer in slot order, first plausible hit wins (§15, CLAUDE.md §2.6). Its filters are
+   `view_params_plausible`, the row-135 self-check and `ue4::view_fits_dispatch`.
+3. **All three accept a small secondary view.** A shadow, planar-reflection, cubemap-face or
+   scene-capture view *is* a real `View` uniform buffer, so it satisfies plausibility and row 135
+   by construction (§36.14's own lesson). And `view_fits_dispatch` bounds the view **only from
+   above** — `w <= covered_w` — which is exactly the asymmetry §15's own footnote flags as
+   uncounted: *"one that is SMALLER passes plausibility, row 135 and the fit bound alike and still
+   wins on a lower root parameter."* The `seam-l1-crash` build counts that subset and it is
+   non-zero: **`suspectSmall=162`, `ambClaimed=176`** on the [view] line.
+4. **`f947ee4` then removed the last check that would have caught it.** The commit that made
+   `EngineSeam=3` the default guarded the create-site aspect + 3.5x-scale gate with
+   `seam_gate != seam::Gate::engine`, reasoning *"Under the engine's gate the shape test is moot:
+   a cubemap face or a reflection capture never reaches `ITemporalUpscaler::AddPasses`."*
+
+### 16.2 Why that reasoning is wrong, and it is the transferable part
+
+**The shape test has two operands and the engine's warrant covers one of them.**
+`fd.output_width/height` is `seam_verdict.out_width/height` — the engine's own announced
+`OutputViewRect`, and trustworthy. `fd.render_width/height` is a constant buffer **we went looking
+for ourselves**, which the engine never announced and which the seam has no opinion about.
+
+Being called through `AddPasses` proves *this dispatch is the primary temporal upscale*. It does
+not prove *the buffer our search picked belongs to this view*. The two propositions were
+conflated, and the test that compared them was deleted as redundant.
+
+**Generalised:** when an authority replaces a heuristic, check which of the compared quantities
+the authority actually covers. A gate whose operands come from two different sources is only moot
+if the new authority supplies **both**.
+
+### 16.3 What the user sees, and why it is a carpet
+
+With the feature created `1024x1024 -> 3840x2160` and evaluated with
+`InRenderSubrectDimensions = 1024x1024` against the real 1920x1080 scene colour, DLSS reads the
+**top-left 1024x1024 texels of the frame** and stretches them to fill 3840x2160. At 64x41 it is
+the top-left 64x41 texels at 60x. Whatever material dominates the upper-left corner fills the
+display for as long as that bogus rect persists — and at floor level in Antvillage that is the
+carpet. Transient (a new rect per spurious creation), and worst while walking, when the most
+secondary views are in flight.
+
+**The colour RESOURCE was almost certainly right the whole time.** The DISPATCH REPORT for the
+pinned pass reads `t1 res=0x2f4c5df0 RGBA16_FLOAT (colour) 1920x1080`, which is the scene colour.
+What was wrong is the **subrect DLSS was told to read from it** — indistinguishable from the
+outside, and a useful reminder that "an unrelated texture filled the screen" has two mechanisms,
+not one.
+
+**And a streamed material texture could not have been the colour input in any case.** Stray's
+carpets cook to `BC3_TYPELESS` / `BC1_TYPELESS` (normals `BC5_UNORM`) at 1024² and 2048², with 7
+mips always resident — read from the pak's own uasset name tables in
+`Content/Data/Props/Carpet/texture/` and `Content/Data/Textures/Tile/Carpet/`, and confirmed to
+the byte by each `.ubulk`'s size being exactly the sum of its streamed mip chain. And
+`FStreamableTextureResource`'s `CreationFlags` (`StreamableTextureResource.cpp:78-79`) never
+contain `TexCreate_UAV` or `TexCreate_RenderTargetable`, so such a resource is created
+`D3D12_RESOURCE_FLAG_NONE` and can never be `R16G16B16A16_FLOAT` or `R11G11B10_FLOAT`. **HARD.**
+
+### 16.4 The fix, and what it costs
+
+`primary_view_shape_ok` (`src/core/taa_signature.hpp`) runs under **both** authorities. It is the
+existing aspect (4%) and 3.5x-scale bounds plus UE 4.27's own
+`kMinTAAUpsampleResolutionFraction` = **0.5** on each axis — the same constant `seam::discover`
+already decodes out of `ITemporalUpscaler`'s vtable to prove it found the right interface, so it
+is the engine's number rather than ours. All 37 measured rects fail it; all 25 correct ones, both
+screen percentages, DLAA and every dynamic-resolution rect in that session pass.
+
+**A refusal costs one frame of the engine's own TAA**, because `suppress_engine_dispatch` is set
+only after a successful evaluate — so the frame renders correctly, just without DLSS. That is
+prime directive 2 exactly: the alternative is an arbitrary part of the world on the display.
+
+`badRenderRect` joins the `[seam]` line's `claimedButNoSR:` breakdown, so the rate is continuous
+rather than reconstructable only by grepping feature creations.
+
+### 16.5 What this does NOT fix, and it is the real remedy
+
+**The View CB search still picks the wrong buffer.** The gate above refuses the consequence; it
+does not stop the search choosing a shadow view. The right fix is the one §15's footnote already
+names and the `seam-l1-crash` build already MEASURES without gating:
+**`ue4::view_fraction_plausible`** — reject a candidate below the engine's 0.5 minimum and *keep
+searching*, so the real view on a higher root parameter is found and DLSS runs correctly instead
+of declining. That predicate is pure, has six subcases in CI, and is deliberately ungated pending
+exactly the number this session produced (`suspectSmall=162`). **It should be gated.**
+
+It lives on `seam-l1-crash`, not on `main`, so it is not duplicated here.
+
+### 16.6 Provenance ledger
+
+| Claim | Status |
+|---|---|
+| 37 of 62 DLSS features in the measured session were created at impossible render rects | **HARD**, the live `stray-dlss-plugin.log`, single session, quoted above |
+| `fd.render_*` comes from the View CB search, `fd.output_*` from the engine's announcement | **HARD**, `taa_hook.cpp` |
+| `view_fits_dispatch` bounds the view only from above | **HARD**, `core/view_params.cpp` |
+| `f947ee4` disabled the shape gate under the engine gate, with the quoted reasoning | **HARD**, the commit |
+| `kMinTAAUpsampleResolutionFraction == 0.5` | **HARD**, `SceneView.h:1438-1439`, and `seam::discover` decodes it live |
+| A streamed `UTexture2D` is BC-format, mipped and `RESOURCE_FLAG_NONE` | **HARD**, UE 4.27 `StreamableTextureResource.cpp:78-79`, `Texture2DResource.cpp:70`, `D3D12Texture.cpp` |
+| Stray's carpet textures are BC3/BC1/BC5 at 1024²/2048² with 7 resident mips | **HARD**, the pak's own uasset name tables + `.ubulk` sizes |
+| The colour resource itself was correct in the measured session | **HARD** for the pinned pass's DISPATCH REPORT; **SOFT** that it was correct on every frame — nothing logs it per frame |
+| That the magnified corner is what the user saw as "a carpet full screen" | **SOFT.** The mechanism is measured and the appearance follows from it; no screenshot ties a specific frame to a specific bogus rect |
+| Whether refusing these frames removes the artefact | **UNCONFIRMED.** Not run on the box |
