@@ -773,14 +773,20 @@ void run_discovery()
 
 	char held[u0::kSlotExpectationCount * 8 + 1] = {};
 	char missed[u0::kSlotExpectationCount * 8 + 1] = {};
+	std::size_t held_n = 0;
+	std::size_t missed_n = 0;
 	for (std::size_t k = 0; k < u0::kSlotExpectationCount; ++k)
 	{
-		char one[8];
-		std::snprintf(one, sizeof(one), " %u", u0::kSlotExpectations[k].slot);
-		if ((g_ctx.expectation_mask & (1u << k)) != 0)
-			std::strncat(held, one, sizeof(held) - std::strlen(held) - 1);
-		else
-			std::strncat(missed, one, sizeof(missed) - std::strlen(missed) - 1);
+		const bool ok = (g_ctx.expectation_mask & (1u << k)) != 0;
+		char *dst = ok ? held : missed;
+		std::size_t &n = ok ? held_n : missed_n;
+		const std::size_t cap = sizeof(held);
+		if (n < cap)
+		{
+			const int w = std::snprintf(dst + n, cap - n, " %u", u0::kSlotExpectations[k].slot);
+			if (w > 0)
+				n += static_cast<std::size_t>(w);
+		}
 	}
 	STRAY_LOG_INFO("U0 HOOK FOUND: FD3D12CommandContext vtable at %#llx (%.1f ms). The seed - "
 		"FD3D12CommandContext::RHIDispatchComputeShader at %#llx, the function our Dispatch hook's "
