@@ -15,6 +15,7 @@
 #include "intercept/backend.hpp"
 #include "log.hpp"
 #include "input_dump.hpp"
+#include "mv_mask.hpp"
 #include "mv_resolve.hpp"
 #include "ngx_fg.hpp"
 #include "ngx_backend.hpp"
@@ -1897,11 +1898,26 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							NGX_TRACE("%s", "barrier mv -> SRV");
 							mv::transition_output(native, /*to_shader_resource=*/true);
 
+							// The bias-current-colour mask, if [STRAYDLSS] MvMask asked for one.
+							// Null in every default configuration, and null is byte-identical
+							// to the behaviour from before it existed. Recorded here, on the
+							// same list and inside the same window as the resolve and the
+							// evaluate, both of which already rebind descriptor heaps and
+							// after which the caller restores the game's state.
+							ID3D12Resource *bias_mask = nullptr;
+							if (mvmask::enabled() &&
+								mvmask::initialise(native_device, render_w, render_h))
+							{
+								bias_mask = mvmask::record(native, render_w, render_h,
+									g_present_frame.load(std::memory_order_relaxed));
+							}
+
 							ngx::EvaluateInputs ei;
 							ei.color = colour;
 							ei.depth = reinterpret_cast<ID3D12Resource *>(depth_resource);
 							ei.motion_vectors = mv::output();
 							ei.output = output;
+							ei.bias_mask = bias_mask;
 							// TemporalAAParams.zw, straight through. (CLAUDE.md §2.7)
 							ei.jitter_x = view.temporal_aa_params.z;
 							ei.jitter_y = view.temporal_aa_params.w;

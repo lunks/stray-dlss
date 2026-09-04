@@ -201,6 +201,16 @@ struct EvaluateInputs
 	float jitter_x = 0.0f;
 	float jitter_y = 0.0f;
 
+	// OPTIONAL, null by default and null is exactly the behaviour from before it existed.
+	// `pInBiasCurrentColorMask` (nvsdk_ngx_helpers.h:391, "DLSS.Input.Bias.Current.Color.Mask"):
+	// DLSS's own per-pixel "do not trust the history here" channel. It is the honest treatment
+	// for content whose motion vectors are structurally wrong rather than merely inaccurate —
+	// screen-space reflections above all, which move with the reflected geometry while our
+	// vectors describe the reflecting surface (CLAUDE.md §5). Bound at
+	// InBiasCurrentColorSubrectBase (0,0), so it must COVER the render subrect.
+	// Produced by src/mv_mask.cpp; gate and semantics in src/core/mv_mask_plan.hpp.
+	ID3D12Resource *bias_mask = nullptr;
+
 	unsigned int render_width = 0;
 	unsigned int render_height = 0;
 	bool reset = false;                        // camera cut / invalid history
