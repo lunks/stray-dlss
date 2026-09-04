@@ -24,9 +24,15 @@ so. Only the first is contingent on a measurement.**
    (`docs/game-config/Hk_project_Config_DefaultEngine.ini:63`, `[/Script/Engine.RendererSettings]`),
    and which routes SSR through the engine's own dedicated temporal filter *before* it is
    composited into scene colour. The four `*.Denoiser=0` lines in the live ini are, under
-   `r.RayTracing=False` + `r.SSGI.Enable=0`, **inert** — they gate signal families that are not
-   being produced. The user's report that they see little noise today is exactly what this
-   configuration predicts. **This is the one part a launch must confirm rather than assume** (§4).
+   `r.RayTracing=False` + `r.SSGI.Enable=0`, **inert**, one by one:
+   `r.AmbientOcclusion.Denoiser` is not a real top-level 4.27 cvar at all
+   (`docs/RESEARCH-GFX-MOD-209.md` §2.4 could not locate a declaration; classic SSAO does not
+   route through `IScreenSpaceDenoiser`); `r.Shadow.Denoiser` and `r.Reflections.Denoiser` gate
+   **ray-traced** shadow and reflection denoising, which needs `r.RayTracing=True`; and
+   `r.DiffuseIndirect.Denoiser` gates the SSGI denoiser, which needs `r.SSGI.Enable>0`. They gate
+   signal families that are not being produced. The user's report that they see little noise
+   today is exactly what this configuration predicts. **This is the one part a launch must
+   confirm rather than assume** (§4).
 2. **RR would replace a working engine denoiser, not an absent one.** The SSR temporal filter is
    already running — §1.3 gives already-measured evidence from our own box — and it is
    purpose-built for this signal. Replacing it with a network trained on ray/path-traced input
@@ -343,6 +349,8 @@ command.
 |---|---|
 | Stray ships `r.SSR.Temporal=1.0` in `[/Script/Engine.RendererSettings]` | **HARD** — `docs/game-config/Hk_project_Config_DefaultEngine.ini:63`, extracted from the game's own pak |
 | Stray ships `r.SSR.HalfResSceneColor=1`, `r.SSGI.Quality=2`, `r.SceneColorFormat=3` | **HARD** — `Hk_project_Config_Windows_WindowsEngine.ini:12,77,69` |
+| The live `Engine.ini [SystemSettings]` carries `r.SSGI.Enable=0`, `r.RayTracing=False` and the four `*.Denoiser=0` lines | **REPORTED BY THE USER, 2026-09-04, not read by us.** The box has not been touched from this branch. If any of it is wrong the §0.1 argument weakens; §4's census does not depend on it |
+| `r.AmbientOcclusion.Denoiser` is not a real 4.27 cvar; `r.Shadow.Denoiser` / `r.Reflections.Denoiser` gate ray-traced signals; `r.DiffuseIndirect.Denoiser` gates SSGI | **HARD-via-`docs/RESEARCH-GFX-MOD-209.md` §2.4** and `RESEARCH-RR1-DENOISER-CONFIG.md` §1,§4 |
 | `r.SSR.Temporal!=0` under TAA ⇒ `bTemporalFilter` ⇒ `ETAAPassConfig::ScreenSpaceReflections` | **HARD-via-mirror-via-`RESEARCH-RR1-DENOISER-CONFIG.md` §3**, which quotes `ScreenSpaceRayTracing.cpp:146-155` and `IndirectLightRendering.cpp:768-772` |
 | `RESEARCH-RR1-DENOISER-CONFIG.md` §3's conclusion (raw SSR reaches TAA) is void | **HARD** — its own stated condition is falsified by the line above |
 | `FSSDTemporalAccumulationCS` in Stray is the SSGI diffuse-indirect denoiser, not reflections or AO | **HARD-via-mirror-via-`RESEARCH-RR1-DENOISER-CONFIG.md` §1,§3,§4** |
