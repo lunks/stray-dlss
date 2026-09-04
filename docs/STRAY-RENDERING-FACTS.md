@@ -3647,7 +3647,10 @@ does, because it is per-`FViewInfo` and rebuilt per frame.
 
 **Rate caveat, stated because this file has paid for the opposite three times:** this is the MENU,
 where §36.21 already proved a counter can read 0 for want of the phenomenon. 4/601 (0.67%) is the
-menu's rate at level 1, not gameplay's, and it is not a refinement of §36.20's 0.33%.
+menu's rate at level 1 — **as was §36.20's 36/10 800 (0.33%)**, which was also a menu session. So
+neither number is gameplay's, the difference between them is not a trend, and averaging them would
+be the §2.4 trap again. What this session establishes is the SHAPE of the residue and that two
+independent instruments count it identically; the rate in gameplay is unmeasured.
 
 ### 36.22.3 What was TRUNCATED, and what it cost to fix
 

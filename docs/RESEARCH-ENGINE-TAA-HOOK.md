@@ -1722,16 +1722,15 @@ says cannot happen, so it would be the finding of the session); any `faults`.
 | `ViewUniformBuffer` is created from it in `InitRHIResources`; `UpdateLateLatchData` is the only in-place writer and copies struct -> buffer; `CreateSnapshot` nulls it | **HARD**, `SceneRendering.cpp` @ 306a7e9 |
 | TAA binds `View.ViewUniformBuffer` | **HARD**, `TemporalAA.cpp:767` |
 | `BufferSizeAndInvSize` is `SceneContext.GetBufferSizeXY()` | **HARD**, `SetupUniformBufferParameters` |
-| `SceneDepthZ` is allocated at `GetBufferSizeXY()` | **[derived]**; a mismatch refuses at its own stage counter |
+| `SceneDepthZ` is allocated at `GetBufferSizeXY()` (prediction 5) | **[derived]** from the source, and **HARD in effect** since facts §36.22: `bufferSize=1` — the survivor passed the row-132 test against the depth extent L1 resolved for the same announcement, so a wrong derivation would have refused it at its own stage counter |
 | The struct's byte layout equals the constant buffer's (so the 2448-byte prefix parses at the same rows) | **HARD** in effect: `CreateUniformBufferImmediate` copies the struct's bytes, and `read_view_cb` has parsed those bytes for weeks |
 | `TUniquePtr` with the default deleter is one pointer | **HARD**, UE4 `UniquePtr.h` (EBO on `TDefaultDelete`) |
 | The scan finds exactly one survivor on this executable, and it latches | **HARD**, facts §36.22: `survivors=1` at every stage, `FViewInfo+5768`, latched after 8 claimed announcements with `preDisagree=0`. Menu, one launch |
 | The offset is `FViewInfo+5768` on this build of `Stray-Win64-Shipping.exe` | **HARD**, facts §36.22 — measured, not derived. Not portable across a game patch, which is why it is scanned for rather than pinned |
-| `SceneDepthZ` is allocated at `GetBufferSizeXY()` (prediction 5) | **HARD in effect**, facts §36.22: `bufferSize=1` — the survivor passed the row-132 test against L1's own depth extent, so a wrong derivation would have refused it |
 | The guards hold on the render thread against a discovered offset | **HARD**, facts §36.22: `faults=0 off=0` over 601 scans, no read the CPU refused |
 | The search's residue is a STALE RING COPY of the same view, not a foreign view | **HARD**, facts §36.22: `disagree=4` == `ambClaimed=4` event for event, every WARN naming jitter / `PreExposure` / `ClipToPrevClip` at row 0 |
 | Level 2 drives `ambClaimed` to 0 and moves the residue into `disagree=` | **UNCONFIRMED.** Level 1 is what ran; the mechanism it depends on is now HARD, the substitution is not. Pure logic tested (`tests/test_view_cached.cpp`, including the measured stale-copy pair as a regression case) |
-| The disagreement RATE (4/601, 0.67%) | **MENU ONLY**, and not comparable with §36.20's gameplay-free 0.33%. §36.21 measured a sibling counter going 0 → 171 across the menu/gameplay boundary |
+| The disagreement RATE (4/601, 0.67%) | **MENU ONLY** — as was §36.20's 0.33%. Neither is gameplay's rate, and §36.21 measured a sibling counter going 0 → 171 across that boundary, so do not average them or read a trend into the difference |
 | That removing the stale View changes the image | **UNCONFIRMED and not settleable by a counter.** §5's compounding class; the user's eyes decide |
 
 ### 19.6 The probe budget had to be the whole window, and it cost ~64 probes
