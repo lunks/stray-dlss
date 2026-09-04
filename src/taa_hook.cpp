@@ -63,6 +63,23 @@ std::atomic<std::uint64_t> g_view_cb_rejected{ 0 };
 // which colour-by-register and the u0 output still require, so this number bounds the saving from
 // above and is expected to be small against `shadow-copy`.
 std::atomic<std::uint64_t> g_view_cb_reads{ 0 };
+// THE OTHER HALF OF THE WRONG-VIEW BUG, AND IT IS NOW GATED (report §16.5, facts §36.20).
+// `view_fits_dispatch` bounds a candidate only from ABOVE, so an impostor whose rect is too
+// SMALL — a shadow, planar-reflection, cubemap-face or scene-capture view — passed plausibility,
+// row 135 and the fit bound alike, and one sitting on a lower root parameter won the search.
+// It counted 162 in the measured session and gated nothing; the consequence was 37 of 62 DLSS
+// features created at rects like 64x41 -> 3840x2160, i.e. the top-left corner of the frame
+// magnified over the whole screen. This counter now means "a candidate REJECTED for being below
+// the engine's own kMinTAAUpsampleResolutionFraction, so the search kept looking" — each one is
+// the fix firing, not a frame we got wrong.
+std::atomic<std::uint64_t> g_view_suspect_small{ 0 };
+// More than one plausible View survived the filter on one dispatch, so the pick was a choice.
+// SPLIT BY WHETHER THE ENGINE CLAIMED THE DISPATCH. A session offers ~10 000 look-alikes beside
+// ~9 000 real upscales, so an undifferentiated count is diluted by an order of magnitude and
+// cannot answer the actual question: was DLSS SR ITSELF ever fed the wrong view?
+std::atomic<std::uint64_t> g_view_amb_claimed{ 0 };
+std::atomic<std::uint64_t> g_view_amb_other{ 0 };
+std::atomic<std::uint32_t> g_view_amb_logged{ 0 };
 std::atomic<std::uint32_t> g_resolve_skipped_stale{ 0 };
 bool g_render_size_logged = false;
 // [STRAYDLSS] NgxEvaluate. Off by default: this is the first switch that can change what the
@@ -705,12 +722,30 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	// on different passes.
 	ue4::ViewParams view{};
 	bool view_ok = false;
+	// INVESTIGATION ONLY (facts §36.20). Nothing below changes which CB is picked; it counts
+	// what the current filter cannot see. `view_fits_dispatch` catches an impostor whose rect is
+	// LARGER than the dispatch; one that is SMALLER passes silently and would feed DLSS another
+	// view's jitter, ClipToPrevClip and CameraCut. These two numbers say whether that subset is
+	// empty, occasional or constant — which is the whole question, and it decides the fix.
+	// `distinct_rival` is the number that matters, and it is NOT "how many candidates survived".
+	// Two root parameters can point at one suballocation, or hold byte-identical copies of the
+	// same view - neither is a choice the search can get wrong. Only a survivor that would hand
+	// DLSS DIFFERENT ClipToPrevClip / jitter / CameraCut is ambiguity.
+	bool distinct_rival = false;
+	char cand_list[192];
+	int cand_off = 0;
+	cand_list[0] = '\0';
 	for (const auto &cb : b.constant_buffers)
 	{
 		ue4::ViewParams candidate{};
 		g_view_cb_reads.fetch_add(1, std::memory_order_relaxed);
 		if (!read_view_cb(cb.second, candidate) || !ue4::view_params_plausible(candidate))
 			continue;
+		if (cand_off >= 0 && cand_off < static_cast<int>(sizeof(cand_list)) - 1)
+			cand_off += std::snprintf(cand_list + cand_off, sizeof(cand_list) - cand_off,
+				" b%u=%.0fx%.0f", cb.first,
+				static_cast<double>(candidate.view_size_and_inv_size.x),
+				static_cast<double>(candidate.view_size_and_inv_size.y));
 		// KEEP LOOKING IF THIS IS A DIFFERENT VIEW'S BUFFER. Plausibility (and row 135) only
 		// establish that a buffer IS a View uniform buffer; a shadow, cubemap-face or
 		// scene-capture view satisfies both. The search runs in slot order, so a wrong-but-
@@ -722,7 +757,37 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// be larger than the dispatch covers cannot be this one.
 		if (!ue4::view_fits_dispatch(candidate, x * 8u, y * 8u))
 		{
-			g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			// Gated on !view_ok so this keeps the meaning it had when the loop still broke at
+			// the winner: candidates on LATER root parameters could never have won under either
+			// selection rule, and counting them would make this incomparable with the 19 870
+			// recorded in facts §36.19.
+			if (!view_ok)
+				g_view_cb_rejected.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		// AND KEEP LOOKING IF IT IS TOO SMALL, which is the other half of the same test and
+		// used to be measured without being acted on (facts §36.20, report §16.5).
+		// `view_fits_dispatch` above bounds a candidate only from ABOVE; a shadow, planar-
+		// reflection, cubemap-face or scene-capture view is SMALLER than the dispatch and
+		// passed plausibility, row 135 and that bound alike, so one on a lower root parameter
+		// still won the search. UE 4.27 will not ask for a temporal upscale from below
+		// `kMinTAAUpsampleResolutionFraction` = 0.5 of the output rect on either axis, and the
+		// dispatch covers the output rect - so a candidate under that floor is not this
+		// dispatch's view. SKIPPING it rather than refusing the frame is the point: the real
+		// view usually sits on a HIGHER root parameter, so the search now finds it and DLSS
+		// runs correctly instead of declining. `primary_view_shape_ok` at the create site is
+		// the backstop for when it does not.
+		if (!ue4::view_fraction_plausible(candidate, x * 8u, y * 8u))
+		{
+			if (!view_ok)
+				g_view_suspect_small.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (view_ok)
+		{
+			// Keep scanning ONLY to judge ambiguity; the pick is unchanged (first accepted).
+			if (ue4::views_differ_temporally(view, candidate))
+				distinct_rival = true;
 			continue;
 		}
 		view = candidate;
@@ -730,7 +795,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		b.view_cb = cb.second;
 		b.view_cb_valid = true;
 		b.view_cb_register = cb.first;
-		break;
 	}
 	// THE CB WE PICKED WAS FOUND BY SEARCH, NOT BY NAME. `view_params_plausible` is a shape
 	// test — it can be satisfied by the wrong buffer — and a wrong View means wrong jitter,
@@ -814,6 +878,35 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	{
 		seam_verdict = seamhook::claim(x, y);
 		seam_gate = seamhook::gate(seam_verdict.announced);
+
+		// THE QUIET-RESIDUE VERDICT, and it is only meaningful on a CLAIMED dispatch. The
+		// question is not "was any dispatch's View ambiguous" - look-alikes outnumber real
+		// upscales here - it is "was DLSS SR itself ever handed a view it had to guess at".
+		// `distinct_rival` means a second surviving candidate would have given different
+		// ClipToPrevClip / jitter / CameraCut, i.e. the slot-order search was guessing.
+		if (view_ok && distinct_rival)
+		{
+			const bool claimed = (seam_gate == seam::Gate::engine);
+			if (claimed)
+				g_view_amb_claimed.fetch_add(1, std::memory_order_relaxed);
+			else
+				g_view_amb_other.fetch_add(1, std::memory_order_relaxed);
+			if (claimed && g_view_amb_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+				STRAY_LOG_WARN("VIEW CB AMBIGUITY ON A CLAIMED DISPATCH: %ux%u groups (covers "
+					"%ux%u px). More than one View survived plausibility + row135 + "
+					"fits-dispatch + the 0.5 minimum fraction, AND they disagree on "
+					"ClipToPrevClip / jitter / CameraCut - so the slot-order search GUESSED, "
+					"and DLSS SR took the guess. We used b%u = %.0fx%.0f (fraction %.3f of the "
+					"dispatch). All plausible candidates:%s. The too-SMALL impostors are gated "
+					"out now (facts §36.20), so anything left here is a rival of a legal shape "
+					"and would need the View CB by IDENTITY to settle (report §15.2). Logged 8 "
+					"times.",
+					x, y, x * 8u, y * 8u, b.view_cb_register,
+					static_cast<double>(view.view_size_and_inv_size.x),
+					static_cast<double>(view.view_size_and_inv_size.y),
+					x != 0 ? static_cast<double>(view.view_size_and_inv_size.x) / (x * 8.0) : 0.0,
+					cand_list);
+		}
 		// L1: the engine handed us its own scene colour, depth and velocity in FPassInputs.
 		// Resolve them HERE - at dispatch time the graph has executed, so a texture that had
 		// no RHI resource at AddPasses time has one now. Each is validated against our own
@@ -2044,11 +2137,16 @@ void resolve_counters(std::uint32_t &attempts, std::uint32_t &skipped_stale)
 	skipped_stale = g_resolve_skipped_stale.load(std::memory_order_relaxed);
 }
 
-void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view)
+void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
+                          std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
+                          std::uint64_t &amb_other)
 {
 	ok = g_view_row135_ok.load(std::memory_order_relaxed);
 	bad = g_view_row135_bad.load(std::memory_order_relaxed);
 	wrong_view = g_view_cb_rejected.load(std::memory_order_relaxed);
+	suspect_small = g_view_suspect_small.load(std::memory_order_relaxed);
+	amb_claimed = g_view_amb_claimed.load(std::memory_order_relaxed);
+	amb_other = g_view_amb_other.load(std::memory_order_relaxed);
 }
 
 std::uint64_t view_cb_read_count()

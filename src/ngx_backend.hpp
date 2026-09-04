@@ -69,8 +69,24 @@ struct FeatureDesc
 // change needs a full ReleaseFeature + CreateFeature (CLAUDE.md §2.1), so this compares the
 // requested description against the live one and rebuilds only on a real change.
 //
+// A RE-creation is additionally DEBOUNCED (`src/core/feature_recreate.hpp`): a differing rect
+// must be asked for `NgxRecreateStableFrames` frames running before anything is torn down, and
+// meanwhile this returns false so the engine's own TAA renders the frame. That is what stops a
+// scripted scene transition — whose view rect animates every few frames — recreating the
+// feature six to ten times in a second, each recreation a lost temporal history and a full
+// CreateFeature stall. The FIRST creation is never debounced.
+//
 // Returns false and records last_error() on failure; the caller must then not evaluate.
 bool ensure_feature(ID3D12GraphicsCommandList *cmd, const FeatureDesc &desc);
+
+// [STRAYDLSS] NgxRecreateStableFrames. 0 restores the pre-2026-09-03 behaviour (recreate on the
+// first differing frame) so the box can A/B it without a rebuild.
+void set_recreate_stable_frames(unsigned int frames);
+
+// `waits` counts frames declined by the debounce, `restarts` the times the requested rect
+// changed AGAIN mid-debounce. A large `restarts` with `waits` climbing and no creations is an
+// ANIMATING rect — the scripted-transition signature — and is the debounce doing its job.
+void recreate_counters(unsigned long long &waits, unsigned long long &restarts);
 
 // [STRAYDLSS] NgxExposure, as parsed by exposure::parse_mode:
 //   auto    — the AutoExposure create flag, DLSS estimates exposure itself (default, and the

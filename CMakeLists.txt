@@ -91,6 +91,8 @@ add_library(stray_dlss_core STATIC
     src/core/exposure_plan.hpp
     src/core/fg_throttle.cpp
     src/core/fg_throttle.hpp
+    src/core/feature_recreate.cpp
+    src/core/feature_recreate.hpp
     src/core/ring.hpp
     src/host/ini.cpp
     src/host/ini.hpp
@@ -469,7 +471,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_native_core.cpp
         tests/test_fg_plan.cpp
         tests/test_exposure_plan.cpp
-        tests/test_fg_throttle.cpp)
+        tests/test_fg_throttle.cpp
+    tests/test_feature_recreate.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 
     if(MSVC)

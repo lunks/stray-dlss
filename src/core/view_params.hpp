@@ -87,6 +87,47 @@ bool view_params_plausible(const ViewParams &p);
 // `covered_w`/`covered_h` are group_count * 8. Inclusive, so DLAA (view == dispatch) passes.
 bool view_fits_dispatch(const ViewParams &p, std::uint32_t covered_w, std::uint32_t covered_h);
 
+// THE OTHER HALF OF THE SAME TEST, and the search GATES on it (facts §36.20, report §16.5).
+//
+// `view_fits_dispatch` catches an impostor whose rect is LARGER than the dispatch — the subset
+// that failed loudly and became the 1.2% `unclaimed` (facts §36.18). An impostor whose rect is
+// SMALLER passes it silently, and hands DLSS another view's jitter, ClipToPrevClip and
+// CameraCut — and, because `fd.render_*` is read from the same buffer, an
+// `InRenderSubrectDimensions` of 64x41 against the real 1920x1080 scene colour, which magnifies
+// the top-left corner of the frame over the whole screen (the user's "carpet"). MEASURED: 37 of
+// 62 DLSS feature creations in one session, `suspectSmall=162` in the same session's `[view]`
+// line while nothing was gated on it.
+//
+// A candidate failing this is SKIPPED and the search continues, so the real view — usually on a
+// HIGHER root parameter — is found and DLSS runs correctly rather than the frame being declined.
+// `taa_signature::primary_view_shape_ok` is the create-site backstop for when it is not.
+//
+// It comes from the engine's own declared range, not from a guess:
+// `FSceneViewScreenPercentageConfig::kMinTAAUpsampleResolutionFraction` is **0.5**
+// (SceneView.h:1438-1439) — the same constant `seam::discover` already validates the
+// ITemporalUpscaler vtable against. So for any `Main*` config the input view rect is at least
+// half the output rect, and the dispatch covers the output rect.
+//
+// The slack is quantisation: the dispatch covers `group count * 8`, which rounds the real
+// output rect UP by at most 7 px per axis, so the floor is loosened by 8 rather than being
+// exact. A shadow or capture view is nowhere near this line — 512x512 against 3840x2160 is
+// 0.13, not 0.5 — so the test does not need to be tight to be decisive.
+bool view_fraction_plausible(const ViewParams &p, std::uint32_t covered_w,
+                             std::uint32_t covered_h);
+
+// Do these two decoded Views differ in the fields that actually REACH A TEMPORAL CONSUMER?
+//
+// This is what makes an ambiguity count mean something. Two root parameters can point at one
+// suballocation, or hold byte-identical copies of the same view's uniform buffer — neither is a
+// choice the search can get wrong, and counting them inflates the number with events where no
+// view was ever at stake. Only a candidate that would hand DLSS DIFFERENT motion is ambiguity.
+//
+// The fields are exactly those a temporal consumer integrates: ClipToPrevClip element by
+// element (the camera-motion reconstruction), TemporalAAParams (the jitter, CLAUDE.md §2.7) and
+// CameraCut (§2.8). Exact comparison, not a tolerance: two reads of the same buffer are
+// bit-identical, and anything else is a different view.
+bool views_differ_temporally(const ViewParams &a, const ViewParams &b);
+
 // Is the PreExposure / OneOverPreExposure pair (rows 135.y and 135.z) self-consistent? Separate
 // from view_params_plausible ON PURPOSE — that gate governs the whole DLSS path, and those rows
 // are [derived], so a wrong offset there would disable upscaling entirely. Callers that consume
