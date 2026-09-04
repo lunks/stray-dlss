@@ -3591,3 +3591,53 @@ creation histogram alone would have shown group A; **only the ordered sequence s
 one costs a second creation**, which is what turned "37 of 62 look wrong" into "59% of all
 creations are this bug". When a counter is a total, ask for the order before estimating what
 removing it buys.
+
+## 37. The engine names `u0` — and every register of the TAA pass — on the RHI thread (2026-09-04)
+
+`[STRAYDLSS] U0Hook` (`src/core/u0_rhi_uav.hpp`, `src/u0_rhi_hook.cpp`, branch `u0-rhi-uav`).
+The route, the discovery and the refusals are `docs/RESEARCH-U0-IDENTITY.md` §10; this section is
+what the box measured. Log lines are verbatim. Config A (no ReShade), `EngineSeam=3`,
+`EngineSeamInputs=1`, `U0Hook=2`, launched `--no-drive` into the main menu with no injected input —
+the menu runs the TAA pass, so every counter below is readable there.
+
+### 37.1 What the design predicted, so the measurement can be checked against it
+
+| Prediction | Kind |
+|---|---|
+| Our `Dispatch` hook's return address resolves through `.pdata` to ONE function start, eight dispatches running | seed |
+| Exactly one read-only qword equals that start; 24 bytes before it is a vtable whose 38 slots are all code | vtable |
+| Slots 5, 10, 11, 12, 13, 25 begin with `C3` (`RHISetAsyncComputeBudget`, the four `UAVOverlap`, `RHIInvalidateCachedState` — empty bodies) | REQUIRED |
+| Slots 28, 32, 33, 37 begin with `C3`; slot 36 with `33 C0 C3` (`return nullptr`) | reported |
+| Exactly one of slots 16/17 is handed objects holding a UAV CPU handle; the other fires rarely or never (the `InitialCount` overload) | measured, not counted |
+| The UAV handle sits at +40 in the object (`FRHIUnorderedAccessView` 24 bytes, `FD3D12View` vptr, `TD3D12ViewDescriptorHandle{Parent, Handle}`) | [derived] |
+| `u0` from the bind == `u0` from the descriptor walk, on every engine-announced dispatch | THE assertion |
+| `t0..t5` from the bind == the walk's SRVs at the same registers | the widened assertion |
+| The bracket binds exactly ONE uniform buffer and its register == the View-CB search's choice | the View register |
+| `(*OutSceneColorTexture)->Name` reads `L"TemporalAA"` at the seam | RDG layout self-check |
+
+### 37.2 Measured
+
+**NOT YET RUN.** The artifact is CI run `33842689249` (`StrayDLSS.dll` md5
+`f21bb04c0b35e9dbee51fe4b6b66a97d`, 929 792 bytes, PDB GUID `03F3D544-478C-4F23-A519-133E2EB929A1`),
+staged on the host at `/tmp/u0/` with `box-deploy.sh` (backs the DLL up, sets `U0Hook=2`). The lines
+that settle each prediction above, in the order they appear in `stray-dlss-plugin.log`:
+
+| Line | Settles |
+|---|---|
+| `U0 HOOK MODE: observe` | the module mapped and `.pdata` was found (`.pdata entries=`) |
+| `U0 HOOK FOUND: FD3D12CommandContext vtable at ...` / `U0 HOOK: ... NOT FOUND - <reason>` | the seed, the vtable, the six REQUIRED `ret` slots; `Predictions held at slots:` / `not held` lists the reported ones; `ICF:` says whether the empty bodies folded |
+| `U0 HOOK slots: ...` | the six probed addresses, for the record |
+| `U0 HOOK INSTALLED: 7 of 7 slots` | the thunks went in |
+| `U0 HOOK: vtable slot 16/17 classified as uav/silent ...` | which overload MSVC put where |
+| `U0 HOOK: the UAV object's CPU descriptor handle sits at +N` | the [derived] +40 |
+| `U0 HOOK: first UAVIndex==0 bind resolved - slot N ...` | the cross-match fired |
+| `U0 HOOK AGREES: ... the SAME resource` / `U0 HOOK ASSERTION: ... THEY DIFFER` | THE assertion |
+| `U0 HOOK REGISTERS on pass ...` | t0..t5 and the View register, engine vs walk, one bracket |
+| `ENGINE SEAM: the engine's output texture ... carries FRDGResource::Name L"TemporalAA"` | the RDG layout self-check |
+| `[u0] frame N: ...` every 600 frames | `assert: agree= disagree= noBind=`, `regs: ... disagreeMask=`, `viewReg: ...`, `faults= off=` |
+| `[seam] frame N: ... u0name: ok= bad= unreadable=` | the self-check's rate |
+
+Success is `disagree=0` in all three groups with `agree` tracking the seam's `claimed`, `noBind=0`,
+`faults=0 off=0`, and `u0name: bad=0`. `noBind` non-zero means the UAV slot is not 16 or 17 on this
+exe; `unresolved` non-zero means the cross-match did not find the handle (read the scan counters);
+`seed foreign=` non-zero means the return address was not the game's (Config B).
