@@ -2809,3 +2809,64 @@ would be cleaner.
 
 The live ini was restored from `Engine.ini.bak-before-rt` afterwards: `r.RayTracing=False`,
 SSGI off, GTAO on, `r.TemporalAASamples=8`.
+
+## §50 `r.MipMapLODBias=-1` was a SECOND mip bias — the engine already applies one (2026-09-04)
+
+The live `Engine.ini` carried `r.MipMapLODBias=-1`, added as "the mip bias DLSS requires"
+(`log2(render/output)` = -1 at 50% screen percentage). **UE 4.27 already computes exactly that,
+automatically**, whenever the primary screen-percentage method is `TemporalUpscale` — which on
+this title is always (§2.3.1, `r.TemporalAA.Upsampling=True`). `SceneVisibility.cpp:3238-3245`:
+
+```cpp
+else if (View.PrimaryScreenPercentageMethod == EPrimaryScreenPercentageMethod::TemporalUpscale)
+{
+    View.MaterialTextureMipBias = -(FMath::Max(-FMath::Log2(EffectivePrimaryResolutionFraction), 0.0f))
+                                  + CVarMinAutomaticViewMipBiasOffset.GetValueOnRenderThread();
+    View.MaterialTextureMipBias = FMath::Max(View.MaterialTextureMipBias,
+                                             CVarMinAutomaticViewMipBias.GetValueOnRenderThread());
+}
+```
+
+Defaults (`:121-131`): `r.ViewTextureMipBias.Offset` = **-0.3**, `r.ViewTextureMipBias.Min` =
+**-2.0**. At 50%: `-(1) + (-0.3) = -1.3`, clamped to -1.3. **So the engine was applying -1.3 and
+the ini added another -1 on top.**
+
+**Removed.** The two are different mechanisms — `r.MipMapLODBias` biases the streaming/sampler
+LOD, `MaterialTextureMipBias` is the per-view value used in material sampling — so strict
+additivity at the sampler is **not proven**; both push the same direction and the intent
+("apply the DLSS bias") was already satisfied by the engine. Over-sharpened sampling is the
+worst-presenting kind of mistake here: it looks SHARPER in a still screenshot and shimmers in
+motion, which is precisely the high-frequency energy a temporal upscaler then has to fight.
+
+**THE PATTERN, and this is the third instance — it deserves a name.** A cvar whose name reads
+like a final value but which the engine treats as an INPUT to something it computes:
+
+| cvar | what it looks like | what it is |
+|---|---|---|
+| `r.TemporalAASamples` | the phase count | a BASE multiplied by `1/fraction²` (§41) |
+| `r.MipMapLODBias` | the DLSS mip bias | a SECOND bias added to an automatic one (here) |
+| `r.AmbientOcclusionMaxQuality` | the AO quality | 100 DEFERS to the post-process volume; -100 enforces |
+
+Each was set to "the documented correct value" and each therefore overshot. **Before setting a
+cvar to a value some guide names, check whether the engine already derives it** — in every one
+of these three the engine did, and in two of them the setting made things worse than leaving it
+alone.
+
+## §51 Six inert lines removed from the live ini (2026-09-04)
+
+Removed with the mip bias, none of which changes behaviour — the point is that the file had
+stopped describing what actually runs, which is how "GTAO is on" hid the fact that SSGI's mask
+was replacing `ScreenSpaceAO` outright for a day:
+
+| line | why it does nothing |
+|---|---|
+| `r.Shadow.Denoiser=0` | **the cvar does not exist in UE 4.27** |
+| `r.AmbientOcclusion.Denoiser=0` | RTAO-only path |
+| `r.Reflections.Denoiser=0` | SSR denoise is gated on `r.SSR.ExperimentalDenoiser`, default 0 |
+| `r.AOQuality=2` | distance-field AO; the game ships `r.GenerateMeshDistanceFields=False` |
+| `r.DiffuseIndirect.Denoiser=0` | gates SSGI, now off |
+| `r.SSGI.Quality` / `.HalfRes` / `.LeakFreeReprojection` | inert with `r.SSGI.Enable=0` |
+
+Live ini after: 97 -> 88 non-blank lines. Backup `Engine.ini.bak-before-drop`. The measured,
+load-bearing settings are untouched: `r.RayTracing=False`, `r.SSGI.Enable=0`,
+`r.AmbientOcclusion.Method=1` with its GTAO knobs, `r.TemporalAASamples=8`, `r.SSR.Temporal=1`.
