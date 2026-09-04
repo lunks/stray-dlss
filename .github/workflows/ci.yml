@@ -44,7 +44,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   build-windows:
-    name: Add-on (Windows, MSVC, NGX=${{ matrix.ngx }})
+    name: Native + WARP (Windows, MSVC, NGX=${{ matrix.ngx }})
     runs-on: windows-latest
     needs: tests-linux
     env:

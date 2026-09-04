@@ -16,7 +16,6 @@
 #include "d3d12_restore.hpp"
 
 
-#include <state_tracking.hpp>
 #include "mv_resolve.hpp"
 
 #include <d3d12.h>
