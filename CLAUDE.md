@@ -3827,3 +3827,17 @@ They are complementary and none of them replaces seeing the game render.
   `docs/STRAY-RENDERING-FACTS.md` in the same change** that reacts to it.
 * Never commit `nvngx_dlss.dll` or game assets. Redistribution is permitted only as part of an
   application with material additional functionality, never stand-alone — CI fetches it.
+* **Before setting a cvar to a value some guide names, check whether the engine already derives
+  it.** Measured three times on this title, each time the "documented correct value" overshot
+  because UE 4.27 computes the quantity itself and the cvar is an INPUT to that computation:
+
+  | cvar | reads like | is | consequence of "setting it correctly" |
+  |---|---|---|---|
+  | `r.TemporalAASamples` | the phase count | a base multiplied by `1/fraction²` | 16 gave **64** phases; NVIDIA wants 32, which is the stock **8** (facts §41) |
+  | `r.MipMapLODBias` | the DLSS mip bias | a second bias added to an automatic one | -1 on top of the engine's -1.3 = **-2.3**, over-sharpened (facts §50) |
+  | `r.AmbientOcclusionMaxQuality` | maximum quality | **100 DEFERS** to the post-process volume | `-100` is what enforces maximum |
+
+  Two of the three made the image worse than leaving them alone, and both presented as "sharper"
+  in a still screenshot while shimmering in motion — the failure mode this project is least able
+  to see and most damaged by. Grep the 4.27 source for the cvar's declaration and read what
+  consumes it before writing it into `Engine.ini`.
