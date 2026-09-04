@@ -32,18 +32,6 @@
 #include <string>
 #include <vector>
 
-// True when the d3d12.dll we bound to is ReShade's proxy — it exports the add-on entry points.
-// The ReShade host is gone, so nothing drops ReShade in beside this exe any more and this is
-// expected to be false everywhere; it is KEPT because every call site already has a correct
-// non-ReShade branch, and because a harness that silently assumed "no ReShade" would be wrong
-// the moment someone did put it back.
-static bool running_under_reshade()
-{
-	HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
-	return d3d12 != nullptr && ::GetProcAddress(d3d12, "ReShadeRegisterAddon") != nullptr;
-}
-
-
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -91,6 +79,13 @@ struct Gpu
 // NVIDIA driver — the layer WARP cannot model.
 bool g_use_hardware = false;
 
+// True when the d3d12.dll we bound to is ReShade's proxy. It exports the add-on entry points;
+// the real runtime does not.
+bool running_under_reshade()
+{
+	const HMODULE d3d12 = ::GetModuleHandleW(L"d3d12.dll");
+	return d3d12 != nullptr && ::GetProcAddress(d3d12, "ReShadeRegisterAddon") != nullptr;
+}
 
 bool create_gpu(Gpu &gpu)
 {
@@ -1265,7 +1260,6 @@ bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
 //
 // get_native() hands the restore the harness's real WARP command list, so the native calls it
 // emits genuinely execute and the debug layer judges them.
-
 // Does ReShade's vkd3d extension hook reach descriptors we mint on the ORIGINAL device?
 //
 // CLAUDE.md §1 mandates initialising NGX with device::get_native() -- the original vkd3d
@@ -1292,7 +1286,6 @@ bool test_validation_catches_wrong_root_parameter_type(Gpu &gpu)
 // This probe answers only that, and deliberately never calls the CUDA functions: it reads the
 // vtable slot from the original device's interface, forces the patch by querying the proxy, and
 // reads the slot again.
-
 // Is copying FROM a shader-visible heap what kills us?
 //
 // mv_resolve copies the game's SRV descriptors into its own heap. The harness has always
@@ -1604,6 +1597,13 @@ int main(int argc, char **argv)
 	std::printf("d3d12.dll is %s\n",
 		under_reshade ? "ReShade's proxy - every test below runs through it"
 		              : "the plain runtime");
+
+	Gpu gpu;
+	if (!create_gpu(gpu))
+	{
+		std::printf("could not create a WARP device\n");
+		return 1;
+	}
 	std::printf("device up, info queue %s\n", gpu.info ? "active" : "UNAVAILABLE");
 
 	test_validation_catches_wrong_root_parameter_type(gpu);
