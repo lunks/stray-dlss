@@ -2201,10 +2201,15 @@ A fourth check runs when the image allows it, and it is also the **only** thing 
 break a tie. `FindFreeElement`'s last act is `FindFreeElementInternal`
 (`RenderTargetPool.cpp:703`), and that function contains the `UE_LOG` format string
 `%d MB, NewRT %s %s` (`:403`). When that literal survives, the internal is nameable from its own
-xref, and **if exactly one of the two front-runners calls it, that one is the function whatever
-the group counts say** (`resolved_by_internal`, reported on the scan line). That is a fact from
-the engine's source, not a preference — with no internal, or with both calling it, or with
-neither, the ranking stands and a tie is still refused. It matters because the realistic
+xref, and **when the two front-runners are TIED on groups and exactly one of them calls it, that
+one is the function** (`resolved_by_internal`, reported on the scan line). That is a fact from the
+engine's source, not a preference — with no internal, or with both calling it, or with neither,
+the ranking stands and a tie is still refused. **It is deliberately not allowed to overrule a
+candidate the ranking already separated**: that would let one mis-attributed `internal_fn` promote
+a one-group candidate over a six-group one, a bigger hole than the tie it closes. Where the
+ranking decided, the internal call is REPORTED and nothing more — and it reading "does NOT call
+it" against a clear winner is exactly the sort of thing a human should see rather than a rule
+should act on. It matters because the realistic
 ambiguity in this binary is not a random address: it is some *other* helper genuinely called
 from four of the six allocators, and no amount of proximity heuristics would separate that
 honestly. **The scan searches for the literal and reports either way**,
