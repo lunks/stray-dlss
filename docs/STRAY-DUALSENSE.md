@@ -2673,8 +2673,9 @@ is the coil lane's own level — a preference, not a correctness question.
 
 > **This corrects a reading taken from the log mid-investigation** — that `Scratch_VIBE` starting
 > at `Level=0.000` and mixing at peak 0.39–0.64 "proves `Level` is not a gain applied before our
-> tap". It does not, and the direct measurement says the opposite. The scratch anomaly is real but
-> is a separate open question (below).
+> tap". It does not, and the direct measurement below says the opposite — as does the game's own
+> Blueprint bytecode (§20.10), independently. The scratch anomaly that prompted that reading was
+> real, and it is resolved in §20.10: the ~60 Hz `SetPS5VibrationLevel` ramp is simply not logged.
 
 #### The measurement: one asset, four levels, a constant ratio
 
