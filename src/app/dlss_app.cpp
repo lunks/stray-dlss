@@ -663,6 +663,17 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// an out-of-range ini value is still visible to a host's status display rather than being
 	// silently rewritten on load.
 	g_nr_ui.style = host::cfg::get_int("NgxNRStyle", g_nr_ui.style);
+	// 1 = the truth (UE 4.27 reversed-Z). 0 is a deliberate lie whose only purpose is to prove
+	// whether feature 18 consumes our depth at all — if the image is identical either way, it
+	// does not, and that retires a whole family of hypotheses in one launch.
+	{
+		const int di = host::cfg::get_int("NgxNRDepthInverted", 1);
+		nr::set_depth_inverted(di != 0 ? 1u : 0u);
+		if (di == 0)
+			STRAY_LOG_WARN("[STRAYDLSS] NgxNRDepthInverted=0: telling feature 18 that depth is "
+				"NOT inverted, which is FALSE for UE 4.27's reversed-Z. This is a diagnostic "
+				"lie: if the image does not change, the runtime is not using our depth.");
+	}
 	int nr_auto_mask = g_nr_ui.auto_mask ? 1 : 0;
 	int nr_ui_correction = g_nr_ui.ui_correction ? 1 : 0;
 	nr_auto_mask = host::cfg::get_int("NgxNRAutoMask", nr_auto_mask);
