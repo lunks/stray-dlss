@@ -1236,6 +1236,57 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		// The render-target pool's name map: the discovery verdict, the RR guide set by name,
 		// and the assertions against the routes that already answer for depth and velocity.
 		poolhook::log_report(when);
+		// RAY RECONSTRUCTION, and it CANNOT be absent while NgxRR is non-zero. Three lines are
+		// possible and exactly one is printed: the totals with every refusal reason; "NOT ASKED"
+		// when no frame ever reached the evaluate; and the [rrprobe] line, always. Totals
+		// without reasons cost this project one round trip on the SR path (CLAUDE.md §2.3) and
+		// a probe with no line at all cost another on 2026-09-04 - a frame that fell back
+		// because the guide set was stale, a frame that fell back because DLSSD would not
+		// create, and a session where RR was never asked are three different fixes.
+		std::uint32_t rr_ok = 0, rr_fallback = 0;
+		taa_hook::rr_counters(rr_ok, rr_fallback);
+		if (rr_ok + rr_fallback > 0)
+		{
+			char line[512];
+			int off = std::snprintf(line, sizeof(line),
+				"[%s] [rr] evaluates=%u fallbacks=%u (%.1f%% RR) | refusals:", when, rr_ok,
+				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
+			std::uint32_t reasons[taa_hook::kRrReasonCount] = {};
+			taa_hook::rr_reason_counters(reasons);
+			for (std::size_t i = 0; i < taa_hook::kRrReasonCount && off > 0 &&
+				off < static_cast<int>(sizeof(line)); ++i)
+			{
+				if (reasons[i] == 0)
+					continue;
+				off += std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off),
+					" %s=%u", taa_hook::rr_reason_name(i), reasons[i]);
+			}
+			if (rr_fallback == 0 && off > 0 && off < static_cast<int>(sizeof(line)))
+				std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off), " none");
+			STRAY_LOG_INFO("%s", line);
+		}
+		else if (ngx::rr_mode() != 0)
+		{
+			// RR WAS NEVER ASKED, AND THAT IS SAID OUT LOUD. The absence of the [rr] line above
+			// is by design under NgxRR=1 - the probe does not evaluate - but "by design" and
+			// "the evaluate site never ran" look identical when the line simply is not there,
+			// and this project has just paid a round trip for exactly that shape of silence.
+			STRAY_LOG_INFO("[%s] [rr] NOT ASKED: no frame has reached the Ray Reconstruction "
+				"evaluate this session. Under NgxRR=1 that is CORRECT and expected - the probe "
+				"only creates and releases a throwaway feature, it never evaluates, so read the "
+				"[rrprobe] line for the answer instead. Under NgxRR=2 it means the TAA hook's "
+				"evaluate site was never reached at all (no DLSS SR evaluate either), which is a "
+				"fault upstream of RR.", when);
+		}
+		// THE PROBE'S OWN LINE, on the LOG channel. Printed whenever NgxRR is non-zero and
+		// whatever happened, including nothing - see src/ngx_backend.hpp's RRProbeState.
+		if (ngx::rr_mode() != 0)
+		{
+			char probe[640] = {};
+			if (ngx::format_rr_probe_report(probe, sizeof(probe)) > 0)
+				STRAY_LOG_INFO("[%s] %s", when, probe);
+		}
+
 		// Beside it, the ONE number that says whether the View constant buffer we are reading
 		// every frame is the right one. It is located by SEARCH and `view_params_plausible` is
 		// a shape test the wrong buffer can satisfy; row 135 validates itself from one read
@@ -1411,6 +1462,21 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				// ASKED about a frame, so an NgxRR=0 session carries none of these keys and a
 				// non-zero one carries every reason including the zeroes - automation must be
 				// able to tell "this reason never fired" from "this reason is not reported".
+				// The probe's SECOND channel. Written whenever NgxRR is non-zero, so automation
+				// can read the outcome without the log - the whole point being that this answer
+				// must not be losable to one channel.
+				if (ngx::rr_mode() != 0)
+				{
+					const ngx::RRStatus &rs = ngx::rr_status();
+					std::fprintf(f, "rr_mode=%d\n", ngx::rr_mode());
+					std::fprintf(f, "rr_probe_state=%s\n", ngx::rr_probe_state_text(rs.state));
+					std::fprintf(f, "rr_probe_ensure_calls=%llu\n",
+						(unsigned long long)rs.ensure_feature_calls);
+					std::fprintf(f, "rr_probe_result=0x%08x\n", rs.probe_create_result);
+					std::fprintf(f, "rr_probe_create_ok=%d\n", rs.probe_create_ok ? 1 : 0);
+					std::fprintf(f, "rr_dlssd_available=%d\n", rs.available ? 1 : 0);
+					std::fprintf(f, "rr_ngx_initialised=%d\n", rs.initialise_ran ? 1 : 0);
+				}
 				std::uint32_t rr_ok = 0, rr_fallback = 0;
 				taa_hook::rr_counters(rr_ok, rr_fallback);
 				if (rr_ok + rr_fallback > 0)
@@ -1679,35 +1745,6 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		taa_hook::resolve_counters(attempts, skipped);
 		STRAY_LOG_INFO("[%s] resolve attempts=%u skipped_stale=%u (%.1f%%)", when, attempts,
 			skipped, attempts ? (100.0 * skipped / attempts) : 0.0);
-
-		// RAY RECONSTRUCTION. Printed only once RR has been ASKED about a frame, so an NgxRR=0
-		// session carries no line at all — but once it is on, the totals and EVERY refusal
-		// reason go out together. Totals without reasons cost this project a whole round trip
-		// on the SR path (CLAUDE.md §2.3) and the same mistake is not worth repeating: a frame
-		// that fell back because the guide set was stale and a frame that fell back because
-		// DLSSD refused to create are different fixes.
-		std::uint32_t rr_ok = 0, rr_fallback = 0;
-		taa_hook::rr_counters(rr_ok, rr_fallback);
-		if (rr_ok + rr_fallback > 0)
-		{
-			char line[512];
-			int off = std::snprintf(line, sizeof(line),
-				"[%s] [rr] evaluates=%u fallbacks=%u (%.1f%% RR) | refusals:", when, rr_ok,
-				rr_fallback, (100.0 * rr_ok) / (rr_ok + rr_fallback));
-			std::uint32_t reasons[taa_hook::kRrReasonCount] = {};
-			taa_hook::rr_reason_counters(reasons);
-			for (std::size_t i = 0; i < taa_hook::kRrReasonCount && off > 0 &&
-				off < static_cast<int>(sizeof(line)); ++i)
-			{
-				if (reasons[i] == 0)
-					continue;
-				off += std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off),
-					" %s=%u", taa_hook::rr_reason_name(i), reasons[i]);
-			}
-			if (rr_fallback == 0 && off > 0 && off < static_cast<int>(sizeof(line)))
-				std::snprintf(line + off, sizeof(line) - static_cast<std::size_t>(off), " none");
-			STRAY_LOG_INFO("%s", line);
-		}
 
 		if (nr::enabled())
 		{
