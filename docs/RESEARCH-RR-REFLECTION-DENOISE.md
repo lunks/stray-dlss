@@ -40,7 +40,7 @@ so. Only the first is contingent on a measurement.**
 2. **RR would replace a working engine denoiser, not an absent one.** The SSR temporal filter is
    already running — §1.3 gives already-measured evidence from our own box — and it is
    purpose-built for this signal. Replacing it with a network trained on ray/path-traced input
-   is a trade of a known-good for an unknown, at the cost of restoring ~1 100 deleted lines, a
+   is a trade of a known-good for an unknown, at the cost of restoring 1 472 deleted lines, a
    level-3 rung on a hook that is at level 1 and has never seen a single render target, a new
    guide-record trigger, and **giving up DLSS SR**, since RR replaces it rather than stacking.
 3. **Reflections are the content RR is *least* equipped for, and this argument holds even if the
@@ -204,9 +204,12 @@ the same published guides).
 | a record point where G-buffer CONTENT is alive | **absent, and not solved by names** (§3.2) |
 | `NgxRR` wiring | refuses at ERROR in `dlss_app.cpp:486`, correctly |
 
-Restoring the resolve is cheap and should be done from git history
-(`git show <deletion-commit>^:src/gbuffer_resolve.cpp`), never rewritten: it was CI-green, it
-implements NVIDIA's own sanctioned `EnvBRDFApproxRTG` recipe verbatim (RR-GBUFFER §2.3-§2.4), and
+Restoring the resolve is cheap and must be done from git history, never rewritten. The deletion
+is **`f2407fe`** and the six files are exactly **1 472 lines**: `shaders/gbuffer_resolve.hlsl`
+178, `src/core/envbrdf.{cpp,hpp}` 139 + 102, `src/gbuffer_resolve.{cpp,hpp}` 713 + 105,
+`tests/test_envbrdf.cpp` 235 — so `f2407fe^:src/gbuffer_resolve.cpp` and siblings. It was
+CI-green, it implements NVIDIA's own sanctioned `EnvBRDFApproxRTG` recipe verbatim
+(RR-GBUFFER §2.3-§2.4), and
 it had its own tests. It comes back **without** `gbuffer_classify` and **without** the finder; its
 three inputs become three named pool records.
 
