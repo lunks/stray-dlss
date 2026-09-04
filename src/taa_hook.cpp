@@ -4,6 +4,7 @@
 #include "core/feature_recreate.hpp"
 #include "engine_seam_hook.hpp"
 #include "view_params_hook.hpp"
+#include "pool_name_hook.hpp"
 #include "u0_rhi_hook.hpp"
 #include "exposure_texture.hpp"
 
@@ -1013,6 +1014,12 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			walk.view_cb_valid = b.view_cb_valid;
 			walk.view_cb_register = b.view_cb_register;
 			u0hook::assert_at_claim(walk, seam_verdict.out_width, seam_verdict.out_height, hash);
+			// ADJACENT ON PURPOSE, and it is the same `walk`: the render-target pool's map has
+			// `SceneColorDeferred` from AllocSceneColor, and t1 is the InputSceneColor this pass
+			// actually reads (CLAUDE.md §2.3). Whether they are the same allocation is an
+			// OBSERVATION with no prediction attached - measured rather than reasoned about.
+			// Inert unless [STRAYDLSS] PoolNames reached level 2 (src/pool_name_hook.hpp).
+			poolhook::note_taa_colour(walk.t[1]);
 		}
 
 		if (seam_gate == seam::Gate::heuristic && seam_verdict.active && !seam_verdict.announced)

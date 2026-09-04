@@ -34,7 +34,7 @@ refused, which every row must have or it does not ship.
 | **2** | **Which bound CB is `View`** — search every root CBV, keep the first plausible; measured taking a stale ring copy on 0.33% of claimed dispatches (facts §36.20) | `taa_hook.cpp` `read_view_cb` + search + `view_fits_dispatch` + the `[view]` counters **~200**; 1 of 9 root hooks; `registry::buffer_for_va`; the never-built two-offset design of TAA-hook §15 | **`FViewInfo::CachedViewUniformShaderParameters`** (`SceneRendering.h:1047`) — a **CPU copy of the exact struct** TAA's `View.ViewUniformBuffer` is created from (`SceneRendering.cpp:1859-1869`, bound at `TemporalAA.cpp:767`), reachable from the `const FViewInfo&` `AddPasses` already hands us | The search, the CB mapping, the ring-copy hazard, the ambiguity instrument, one root hook, `va_map` | The pointee must pass `view_params_plausible` **and** row 135 **and** its rows 129/130 must equal the extents L1 already resolves — then be **byte-identical** to `read_view_cb`'s 2448-byte prefix while both run | **BUILT AND MEASURED 2026-09-04** — `[STRAYDLSS] EngineSeamViewParams`, `src/core/view_cached.hpp`, `src/view_params_hook.cpp`. Level 1 ran on the box: **`FViewInfo+5768`**, one survivor, byte-IDENTICAL to the bound buffer, latched, `faults=0`, and `disagree=4` == the search's own `ambClaimed=4` **event for event** (facts §36.22). **Level 2 is now the DEFAULT**; level 3 (delete the search) declared, not built. Level 2's substitution is **UNCONFIRMED live and needs GAMEPLAY** (§2.4, TAA-hook report §19) |
 | **3** | **`u0`** — the SRV/UAV table walk's sole irreducible job | (counted in #1) | Three routes: the RHI bind stream (#1), the pool hook by name `L"TemporalAA"`, a fake `ISceneViewExtension` reading `ResourceRHI` inside `Execute()` | The reason #1 could not be deleted | Per route, in `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` | **In progress** on the box |
 | **4** | **The structural matcher's register roles, depth+stencil signature, rect arithmetic, cooked-hash table, pin, round-trip, shape gates** — bypassed under `EngineSeam=3`, still executed | sweep §11 steps 2+3: **~550** (`taa_hook.cpp` ~230, `taa_signature.cpp` ~160, `taa_hashes.hpp` 51, tests ~60) | Already the seam; #1 removes the last reason to run the matcher at all (register roles) | ~550 lines and the `MatchResult` dependency | The seam's own `unclaimed=0`/`orphans=0` session, already the licence condition | **Delete, after #1** — the sweep already said so; #1 removes its last excuse (§4) |
-| **5** | **RR's G-buffer guides** — the heuristic finder was deleted (~1 900 lines) and RR now refuses; nothing replaces it | 0 today; **~1 900 prevented** from regrowing | **The render-target pool's name argument.** In 4.27 `GBufferA-E`, `SceneDepthZ`, `GBufferVelocity`, `SceneColorDeferred` are allocated through the *outer* `FRenderTargetPool::FindFreeElement` with literal names (`SceneRenderTargets.cpp:1005-1741`) — **the exact function UEVR hooks**, with `Out` as an explicit parameter and no ABI trap | Any future finder. Replaces 1 900 lines with ~150 | Name equality + `FPooledRenderTargetDesc` format/extent + the `+8` `FRHITexture` → registry; and `FSceneRenderTargets`'s public members (`SceneRenderTargets.h:459-476`) as an independent oracle | **Build when RR is wired; do not rebuild a finder** (§5) |
+| **5** | **RR's G-buffer guides** — the heuristic finder was deleted (~1 900 lines) and RR now refuses; nothing replaces it | 0 today; **~1 900 prevented** from regrowing | **The render-target pool's name argument.** In 4.27 `GBufferA-E`, `SceneDepthZ`, `GBufferVelocity`, `SceneColorDeferred` are allocated through the *outer* `FRenderTargetPool::FindFreeElement` with literal names (`SceneRenderTargets.cpp:1005-1741`) — **the exact function UEVR hooks**, with `Out` as an explicit parameter and no ABI trap | Any future finder. Replaces 1 900 lines with ~150 | Name equality + `FPooledRenderTargetDesc` format/extent + the `+8` `FRHITexture` → registry; and `FSceneRenderTargets`'s public members (`SceneRenderTargets.h:459-476`) as an independent oracle | **BUILT 2026-09-04, level 1 (discover) — `[STRAYDLSS] PoolNames`, `src/core/pool_locator.hpp`, `src/pool_name_hook.hpp`. UNCONFIRMED live** (§5) |
 | **6** | **Camera-cut OR, jitter, `ClipToPrevClip`, `PreExposure`** — row reads from the searched CB | `core/view_params`, `ue4_view` (~400, all kept) | Same rows, from #2's CPU struct; the cut's second term from `View.PrevViewInfo.TemporalAAHistory.IsValid()` | Nothing — **the row reads are the safer thing** and stay; only their *source* changes | Row 135 as today | **Keep the reads; retarget the source** (§6) |
 | **7** | **"Are we in gameplay"** | `dlss_app.cpp:1253-1268` **~16** + the hash census | UE4SS reflection from C++ (`UObjectGlobals::FindFirstOf`, the probe's exact route) | ~16 + the census set | The probe file already agrees | **Delete** (sweep §7, unchanged) |
 | **8** | **Engine cvars as HARD comments** (`r.RayTracing`, `r.SceneColorFormat`, …) | comments + a planned ~30-line assertion | **UE4SS locates `ConsoleManagerSingleton` by AOB** — SOFT (DeepWiki over the repo) — so `FindConsoleVariable` is callable from a C++ mod | The planned assertion; turns four premises into reads | The returned `IConsoleVariable*` must carry the literal name back | **Fetch, do not assert** — overturns sweep §9 (§8) |
@@ -315,6 +315,40 @@ same names — key the map by `(name, FSceneRenderTargets instance)` or accept o
 
 **Not for depth and velocity on the SR path.** L1 already has those from `FPassInputs` with the same
 `+16`/slot-7 hops and a registry check; the pool hook is an oracle for L1, not a replacement.
+
+### 5.1 Status: BUILT 2026-09-04, level 1; nothing has run
+
+`[STRAYDLSS] PoolNames` — `src/core/pool_locator.{hpp,cpp}` (pure: the name table, the
+single-pass literal scan, the `lea reg,[rip+d]` pass, the forward call collection, the
+aggregation and the verdict), `src/pool_name_hook.{hpp,cpp}` (live: the module map, L1's guards,
+the forwarding thunk, the map, the assertions), `tests/test_pool_locator.cpp`. Four refinements
+against the design above, each from reading the source rather than assuming it:
+
+* **The locator does not decode instructions.** UEVR uses bdshemu; a partial decoder of our own
+  that landed mid-instruction would produce a plausible wrong answer, which is the failure this
+  project exists to avoid. Instead every `E8 rel32` in a bounded window after a name `lea` is a
+  candidate and three filters replace the decoder: the target must be a
+  `RUNTIME_FUNCTION::BeginAddress` in the exe's own `.pdata`; ranking is on **distinct enclosing
+  functions**, also `.pdata`-derived, which is what refuses a helper reached by seven literals
+  inside `AllocGBufferTargets` alone; and the bar is ≥ 3 groups, ≥ 4 names, runner-up beaten
+  outright, tie refused. §11.3's "discover by observing, not counting" applied to a call target.
+* **The residual is SETTLED at startup rather than assumed.** The scan also looks for
+  `%d MB, NewRT %s %s` and reports either way, so `docs/RESEARCH-U0-EXTERNAL-PRIOR-ART.md` §2.5's
+  falsifiable test costs a log line rather than a grep of the exe on the box. When it survives it
+  is a *fourth* independent check: `FindFreeElement` must be seen calling the internal
+  (`RenderTargetPool.cpp:703`).
+* **§11.1 is honoured structurally, not by discipline.** The trampoline is MinHook's and is
+  supplied by the plugin HOST (`mods/StrayDLSS/src/Host.cpp`) rather than linked into
+  `stray_dlss_native`, so the ReShade add-on host — which does not own MinHook — physically
+  cannot install one and reports `no-installer`. And installation is refused outright when the
+  static bar is not met, so the level degrades to 1 and says so.
+* **The default is level 1.** This is the project's first inline hook into ENGINE CODE, and §9's
+  rule is that nothing is installed on a guess. `pool::kDefaultLevel` is pinned by a test.
+
+Full design, the launch checklist and the provenance ledger:
+`docs/RESEARCH-ENGINE-TAA-HOOK.md` §20. **Level 3 — feeding RR the guides — is declared and not
+built**, deliberately: it is a separate decision after level 2's assertions have run clean in
+GAMEPLAY, not in the menu.
 
 ---
 

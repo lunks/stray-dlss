@@ -33,6 +33,7 @@
 #include "engine_seam_hook.hpp"
 #include "view_params_hook.hpp"
 #include "u0_rhi_hook.hpp"
+#include "pool_name_hook.hpp"
 
 #include <d3d12.h>
 
@@ -287,6 +288,10 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		// The same rule for the RHI-context slots the u0 route patched: they live in the game's
 		// .rdata and must point back at the engine before this DLL can go.
 		u0hook::shutdown();
+		// And the inline trampoline the pool-name hook wrote into the game's own code. Same
+		// rule, one level worse: a detour into an unmapped module is an address-0 crash on the
+		// engine's next render-target allocation.
+		poolhook::shutdown();
 		// The present stage records onto a command list of its own and hands work to nr::,
 		// so it must be torn down before nr:: is.
 		nrhook::shutdown();
@@ -384,6 +389,20 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// walk's on every engine-announced dispatch (the walk stays authoritative). Level 3 is
 	// declared, not implemented. src/u0_rhi_hook.hpp, src/core/u0_rhi_uav.hpp.
 	u0hook::configure(host::cfg::get_int("U0Hook", 1));
+
+	// [STRAYDLSS] PoolNames, default 1 (discover). UE 4.27 passes every pooled render target's
+	// DEBUG NAME to FRenderTargetPool::FindFreeElement as a live `const TCHAR*` argument, in
+	// Shipping (RenderTargetPool.cpp:411, outside any #if) - which is how praydog/UEVR names
+	// render targets in hundreds of shipping UE titles, and which corrects
+	// docs/RESEARCH-U0-IDENTITY.md §4.1/§4.2. That names GBufferA-E, i.e. DLSS Ray
+	// Reconstruction's ENTIRE guide set, without rebuilding the ~3 970-line heuristic finder
+	// that was deleted for identifying them by descriptor SHAPE (report §13).
+	// 1 locates the function by caller-literal agreement (>= 3 distinct enclosing functions and
+	// >= 4 distinct name literals on one .pdata function start) and INSTALLS NOTHING; 2 also
+	// installs a FORWARDING recorder into the game's code and ASSERTS each name's resource
+	// against L1's FPassInputs depth/velocity and View row 132's extent; 3 (feeding RR) is
+	// declared, not built. src/pool_name_hook.hpp, docs/RESEARCH-ENGINE-AWARE-REPLAN.md §5.
+	poolhook::configure(host::cfg::get_int("PoolNames", pool::kDefaultLevel));
 
 	// [STRAYDLSS] StageFile, default OFF. The per-dispatch crash breadcrumb
 	// (stray-dlss-stage.txt) was written for the Phase B access violation, which is long
@@ -1144,6 +1163,9 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		// The u0 route's own line: vtable verdict, per-slot roles, the handle latch, and the
 		// assertion counters (`disagree` must stay 0; `noBind` means the slot is wrong).
 		u0hook::log_report(when);
+		// The render-target pool's name map: the discovery verdict, the RR guide set by name,
+		// and the assertions against the routes that already answer for depth and velocity.
+		poolhook::log_report(when);
 		// Beside it, the ONE number that says whether the View constant buffer we are reading
 		// every frame is the right one. It is located by SEARCH and `view_params_plausible` is
 		// a shape test the wrong buffer can satisfy; row 135 validates itself from one read
@@ -1301,6 +1323,11 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				char u0line[1024] = {};
 				if (u0hook::format_report(u0line, sizeof(u0line)) > 0)
 					std::fprintf(f, "%s\n", u0line);
+				// And the pool-name map beside it, so automation can read `assert:` and the
+				// per-name status without the log ([STRAYDLSS] PoolNames).
+				char poolline[1024] = {};
+				if (poolhook::format_report(poolline, sizeof(poolline)) > 0)
+					std::fprintf(f, "%s\n", poolline);
 			}
 			{
 				// Frame generation (src/backend_native/fg_present.hpp): the probe's engine frame

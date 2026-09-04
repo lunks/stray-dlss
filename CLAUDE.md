@@ -1742,6 +1742,20 @@ denoise exactly that. RR was doing its job; the noise simply should not have bee
 > the intended one is the engine's own **named RDG G-buffer textures**, reachable from the
 > `const FViewInfo&` that `ITemporalUpscaler::AddPasses` already hands us. Identity from the
 > engine, exactly as L1 does for depth and velocity (§2.3). **Do not resurrect the finder.**
+>
+> **AND THE ROUTE IS BUILT, 2026-09-04: the render-target pool NAMES them.** UE 4.27 passes every
+> pooled target's debug name to `FRenderTargetPool::FindFreeElement` as a live `const TCHAR*`
+> argument, used unconditionally in Shipping (`RenderTargetPool.cpp:415`, outside any `#if`) —
+> which is how `praydog/UEVR` names render targets in hundreds of shipping UE titles, and which
+> corrects `docs/RESEARCH-U0-IDENTITY.md` §4.1/§4.2 (they asked what is STORED when the question
+> is what is PASSED, and looked for an anchor inside the function when the anchor is in its 25
+> callers). `[STRAYDLSS] PoolNames`, default **1 = discover and log, install nothing**; 2
+> installs a forwarding recorder into the game's own code — **this project's first inline hook
+> into ENGINE code**, gated on ≥ 3 distinct enclosing functions and ≥ 4 distinct name literals
+> agreeing on one `.pdata` function start, with the trampoline supplied by the plugin HOST so the
+> ReShade host physically cannot install one. Level 3 (feeding RR) is declared, not built.
+> `src/core/pool_locator.hpp`, `docs/RESEARCH-ENGINE-TAA-HOOK.md` §20,
+> `docs/RESEARCH-ENGINE-AWARE-REPLAN.md` §5. **Nothing has run against the game.**
 
 > **CORRECTED 2026-09-01.** This bullet previously asserted "RR REQUIRES `r.RayTracing=True`,
 > so RR is not independently usable here" and treated it as concluded. **That was never
