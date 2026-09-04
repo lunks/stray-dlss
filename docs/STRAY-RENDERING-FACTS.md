@@ -2515,3 +2515,40 @@ the name `bOutputTranslucentVelocity` appearing in a cooked material's tag strea
 turned on. It needs `tools/pakextract.py` over the material assets plus `tools/oodle_unblock.py`
 with an `ooz` build, because the entries are Oodle-compressed and a raw grep over the pak cannot
 see the string. Not run here.
+
+## §43 `DLSSNR.BidirectionalDistortionField` does not apply to this title (2026-09-04)
+
+The name and its four subrect siblings are present in the 310.8.0 NR snippet's string table
+(§ the parameter-name audit), and were carried as "unexplored". They are now explained, and the
+answer is that there is nothing to feed.
+
+**HARD, from NVIDIA's own Streamline header** (`sl_core_types.h:166-167`, the SL 2.13 tree staged
+on the box at `dlss5-stage/slx/include/`):
+
+```cpp
+//! Optional - Bidirectional distortion field. 4 channels in normalized [0,1] pixel space.
+//! RG = distorted pixel to undistorted pixel displacement.
+//! BA = undistorted pixel to distorted pixel displacement.
+constexpr BufferType kBufferTypeBidirectionalDistortionField = 50;
+```
+
+It is a **geometric** warp field for pipelines that present a distorted image — VR lens
+correction, barrel distortion — letting the network reason in undistorted space while the game
+displays distorted. It is marked **Optional**, and it is a `BufferType` in Streamline's tagging
+enum rather than anything specific to feature 18.
+
+**Stray presents no geometric distortion.** Its shipped config contains no distortion, barrel or
+HMD setting and links no VR plugin (`docs/game-config/`). So the field has no content to carry
+here, and writing one would be inventing a warp the game does not apply.
+
+**One thing NOT claimed, because it is a different mechanism.** `WindowsEngine.ini:39` does set
+`r.SceneColorFringeQuality=1`, which enables UE4's chromatic aberration. That is a **per-colour-
+channel radial offset applied in the tonemapper**, not a single geometric mapping, so BDF does
+not model it — and its actual strength comes from a post-process volume's `SceneFringeIntensity`
+which has not been extracted, so whether any fringe is applied at all is **UNCONFIRMED**. Worth
+knowing only because our NR stage runs post-tonemap on the back buffer and therefore sees
+whatever fringe exists, while its depth and motion guides do not.
+
+**Consequence: this closes the last of the four items carried as open feed gaps.** The other
+three closed as §40 (subrect bases, latent), §41 (`r.TemporalAASamples`, the premise was
+inverted) and §42 (translucency/WPO, an engine question that turned out to be a content one).
