@@ -2463,6 +2463,14 @@ available moves are reducing NR's strength on that content, disabling SSR, or ac
 >    missed falls back to a reflection capture, which moves differently again. Coverage varies
 >    per pixel and per frame.
 >
+> **Provenance, because these four are not equal.** (3) and (4) are HARD and need no source:
+> they are arithmetic and geometry, and no better engine input touches them — a blended pixel
+> has one motion-vector slot and two motions whatever you feed the shader. (1) and (2) are
+> **SOFT**: they are read off UE 4.27's structure as this project understands it, NOT verified
+> against the 4.27.2 source in the session that wrote this. **Verify them before anyone builds
+> on them** — but note that verifying them the other way would not rescue option (1), because
+> (3) alone is fatal.
+>
 > **NVIDIA agrees, and says so in the struct.** The same header carries
 > `pInMotionVectorsReflections` — *"motion vectors of reflected objects like for mirrored
 > surfaces"* — a **separate texture**, not a corrected single field, which is the header
@@ -2494,6 +2502,16 @@ available moves are reducing NR's strength on that content, disabling SSR, or ac
 > cannot. Whether UE 4.27's `ScreenSpaceReflections` RDG texture is reachable by name through
 > the outer `FindFreeElement` the pool hook targets is **UNCONFIRMED** and is the first thing
 > to check when that lands.
+>
+> **AND THE CENSUS MAY HAND LEVEL 3 ITS FIRST SIGNAL FOR FREE, with no G-buffer at all.** The
+> camera branch emits an **exact zero** whenever `prev_clip.w <= 0`, and a zero vector tells a
+> temporal accumulator *"this pixel did not move"* — a confident false statement, which is
+> strictly worse than an admission of ignorance. Those pixels are known per-pixel inside
+> `mv_resolve.hlsl` already; marking them is one extra UAV write in a shader that now has the
+> UAV. **If `w<=0 rejected` comes back non-trivial in the census, that is a correct content
+> signal available immediately, and it is not the reflection one** — it is a second, unrelated
+> class of pixel we have been lying to DLSS about since the resolve was written. Read that
+> counter before deciding what to build.
 
 ### The motion-vector density has never been measured — `[STRAYDLSS] MvStats` (2026-09-04)
 
