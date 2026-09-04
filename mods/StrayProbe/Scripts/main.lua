@@ -27,35 +27,13 @@
 -- Two independent periodic writers below, each with its own switch. Both default ON
 -- (identical behaviour to before these switches existed). Turn one off when chasing a
 -- periodic hitch, to rule its write in or out without losing the other, or the mod's
--- existing stray-probe-quiet flag file (see flagPresent(), below), which suppresses the
--- engine queries but keeps the heartbeat's own liveness write going.
--- ARMED ONLY WHEN THE LAUNCHER ASKED FOR IT.
---
--- The probe exists so tools/launch-stray-safe.sh can tell gameplay from the title screen, and
--- that is the only time anyone needs it. Left running it costs a file write and one engine read
--- on the GAME THREAD every second, forever — which is exactly the shape of the ~1 Hz frame-time
--- blip the user reports, and a diagnostic that perturbs what it measures is worse than none.
---
--- So: the launcher writes `stray-probe-armed` before asking Steam to start the game, and this
--- consumes it (deletes it) at load. A launch the user starts from Steam therefore finds no flag
--- and the probe does nothing at all — no loops scheduled, not merely no writes. The flag is
--- one-shot by deletion rather than by the launcher cleaning up, because the launcher does not
--- outlive every session and a stale flag would silently re-arm the next Steam launch.
-local ARM_FLAG = "stray-probe-armed"
-local function consume_arm_flag()
-    local f = io.open(ARM_FLAG, "rb")
-    if not f then return false end
-    f:close()
-    os.remove(ARM_FLAG)          -- one-shot: the next Steam launch must not inherit it
-    return true
-end
-local ARMED = consume_arm_flag()
-
+-- existing stray-probe-quiet flag file (see quiet(), below), which suppresses the engine
+-- queries but keeps the heartbeat's own liveness write going.
 local HEARTBEAT_ENABLED     = true   -- STATE (stray-game-state.txt), once a second
 local HEARTBEAT_INTERVAL_MS = 1000
 local BENCH_ENABLED         = true   -- FRAME (stray-frame.txt), 4x/s while stray-probe-bench
-                                      -- exists (flagPresent(), below) - this switch skips
-                                      -- even scheduling the poll, not just the write in it
+                                      -- exists (benchFlag(), below) - this switch skips even
+                                      -- scheduling the poll, not just the write inside it
 local BENCH_INTERVAL_MS     = 250
 
 local UEHelpers = require("UEHelpers")
@@ -73,31 +51,9 @@ end
 -- game thread, so the expensive lookups are CACHED: a tick normally does only IsValid()
 -- checks and a couple of cheap getters. A rescan happens only when a cached object has
 -- gone invalid, and never more than once per RESCAN_S.
---
--- ROUND 3 (user-reported 2026-09-03: the spike is still there). Round 1 moved the write
--- off the game thread, round 2 cached FindFirstOf, and this is what was still crossing
--- onto the game thread every second:
---
---   * an io.open of stray-probe-quiet, through Wine's path translation, for a file that
---     normally does not exist. The flag now travels the other way: the async loop reads
---     it, where every other file touch already lives, and a quiet tick queues NOTHING on
---     the game thread - which is what the quiet() comment always claimed it did.
---   * three GetFullName() calls, an FString build plus a Lua pattern match each. The
---     NAMES are now cached beside the objects they came from and recomputed only when a
---     cached object is replaced, exactly as the objects themselves already were.
---   * one of those three was pawnName() evaluated TWICE per tick, once through
---     pawnPresent() and once for state.pawnname. pawnPresent is gone; collect asks once.
---
--- What is deliberately NOT done: skipping ExecuteInGameThread on a non-quiet tick because
--- "nothing can have changed". Nothing here knows that, and the launcher polls ingame=1 to
--- decide the game reached gameplay - staleness there costs a launch, not a frame.
 local RESCAN_S = 2
 local cachedPawn, cachedWorld = nil, nil
 local lastPawnScan, lastWorldScan = 0, 0
--- The name that goes with each cached object. nil means "not read yet", so a GetFullName
--- that throws is retried next tick rather than sticking for the object's whole life, and a
--- successful read is never repeated while the object is the same one.
-local cachedPawnName, cachedWorldName = nil, nil
 
 local function objectName(obj)
     local full = obj:GetFullName()
@@ -106,7 +62,6 @@ end
 
 local function world()
     if valid(cachedWorld) then return cachedWorld end
-    cachedWorld, cachedWorldName = nil, nil
     local now = os.time()
     if now - lastWorldScan < RESCAN_S then return nil end
     lastWorldScan = now
@@ -118,18 +73,15 @@ end
 local function mapName()
     local w = world()
     if w == nil then return "?" end
-    if cachedWorldName == nil then
-        local ok, name = pcall(objectName, w)   -- "World /Game/Maps/Foo.Foo" -> "Foo"
-        cachedWorldName = ok and name or nil
-    end
-    return cachedWorldName or "?"
+    local ok, name = pcall(objectName, w)   -- "World /Game/Maps/Foo.Foo" -> "Foo"
+    return ok and name or "?"
 end
 
 -- The pawn's instance name (e.g. BP_CatPawn_C_2147480326) or "" when absent. Measured
 -- 2026-09-02: a checkpoint reload keeps the same pawn, so this is a diagnostic, not a gate.
 local function pawnName()
     if not valid(cachedPawn) then
-        cachedPawn, cachedPawnName = nil, nil
+        cachedPawn = nil
         local now = os.time()
         if now - lastPawnScan < RESCAN_S then return "" end
         lastPawnScan = now
@@ -137,26 +89,44 @@ local function pawnName()
         if not (ok and valid(p)) then return "" end
         cachedPawn = p
     end
-    if cachedPawnName == nil then
-        local ok, name = pcall(objectName, cachedPawn)
-        cachedPawnName = ok and name or nil
-    end
-    return cachedPawnName or ""
+    local ok, name = pcall(objectName, cachedPawn)
+    return ok and name or ""
 end
 
 -- Quiet mode: while a measurement window is open, the bench drops the file
 -- stray-probe-quiet in the game dir and the probe stops asking the engine anything; it
 -- keeps writing seq/t so liveness is still visible. Nothing of ours then runs on the
--- game thread during the window - INCLUDING this test, which is an io.open and so belongs
--- with the rest of the file work on the async thread. The loop bodies below read the flags
--- once per tick and hand the answer to the game-thread closure; nothing here is ever called
--- from inside ExecuteInGameThread.
-local QUIET_FLAG = "stray-probe-quiet"
-local BENCH_FLAG = "stray-probe-bench"
-local function flagPresent(path)   -- ASYNC THREAD ONLY
-    local f = io.open(path, "rb")
-    if f then f:close(); return true end
+-- game thread during the window.
+-- MEASURED 2026-09-04: a stray-probe-quiet left behind by a session on 2026-09-03 suppressed
+-- the engine queries for the next TWENTY-ONE HOURS. Every launcher run that gates on ingame=1
+-- then waited for a field the probe had stopped writing, and the box looked hung while the game
+-- sat happily in gameplay. A flag with no expiry is a landmine, so quiet mode is now BOUNDED:
+-- past the bound the flag is ignored, loudly, and the probe resumes. A real window is seconds
+-- to a couple of minutes; anything longer is a leak, not a measurement.
+local QUIET_MAX_SECONDS = 300
+local quietSince, quietExpired = nil, false
+
+local function quiet()
+    local f = io.open("stray-probe-quiet", "r")
+    if not f then
+        if quietSince then print("[StrayProbe] quiet mode released\n") end
+        quietSince, quietExpired = nil, false
+        return false
+    end
+    f:close()
+    quietSince = quietSince or os.time()
+    if os.time() - quietSince <= QUIET_MAX_SECONDS then return true end
+    if not quietExpired then
+        quietExpired = true
+        print(string.format("[StrayProbe] IGNORING stray-probe-quiet: held for more than %d s, "
+            .. "so it is a leftover rather than a measurement window. Engine queries resume; "
+            .. "delete the file to silence this.\n", QUIET_MAX_SECONDS))
+    end
     return false
+end
+
+local function pawnPresent()
+    return pawnName() ~= ""
 end
 
 local function controllerPresent()
@@ -186,16 +156,14 @@ end
 -- game thread, and the async thread never touches a UObject.
 local state = { seq = 0, pawn = 0, pawnname = "", pc = 0, map = "?", paused = 0, ingame = 0 }
 
--- Quiet is decided by the caller (the async loop), which simply does not queue this on a
--- quiet tick - so there is no file test here and no engine query on a silenced frame.
 local function collect()
-    local name = pawnName()                     -- asked ONCE: it is the GetFullName path
-    local pawn = (name ~= "") and 1 or 0
+    if quiet() then return end
+    local pawn = pawnPresent() and 1 or 0
     local pc = controllerPresent() and 1 or 0
     local map = mapName()
     local paused = isPaused() and 1 or 0
     local menu = map:lower():find("menu", 1, true) ~= nil
-    state.pawn, state.pawnname, state.pc, state.map, state.paused = pawn, name, pc, map, paused
+    state.pawn, state.pawnname, state.pc, state.map, state.paused = pawn, pawnName(), pc, map, paused
     state.ingame = (pawn == 1 and pc == 1 and not menu) and 1 or 0
 end
 
@@ -214,9 +182,9 @@ local function atomicWrite(path, text)
     end
 end
 
-local function flush(isQuiet)
+local function flush()
     seq = seq + 1
-    if isQuiet then
+    if quiet() then
         atomicWrite(STATE, string.format("seq=%d\nt=%d\nquiet=1\n", seq, os.time()))
     else
         atomicWrite(STATE, string.format("seq=%d\nt=%d\npawn=%d\npawnname=%s\npc=%d\nmap=%s\npaused=%d\ningame=%d\n",
@@ -224,20 +192,14 @@ local function flush(isQuiet)
     end
 end
 
-if ARMED and HEARTBEAT_ENABLED then
+if HEARTBEAT_ENABLED then
     LoopAsync(HEARTBEAT_INTERVAL_MS, function()
-        -- ONE flag read per tick, on this thread, governing both halves: the write says
-        -- quiet=1 and the game thread is not touched at all.
-        local isQuiet = flagPresent(QUIET_FLAG)
-        pcall(flush, isQuiet)                                           -- async thread: file I/O
-        if not isQuiet then
-            pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
-        end
+        pcall(flush)                                                    -- async thread: file I/O
+        pcall(function() ExecuteInGameThread(function() pcall(collect) end) end)   -- game thread: reads
         return false   -- keep looping
     end)
 else
-    print("[StrayProbe] idle: " .. (ARMED and ("HEARTBEAT_ENABLED=false, not writing " .. STATE)
-        or "not armed (no " .. ARM_FLAG .. "), so this session costs nothing") .. "\n")
+    print("[StrayProbe] HEARTBEAT_ENABLED=false: not writing " .. STATE .. "\n")
 end
 
 -- BENCH COUNTER, host-independent. While stray-probe-bench exists (stray-traverse.sh
@@ -248,6 +210,11 @@ end
 -- measured by the identical instrument (the user's requirement 2026-09-02: never poison
 -- one arm against another).
 local FRAME = "stray-frame.txt"
+local function benchFlag()
+    local f = io.open("stray-probe-bench", "r")
+    if f then f:close(); return true end
+    return false
+end
 local frameState = { frame = -1, dt = -1 }
 local function collectFrame()   -- game thread: two static calls, nothing else
     local ok = pcall(function()
@@ -262,9 +229,9 @@ end
 local function flushFrame()     -- async thread: the write, atomic (see atomicWrite)
     atomicWrite(FRAME, string.format("frame=%d\ndt=%.6f\nt=%d\n", frameState.frame, frameState.dt, os.time()))
 end
-if ARMED and BENCH_ENABLED then
+if BENCH_ENABLED then
     LoopAsync(BENCH_INTERVAL_MS, function()
-        if flagPresent(BENCH_FLAG) then   -- async thread, like every other file test
+        if benchFlag() then
             pcall(flushFrame)
             pcall(function() ExecuteInGameThread(function() pcall(collectFrame) end) end)
         end
