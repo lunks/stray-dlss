@@ -438,6 +438,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_fg_plan.cpp
         tests/test_exposure_plan.cpp
         tests/test_fg_throttle.cpp
+        tests/test_log.cpp
     tests/test_feature_recreate.cpp)
     target_link_libraries(stray_dlss_tests PRIVATE stray_dlss_core doctest::doctest)
 

@@ -328,6 +328,19 @@ void on_present(std::uint64_t dispatches_total, std::uint64_t large_dispatches_t
 		p50, p95, p99, p999,
 		static_cast<unsigned long long>(hitches16), static_cast<unsigned long long>(hitches33));
 
+	// The logger itself. Its file write used to be synchronous on the calling thread and the
+	// user correlated the flicker with the log line for line (log.cpp, 2026-09-05). `caller max`
+	// is what a write() now costs the thread that called it (an ERROR waits for the drain, so it
+	// is the expected maximum); `dropped` must stay 0; `writer max` is the slowest batch on the
+	// writer thread, where a slow disk is now allowed to be slow.
+	{
+		const log::Stats ls = log::stats();
+		STRAY_LOG_INFO("[perf] log: lines %llu written %llu dropped %llu queued %llu | writer batches %llu max-batch %llu lines, %.2f ms sum, %.2f ms max | caller max %.3f ms",
+			ls.lines, ls.written, ls.dropped, ls.queued_now, ls.writer_batches, ls.batch_max,
+			static_cast<double>(ls.writer_ns_sum) / 1e6, static_cast<double>(ls.writer_ns_max) / 1e6,
+			static_cast<double>(ls.caller_ns_max) / 1e6);
+	}
+
 	// Non-overlapping attribution: kDispatchPath CONTAINS the nested buckets, so subtract them
 	// to get the intercept-only share, leaving the parts summing to the total instead of
 	// double-counting. Clamped at zero — nesting makes it non-negative, but a future call site

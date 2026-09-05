@@ -9,8 +9,10 @@
 namespace stray_dlss::log {
 
 void init_file_sink() {}
+void init_file_sink_path(const char *) {}
 void shutdown_file_sink() {}
 void set_external_sink(ExternalSink) {}
+Stats stats() { return Stats{}; }
 
 void write(Level level, const char *message)
 {

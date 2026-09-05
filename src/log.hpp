@@ -8,6 +8,14 @@
 //                      "register_addon returned false" are distinguishable. An imgui version
 //                      mismatch fails exactly this way, silently. (docs/RESEARCH.md §2.8)
 //
+// THE FILE WRITE IS ASYNCHRONOUS since 2026-09-05. write() formats the line and enqueues it;
+// one writer thread does the fputs + fflush in batches. The user correlated the on-screen
+// flicker with the log line for line (a small blink on the 600-frame status block, a large one
+// on the [stall] line) while the stall detector's own buckets accounted for ~2.6 ms of a 40 ms
+// frame: the synchronous write on the present thread was the unmeasured rest. An ERROR line
+// still reaches the disk before its caller continues (bounded wait), because the interesting
+// failures are the ones that crash next. Details and the measurement in log.cpp.
+//
 // No framework header is included here or in log.cpp: this file is shared by every host.
 #pragma once
 
@@ -23,19 +31,39 @@ enum class Level
 
 // Opens the side-channel file next to the add-on. Safe to call before register_addon.
 void init_file_sink();
+// The same sink at a narrow path, every platform (the unit tests use it).
+void init_file_sink_path(const char *path);
 #ifdef _WIN32
 // The same sink at an explicit path (the UE4SS host writes <game>/stray-dlss-plugin.log so it
 // never collides with a ReShade add-on's stray-dlss.log in the same directory).
 void init_file_sink(const wchar_t *path);
 #endif
+// Stops the writer thread, draining everything queued, then closes the file.
 void shutdown_file_sink();
 
 // An optional second sink, installed by whichever host we run inside: the ReShade backend
 // forwards into ReShade.log once register_addon has succeeded; the UE4SS plugin mirrors into
-// UE4SS's console. Called after the file write, on the logging thread, under the log mutex —
-// so it must not log back into here. nullptr removes it.
+// UE4SS's console. Called from the WRITER thread after the file write (or from the caller,
+// synchronously, when no writer is running) — so it must not log back into here. nullptr
+// removes it.
 using ExternalSink = void (*)(Level level, const char *message);
 void set_external_sink(ExternalSink sink);
+
+// What the logger cost. `caller_ns_max` is the longest any write() took on its calling thread
+// (an ERROR waits for the drain and is expected to be the maximum); `dropped` must stay 0.
+struct Stats
+{
+	unsigned long long lines = 0;          // write() calls
+	unsigned long long written = 0;        // lines the writer put in the file
+	unsigned long long dropped = 0;        // lines refused because the queue was full
+	unsigned long long queued_now = 0;     // queue depth when stats() was called
+	unsigned long long writer_batches = 0;
+	unsigned long long batch_max = 0;      // largest batch drained at once
+	unsigned long long writer_ns_sum = 0;  // time the writer thread spent in fputs/fflush
+	unsigned long long writer_ns_max = 0;  // slowest single batch
+	unsigned long long caller_ns_max = 0;  // slowest write() as seen by a caller
+};
+Stats stats();
 
 void write(Level level, const char *message);
 
