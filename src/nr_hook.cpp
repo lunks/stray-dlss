@@ -5,6 +5,7 @@
 #include "mv_resolve.hpp"
 #include "ngx_nr.hpp"
 #include "nr_mask.hpp"
+#include "nr_model.hpp"
 #include "nr_stage.hpp"
 #include "perf.hpp"
 
@@ -139,6 +140,23 @@ nrmaskplan::Config mask_config()
 	return g_mask_cfg;
 }
 
+std::mutex g_model_mutex;
+nrmodel_plan::Config g_model_cfg;
+std::atomic<int> g_model_result{0};
+std::atomic<std::uint32_t> g_model_w{0}, g_model_h{0};
+std::atomic<std::uint64_t> g_model_applied{0}, g_model_fallbacks{0};
+
+void set_model(const nrmodel_plan::Config &cfg)
+{
+	std::lock_guard<std::mutex> lock(g_model_mutex);
+	g_model_cfg = cfg;
+}
+nrmodel_plan::Config model_config()
+{
+	std::lock_guard<std::mutex> lock(g_model_mutex);
+	return g_model_cfg;
+}
+
 void note_guides(ID3D12Resource *depth, ID3D12Resource *motion_vectors,
                  std::uint32_t render_width, std::uint32_t render_height, bool reset)
 {
@@ -182,6 +200,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// must happen even on a frame the gate refuses.
 	nrstage::collect(pc.frame);
 	nrmask::collect(pc.frame);
+	nrmodel::collect(pc.frame);
 
 	if (!nr::enabled())
 		return;
@@ -275,6 +294,45 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// --- read the frame out of the back buffer ---
 	nrstage::record_capture(cmd, colour, bb_state, issue_barrier, &bctx);
 
+	// MODEL RESOLUTION. Decide from numbers (core/nr_model_plan.hpp), then downsample the
+	// staging copy into the two small textures; feature 18 is shown `model` and answers into it.
+	nrmodel_plan::Plan model_plan = nrmodel_plan::plan(model_config(), plan.width, plan.height,
+		cd.typed_uav_load, cd.typed_uav_store);
+	if (model_plan.result == nrmodel_plan::Result::ok)
+	{
+		if (!nrmodel::ensure(device, model_plan.width, model_plan.height,
+				static_cast<int>(src.Format), pc.frame)
+			|| !nrmodel::record_downsample(cmd, staging, plan.width, plan.height))
+		{
+			model_plan.result = nrmodel_plan::Result::off; // alloc or record failed: full-res
+			static bool s_model_fail_logged = false;
+			if (!s_model_fail_logged)
+			{
+				s_model_fail_logged = true;
+				STRAY_LOG_ERROR("NR MODEL RESOLUTION: refused this frame (%s); running the model "
+					"at full resolution instead. First occurrence only.", nrmodel::last_error());
+			}
+		}
+	}
+	{
+		static int s_model_logged = -1;
+		const int idx = static_cast<int>(model_plan.result);
+		if (s_model_logged != idx)
+		{
+			s_model_logged = idx;
+			STRAY_LOG_WARN("NR MODEL RESOLUTION: %s (scale %.2f -> model %ux%u over a %ux%u "
+				"frame, typed UAV load=%d store=%d, transfer %.2f)",
+				nrmodel_plan::result_name(model_plan.result),
+				static_cast<double>(model_config().scale), model_plan.width, model_plan.height,
+				plan.width, plan.height, cd.typed_uav_load ? 1 : 0, cd.typed_uav_store ? 1 : 0,
+				static_cast<double>(model_plan.transfer_strength));
+		}
+	}
+	g_model_result.store(static_cast<int>(model_plan.result), std::memory_order_relaxed);
+	g_model_w.store(model_plan.width, std::memory_order_relaxed);
+	g_model_h.store(model_plan.height, std::memory_order_relaxed);
+	const bool model_small = model_plan.result == nrmodel_plan::Result::ok;
+
 	// --- DLSSNR.ControlMask, if it is turned on ---
 	//
 	// RECORDED AFTER record_capture, and that ordering is load-bearing under the ReShade backend.
@@ -334,15 +392,15 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	}
 
 	nr::ApplyInputs ni;
-	ni.image = staging;
+	ni.image = model_small ? nrmodel::model() : staging;
 	ni.depth = guides.depth;
 	ni.motion_vectors = guides.motion_vectors;
 	ni.render_width = guides.render_width;
 	ni.render_height = guides.render_height;
 	// The COLOUR rect, which at a post-tonemap site is the BACK BUFFER's and not necessarily the
 	// TAA output rect the guides were sized against.
-	ni.output_width = plan.width;
-	ni.output_height = plan.height;
+	ni.output_width = model_small ? model_plan.width : plan.width;
+	ni.output_height = model_small ? model_plan.height : plan.height;
 	// The camera-cut OR from the TAA capture (CLAUDE.md §2.8). Feature 18 keeps its own temporal
 	// accumulation, so dropping this on the way to a new site would reintroduce exactly the bug
 	// the TAA path already fixed once.
@@ -384,6 +442,23 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 
 	mv::transition_output(cmd, /*to_shader_resource=*/false);
 
+	if (model_small)
+	{
+		// The model answered into the small texture; carry only its difference up onto the
+		// full staging copy. If it did not answer, the frame is left exactly as captured.
+		if (applied)
+		{
+			applied = nrmodel::record_resolve(cmd, staging, plan.width, plan.height,
+				model_plan.transfer_strength);
+			if (applied)
+				g_model_applied.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	else if (applied && model_config().scale < nrmodel_plan::kOffAbove)
+	{
+		g_model_fallbacks.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	if (applied)
 	{
 		nrstage::record_writeback(cmd, colour, bb_state, issue_barrier, &bctx);
@@ -415,6 +490,7 @@ void shutdown()
 {
 	nrstage::shutdown();
 	nrmask::shutdown();
+	nrmodel::shutdown();
 	std::lock_guard<std::mutex> lock(g_guides_mutex);
 	// The publish-side references (note_guides) go here. Device destruction is the one call site
 	// where the caller, not us, has established that the GPU is idle.
@@ -443,6 +519,12 @@ Counters counters()
 	c.last_mask_result = static_cast<nrmaskplan::MaskResult>(
 		g_mask_result.load(std::memory_order_relaxed));
 	c.mask_bound = g_mask_bound.load(std::memory_order_relaxed);
+	c.last_model_result = static_cast<nrmodel_plan::Result>(
+		g_model_result.load(std::memory_order_relaxed));
+	c.model_width = g_model_w.load(std::memory_order_relaxed);
+	c.model_height = g_model_h.load(std::memory_order_relaxed);
+	c.model_applied = g_model_applied.load(std::memory_order_relaxed);
+	c.model_fallbacks = g_model_fallbacks.load(std::memory_order_relaxed);
 	c.mask_r = ms.value_r;
 	c.mask_g = ms.value_g;
 	c.mask_b = ms.value_b;

@@ -26,6 +26,7 @@
 #include "ngx_nr.hpp"
 #include "ngx_snippet.hpp"
 #include "nr_hook.hpp"
+#include "core/nr_model_plan.hpp"
 #include "mv_mask.hpp"
 #include "nr_mask.hpp"
 #include "perf.hpp"
@@ -740,6 +741,12 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		mask.value_g = host::cfg::get_float("NgxNRMaskG", nrmaskplan::kNeutral);
 		mask.value_b = host::cfg::get_float("NgxNRMaskB", nrmaskplan::kNeutral);
 		nrhook::set_mask(mask);
+		// [STRAYDLSS] NgxNRModelScale (default 0.5 on this branch) + NgxNRModelTransfer: feature
+		// 18 at a fraction of the frame, its difference laid back (core/nr_model_plan.hpp).
+		nrmodel_plan::Config model;
+		model.scale = host::cfg::get_float("NgxNRModelScale", 0.5f);
+		model.transfer_strength = host::cfg::get_float("NgxNRModelTransfer", 1.0f);
+		nrhook::set_model(model);
 
 		// The mask's DXGI_FORMAT. A KNOB and not a constant because the runtime never inspects a
 		// caller-supplied texture's format on this path, so getting it wrong is the silent-wrong-
@@ -1818,6 +1825,13 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 							nrplan::plan_result_name(static_cast<nrplan::PlanResult>(i)),
 							sc.reasons[i]);
 				STRAY_LOG_INFO("%s", line);
+				STRAY_LOG_INFO("[%s] NR MODEL: %s model=%ux%u applied=%llu fallbacks=%llu "
+					"(fallbacks = presents where a sub-native scale was asked for and the full "
+					"frame ran instead)",
+					when, nrmodel_plan::result_name(sc.last_model_result),
+					sc.model_width, sc.model_height,
+					static_cast<unsigned long long>(sc.model_applied),
+					static_cast<unsigned long long>(sc.model_fallbacks));
 
 				// THE MASK, reported separately and by its ACTUAL content. "Bound and
 				// deliberately neutral" and "refused" must never look alike here — an identity

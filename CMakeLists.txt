@@ -90,6 +90,7 @@ add_library(stray_dlss_core STATIC
     src/core/nr_lifetime.hpp
     src/core/nr_mask_plan.cpp
     src/core/nr_mask_plan.hpp
+    src/core/nr_model_plan.hpp
     src/core/mv_census.cpp
     src/core/mv_census.hpp
     src/core/mv_mask_plan.cpp
@@ -223,6 +224,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/nr_stage.hpp
         src/nr_mask.cpp
         src/nr_mask.hpp
+        src/nr_model.cpp
+        src/nr_model.hpp
         src/input_dump.cpp
         src/input_dump.hpp
         src/mv_resolve.cpp
@@ -302,6 +305,11 @@ if(STRAY_DLSS_BUILD_NATIVE)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
                    main cs_5_0 g_nr_mask_dxbc)
+    # NR at model resolution: the exact-area downsample and the matched-residual resolve.
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_downsample.hlsl"
+                   main cs_5_0 g_nr_downsample_dxbc)
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_resolve.hlsl"
+                   main cs_5_0 g_nr_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
                    main cs_5_0 g_gbuffer_resolve_dxbc)
 endif()
@@ -407,6 +415,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp
+        tests/test_nr_model_plan.cpp
         tests/test_mv_census.cpp
         tests/test_mv_mask_plan.cpp
         tests/test_nr_params.cpp

@@ -18,6 +18,7 @@
 
 #include "core/nr_hook_plan.hpp"
 #include "core/nr_mask_plan.hpp"
+#include "core/nr_model_plan.hpp"
 #include "intercept/types.hpp"
 
 #include <cstdint>
@@ -59,6 +60,11 @@ std::uint32_t back_buffer_state();
 // image at all" from "do the mask's VALUES change the image".
 void set_mask(const nrmaskplan::Config &cfg);
 nrmaskplan::Config mask_config();
+
+// [STRAYDLSS] NgxNRModelScale / NgxNRModelTransfer: run feature 18 at a FRACTION of the frame
+// and lay only its difference back (core/nr_model_plan.hpp). Default 0.5 on this branch.
+void set_model(const nrmodel_plan::Config &cfg);
+nrmodel_plan::Config model_config();
 
 // --- the feed ---
 
@@ -129,6 +135,12 @@ struct Counters
 	float mask_b = 0.0f;
 	std::uint64_t mask_fills = 0;
 	std::uint64_t mask_bytes = 0;
+	// Model resolution: what the last present decided and how often each path ran.
+	nrmodel_plan::Result last_model_result = nrmodel_plan::Result::off;
+	std::uint32_t model_width = 0;
+	std::uint32_t model_height = 0;
+	std::uint64_t model_applied = 0;   // presents where the small model + resolve reached the frame
+	std::uint64_t model_fallbacks = 0; // presents where the plan refused and full resolution ran
 };
 
 Counters counters();
