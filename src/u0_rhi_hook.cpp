@@ -1152,6 +1152,25 @@ void note_claim_decision(std::uint64_t pass_hash)
 			"bracket=` on the [u0] line should track the seam's `claimed`; any `fellBack:` reason "
 			"above 0 names a frame the walk had to supply.",
 			static_cast<unsigned long long>(pass_hash));
+	// A fallback BEFORE the bracket has ever answered is the session's warm-up - measured three
+	// sessions running as ~270-290 dispatches at t4 (the stencil SRV) while the SRV latch forms,
+	// then a clean streak to the end - and reads as INFO. A fallback AFTER the first success is the
+	// WARN below: that one names a register the thunks are not seeing on this build.
+	if (log_fallback && g_l3_from_bracket.load(std::memory_order_relaxed) == 0)
+	{
+		STRAY_LOG_INFO("U0 HOOK LEVEL 3 warm-up on pass 0x%016llx: the bracket could not yet supply the TAA "
+			"registers (%s%s%u) and the descriptor walk answered this frame. Expected for the first few "
+			"hundred dispatches of a session while the SRV latch forms (CLAUDE.md §2.9); `l3: walk=` on "
+			"the [u0] line should stop growing once `fromBracket=` starts, and U0HookSkipWalk arms only "
+			"after 600 clean dispatches. A fallback that arrives after that is a WARN, not this line.",
+			static_cast<unsigned long long>(pass_hash), u0auth::fallback_name(d.fallback),
+			(d.fallback == u0auth::Fallback::tex_no_bind || d.fallback == u0auth::Fallback::tex_unresolved ||
+			 d.fallback == u0auth::Fallback::tex_not_live) ? " at t" : " reg=",
+			d.reg);
+		log_fallback = false;
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_l3_fallback_logged[static_cast<std::size_t>(d.fallback)] = false; // the WARN may still fire later
+	}
 	if (log_fallback)
 		STRAY_LOG_WARN("U0 HOOK LEVEL 3 FELL BACK on pass 0x%016llx: the bracket could not supply the TAA "
 			"registers (%s%s%u) and the descriptor walk's answer was used for this frame%s. Once per "
