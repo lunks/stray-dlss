@@ -62,11 +62,17 @@ TEST_CASE("async logger: every line from every thread reaches the file, per-thre
 	CHECK(lines.back() == "[ERROR] the error line");
 
 	// Per-thread order: each thread's counter must be strictly increasing in file order.
+	// Line shape: "[INFO ] t<thread> line <i>" (parsed by hand: sscanf is a warning on MSVC).
 	int next[kThreads] = {};
 	for (std::size_t k = 0; k + 1 < lines.size(); ++k)
 	{
-		int t = -1, i = -1;
-		REQUIRE(std::sscanf(lines[k].c_str(), "[INFO ] t%d line %d", &t, &i) == 2);
+		const std::string &l = lines[k];
+		const std::string prefix = "[INFO ] t";
+		REQUIRE(l.compare(0, prefix.size(), prefix) == 0);
+		const std::size_t sp = l.find(" line ", prefix.size());
+		REQUIRE(sp != std::string::npos);
+		const int t = std::stoi(l.substr(prefix.size(), sp - prefix.size()));
+		const int i = std::stoi(l.substr(sp + 6));
 		REQUIRE(t >= 0);
 		REQUIRE(t < kThreads);
 		CHECK(i == next[t]);
