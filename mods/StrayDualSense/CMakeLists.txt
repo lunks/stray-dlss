@@ -48,6 +48,8 @@ endif()
 add_library(straydualsense_core STATIC
     src/AssetName.cpp
     src/AssetName.hpp
+    src/Log.cpp
+    src/Log.hpp
     src/PadAudio.cpp
     src/PadAudio.hpp
     src/SubmixChoice.cpp
@@ -65,7 +67,7 @@ target_compile_features(straydualsense_core PUBLIC cxx_std_20)
 target_compile_options(straydualsense_core PRIVATE ${SDS_WARN})
 
 enable_testing()
-foreach(t asset_name trigger_effect submix_dsp submix_choice submix_watch submix_routing pad_audio)
+foreach(t asset_name trigger_effect submix_dsp submix_choice submix_watch submix_routing pad_audio log)
     add_executable(straydualsense_test_${t} tests/test_${t}.cpp)
     target_link_libraries(straydualsense_test_${t} PRIVATE straydualsense_core)
     target_compile_options(straydualsense_test_${t} PRIVATE ${SDS_WARN})
