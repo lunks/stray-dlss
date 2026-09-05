@@ -54,8 +54,14 @@ void warp_stage_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, st
 // A stand-in for a swapchain back buffer: plain 2D, single subresource, NO ALLOW_UNORDERED_ACCESS
 // (a real swapchain buffer has none either — which is the first reason the stage stages at all),
 // resting in COMMON, which IS D3D12_RESOURCE_STATE_PRESENT.
+// `flags` defaults to NONE, which is what the NR stage's tests want (a plain copy target). A
+// test that puts the stand-in into RENDER_TARGET - as the HUD-less copy does, because the
+// engine holds the real back buffer there at Slate's pass - must pass ALLOW_RENDER_TARGET, or
+// the debug layer reports #524 (state bits the resource does not support) and the shared list
+// can no longer Close: a real swapchain buffer always carries that flag.
 bool create_fake_back_buffer(Gpu &gpu, UINT w, UINT h, DXGI_FORMAT fmt,
-                             ComPtr<ID3D12Resource> &out)
+                             ComPtr<ID3D12Resource> &out,
+                             D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE)
 {
 	D3D12_HEAP_PROPERTIES def = {};
 	def.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -68,7 +74,7 @@ bool create_fake_back_buffer(Gpu &gpu, UINT w, UINT h, DXGI_FORMAT fmt,
 	d.MipLevels = 1;
 	d.Format = fmt;
 	d.SampleDesc.Count = 1;
-	d.Flags = D3D12_RESOURCE_FLAG_NONE;
+	d.Flags = flags;
 
 	HR(gpu.device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &d,
 		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&out)));

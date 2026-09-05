@@ -77,7 +77,10 @@ bool test_hudless_copy(Gpu &gpu)
 	std::printf("\n[hudless] copy on the game's list with the back buffer in RENDER_TARGET, judged by the debug layer\n");
 	constexpr UINT w = 64, h = 32;
 	ComPtr<ID3D12Resource> bb;
-	if (!create_fake_back_buffer(gpu, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, bb))
+	// ALLOW_RENDER_TARGET: the stand-in is put into RENDER_TARGET below, which the debug layer
+	// permits only on a resource created with that flag - as every real swapchain buffer is.
+	if (!create_fake_back_buffer(gpu, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, bb,
+			D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
 		return false;
 	std::vector<std::uint32_t> texels(static_cast<std::size_t>(w) * h);
 	for (UINT y = 0; y < h; ++y)
