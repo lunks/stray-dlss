@@ -3750,24 +3750,27 @@ transfer (hhkbble/Dagherbou, 2026-09), on our present stage. **MEASURED on the b
 a clean in-game frame. At 0.5 the model's extent IS the guides' extent, so the ratio is 1.0 and
 nothing but colour is resampled.
 
-> **AND IT BUYS NOTHING HERE — BENCHED 2026-09-05, and the number is the finding.** Two passes of
-> the reload+traverse bench (three cycles per arm, one process, thermal order reversed between
-> passes, foreign jobs 0): **NR off 82.3 fps; NR at full resolution 70.5; model 0.5 70.4; model
-> 0.25 (960x540) 70.3**; resolve modes 0/1/2 identical. NR costs **~2 ms a frame at ANY size**,
-> across a 16x change in pixels — a fixed per-evaluate term, not the network. Our CPU is not it
-> (`[perf]` puts NR at 0.45 ms, zero fence waits). The plausible mechanisms are the ones this
-> stack is built on: every NGX evaluate under vkd3d-proton hands the queue D3D12 -> CUDA -> D3D12
-> through NVAPI, and each handoff drains the pipeline; or the network is launch-bound (dozens of
-> small kernels whose fixed latency dominates). The D18 timings that scale with ratio were taken
-> natively on a 50-series card and do not contradict this. **Consequences:** `NgxNRModelScale=1.0`
-> is the better default until the fixed term is found (same cost, structure at native pixel size);
-> every idea that rested on per-pixel cost — pre-scale, SR-as-resolve, dynamic scale, residual
-> reprojection — is moot for the same reason; the only lever against a fixed per-evaluate cost is
-> evaluating LESS OFTEN (multi-frame generation; a static-frame skip). **Next is an instrument,
-> not a feature: GPU timestamp queries around the evaluate, the two small passes and the copies on
-> the present list**, so the 2 ms is placed inside or around the evaluate before anything else is
-> built on this branch. The earlier "12.5 vs ~14 ms median" comparison was two different scenes
-> at two different times and is retracted; the bench is the measurement.
+> **THE BENCH THAT "MEASURED" THIS WAS INVALID, AND THE WAY IT WAS INVALID IS THE LESSON
+> (2026-09-05).** Two passes of the reload+traverse bench were run with arms `full`, `m05-g0/1/2`,
+> `m025`, `nr-off`, and every NR arm read ~70.4 fps against 82.3 with NR off. That was reported as
+> "NR costs ~2 ms at ANY size, a fixed per-evaluate term". **It measured nothing of the kind:
+> `NgxNRModel*` are NOT on the hot-reload path** — the host re-applies only the keys the tweak tab
+> exposes (`NgxNR`, the sliders, `NgxNRMVecScale`, preset, style, mask) — so `dlss-set.sh
+> NgxNRModelScale …` rewrote the ini and changed nothing in the running game. The log proves it:
+> exactly two `NR MODEL RESOLUTION:` lines exist, one per launch, none from any arm. Every "arm"
+> ran at the deployed state (0.5, local affine). **What was actually measured: NR at 0.5 costs ~2
+> ms/frame against NR off. Full resolution vs 0.5 has never been compared.** Whether the network's
+> cost scales with pixels on this stack is OPEN; the resolution-independence claim, the "fixed
+> handoff" mechanism and the "1.0 is the better default" consequence are all withdrawn. The earlier
+> "12.5 vs ~14 ms median" comparison was two scenes at two times and proves nothing either.
+>
+> **The rule this earns, and it is §0.2 again: a knob flip is not applied until the log says so.**
+> Every arm's set line prints a state-change line when it takes (`NR MODEL RESOLUTION: off` for
+> scale 1.0); the driver grepped for it and got nothing, and the silence was read as "nothing to
+> report" instead of "the flip did not happen". A model-scale arm needs a game restart per arm
+> (or the keys added to `TweakState`'s live list), and the bench driver must REFUSE an arm whose
+> state-change line does not appear. **DROPPED BY THE USER the same day** on image quality at 0.5
+> ("just worse"), which stands on its own: the branch stays pushed as the record, not for merge.
 
 **Why this and not the two obvious alternatives, both closed the same day:**
 

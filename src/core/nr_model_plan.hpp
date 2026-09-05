@@ -23,7 +23,9 @@ struct Config
 {
 	// [STRAYDLSS] NgxNRModelScale. 1.0 (or anything >= kOffAbove) = the model sees the full
 	// frame, i.e. today's present stage exactly. 0.5 = the model sees a quarter of the pixels.
-	float scale = 0.5f;
+	// Default 1.0: the user judged 0.5 worse on image quality (2026-09-05) and the cost side was
+	// never validly measured. The path stays as an instrument, off unless asked for.
+	float scale = 1.0f;
 	// [STRAYDLSS] NgxNRModelTransfer: how much of the model's difference lands. 0 = the frame
 	// comes back untouched (the honest A/B), 1 = the full edit, >1 exaggerates.
 	float transfer_strength = 1.0f;

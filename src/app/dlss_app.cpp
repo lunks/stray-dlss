@@ -744,7 +744,7 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		// [STRAYDLSS] NgxNRModelScale (default 0.5 on this branch) + NgxNRModelTransfer: feature
 		// 18 at a fraction of the frame, its difference laid back (core/nr_model_plan.hpp).
 		nrmodel_plan::Config model;
-		model.scale = host::cfg::get_float("NgxNRModelScale", 0.5f);
+		model.scale = host::cfg::get_float("NgxNRModelScale", 1.0f);   // 1.0 = the old stage exactly
 		model.transfer_strength = host::cfg::get_float("NgxNRModelTransfer", 1.0f);
 		// How the edit comes up: 0 bilinear, 1 joint bilateral (sigma), 2 local affine (eps).
 		model.guided = host::cfg::get_int("NgxNRModelGuided", 2);
