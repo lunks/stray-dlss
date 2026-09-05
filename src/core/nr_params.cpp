@@ -66,6 +66,14 @@ int build_mask_rect(std::uint32_t width, std::uint32_t height, Entry *out, int c
 		"DLSSNR.ControlMaskSubrectWidth", "DLSSNR.ControlMaskSubrectHeight", width, height);
 }
 
+int build_backbuffer_rect(std::uint32_t width, std::uint32_t height, Entry *out, int cap)
+{
+	if (out == nullptr || cap < kMaxBackbufferRectEntries)
+		return 0;
+	return emit_rect(out, "DLSSNR.BackbufferSubrectBaseX", "DLSSNR.BackbufferSubrectBaseY",
+		"DLSSNR.BackbufferSubrectWidth", "DLSSNR.BackbufferSubrectHeight", width, height);
+}
+
 int build_create(std::uint32_t in_width, std::uint32_t in_height, float scaling_ratio, Entry *out,
                  int cap)
 {

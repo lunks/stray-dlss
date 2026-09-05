@@ -9,6 +9,7 @@
 #include "core/u0_rhi_uav.hpp"
 #include "intercept/types.hpp"
 #include "log.hpp"
+#include "rhi_gfx_hook.hpp"
 
 #include <windows.h>
 
@@ -873,9 +874,12 @@ void run_discovery()
 	{
 		STRAY_LOG_INFO("U0 HOOK: U0Hook=1, so nothing is installed. Set U0Hook=2 to install the "
 			"forwarding thunks and assert the engine's bind stream against the descriptor walk.");
-		return;
 	}
-	install_hooks();
+	else
+		install_hooks();
+	// The graphics seams stand on this same vtable (RHIBeginDrawingViewport, RHIBeginRenderPass,
+	// ...): one discovery, two halves. Their own keys decide whether anything is installed.
+	rhigfx::on_context_discovered(g_ctx, g_image);
 }
 
 void log_foreign_seed_once(const void *ret)
@@ -1601,6 +1605,45 @@ void log_report(const char *when)
 		             "claimed; assert/regs disagree must stay 0 while the walk runs and read walkAbsent once "
 		             "skip is ARMED)"
 		: "  (assert/regs/viewReg disagree must stay 0; noBind means the UAV slot is wrong)");
+}
+
+bool guarded_read_u64(std::uint64_t va, std::uint64_t *out)
+{
+	return guarded_read(nullptr, va, out);
+}
+
+std::uint64_t resolve_texture_native(std::uint64_t rhi_texture)
+{
+	if (rhi_texture == 0 || g_disabled.load(std::memory_order_acquire))
+		return 0;
+	const std::uint64_t r = resolve_rhi_texture(rhi_texture);
+	note_faults_and_latch();
+	return r;
+}
+
+bool patch_vtable_slot(void **slot, void *replacement, void **original_out)
+{
+	void *orig = nullptr;
+	if (!patch_slot(slot, replacement, orig))
+		return false;
+	if (original_out != nullptr)
+		*original_out = orig;
+	return true;
+}
+
+bool in_module_rdata(std::uint64_t va)
+{
+	if (!g_mapped || !in_module(va))
+		return false;
+	for (const Region &r : g_regions)
+		if (va >= r.va && va < r.va + r.size)
+			return !r.executable && r.name != nullptr && std::strncmp(r.name, ".rdata", 6) == 0;
+	return false;
+}
+
+const seam::Image *module_image()
+{
+	return g_mapped ? &g_image : nullptr;
 }
 
 void shutdown()

@@ -129,6 +129,11 @@ struct Counters
 	float mask_b = 0.0f;
 	std::uint64_t mask_fills = 0;
 	std::uint64_t mask_bytes = 0;
+	// The HUD-less copy as DLSSNR.Color (EngineSeamHudless=2, EngineSeamHudlessNR=1): frames it
+	// was bound on, and frames that wanted it and had no fresh copy (no UI drawn, or the seam's
+	// own refusal - read the [rhigfx] line).
+	std::uint64_t hudless_used = 0;
+	std::uint64_t hudless_missing = 0;
 };
 
 Counters counters();

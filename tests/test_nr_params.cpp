@@ -220,3 +220,32 @@ TEST_CASE("build_rects does NOT emit a ControlMask rect")
 	const std::vector<Entry> e = rects(r);
 	CHECK(find(e, "DLSSNR.ControlMaskSubrectWidth") == nullptr);
 }
+
+TEST_CASE("the Backbuffer subrect is written in the same TYPES as the other four, under the runtime's own names, never partially")
+{
+	Entry out[kMaxBackbufferRectEntries];
+	const int n = build_backbuffer_rect(3840, 2160, out, kMaxBackbufferRectEntries);
+	REQUIRE(n == 4);
+	CHECK(std::string(out[0].name) == "DLSSNR.BackbufferSubrectBaseX");
+	CHECK(std::string(out[1].name) == "DLSSNR.BackbufferSubrectBaseY");
+	CHECK(std::string(out[2].name) == "DLSSNR.BackbufferSubrectWidth");
+	CHECK(std::string(out[3].name) == "DLSSNR.BackbufferSubrectHeight");
+	for (int i = 0; i < n; ++i)
+		CHECK(out[i].type == Type::i32);
+	CHECK(out[0].i == 0);
+	CHECK(out[1].i == 0);
+	CHECK(out[2].i == 3840);
+	CHECK(out[3].i == 2160);
+	CHECK(build_backbuffer_rect(3840, 2160, out, kMaxBackbufferRectEntries - 1) == 0);
+	CHECK(build_backbuffer_rect(3840, 2160, nullptr, kMaxBackbufferRectEntries) == 0);
+	// And build_rects still emits none of them: the rect is optional.
+	Rects r;
+	r.color_width = r.output_width = 3840;
+	r.color_height = r.output_height = 2160;
+	r.guide_width = 1920;
+	r.guide_height = 1080;
+	Entry all[kMaxRectEntries];
+	const int m = build_rects(r, all, kMaxRectEntries);
+	for (int i = 0; i < m; ++i)
+		CHECK(std::string(all[i].name).find("Backbuffer") == std::string::npos);
+}

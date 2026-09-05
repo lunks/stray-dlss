@@ -1,5 +1,8 @@
 #include "ngx_fg.hpp"
 
+#include "hudless.hpp"
+#include "rhi_gfx_hook.hpp"
+
 #include "core/fg_plan.hpp"
 #include "log.hpp"
 #include "ngx_backend.hpp"
@@ -41,6 +44,7 @@ GuideSet g_guides[2];
 unsigned g_publish_next = 0;
 std::atomic<std::uint64_t> g_publish_seq{ 0 }; // the newest publish; the present consumes it once
 std::uint64_t g_consumed_seq = 0;
+std::uint64_t g_hudless_consumed = 0; // the newest hudless publication handed to an evaluate
 D3D12_RESOURCE_DESC g_depth_desc = {}, g_mv_desc = {};
 bool g_guides_ok = false;
 
@@ -409,6 +413,35 @@ public:
 		p->Set("DLSSG.MVecsSubrectBaseY", 0u);
 		p->Set("DLSSG.MVecsSubrectWidth", c.render_width);
 		p->Set("DLSSG.MVecsSubrectHeight", c.render_height);
+		// THE HUD-LESS FRAME (stage 3, src/hudless.hpp): the copy the graphics seam took on the
+		// game's list at Slate's HUD pass, this frame. `DLSSG.HUDLess` and its four subrect
+		// siblings are in the 2.12.0 snippet's PRESENT set (facts §32.2, "each with
+		// SubrectBaseX/BaseY/Width/Height siblings"); UNCONFIRMED against the box's SL 2.13
+		// copy until tools/ngx_param_names.py is run there. A frame with no copy (no UI drawn,
+		// or the seam below level 2) writes a NULL so a previous frame's copy is never left
+		// bound - the parameter block persists across evaluates and nothing clears it.
+		ID3D12Resource *hudless_tex = nullptr;
+		{
+			const hudless::Current hl = hudless::current();
+			if (hl.sequence != 0 && hl.sequence != g_hudless_consumed && hl.texture != nullptr &&
+				hl.width == width && hl.height == height && hl.format == dxgi_format)
+			{
+				g_hudless_consumed = hl.sequence;
+				hudless_tex = hl.texture;
+			}
+		}
+		p->Set("DLSSG.HUDLess", hudless_tex);
+		p->Set("DLSSG.HUDLessSubrectBaseX", 0u);
+		p->Set("DLSSG.HUDLessSubrectBaseY", 0u);
+		p->Set("DLSSG.HUDLessSubrectWidth", hudless_tex != nullptr ? width : 0u);
+		p->Set("DLSSG.HUDLessSubrectHeight", hudless_tex != nullptr ? height : 0u);
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			if (hudless_tex != nullptr)
+				++g_stats.hudless_bound;
+			else
+				++g_stats.hudless_absent;
+		}
 		p->Set("DLSSG.OutputInterpolated", out);
 		p->Set("DLSSG.OutputInterpolatedSubrectBaseX", 0u);
 		p->Set("DLSSG.OutputInterpolatedSubrectBaseY", 0u);
@@ -481,7 +514,11 @@ public:
 		barrier(list, out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		if (g_output_real != nullptr)
 			barrier(list, g_output_real, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		if (hudless_tex != nullptr)
+			barrier(list, hudless_tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_EvaluateFeature(list, g_feature, g_params, nullptr);
+		if (hudless_tex != nullptr)
+			barrier(list, hudless_tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 		barrier(list, real_current, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 		barrier(list, g->depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 		barrier(list, g->mvecs, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -504,8 +541,14 @@ public:
 		}
 		static std::atomic<int> s_logged{ 0 };
 		if (s_logged.fetch_add(1) == 0)
-			STRAY_LOG_WARN("fg/ngx: first DLSS-G evaluate OK: backbuffer %ux%u, guides %ux%u, jitter=%.4f,%.4f reset=%d fov=%.4f rad aspect=%.4f near=%.3f far=%.3f mvecScale=%.6f,%.6f hdr=%d",
-				width, height, c.render_width, c.render_height, c.jitter_x, c.jitter_y, reset ? 1 : 0, fov, aspect, near_sent, g_cfg.camera_far, sx, sy, g_feature_hdr);
+			STRAY_LOG_WARN("fg/ngx: first DLSS-G evaluate OK: backbuffer %ux%u, guides %ux%u, jitter=%.4f,%.4f reset=%d fov=%.4f rad aspect=%.4f near=%.3f far=%.3f mvecScale=%.6f,%.6f hdr=%d hudless=%s",
+				width, height, c.render_width, c.render_height, c.jitter_x, c.jitter_y, reset ? 1 : 0, fov, aspect, near_sent, g_cfg.camera_far, sx, sy, g_feature_hdr,
+				hudless_tex != nullptr ? "bound" : "none");
+		static std::atomic<int> s_hudless_logged{ 0 };
+		if (hudless_tex != nullptr && s_hudless_logged.fetch_add(1) == 0)
+			STRAY_LOG_WARN("fg/ngx: first DLSS-G evaluate WITH DLSSG.HUDLess (%p, %ux%u) - the indicator's Hudless field "
+				"should read Yes from here. If the generated frame's HUD doubles or vanishes, EngineSeamHudless=1 "
+				"keeps the copy out of DLSS-G.", static_cast<void *>(hudless_tex), width, height);
 		return true;
 #endif
 	}

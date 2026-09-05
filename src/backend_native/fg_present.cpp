@@ -1,5 +1,6 @@
 #include "backend_native/fg_present.hpp"
 
+#include "backend_native/backbuffer_state.hpp"
 #include "backend_native/fg_reflex.hpp"
 #include "backend_native/fg_throttle.hpp"
 #include "backend_native/native_backend.hpp"
@@ -8,6 +9,7 @@
 #include "backend_native/vtable_slots.hpp"
 #include "log.hpp"
 #include "perf.hpp"
+#include "rhi_gfx_hook.hpp"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -495,6 +497,16 @@ bool arm_locked(Chain &c)
 		return false;
 	c.mirror.reset(sd.BufferCount);
 	c.armed = true;
+	// The swapchain-class candidate set the engine's answers are held to (frame_seams.hpp): from
+	// here the game holds the REPLACEMENTS, so they - not the real ring - are what the engine's
+	// RHIBeginRenderPass resolves to and what FD3D12Viewport::Present transitions to PRESENT.
+	{
+		std::uint64_t ids[kMaxReplacements] = {};
+		for (std::uint32_t i = 0; i < sd.BufferCount; ++i)
+			ids[i] = reinterpret_cast<std::uint64_t>(c.replacement[i].Get());
+		bbstate::set_candidates(ids, sd.BufferCount, "fg replacements armed");
+		rhigfx::note_reconfigure("fg armed");
+	}
 	{
 		std::lock_guard<std::mutex> lock(g_smutex);
 		g_stats.replacement_count = sd.BufferCount;
@@ -533,6 +545,21 @@ void disarm_locked(Chain &c)
 	c.judge.reset();
 	c.pacer.reset();
 	c.sched.reset();
+	bbstate::clear_candidates("fg replacements dropped");
+	rhigfx::note_reconfigure("fg disarmed");
+}
+
+// WHICH replacement holds the frame the game rendered: the mirror's answer, or - at
+// [STRAYDLSS] EngineSeamBackBuffer=2 - the one the engine's own RHIBeginRenderPass resolved to
+// this frame (rhi_gfx_hook.hpp), the mirror becoming the assertion. Caller holds g_mutex.
+ID3D12Resource *current_replacement_locked(Chain &c)
+{
+	ID3D12Resource *mirror = c.replacement[c.mirror.current()].Get();
+	const std::uint64_t chosen = rhigfx::select_game_frame(reinterpret_cast<std::uint64_t>(mirror));
+	for (std::uint32_t i = 0; i < c.replacement_count; ++i)
+		if (reinterpret_cast<std::uint64_t>(c.replacement[i].Get()) == chosen)
+			return c.replacement[i].Get();
+	return mirror; // an answer outside the ring is never used (select_game_frame refuses it; belt and braces)
 }
 
 // ---- the experiment's generated frame: previous real frame + magenta band ----
@@ -1140,6 +1167,7 @@ void after_reconfigure(IDXGISwapChain *sc, const char *what, bool drop_replaceme
 	c.sched.reset();
 	c.generated_valid = false;
 	c.epoch.end_reconfigure();
+	rhigfx::note_reconfigure(what);
 	if (g_generator != nullptr)
 		g_generator->on_reconfigure();
 	// MSDN: ResizeBuffers "can reset or change all DXGI_SWAP_CHAIN_FLAG flags". We re-assert the
@@ -1158,6 +1186,17 @@ void after_reconfigure(IDXGISwapChain *sc, const char *what, bool drop_replaceme
 }
 
 ID3D12Resource *game_frame(IDXGISwapChain *sc)
+{
+	if (!g_cfg.enabled || !g_have_chain.load() || sc != g_chain.sc)
+		return nullptr;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	Chain &c = g_chain;
+	if (!c.armed)
+		return nullptr;
+	return current_replacement_locked(c);
+}
+
+ID3D12Resource *mirror_frame(IDXGISwapChain *sc)
 {
 	if (!g_cfg.enabled || !g_have_chain.load() || sc != g_chain.sc)
 		return nullptr;
@@ -1193,7 +1232,7 @@ bool record(IDXGISwapChain *sc, ID3D12GraphicsCommandList *list, std::uint64_t f
 	}
 	ID3D12Resource *out = c.generated[c.generated_next].Get();
 	c.generated_next ^= 1;
-	ID3D12Resource *real_current = c.replacement[c.mirror.current()].Get();
+	ID3D12Resource *real_current = current_replacement_locked(c);
 	bool produced = false;
 	const char *why = "generator declined";
 	if (g_cfg.mode == Mode::experiment || g_generator == nullptr)
@@ -1287,7 +1326,7 @@ bool present(const PresentArgs &args, long *hr_out)
 
 		p.sc = args.sc;
 		p.generated = r == core::fg::Refusal::none ? c.generated_this : nullptr;
-		p.real = c.replacement[c.mirror.current()].Get();
+		p.real = current_replacement_locked(c);
 		p.epoch = c.epoch.value;
 		p.delay_ns = delay;
 		p.sync = args.sync;
@@ -1408,6 +1447,17 @@ void log_stats(const char *when)
 	if (n == 0)
 		std::snprintf(refusals, sizeof(refusals), " none");
 	const reflex::Status rs = reflex::status();
+	// The back-buffer identity from the engine (rhi_gfx_hook.hpp): the render-pass resolve
+	// against this mirror, and against the engine's own PRESENT transition. Both `disagree`
+	// counts must stay 0; `selected engine=` grows only at EngineSeamBackBuffer=2.
+	const rhigfx::Stats gx = rhigfx::stats();
+	const auto idm = [&](fseam::IdVerdict x) { return static_cast<unsigned long long>(gx.id_vs_mirror[static_cast<int>(x)]); };
+	const auto idb = [&](fseam::IdVerdict x) { return static_cast<unsigned long long>(gx.id_vs_barrier[static_cast<int>(x)]); };
+	STRAY_LOG_INFO("[fg] %s: engineId vsMirror(agree=%llu disagree=%llu absent=%llu notCandidate=%llu) vsPresentBarrier(agree=%llu disagree=%llu absent=%llu) selected(engine=%llu mirror=%llu fellBack=%llu) hooked=%d",
+		when, idm(fseam::IdVerdict::agree), idm(fseam::IdVerdict::disagree), idm(fseam::IdVerdict::engine_absent), idm(fseam::IdVerdict::not_candidate),
+		idb(fseam::IdVerdict::agree), idb(fseam::IdVerdict::disagree), idb(fseam::IdVerdict::engine_absent) + idb(fseam::IdVerdict::other_absent),
+		static_cast<unsigned long long>(gx.selected_engine), static_cast<unsigned long long>(gx.selected_mirror),
+		static_cast<unsigned long long>(gx.select_fell_back), gx.hooked ? 1 : 0);
 	STRAY_LOG_INFO("[fg] %s: game presents=%llu issued=%llu generated=%llu (%.2fx) | refused:%s | pacer median %.2f ms hitches=%llu (schedule: holds=%llu catchups=%llu reanchors=%llu) | issued-interval p50=%u ms p99=%u ms %s | worker waits=%llu | epoch=%llu reconfigures=%llu | %ux%u fmt %u colourspace %d | crops ok=%llu identical=%llu black=%llu stale=%llu suspect=%llu dark=%llu validated=%d | reflex dll=%d init=%d sleepMode=%d(%d) sleeps=%llu(%d) markers=%llu(%d) oob=%d(%d,type %d) | throttle %s(%s) flag=%s latency %d->%d waits=%llu slots=%llu timeouts=%llu failed=%llu skipped=%llu bypassed=%llu blocked mean %.2f ms max %.2f ms",
 		when, static_cast<unsigned long long>(s.game_presents), static_cast<unsigned long long>(s.presents_issued),
 		static_cast<unsigned long long>(s.generated_presented),

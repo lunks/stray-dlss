@@ -137,6 +137,11 @@ constexpr const char *kStyle        = "DLSSNR.Style";
 // the way those four are. src/core/nr_mask_plan.hpp carries the addresses and the two things
 // binding one costs.
 constexpr const char *kControlMask  = "DLSSNR.ControlMask";
+// The final frame WITH the UI, bound only when DLSSNR.Color is the HUD-less copy. In the runtime's
+// own string table (docs/RESEARCH-DLSSNR-STYLES.md §2), read into +0xa8 through the same vtable
+// slot as Color (§8.1), consumed and validated against the Output rect (§8.3), and the
+// precondition UICorrection has always lacked here (§8.5). A NULL unbinds it (§8.1).
+constexpr const char *kBackbuffer   = "DLSSNR.Backbuffer";
 
 // Refusal indices, parallel to kNrRefusalNames.
 enum
@@ -172,6 +177,7 @@ constexpr unsigned long long kNrApplicationId = 0x5354524159444C53ull; // "STRAY
 // feature-18 then goes through the snippet rather than the NGX core, because the core has no
 // knowledge of a pre-release snippet and answers FAIL_OutOfDate (measured: 0xbad0000c).
 bool g_use_direct = false;
+std::atomic<std::uint64_t> g_hudless_evaluates{ 0 }; // evaluates whose Color was the HUD-less copy
 // Which runtime allocated g_params. An NVSDK_NGX_Parameter is just an interface object, so the
 // snippet happily consumes one the CORE allocated — but whatever allocated it must also destroy
 // it, so this flag pairs the two and we never cross-call.
@@ -1002,6 +1008,11 @@ void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[
 		out[i] = g_refusals[i].load(std::memory_order_relaxed);
 }
 
+std::uint64_t hudless_evaluates()
+{
+	return g_hudless_evaluates.load(std::memory_order_relaxed);
+}
+
 ResetCounts reset_counters()
 {
 	ResetCounts c;
@@ -1144,7 +1155,11 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// residual transfer) as its input contract, plus five refusal reasons enforcing it, plus an
 	// end-of-frame history restore because `u0` is a feedback node. All of it existed to make one
 	// wrong hook point survivable. None of it is needed here.
-	ID3D12Resource *colour = in.image;
+	// THE COLOUR INPUT: the final frame today; the HUD-less copy when the graphics seam supplied
+	// one (nr_hook.cpp), with the final frame then bound as DLSSNR.Backbuffer below.
+	ID3D12Resource *colour = in.hudless != nullptr ? in.hudless : in.image;
+	if (in.hudless != nullptr)
+		g_hudless_evaluates.fetch_add(1, std::memory_order_relaxed);
 
 	// The state `image` arrives in and must be left in — nrstage::kStagingRestState, which the
 	// present stage keeps its staging copy at precisely so this is a constant. The barriers below
@@ -1266,6 +1281,25 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	g_params->Set(kDepth, in.depth);
 	g_params->Set(kMVec, in.motion_vectors);
 	g_params->Set(kOutput, g_nr_output);
+	// DLSSNR.Backbuffer: the final frame when Color is the HUD-less copy; NULL otherwise, so a
+	// previous frame's binding never outlives its copy (the block persists across evaluates).
+	g_params->Set(kBackbuffer, in.hudless != nullptr ? in.image : static_cast<ID3D12Resource *>(nullptr));
+	if (in.hudless != nullptr)
+	{
+		nrparam::Entry bb_rect[nrparam::kMaxBackbufferRectEntries];
+		const int n = nrparam::build_backbuffer_rect(cw, ch, bb_rect, nrparam::kMaxBackbufferRectEntries);
+		apply_entries(g_params, bb_rect, n);
+		static bool s_hudless_logged = false;
+		if (!s_hudless_logged)
+		{
+			s_hudless_logged = true;
+			STRAY_LOG_WARN("NR: first evaluate with DLSSNR.Color = the HUD-LESS copy (%p) and DLSSNR.Backbuffer = the "
+				"final frame (%p), both %ux%u. This is the first time UICorrection=%u has had a Backbuffer to arm "
+				"against (docs/RESEARCH-DLSSNR-STYLES.md §8.5). What the network does with the pair is UNCONFIRMED: "
+				"a HUD missing from the NR'd frame is this input, and EngineSeamHudlessNR=0 removes it.",
+				static_cast<void *>(in.hudless), static_cast<void *>(in.image), cw, ch, g_ui_correction);
+		}
+	}
 
 	// THE CONTROL MASK, and the null is as load-bearing as the pointer. The parameter block
 	// persists across evaluates and nothing clears it, so a frame that stops wanting a mask has to

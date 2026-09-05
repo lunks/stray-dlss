@@ -102,6 +102,25 @@ void assert_at_claim(const WalkAnswer &walk, std::uint32_t out_width, std::uint3
 int format_report(char *buffer, std::size_t size);
 void log_report(const char *when);
 
+// ---- shared with the graphics seams (src/rhi_gfx_hook.hpp) ----
+//
+// One discovery, two halves: the graphics thunks stand on the same vtable and use the same
+// guarded reader, the same FRHITexture::GetNativeResource route and the same slot patcher, so
+// none of that is duplicated. Each is safe to call from any thread; none takes u0hook's mutex
+// (rhigfx::on_context_discovered runs INSIDE the discovery, which holds it).
+bool guarded_read_u64(std::uint64_t va, std::uint64_t *out);
+// FRHITexture* -> ID3D12Resource* through vtable slot seam::kRhiGetNativeResourceSlot, refused
+// (0) unless the vptr is in the module with eight code slots; the call runs under SEH and a
+// fault is counted against u0hook's own latch.
+std::uint64_t resolve_texture_native(std::uint64_t rhi_texture);
+// VirtualProtect-write-restore on one vtable slot; `original_out` receives what was there.
+bool patch_vtable_slot(void **slot, void *replacement, void **original_out);
+// True when `va` lies inside a READ-ONLY, non-executable section of the game module (.rdata):
+// where a `TEXT("...")` literal lives. Identity of the pass NAME pointer, never its contents.
+bool in_module_rdata(std::uint64_t va);
+// The module's code / read-only ranges, for a caller that needs the image itself.
+const seam::Image *module_image();
+
 // Restores every patched slot that is still ours. Must run before this DLL can be unloaded.
 void shutdown();
 

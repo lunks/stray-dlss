@@ -1,5 +1,7 @@
 #include "backend_native/d3d12_hooks.hpp"
 
+#include "backend_native/backbuffer_state.hpp"
+
 #include "app/diff_observer.hpp"
 #include "backend_native/descriptor_shadow.hpp"
 #include "backend_native/native_backend.hpp"
@@ -12,6 +14,7 @@
 #include "core/fnv1a.hpp"
 #include "log.hpp"
 #include "perf.hpp"
+#include "rhi_gfx_hook.hpp"
 #include "u0_rhi_hook.hpp"
 
 #include <d3d12.h>
@@ -105,6 +108,10 @@ using PFN_List_SetComputeRoot32BitConstant = void(STDMETHODCALLTYPE *)(ID3D12Gra
 using PFN_List_SetComputeRoot32BitConstants = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, const void *, UINT);
 using PFN_List_SetComputeRootView = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 using PFN_List_Dispatch = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, UINT);
+using PFN_List_ResourceBarrier = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *);
+using PFN_List_DrawInstanced = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, UINT);
+using PFN_List_DrawIndexedInstanced = void(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, INT, UINT);
+using PFN_Queue_ExecuteCommandLists = void(STDMETHODCALLTYPE *)(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *);
 
 PFN_CreateCommandQueue g_orig_CreateCommandQueue = nullptr;
 PFN_CreateCommittedResource g_orig_CreateCommittedResource = nullptr;
@@ -144,6 +151,9 @@ PFN_List_SetComputeRootView g_orig_List_SetComputeRootConstantBufferView = nullp
 PFN_List_SetComputeRootView g_orig_List_SetComputeRootShaderResourceView = nullptr;
 PFN_List_SetComputeRootView g_orig_List_SetComputeRootUnorderedAccessView = nullptr;
 PFN_List_Dispatch g_orig_List_Dispatch = nullptr;
+PFN_List_ResourceBarrier g_orig_List_ResourceBarrier = nullptr;
+PFN_List_DrawInstanced g_orig_List_DrawInstanced = nullptr;
+PFN_List_DrawIndexedInstanced g_orig_List_DrawIndexedInstanced = nullptr;
 
 // ---- helpers ----
 
@@ -298,13 +308,34 @@ void store_pipeline(void *pso, const void *code, std::size_t len)
 
 // ---- device hooks ----
 
+// ID3D12CommandQueue::ExecuteCommandLists: the moment a game list's recorded barriers become
+// GPU order (backbuffer_state.hpp). Per-vtable original (vkd3d shares one vtable per class,
+// facts §11; a proxy queue would have its own and gets its own patch record).
+void STDMETHODCALLTYPE hk_Queue_ExecuteCommandLists(ID3D12CommandQueue *self, UINT n, ID3D12CommandList *const *lists)
+{
+	auto orig = reinterpret_cast<PFN_Queue_ExecuteCommandLists>(original_for(self, slot::kQueue_ExecuteCommandLists));
+	if (!in_own_code())
+		bbstate::on_execute(n, lists);
+	if (orig != nullptr)
+	{
+		OwnCodeScope forward;
+		orig(self, n, lists);
+	}
+}
+
 HRESULT STDMETHODCALLTYPE hk_CreateCommandQueue(ID3D12Device *self, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **out)
 {
 	const HRESULT hr = g_orig_CreateCommandQueue(self, desc, riid, out);
 	// Every queue, ours included: the present owner needs the REAL queue objects (a proxy
 	// device forwards here with the real ones), and it picks by identity or by type.
 	if (SUCCEEDED(hr) && out != nullptr && *out != nullptr && desc != nullptr)
-		present::note_queue(static_cast<ID3D12CommandQueue *>(*out), static_cast<int>(desc->Type));
+	{
+		auto *queue = static_cast<ID3D12CommandQueue *>(*out);
+		present::note_queue(queue, static_cast<int>(desc->Type));
+		// The barrier ledger needs execute order for every DIRECT queue the game submits on.
+		if (desc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT && !in_own_code())
+			patch_slot(queue, slot::kQueue_ExecuteCommandLists, reinterpret_cast<void *>(&hk_Queue_ExecuteCommandLists), "ID3D12CommandQueue::ExecuteCommandLists");
+	}
 	return hr;
 }
 
@@ -650,6 +681,7 @@ HRESULT STDMETHODCALLTYPE hk_List_Reset(ID3D12GraphicsCommandList *self, ID3D12C
 		perf::Scope _ps(perf::kRootBind);
 		perf::count(perf::kCntRootBinds);
 		root::on_reset(self, pso);
+		bbstate::on_list_reset(self);
 		if (icept::Sink *sk = drive_sink())
 			sk->on_command_list_reset(context_for(self));
 	}
@@ -673,6 +705,10 @@ void STDMETHODCALLTYPE hk_List_SetDescriptorHeaps(ID3D12GraphicsCommandList *sel
 
 void STDMETHODCALLTYPE hk_List_SetPipelineState(ID3D12GraphicsCommandList *self, ID3D12PipelineState *pso)
 {
+	// The HUD-less carrier: a copy armed by the RHIBeginRenderPass thunk on this thread is
+	// recorded on THIS list, before the engine's own command (rhi_gfx_hook.hpp).
+	if (rhigfx::t_copy_pending && !in_own_code())
+		rhigfx::carry(self);
 	{
 		OwnCodeScope forward;
 		g_orig_List_SetPipelineState(self, pso);
@@ -786,6 +822,40 @@ void STDMETHODCALLTYPE hk_List_SetComputeRootUnorderedAccessView(ID3D12GraphicsC
 		perf::count(perf::kCntRootBinds);
 		root::on_set_compute_root_uav(self, param, va);
 	}
+}
+
+// ResourceBarrier: the engine's own statement of every state a swapchain-class resource is put
+// in (backbuffer_state.hpp), queued per list and replayed at ExecuteCommandLists. Also a HUD-less
+// carrier. Our own barriers - the present list's, FG's copies, the TAA hook's - run under
+// OwnCodeScope and are not the game's.
+void STDMETHODCALLTYPE hk_List_ResourceBarrier(ID3D12GraphicsCommandList *self, UINT n, const D3D12_RESOURCE_BARRIER *barriers)
+{
+	const bool game = !in_own_code();
+	if (game && rhigfx::t_copy_pending)
+		rhigfx::carry(self);
+	{
+		OwnCodeScope forward;
+		g_orig_List_ResourceBarrier(self, n, barriers);
+	}
+	if (game)
+		bbstate::on_barriers(self, n, barriers);
+}
+
+// The two draws are hooked for ONE reason: as the HUD-less copy's last-resort carrier, so the copy
+// is on the list before the UI's first draw even when neither the PSO nor a barrier changed. The
+// fast path is a thread-local bool.
+void STDMETHODCALLTYPE hk_List_DrawInstanced(ID3D12GraphicsCommandList *self, UINT vpi, UINT ic, UINT sv, UINT si)
+{
+	if (rhigfx::t_copy_pending && !in_own_code())
+		rhigfx::carry(self);
+	g_orig_List_DrawInstanced(self, vpi, ic, sv, si);
+}
+
+void STDMETHODCALLTYPE hk_List_DrawIndexedInstanced(ID3D12GraphicsCommandList *self, UINT ipi, UINT ic, UINT sil, INT bvl, UINT si)
+{
+	if (rhigfx::t_copy_pending && !in_own_code())
+		rhigfx::carry(self);
+	g_orig_List_DrawIndexedInstanced(self, ipi, ic, sil, bvl, si);
 }
 
 void STDMETHODCALLTYPE hk_List_Dispatch(ID3D12GraphicsCommandList *self, UINT x, UINT y, UINT z)
@@ -1130,6 +1200,9 @@ unsigned install_list_hooks(::ID3D12Device *device)
 	hook(slot::kList_SetComputeRootShaderResourceView, reinterpret_cast<void *>(&hk_List_SetComputeRootShaderResourceView), reinterpret_cast<void **>(&g_orig_List_SetComputeRootShaderResourceView), "ID3D12GraphicsCommandList::SetComputeRootShaderResourceView");
 	hook(slot::kList_SetComputeRootUnorderedAccessView, reinterpret_cast<void *>(&hk_List_SetComputeRootUnorderedAccessView), reinterpret_cast<void **>(&g_orig_List_SetComputeRootUnorderedAccessView), "ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView");
 	hook(slot::kList_Dispatch, reinterpret_cast<void *>(&hk_List_Dispatch), reinterpret_cast<void **>(&g_orig_List_Dispatch), "ID3D12GraphicsCommandList::Dispatch");
+	hook(slot::kList_ResourceBarrier, reinterpret_cast<void *>(&hk_List_ResourceBarrier), reinterpret_cast<void **>(&g_orig_List_ResourceBarrier), "ID3D12GraphicsCommandList::ResourceBarrier");
+	hook(slot::kList_DrawInstanced, reinterpret_cast<void *>(&hk_List_DrawInstanced), reinterpret_cast<void **>(&g_orig_List_DrawInstanced), "ID3D12GraphicsCommandList::DrawInstanced");
+	hook(slot::kList_DrawIndexedInstanced, reinterpret_cast<void *>(&hk_List_DrawIndexedInstanced), reinterpret_cast<void **>(&g_orig_List_DrawIndexedInstanced), "ID3D12GraphicsCommandList::DrawIndexedInstanced");
 	return n;
 }
 

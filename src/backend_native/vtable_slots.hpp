@@ -40,8 +40,11 @@ constexpr unsigned kDevice8_CreatePlacedResource1 = 70;
 // ID3D12GraphicsCommandList 9-59.
 constexpr unsigned kList_Close = 9;
 constexpr unsigned kList_Reset = 10;
+constexpr unsigned kList_DrawInstanced = 12;
+constexpr unsigned kList_DrawIndexedInstanced = 13;
 constexpr unsigned kList_Dispatch = 14;
 constexpr unsigned kList_SetPipelineState = 25;
+constexpr unsigned kList_ResourceBarrier = 26;
 constexpr unsigned kList_SetDescriptorHeaps = 28;
 constexpr unsigned kList_SetComputeRootSignature = 29;
 constexpr unsigned kList_SetComputeRootDescriptorTable = 31;

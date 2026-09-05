@@ -143,6 +143,19 @@ struct ApplyInputs
 	ID3D12Resource *control_mask = nullptr;
 	std::uint32_t control_mask_width = 0;
 	std::uint32_t control_mask_height = 0;
+
+	// THE HUD-LESS FRAME ([STRAYDLSS] EngineSeamHudless=2 with EngineSeamHudlessNR=1). When set,
+	// it is DLSSNR.Color - the scene BEFORE Slate drew the UI - and `image` (the final frame) is
+	// bound as DLSSNR.Backbuffer, which is the runtime's own precondition for UICorrection to arm
+	// at all (docs/RESEARCH-DLSSNR-STYLES.md §8.5: `UICorrection && Backbuffer && !(UI||UIAlpha)`).
+	// Rests in NON_PIXEL_SHADER_RESOURCE for the call (the caller transitions it around apply()).
+	// Null = today's path: Color = image, no Backbuffer, and a NULL written to unbind any previous
+	// frame's.
+	//
+	// UNCONFIRMED, and it is the whole risk of this input: §8.3 read the runtime substituting the
+	// Backbuffer for Color "where present" and left what it does with the pair unverified. A HUD
+	// that vanishes from the NR'd frame is this feature; EngineSeamHudlessNR=0 removes it.
+	ID3D12Resource *hudless = nullptr;
 };
 
 // Runs feature 18 and, once validated, copies the neural result back over `image`. Returns
@@ -193,5 +206,7 @@ struct ResetCounts
 	std::uint32_t new_feature = 0; // the first evaluate against a freshly created feature
 };
 ResetCounts reset_counters();
+// Evaluates whose DLSSNR.Color was the HUD-less copy (ApplyInputs::hudless).
+std::uint64_t hudless_evaluates();
 
 } // namespace stray_dlss::nr

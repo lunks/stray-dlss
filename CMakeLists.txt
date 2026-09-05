@@ -219,6 +219,10 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/view_params_hook.hpp
         src/u0_rhi_hook.cpp
         src/u0_rhi_hook.hpp
+        src/rhi_gfx_hook.cpp
+        src/rhi_gfx_hook.hpp
+        src/hudless.cpp
+        src/hudless.hpp
         src/pool_name_hook.cpp
         src/pool_name_hook.hpp
         src/perf.cpp
@@ -263,6 +267,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/backend_native/fg_reflex.hpp
         src/backend_native/fg_throttle.cpp
         src/backend_native/fg_throttle.hpp
+        src/backend_native/backbuffer_state.cpp
+        src/backend_native/backbuffer_state.hpp
         src/backend_native/vtable_slots.hpp
         # Compile-time proof of the slot numbers against the SDK's C Vtbl structs; links nothing.
         src/backend_native/vtable_slots_check.c)
@@ -364,7 +370,12 @@ if(STRAY_DLSS_BUILD_WARP_TESTS AND WIN32)
         src/app/diff_observer.cpp
         # The Dispatch hook feeds the u0 RHI-context discovery its seed (src/u0_rhi_hook.hpp);
         # unconfigured in the harness, so it maps and scans nothing, but it must link.
-        src/u0_rhi_hook.cpp)
+        src/u0_rhi_hook.cpp
+        # The graphics seams, the barrier ledger and the HUD-less copy (warp_hudless.inc judges the
+        # copy's barriers; the seams themselves install nothing without a discovery).
+        src/rhi_gfx_hook.cpp
+        src/hudless.cpp
+        src/backend_native/backbuffer_state.cpp)
 
     compile_shader(stray_dlss_warp "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mv_resolve.hlsl"
                    main cs_5_0 g_mv_resolve_dxbc)

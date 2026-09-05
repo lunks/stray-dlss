@@ -1,5 +1,7 @@
 #include "nr_hook.hpp"
 
+#include "backend_native/backbuffer_state.hpp"
+#include "hudless.hpp"
 #include "intercept/backend.hpp"
 #include "log.hpp"
 #include "mv_resolve.hpp"
@@ -7,6 +9,7 @@
 #include "nr_mask.hpp"
 #include "nr_stage.hpp"
 #include "perf.hpp"
+#include "rhi_gfx_hook.hpp"
 
 #include <d3d12.h>
 
@@ -118,6 +121,26 @@ void issue_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, std::ui
 		after);
 }
 
+// A transition on a texture WE own, recorded natively on the present list (the seam's
+// present_barrier is for the back buffer, whose transitions must mark the list as used; ours
+// come after it on a frame that already did).
+void transition_own(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+	if (cmd == nullptr || res == nullptr || from == to)
+		return;
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = res;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = from;
+	b.Transition.StateAfter = to;
+	cmd->ResourceBarrier(1, &b);
+}
+
+std::uint64_t g_hudless_consumed = 0;               // the newest hudless publication handed to an evaluate
+std::atomic<std::uint64_t> g_hudless_used{ 0 };     // frames whose Color was the HUD-less copy
+std::atomic<std::uint64_t> g_hudless_missing{ 0 };  // frames that wanted one and had no fresh copy
+
 } // namespace
 
 void set_back_buffer_state(std::uint32_t states)
@@ -182,6 +205,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// must happen even on a frame the gate refuses.
 	nrstage::collect(pc.frame);
 	nrmask::collect(pc.frame);
+	hudless::collect(pc.frame);
 
 	if (!nr::enabled())
 		return;
@@ -270,7 +294,10 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 
 	BarrierCtx bctx;
 	bctx.pc = &pc;
-	const std::uint32_t bb_state = back_buffer_state();
+	// THE BACK BUFFER'S STATE: the assumed constant ([STRAYDLSS] NgxNRStageBackBufferState),
+	// asserted against - or at EngineSeamBackBufferState=2 replaced by - the state the engine's
+	// own last executed ResourceBarrier left it in (backend_native/backbuffer_state.hpp).
+	const std::uint32_t bb_state = native::bbstate::present_state(reinterpret_cast<std::uint64_t>(colour), back_buffer_state());
 
 	// --- read the frame out of the back buffer ---
 	nrstage::record_capture(cmd, colour, bb_state, issue_barrier, &bctx);
@@ -362,6 +389,24 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	ni.control_mask = mask_texture;
 	ni.control_mask_width = mask_plan.width;
 	ni.control_mask_height = mask_plan.height;
+	// THE HUD-LESS COPY as DLSSNR.Color, the staging copy (the final frame) as DLSSNR.Backbuffer
+	// (src/hudless.hpp; ngx_nr.hpp ApplyInputs::hudless). Only a copy taken THIS frame, at the
+	// back buffer's own extent and format; consumed once. Refused frames are counted by reason.
+	ID3D12Resource *hudless_tex = nullptr;
+	{
+		const hudless::Current hl = hudless::current();
+		const bool wanted = rhigfx::hudless_level() == fseam::Level::authoritative && rhigfx::config().hudless_nr;
+		if (wanted && hl.sequence != 0 && hl.sequence != g_hudless_consumed && hl.texture != nullptr &&
+			hl.width == plan.width && hl.height == plan.height && hl.format == static_cast<unsigned>(src.Format))
+		{
+			g_hudless_consumed = hl.sequence;
+			hudless_tex = hl.texture;
+			g_hudless_used.fetch_add(1, std::memory_order_relaxed);
+		}
+		else if (wanted)
+			g_hudless_missing.fetch_add(1, std::memory_order_relaxed);
+	}
+	ni.hudless = hudless_tex;
 
 	// Our dense RG16_FLOAT motion vectors rest in UNORDERED_ACCESS; NGX wants its inputs in
 	// NON_PIXEL_SHADER_RESOURCE. Balanced on every path out, like the TAA hook's pair. Recording
@@ -373,6 +418,10 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// a guessed StateBefore would be worse than none. UE4 leaves scene depth shader-readable
 	// through the post chain.
 	mv::transition_output(cmd, /*to_shader_resource=*/true);
+	// The HUD-less copy rests in COMMON (hudless.hpp); NGX wants its inputs in
+	// NON_PIXEL_SHADER_RESOURCE. Our own texture, our own list: no engine state to guess.
+	if (hudless_tex != nullptr)
+		transition_own(cmd, hudless_tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
 	bool applied = false;
 	{
@@ -382,6 +431,8 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 		applied = nr::apply(device, cmd, ni);
 	}
 
+	if (hudless_tex != nullptr)
+		transition_own(cmd, hudless_tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 	mv::transition_output(cmd, /*to_shader_resource=*/false);
 
 	if (applied)
@@ -448,6 +499,8 @@ Counters counters()
 	c.mask_b = ms.value_b;
 	c.mask_fills = ms.fills;
 	c.mask_bytes = ms.bytes;
+	c.hudless_used = g_hudless_used.load(std::memory_order_relaxed);
+	c.hudless_missing = g_hudless_missing.load(std::memory_order_relaxed);
 	return c;
 }
 

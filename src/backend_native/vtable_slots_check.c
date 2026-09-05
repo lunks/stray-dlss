@@ -48,8 +48,11 @@ SLOT_IS(ID3D12Device8Vtbl, CreatePlacedResource1, 70);
 
 SLOT_IS(ID3D12GraphicsCommandListVtbl, Close, 9);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, Reset, 10);
+SLOT_IS(ID3D12GraphicsCommandListVtbl, DrawInstanced, 12);
+SLOT_IS(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced, 13);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, Dispatch, 14);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, SetPipelineState, 25);
+SLOT_IS(ID3D12GraphicsCommandListVtbl, ResourceBarrier, 26);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, SetDescriptorHeaps, 28);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature, 29);
 SLOT_IS(ID3D12GraphicsCommandListVtbl, SetComputeRootDescriptorTable, 31);

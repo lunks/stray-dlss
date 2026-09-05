@@ -82,4 +82,13 @@ int build_create(std::uint32_t in_width, std::uint32_t in_height, float scaling_
 // runtime reads it through exactly the same getter as the Color/Depth/MVec/Output subrects).
 int build_mask_rect(std::uint32_t width, std::uint32_t height, Entry *out, int cap);
 
+// The OPTIONAL Backbuffer subrect (DLSSNR.Backbuffer + SubrectBaseX/Y/Width/Height, every name
+// in the runtime's own string table - docs/RESEARCH-DLSSNR-STYLES.md §2, HARD), read by the
+// evaluate parameter reader into +0xa8 through the SAME vtable slots as Color's (§8.1), so it is
+// written in the same types. Optional for the same reason the mask is: a frame without a HUD-less
+// copy must emit no rect, because "Invalid Backbuffer/active Output rect configuration" turns the
+// whole evaluate into a silent no-op (§8.3).
+constexpr int kMaxBackbufferRectEntries = 4;
+int build_backbuffer_rect(std::uint32_t width, std::uint32_t height, Entry *out, int cap);
+
 } // namespace stray_dlss::nrparam

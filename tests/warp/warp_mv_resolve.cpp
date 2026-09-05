@@ -1535,6 +1535,7 @@ bool test_private_data_release_on_destroy(Gpu &gpu)
 }
 
 #include "warp_nr_stage.inc"
+#include "warp_hudless.inc"
 #include "warp_nr_mask.inc"
 #include "warp_mv_census.inc"
 
@@ -1615,6 +1616,7 @@ int main(int argc, char **argv)
 	test_static_vtables(gpu);
 	test_private_data_release_on_destroy(gpu);
 	test_nr_present_stage_round_trip(gpu);
+	test_hudless_copy(gpu);
 	test_nr_present_stage_deferred_free(gpu);
 	test_nr_control_mask_fill(gpu);
 	test_mv_census_counts_the_branches(gpu);

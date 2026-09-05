@@ -1,5 +1,8 @@
 #include "backend_native/present_owner.hpp"
 
+#include "backend_native/backbuffer_state.hpp"
+#include "rhi_gfx_hook.hpp"
+
 #include "backend_native/fg_present.hpp"
 #include "backend_native/native_backend.hpp"
 #include "host/config.hpp"
@@ -221,6 +224,17 @@ void report_back_buffers(IDXGISwapChain *sc, bool created)
 		}
 	}
 	sk->on_swapchain(ids, n, true);
+	// The swapchain-class candidate set (backbuffer_state.hpp): the REAL buffers, unless frame
+	// generation has already handed the game its replacements - then those are the set and
+	// fg_present registered them at arm.
+	if (fg::game_frame(sc) == nullptr)
+	{
+		std::uint64_t res[16] = {};
+		for (std::uint32_t i = 0; i < n; ++i)
+			res[i] = static_cast<std::uint64_t>(ids[i]);
+		bbstate::set_candidates(res, n, "swapchain back buffers");
+		rhigfx::note_reconfigure("swapchain reported");
+	}
 }
 
 // ---- factory hooks ----
@@ -449,6 +463,15 @@ void before_present(IDXGISwapChain *sc, UINT flags)
 		if (!s_said.exchange(true))
 			STRAY_LOG_WARN("present owner: FIRST Present delivered on_present (queue=%p present_list=%p back_buffer=%p) - the frame boundary is live",
 				static_cast<void *>(pc.queue), static_cast<void *>(pc.present_list), reinterpret_cast<void *>(pc.back_buffer));
+	}
+	// The engine's own back-buffer identity for this frame against the two models - the FG
+	// mirror when armed, DXGI's current index otherwise - and against the engine's PRESENT
+	// transition; also closes the graphics seams' per-frame ledger (rhi_gfx_hook.hpp).
+	{
+		ID3D12Resource *model = fg::mirror_frame(sc);
+		if (model == nullptr)
+			model = pc.back_buffer;
+		rhigfx::note_present(reinterpret_cast<std::uint64_t>(model), bbstate::last_present_resource(), pc.frame);
 	}
 	sk->on_present(pc);
 	// Frame generation's game-thread half: the generated frame's production (and, in ngx mode,

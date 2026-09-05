@@ -15,7 +15,8 @@
 // consumes, copied into FG-owned textures at the TAA hook because the engine's depth is a
 // pooled target whose content at present time is not guaranteed; jitter, camera-cut reset,
 // the jitter-free ViewToClip and ClipToPrevClip (row-major, row-vector, UE4's own), near
-// plane, FOV. HUD-less is stage 3 and not here.
+// plane, FOV. HUD-less (stage 3) is the graphics seam's copy, src/hudless.hpp, bound as
+// DLSSG.HUDLess when a copy exists for the frame and NULLed when it does not.
 #pragma once
 
 #include "backend_native/fg_present.hpp"
@@ -93,6 +94,8 @@ struct Stats
 	std::uint64_t refused_no_publish = 0; // generate() with no fresh guides this frame
 	std::uint64_t refused_warmup = 0;
 	std::uint64_t refused_not_ready = 0;  // NGX not initialised / create failed / latched
+	std::uint64_t hudless_bound = 0;      // evaluates handed a DLSSG.HUDLess copy of this frame
+	std::uint64_t hudless_absent = 0;     // ...and evaluates that wrote NULL (no copy this frame)
 	std::uint32_t width = 0, height = 0, render_width = 0, render_height = 0;
 	int hdr = -1;
 	unsigned multi_frame_count_max = 0; // DLSSG.MultiFrameCountMax as populated by the core, 0 if absent

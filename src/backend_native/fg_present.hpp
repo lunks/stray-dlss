@@ -115,8 +115,11 @@ void before_reconfigure(IDXGISwapChain *sc, const char *what);
 void after_reconfigure(IDXGISwapChain *sc, const char *what, bool drop_replacements, std::uint32_t new_count, long hr);
 
 // The replacement the game rendered this frame into, or null when FG is not armed for `sc`.
-// Non-owning. Used by the present owner as the PresentContext's back buffer.
+// Non-owning. Used by the present owner as the PresentContext's back buffer. The MIRROR's answer
+// below EngineSeamBackBuffer=2; the engine's above it (rhi_gfx_hook.hpp).
 ID3D12Resource *game_frame(IDXGISwapChain *sc);
+// The mirror's own answer regardless of level - the model, for the assertion. Null when unarmed.
+ID3D12Resource *mirror_frame(IDXGISwapChain *sc);
 
 // The game-thread half of a present: records the generated frame's production onto `list`
 // (the owner's present list, executed on `queue` before anything else FG does). Returns true
