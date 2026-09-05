@@ -1,4 +1,6 @@
 #include "ngx_nr.hpp"
+#include "nr_codec_pass.hpp"
+#include "core/nr_codec.hpp"
 
 #include "log.hpp"
 #include "ngx_backend.hpp"
@@ -29,6 +31,8 @@ const char *const kNrRefusalNames[kNrRefusalCount] = {
 	// A teardown or a resolution change is waiting on the GPU. Frames in this state are normal
 	// and brief; a rate that never falls means a fence that never advances.
 	"recreating",
+	// The codec could not initialise, encode or decode (pre-scale site only).
+	"codec-failed",
 	// The five codec refusals — codec-failed, codec-topology, no-codec, exposure-unknown and
 	// degenerate-scale — went with the TAA site on 2026-09-03. They enforced the input contract
 	// of a display-referred network fed raw linear HDR; the present stage hands it an already
@@ -54,6 +58,9 @@ void set_warmup_frames(unsigned int) {}
 bool apply(ID3D12Device *, ID3D12GraphicsCommandList *, const ApplyInputs &) { return false; }
 void on_present(ID3D12CommandQueue *) {}
 void shutdown() {}
+void set_codec_tuning(float, float, float) {}
+void set_track_exposure(bool) {}
+void set_exposure_smoothing(float) {}
 const char *last_error() { return g_err; }
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
 {
@@ -151,6 +158,7 @@ enum
 	kRefWarmup,
 	kRefMippedInput,
 	kRefRecreating,
+	kRefCodecFailed,
 };
 
 // Validation crop: a centred region of the neural output, read back once. Small enough that
@@ -300,6 +308,14 @@ bool g_refusal_logged[kNrRefusalCount] = {};
 // signalled once per present, is what separates "the CPU is done with this" from "the GPU is done
 // with this". Every deferred free and ReleaseFeature itself is decided against it.
 nrlife::Timeline g_timeline;
+// Codec state (pre-scale site). Tracking follows 1/PreExposure with a LONG time constant:
+// CLAUDE.md measured 0.05 ringing on a ~5 s loop and concluded 0.002 (~500 frames).
+float g_paper_white = 1.0f;
+float g_color_strength = 1.0f;
+float g_transfer_strength = 1.0f;
+bool g_track_exposure = true;
+float g_exposure_rate = 0.002f;
+float g_exposure_smoothed = 0.0f;
 ID3D12Fence *g_fence = nullptr;
 // A fence that could not be created is a diagnosis, not a retry loop: fall back to the
 // conservative present ring for the rest of the session and say so once.
@@ -994,6 +1010,18 @@ void set_renodx_tuning(float skin_structure_strength, unsigned int preset,
 void set_style(unsigned int style) { g_style = style; }
 void set_depth_inverted(unsigned int inverted) { g_depth_inverted = inverted ? 1u : 0u; }
 
+void set_codec_tuning(float paper_white, float color_strength, float transfer_strength)
+{
+	g_paper_white = paper_white;
+	g_color_strength = color_strength;
+	g_transfer_strength = transfer_strength;
+	STRAY_LOG_INFO("NR codec: paperWhite=%.4f (-> scale %.4f) colorStrength=%.2f transferStrength=%.2f",
+		static_cast<double>(paper_white), static_cast<double>(nrc::proxy_scale(paper_white, 1.0f)),
+		static_cast<double>(color_strength), static_cast<double>(transfer_strength));
+}
+void set_track_exposure(bool enabled) { g_track_exposure = enabled; }
+void set_exposure_smoothing(float rate) { g_exposure_rate = rate; }
+
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount])
 {
 	applied = g_applied.load(std::memory_order_relaxed);
@@ -1145,11 +1173,14 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 	// end-of-frame history restore because `u0` is a feedback node. All of it existed to make one
 	// wrong hook point survivable. None of it is needed here.
 	ID3D12Resource *colour = in.image;
+	const bool codec = in.codec;
 
 	// The state `image` arrives in and must be left in — nrstage::kStagingRestState, which the
 	// present stage keeps its staging copy at precisely so this is a constant. The barriers below
 	// and the validation crop both depend on getting it right.
-	const D3D12_RESOURCE_STATES image_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	const D3D12_RESOURCE_STATES image_state = codec
+		? D3D12_RESOURCE_STATE_UNORDERED_ACCESS   // the codec binds the image as a UAV
+		: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 	// A mipped / arrayed / multisampled colour input is the one hazard we cannot fix by
 	// allocating our own texture, and feeding one is a documented DXGI_ERROR_DEVICE_HUNG rather
@@ -1173,6 +1204,37 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 			return refuse_pre_evaluate(kRefRecreating,
 				"the feature's rects moved; its release is deferred to the present boundary.");
 		return refuse_pre_evaluate(kRefCreateFailed, "feature 18 could not be created.");
+	}
+	if (codec)
+	{
+		nrp::set_timeline(g_timeline);
+		if (!nrp::initialise(device, in.image, cw, ch))
+			return refuse_pre_evaluate(kRefCodecFailed, nrp::last_error());
+		const float static_scale = nrc::proxy_scale(g_paper_white, 1.0f);
+		if (g_track_exposure && in.pre_exposure_ok)
+			g_exposure_smoothed = nrc::smooth_exposure_factor(g_exposure_smoothed,
+				in.one_over_pre_exposure, g_exposure_rate);
+		else if (!g_track_exposure)
+			g_exposure_smoothed = 0.0f;
+		const float codec_scale = (g_track_exposure && g_exposure_smoothed > 0.0f)
+			? nrc::proxy_scale_tracked(g_paper_white, 1.0f, g_exposure_smoothed)
+			: static_scale;
+		static bool s_scale_logged = false;
+		if (!s_scale_logged)
+		{
+			s_scale_logged = true;
+			STRAY_LOG_WARN("NR codec (pre-scale): paperWhite=%.4f staticScale=%.4f x "
+				"1/PreExposure=%.4f (tracking=%s, rate=%.4f) = EFFECTIVE %.4f. The knee is at "
+				"0.75 display-referred; this scale is what lands the frame near it.",
+				static_cast<double>(g_paper_white), static_cast<double>(static_scale),
+				static_cast<double>(in.one_over_pre_exposure), g_track_exposure ? "on" : "off",
+				static_cast<double>(g_exposure_rate), static_cast<double>(codec_scale));
+		}
+		if (!nrp::record_encode(cmd, in.image, cw, ch, codec_scale, g_color_strength,
+				g_transfer_strength))
+			return refuse_pre_evaluate(kRefCodecFailed, nrp::last_error());
+		colour = nrp::proxy();
+		nrp::transition_proxy(cmd, /*to_shader_resource=*/true);
 	}
 
 
@@ -1374,6 +1436,8 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 
 	const NVSDK_NGX_Result result =
 		nr_evaluate_feature(cmd, g_feature, g_params);
+	if (codec)
+		nrp::transition_proxy(cmd, /*to_shader_resource=*/false);
 
 	if (NVSDK_NGX_FAILED(result))
 	{
@@ -1436,6 +1500,12 @@ bool apply(ID3D12Device *device, ID3D12GraphicsCommandList *cmd, const ApplyInpu
 		return refuse(kRefValidating, "the neural output is still being validated.");
 	}
 
+	if (codec)
+	{
+		if (!nrp::record_decode(cmd, in.image, g_nr_output, cw, ch))
+			return refuse(kRefCodecFailed, nrp::last_error());
+	}
+	else
 	{
 		// A WHOLE COPY, which the old TAA site could not have done — none of its three reasons
 		// applies here.
@@ -1639,6 +1709,8 @@ void on_present(ID3D12CommandQueue *queue)
 		return;
 
 	advance_timeline(queue);
+	nrp::set_timeline(g_timeline);
+	nrp::collect();
 
 	// Everything the GPU has passed, in one place and on one thread.
 	retire_keep_alive(/*all=*/false);
@@ -1659,6 +1731,7 @@ void on_present(ID3D12CommandQueue *queue)
 			bury(g_nr_output, "neural output texture (teardown)");
 			bury(g_crop_input.buffer, "validation crop: colour input (teardown)");
 			bury(g_crop_neural.buffer, "validation crop: neural output (teardown)");
+			nrp::request_shutdown();
 			g_nr_width = g_nr_height = 0;
 			g_nr_format = DXGI_FORMAT_UNKNOWN;
 			g_validation.store(Validation::pending, std::memory_order_release);
@@ -1727,6 +1800,7 @@ void shutdown()
 	release_feature_now("shutdown");
 	release(g_crop_input.buffer);
 	release(g_crop_neural.buffer);
+	nrp::shutdown();
 	release(g_nr_output);
 	for (Grave &g : g_graves)
 		g.obj->Release();

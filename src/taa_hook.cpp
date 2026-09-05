@@ -2391,7 +2391,8 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 									perf::Scope perf_nr(perf::kNgxNr);
 									nrhook::apply_prescale(native_device, native, ei.color,
 										ei.depth, ei.motion_vectors, ei.render_width,
-										ei.render_height, ei.reset);
+										ei.render_height, ei.reset, view.one_over_pre_exposure,
+										ue4::pre_exposure_plausible(view));
 								}
 								bool rr_ok = false;
 								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)

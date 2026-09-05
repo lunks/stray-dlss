@@ -702,6 +702,13 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// an out-of-range ini value is still visible to a host's status display rather than being
 	// silently rewritten on load.
 	g_nr_ui.style = host::cfg::get_int("NgxNRStyle", g_nr_ui.style);
+	// The codec (pre-scale site on this branch). Defaults: paper white 1.0 with exposure
+	// tracking on at the long time constant CLAUDE.md settled on.
+	nr::set_codec_tuning(host::cfg::get_float("NgxNRPaperWhiteScale", 1.0f),
+		host::cfg::get_float("NgxNRColorStrength", 1.0f),
+		host::cfg::get_float("NgxNRTransferStrength", 1.0f));
+	nr::set_track_exposure(host::cfg::get_int("NgxNRTrackExposure", 1) != 0);
+	nr::set_exposure_smoothing(host::cfg::get_float("NgxNRExposureSmoothing", 0.002f));
 	// 1 = the truth (UE 4.27 reversed-Z). 0 is a deliberate lie whose only purpose is to prove
 	// whether feature 18 consumes our depth at all — if the image is identical either way, it
 	// does not, and that retires a whole family of hypotheses in one launch.

@@ -133,12 +133,53 @@ void set_prescale(bool on)
 }
 bool prescale() { return g_prescale.load(std::memory_order_relaxed); }
 
+// A plain transition on the game's list: the pre-scale site has no present context to route
+// barriers through, and needs none.
+void prescale_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, std::uint32_t after)
+{
+	auto *cmd = static_cast<ID3D12GraphicsCommandList *>(ctx);
+	if (cmd == nullptr || res == nullptr || before == after)
+		return;
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = res;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(before);
+	b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(after);
+	cmd->ResourceBarrier(1, &b);
+}
+std::uint64_t g_prescale_frame = 0;
+
 bool apply_prescale(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	ID3D12Resource *colour, ID3D12Resource *depth, ID3D12Resource *motion_vectors,
-	std::uint32_t render_width, std::uint32_t render_height, bool reset)
+	std::uint32_t render_width, std::uint32_t render_height, bool reset,
+	float one_over_pre_exposure, bool pre_exposure_ok)
 {
+	// The codec binds its image as a UAV in both passes and t1 may not allow one, so NR works
+	// on the present stage's staging copy (ALLOW_UNORDERED_ACCESS, rests at 0x40 = the state
+	// nr::apply's non-codec path assumes) and the result is copied back over t1. Two 1080p
+	// copies; the same shape the present stage uses on the back buffer.
+	const D3D12_RESOURCE_DESC cd = colour->GetDesc();
+	++g_prescale_frame;
+	nrstage::collect(g_prescale_frame);
+	if (!nrstage::ensure(device, render_width, render_height, static_cast<int>(cd.Format),
+			g_prescale_frame))
+	{
+		if (g_prescale_refused.fetch_add(1) == 0)
+			STRAY_LOG_ERROR("NR PRE-SCALE: staging copy could not be created (%ux%u fmt=%d)",
+				render_width, render_height, static_cast<int>(cd.Format));
+		return false;
+	}
+	ID3D12Resource *staging = nrstage::staging();
+	constexpr std::uint32_t kSrv = 0x40;   // NON_PIXEL_SHADER_RESOURCE: t1's state here
+	constexpr std::uint32_t kUav = 0x8;    // UNORDERED_ACCESS: what the codec binds
+	nrstage::record_capture(cmd, colour, kSrv, prescale_barrier, cmd);
+	prescale_barrier(cmd, staging, nrstage::kStagingRestState, kUav);
 	nr::ApplyInputs ni;
-	ni.image = colour;            // t1, linear pre-exposed HDR, in NON_PIXEL_SHADER_RESOURCE
+	ni.image = staging;
+	ni.codec = true;
+	ni.one_over_pre_exposure = one_over_pre_exposure;
+	ni.pre_exposure_ok = pre_exposure_ok;
 	ni.depth = depth;
 	ni.motion_vectors = motion_vectors;
 	ni.render_width = render_width;
@@ -149,6 +190,9 @@ bool apply_prescale(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	ni.mvec_scale_x = 1.0f;           // guides and colour share one grid here
 	ni.mvec_scale_y = 1.0f;
 	const bool ok = nr::apply(device, cmd, ni);
+	prescale_barrier(cmd, staging, kUav, nrstage::kStagingRestState);
+	if (ok)
+		nrstage::record_writeback(cmd, colour, kSrv, prescale_barrier, cmd);
 	const std::uint64_t n = ok ? g_prescale_applied.fetch_add(1) + 1 : g_prescale_refused.fetch_add(1) + 1;
 	if (n == 1)
 		STRAY_LOG_WARN("NR PRE-SCALE: first %s at %ux%u (raw HDR t1 -> feature 18 -> t1, then RR/SR)",

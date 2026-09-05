@@ -62,7 +62,8 @@ bool prescale();
 // and before the RR/SR evaluate. Writes NR's result back over `colour` in place.
 bool apply_prescale(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
 	ID3D12Resource *colour, ID3D12Resource *depth, ID3D12Resource *motion_vectors,
-	std::uint32_t render_width, std::uint32_t render_height, bool reset);
+	std::uint32_t render_width, std::uint32_t render_height, bool reset,
+	float one_over_pre_exposure, bool pre_exposure_ok);
 
 // [STRAYDLSS] NgxNRMask + NgxNRMaskR/G/B and their three enables, default OFF.
 //

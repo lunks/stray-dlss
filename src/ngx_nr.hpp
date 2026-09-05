@@ -76,6 +76,12 @@ void set_style(unsigned int style);
 // image if depth informs anything it does. If it does not, depth is inert here and every
 // depth-shaped hypothesis about NR is dead.
 void set_depth_inverted(unsigned int inverted);
+// The codec's knobs ([STRAYDLSS] NgxNRPaperWhiteScale / NgxNRColorStrength /
+// NgxNRTransferStrength / NgxNRTrackExposure / NgxNRExposureSmoothing). Only the pre-scale site
+// uses them; the present stage's back buffer is already display-encoded.
+void set_codec_tuning(float paper_white, float color_strength, float transfer_strength);
+void set_track_exposure(bool enabled);
+void set_exposure_smoothing(float rate);
 
 // [STRAYDLSS] NgxNRPreload (default ON): LoadLibrary the staged nvngx_dlssnr.dll, resolve its
 // exports and patch its GetModuleFileNameW import, at device init. This is the CHEAP half only
@@ -143,6 +149,14 @@ struct ApplyInputs
 	ID3D12Resource *control_mask = nullptr;
 	std::uint32_t control_mask_width = 0;
 	std::uint32_t control_mask_height = 0;
+	// THE CODEC (this branch, pre-scale site). `image` is linear pre-exposed HDR rather than the
+	// display-encoded back buffer, so it is encoded into a display-referred proxy (divide by the
+	// tracked white point, hybrid knee, exact sRGB), the proxy is what feature 18 sees, and the
+	// decode carries back only the network's CHANGE. `image` must be in UNORDERED_ACCESS: both
+	// passes bind it as a UAV. The exposure pair comes from View row 135 (CLAUDE.md §2.6).
+	bool codec = false;
+	float one_over_pre_exposure = 0.0f;
+	bool pre_exposure_ok = false;
 };
 
 // Runs feature 18 and, once validated, copies the neural result back over `image`. Returns
@@ -170,7 +184,7 @@ const char *last_error();
 
 // Telemetry for the periodic report: how often NR replaced the image versus refused, and why.
 // NOTE: the count is duplicated in src/ngx_nr.cpp's kNrRefusalNames — change both together.
-constexpr int kNrRefusalCount = 10;
+constexpr int kNrRefusalCount = 11;
 extern const char *const kNrRefusalNames[kNrRefusalCount];
 void counters(std::uint64_t &applied, std::uint64_t &refused, std::uint32_t out[kNrRefusalCount]);
 bool validated();

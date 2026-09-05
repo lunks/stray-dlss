@@ -84,6 +84,8 @@ add_library(stray_dlss_core STATIC
     src/core/rr_guides.hpp
     src/core/envbrdf.cpp
     src/core/envbrdf.hpp
+    src/core/nr_codec.cpp
+    src/core/nr_codec.hpp
     src/core/nr_hook_plan.cpp
     src/core/nr_hook_plan.hpp
     src/core/nr_lifetime.cpp
@@ -217,6 +219,8 @@ if(STRAY_DLSS_BUILD_NATIVE)
         src/pool_name_hook.hpp
         src/perf.cpp
         src/perf.hpp
+        src/nr_codec_pass.cpp
+        src/nr_codec_pass.hpp
         src/nr_hook.cpp
         src/nr_hook.hpp
         src/nr_stage.cpp
@@ -302,6 +306,13 @@ if(STRAY_DLSS_BUILD_NATIVE)
                    main cs_5_0 g_mv_resolve_dxbc)
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_mask.hlsl"
                    main cs_5_0 g_nr_mask_dxbc)
+    # The DLSS-NR HDR colour codec (pre-scale site). Both halves include nr_codec.hlsli.
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_encode.hlsl"
+                   main cs_5_0 g_nr_encode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
+    compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_decode.hlsl"
+                   main cs_5_0 g_nr_decode_dxbc
+                   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr_codec.hlsli")
     compile_shader(stray_dlss_native "${CMAKE_CURRENT_SOURCE_DIR}/shaders/gbuffer_resolve.hlsl"
                    main cs_5_0 g_gbuffer_resolve_dxbc)
 endif()
@@ -404,6 +415,7 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_pool_locator.cpp
         tests/test_rr_guides.cpp
         tests/test_envbrdf.cpp
+        tests/test_nr_codec.cpp
         tests/test_nr_hook_plan.cpp
         tests/test_nr_lifetime.cpp
         tests/test_nr_mask_plan.cpp
