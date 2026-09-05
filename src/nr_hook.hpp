@@ -24,6 +24,7 @@
 
 struct ID3D12Device;
 struct ID3D12Resource;
+struct ID3D12GraphicsCommandList;
 
 namespace stray_dlss::nrhook {
 
@@ -43,6 +44,25 @@ namespace stray_dlss::nrhook {
 // one ini key is cheaper than a round trip.
 void set_back_buffer_state(std::uint32_t d3d12_resource_states);
 std::uint32_t back_buffer_state();
+
+// [STRAYDLSS] NgxNRPreScale (default ON on this branch): run feature 18 BEFORE the upscaler, on
+// the 1080p InputSceneColor (t1), with NO codec - raw linear pre-exposed HDR straight into a
+// display-referred network - and let RR (or SR) consume the enhanced input. An EXPERIMENT, by
+// the user's decision on 2026-09-05: "build in a way I can add it before RR without the codec
+// just to try". Three things are traded for a ~4x cheaper NR (1080p instead of 4K) and guides
+// at a 1.0 ratio: the input domain (CLAUDE.md: the codec IS the input domain), the fact that the
+// pre-TAA frame is sub-pixel jittered every frame and NR has no jitter input (the param audit's
+// closed list has nothing jitter-shaped), and RR then denoising a pre-enhanced image. The
+// prediction is shimmer; the screen decides. While it is on, the present-time stage is skipped -
+// on this branch NR runs before RR ONLY.
+void set_prescale(bool on);
+bool prescale();
+// The pre-scale call itself, from the TAA hook, on the game's list, after the inputs have been
+// barriered to NON_PIXEL_SHADER_RESOURCE (which is the state nr::apply assumes for its image)
+// and before the RR/SR evaluate. Writes NR's result back over `colour` in place.
+bool apply_prescale(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+	ID3D12Resource *colour, ID3D12Resource *depth, ID3D12Resource *motion_vectors,
+	std::uint32_t render_width, std::uint32_t render_height, bool reset);
 
 // [STRAYDLSS] NgxNRMask + NgxNRMaskR/G/B and their three enables, default OFF.
 //

@@ -11,6 +11,7 @@
 #include "intercept/backend.hpp"
 #include "log.hpp"
 #include "ngx_nr.hpp"
+#include "nr_hook.hpp"
 #include "pool_name_hook.hpp"
 
 #include "TweakState.hpp"
@@ -549,6 +550,7 @@ void Tick()
 				STRAY_LOG_WARN("host: %d live tuning value(s) re-applied from %s.", moved, g_ini_path.c_str());
 		}
 
+		nrhook::set_prescale(host::cfg::get_bool("NgxNRPreScale", true));
 		const bool want = host::cfg::get_bool("NgxNR", nr::enabled());
 		if (want != nr::enabled())
 		{

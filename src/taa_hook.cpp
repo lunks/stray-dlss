@@ -2383,6 +2383,16 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								// DLSS-RR is enabled it effectively overrides DLSS-SR
 								// execution"). A frame RR cannot carry is carried by SR with a
 								// counted, named reason - never dropped, never guessed at.
+								// NR PRE-SCALE (this branch): feature 18 on the raw 1080p t1,
+								// in place, before RR or SR reads it. Inputs are already in
+								// NON_PIXEL_SHADER_RESOURCE here, which is what nr::apply assumes.
+								if (nr::enabled() && nrhook::prescale())
+								{
+									perf::Scope perf_nr(perf::kNgxNr);
+									nrhook::apply_prescale(native_device, native, ei.colour,
+										ei.depth, ei.motion_vectors, ei.render_width,
+										ei.render_height, ei.reset);
+								}
 								bool rr_ok = false;
 								if (g_ngx_rr_mode.load(std::memory_order_relaxed) == 2)
 								{

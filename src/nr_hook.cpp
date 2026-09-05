@@ -120,6 +120,47 @@ void issue_barrier(void *ctx, ID3D12Resource *res, std::uint32_t before, std::ui
 
 } // namespace
 
+std::atomic<bool> g_prescale{true};   // this branch: before RR only
+std::atomic<std::uint64_t> g_prescale_applied{0}, g_prescale_refused{0}, g_prescale_stage_skipped{0};
+
+void set_prescale(bool on)
+{
+	if (g_prescale.exchange(on) != on)
+		STRAY_LOG_WARN("NR PRE-SCALE %s ([STRAYDLSS] NgxNRPreScale=%d): feature 18 runs %s.",
+			on ? "ON" : "OFF", on ? 1 : 0,
+			on ? "BEFORE the upscaler on the 1080p t1, no codec; the present stage is skipped"
+			   : "at the present stage only");
+}
+bool prescale() { return g_prescale.load(std::memory_order_relaxed); }
+
+bool apply_prescale(ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
+	ID3D12Resource *colour, ID3D12Resource *depth, ID3D12Resource *motion_vectors,
+	std::uint32_t render_width, std::uint32_t render_height, bool reset)
+{
+	nr::ApplyInputs ni;
+	ni.image = colour;            // t1, linear pre-exposed HDR, in NON_PIXEL_SHADER_RESOURCE
+	ni.depth = depth;
+	ni.motion_vectors = motion_vectors;
+	ni.render_width = render_width;
+	ni.render_height = render_height;
+	ni.output_width = render_width;   // 1:1 - feature 18 cannot upscale in this runtime
+	ni.output_height = render_height;
+	ni.reset = reset;
+	ni.mvec_scale_x = 1.0f;           // guides and colour share one grid here
+	ni.mvec_scale_y = 1.0f;
+	const bool ok = nr::apply(device, cmd, ni);
+	const std::uint64_t n = ok ? g_prescale_applied.fetch_add(1) + 1 : g_prescale_refused.fetch_add(1) + 1;
+	if (n == 1)
+		STRAY_LOG_WARN("NR PRE-SCALE: first %s at %ux%u (raw HDR t1 -> feature 18 -> t1, then RR/SR)",
+			ok ? "APPLY" : "REFUSAL", render_width, render_height);
+	if (((g_prescale_applied.load() + g_prescale_refused.load()) % 600) == 0)
+		STRAY_LOG_INFO("NR PRE-SCALE: applied=%llu refused=%llu stageSkipped=%llu",
+			static_cast<unsigned long long>(g_prescale_applied.load()),
+			static_cast<unsigned long long>(g_prescale_refused.load()),
+			static_cast<unsigned long long>(g_prescale_stage_skipped.load()));
+	return ok;
+}
+
 void set_back_buffer_state(std::uint32_t states)
 {
 	g_bb_state.store(states, std::memory_order_relaxed);
@@ -222,6 +263,12 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 	// (CLAUDE.md §5, "ReShade's view -> resource map outlives the resource").
 	cd.live = true;
 
+	if (g_prescale.load(std::memory_order_relaxed))
+	{
+		// This branch runs NR before RR only; the present stage stands down.
+		g_prescale_stage_skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	nrplan::GuideState gs;
 	Guides guides;
 	// Taken INSIDE the lock, so the reference is on the resource the copy names. See GuideRef.
