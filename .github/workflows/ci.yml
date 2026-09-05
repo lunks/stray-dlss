@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui ]
+    branches: [ main, dlss-ue4ss, ini-cleanup, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ main, dlss-ue4ss, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui ]
+    branches: [ main, dlss-ue4ss, ini-cleanup, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui ]
   workflow_dispatch:
 
 env:
