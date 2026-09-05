@@ -78,7 +78,7 @@ struct Args
 		// LAYOUT looks like - three writes landing on one offset leaves the context null and
 		// Create returns null without a crash. Print the layout once so the log settles it.
 		static int dumped = 0;
-		const bool dump = dumped < 6;
+		const bool dump = dumped < 0;   // answered 2026-09-04: 0/8/16/24, 32 bytes
 		if (dump) ++dumped;
 		if (dump)
 			STRAY_LOG_WARN("dlss-menu: layout of %S:", fn ? fn->GetName().c_str() : STR("<null>"));
@@ -131,6 +131,25 @@ struct Args
 			if (p->GetName() != name)
 				continue;
 			std::memcpy(buf.data() + p->GetOffset_Internal(), &value, sizeof(value));
+			return true;
+		}
+		return false;
+	}
+
+	bool set_bytes(const wchar_t *name, const void *src, std::size_t n)
+	{
+		for (FProperty *p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None))
+		{
+			if (p == nullptr || !p->HasAnyPropertyFlags(CPF_Parm))
+				continue;
+			if (p->GetName() != name)
+				continue;
+			if (static_cast<std::size_t>(p->GetSize()) != n)
+			{
+				STRAY_LOG_ERROR("dlss-menu: %S is %d bytes, caller has %zu", name, p->GetSize(), n);
+				return false;
+			}
+			std::memcpy(buf.data() + p->GetOffset_Internal(), src, n);
 			return true;
 		}
 		return false;
@@ -245,20 +264,85 @@ std::wstring menu_text()
 	return s;
 }
 
+UObject *g_row = nullptr;   // BP_HKTextBlock_C, a TextBlock subclass; rooted
+
+// The row: constructed directly (not via Create, which refuses non-UserWidgets), outer = the
+// container so it is reachable from a rooted object, rooted itself as well, then added to the
+// container's root CanvasPanel and laid out top-left at (200,200) 900x70 - the placement the
+// Lua version rendered with. Every step logs; a failure leaves the container on screen.
+void build_row()
+{
+	UClass *rcls = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr,
+		STR("/Game/GUI/Widgets/BP_HKTextBlock.BP_HKTextBlock_C"));
+	if (rcls == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: BP_HKTextBlock_C not resident");
+		return;
+	}
+	FStaticConstructObjectParameters params(rcls, g_widget);
+	g_row = UObjectGlobals::StaticConstructObject(params);
+	if (g_row == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: StaticConstructObject returned null");
+		return;
+	}
+	Root(g_row);
+	STRAY_LOG_WARN("dlss-menu: row constructed: %S rootSet=%d", g_row->GetFullName().c_str(),
+		g_row->IsRootSet() ? 1 : 0);
+
+	UObject **tree = g_widget->GetValuePtrByPropertyName<UObject *>(STR("WidgetTree"));
+	UObject **root = (tree && *tree) ? (*tree)->GetValuePtrByPropertyName<UObject *>(STR("RootWidget")) : nullptr;
+	if (root == nullptr || *root == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: container has no WidgetTree/RootWidget (tree=%p)",
+			tree ? static_cast<void *>(*tree) : nullptr);
+		return;
+	}
+	STRAY_LOG_WARN("dlss-menu: row: container root is %S", (*root)->GetFullName().c_str());
+
+	UFunction *add = find_fn(STR("/Script/UMG.CanvasPanel:AddChildToCanvas"));
+	if (add == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: CanvasPanel:AddChildToCanvas not found");
+		return;
+	}
+	Args a(add);
+	a.set_ptr(STR("Content"), g_row);
+	(*root)->ProcessEvent(add, a.buf.data());
+	UObject *slot = static_cast<UObject *>(a.ret_ptr());
+	if (slot == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: AddChildToCanvas returned null (root not a CanvasPanel?)");
+		return;
+	}
+	STRAY_LOG_WARN("dlss-menu: row: slot %S", slot->GetFullName().c_str());
+
+	// FAnchors = {FVector2D Minimum, Maximum}, FVector2D = {float X, Y}. Sizes are checked
+	// against the property at write time, so a layout mismatch is a logged refusal.
+	const float anchors[4] = { 0.f, 0.f, 0.f, 0.f };
+	const float pos[2] = { 200.f, 200.f };
+	const float size[2] = { 900.f, 70.f };
+	struct Call { const wchar_t *fn; const wchar_t *arg; const void *v; std::size_t n; } calls[] = {
+		{ STR("/Script/UMG.CanvasPanelSlot:SetAnchors"),  STR("InAnchors"),  anchors, sizeof(anchors) },
+		{ STR("/Script/UMG.CanvasPanelSlot:SetPosition"), STR("InPosition"), pos,     sizeof(pos) },
+		{ STR("/Script/UMG.CanvasPanelSlot:SetSize"),     STR("InSize"),     size,    sizeof(size) },
+	};
+	for (const Call &c : calls)
+	{
+		UFunction *f = find_fn(c.fn);
+		if (f == nullptr) { STRAY_LOG_ERROR("dlss-menu: row: %S not found", c.fn); continue; }
+		Args s(f);
+		if (s.set_bytes(c.arg, c.v, c.n))
+			slot->ProcessEvent(f, s.buf.data());
+	}
+}
+
 void set_text()
 {
 	if (g_widget == nullptr)
 		return;
-	// BP_HKTextBlock_C is a UserWidget wrapping one UTextBlock in a member named Text. From Lua
-	// it was row.Text:SetText(); assigning row.Text directly wrote an FText struct over the
-	// widget pointer, which is the same mistake this offset-based path cannot make.
-	UObject **inner = g_widget->GetValuePtrByPropertyName<UObject *>(STR("Text"));
-	if (inner == nullptr || *inner == nullptr)
-	{
-		STRAY_LOG_ERROR("dlss-menu: BP_HKTextBlock_C has no Text member (ptr=%p)",
-			static_cast<void *>(inner));
+	if (g_row == nullptr)
 		return;
-	}
 	UFunction *fn = find_fn(STR("/Script/UMG.TextBlock:SetText"));
 	if (fn == nullptr)
 		return;
@@ -271,12 +355,13 @@ void set_text()
 			*dst = FText(menu_text().c_str());
 		}
 	}
-	(*inner)->ProcessEvent(fn, a.buf.data());
+	g_row->ProcessEvent(fn, a.buf.data());
 }
 
 } // namespace
 
 namespace {
+void build_row();
 void do_toggle();
 void do_left();
 void do_right();
@@ -346,13 +431,16 @@ void do_toggle()
 
 	if (g_widget == nullptr)
 	{
-		// One widget, not a hierarchy: the fewer objects we own, the fewer there are to be
-		// collected. It must be a UUserWidget child - UE 4.27 UserWidget.cpp:2021 refuses any
-		// other class ("CreateWidget can only be used on UUserWidget children") and the first
-		// build asked for a plain TextBlock and got null. BP_HKTextBlock_C is the game's own
-		// text row: a UserWidget wrapping one TextBlock, in the game's font.
-		const wchar_t *kClass = STR("/Game/GUI/Widgets/BP_HKTextBlock.BP_HKTextBlock_C");
-		UClass *cls = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr, kClass);
+		// Run 4 (2026-09-04) settled the widget question by measurement: the params layout is
+		// 0/8/16/24, the call WORKS - UMG_DebugMenu_C came back created with the menu's own
+		// controller as context and owner - and BP_HKTextBlock_C reads isUserWidget=0. It is a
+		// TextBlock subclass, and CreateWidget refuses anything that is not a UUserWidget
+		// (UserWidget.cpp:2021). So the CONTAINER is the game's UMG_DebugMenu_C (a UserWidget
+		// whose root is a CanvasPanel, rendered from Lua, inert) and the ROW is a
+		// BP_HKTextBlock_C constructed directly and added to that canvas - the Lua arrangement
+		// that rendered once and then died to the collector, now with both objects rooted.
+		const wchar_t *kContainer = STR("/Game/GUI/HUD/UMG_DebugMenu.UMG_DebugMenu_C");
+		UClass *cls = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr, kContainer);
 		UFunction *create = find_fn(STR("/Script/UMG.WidgetBlueprintLibrary:Create"));
 		UObject *cdo = UObjectGlobals::StaticFindObject<UObject *>(
 			nullptr, nullptr, STR("/Script/UMG.Default__WidgetBlueprintLibrary"));
@@ -362,45 +450,14 @@ void do_toggle()
 			STRAY_LOG_ERROR("dlss-menu: cannot create: class=%p create=%p cdo=%p world=%p "
 				"(class is %S); menu off for this session.",
 				static_cast<void *>(cls), static_cast<void *>(create), static_cast<void *>(cdo),
-				static_cast<void *>(ctx), kClass);
+				static_cast<void *>(ctx), kContainer);
 			g_failed = true;
 			return;
-		}
-		// Is the class a UUserWidget child at all? ValidateUserWidgetClass (UserWidget.cpp:2021)
-		// returns null for anything else, and "HKTextBlock" could as easily be a UTextBlock
-		// subclass. IsA on its CDO answers without any unverified accessor.
-		{
-			UClass *uw = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr,
-				STR("/Script/UMG.UserWidget"));
-			UObject *tcdo = UObjectGlobals::StaticFindObject<UObject *>(nullptr, nullptr,
-				STR("/Game/GUI/Widgets/BP_HKTextBlock.Default__BP_HKTextBlock_C"));
-			STRAY_LOG_WARN("dlss-menu: BP_HKTextBlock_C cdo=%p userWidgetClass=%p isUserWidget=%d",
-				static_cast<void *>(tcdo), static_cast<void *>(uw),
-				(tcdo != nullptr && uw != nullptr && tcdo->IsA(uw)) ? 1 : 0);
-		}
-		// CONTROL: UMG_DebugMenu_C created and rendered from Lua through this same library
-		// call. If it comes back null too, the fault is the call, not the class.
-		{
-			UClass *dbg = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr,
-				STR("/Game/GUI/HUD/UMG_DebugMenu.UMG_DebugMenu_C"));
-			if (dbg != nullptr)
-			{
-				Args c(create);
-				c.set_ptr(STR("WorldContextObject"), ctx);
-				c.set_ptr(STR("WidgetType"), dbg);
-				c.set_ptr(STR("OwningPlayer"), ctx);
-				cdo->ProcessEvent(create, c.buf.data());
-				UObject *w = static_cast<UObject *>(c.ret_ptr());
-				STRAY_LOG_WARN("dlss-menu: CONTROL UMG_DebugMenu_C -> %p %S", static_cast<void *>(w),
-					w ? w->GetFullName().c_str() : STR("(null)"));
-			}
-			else
-				STRAY_LOG_WARN("dlss-menu: CONTROL UMG_DebugMenu_C not resident");
 		}
 		Args a(create);
 		a.set_ptr(STR("WorldContextObject"), ctx);
 		a.set_ptr(STR("WidgetType"), cls);
-		a.set_ptr(STR("OwningPlayer"), ctx);   // the Lua call passed the controller here too
+		a.set_ptr(STR("OwningPlayer"), ctx);   // measured working in run 4
 		cdo->ProcessEvent(create, a.buf.data());
 		g_widget = static_cast<UObject *>(a.ret_ptr());
 		if (g_widget == nullptr)
@@ -413,6 +470,7 @@ void do_toggle()
 		Root(g_widget);   // before anything can tick
 		STRAY_LOG_WARN("dlss-menu: widget created: %S rootSet=%d",
 			g_widget->GetFullName().c_str(), g_widget->IsRootSet() ? 1 : 0);
+		build_row();
 	}
 
 	UFunction *add = find_fn(STR("/Script/UMG.UserWidget:AddToViewport"));
