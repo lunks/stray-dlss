@@ -358,8 +358,13 @@ bool create_srvs(UINT slot, ID3D12Resource *a, ID3D12Resource *b, ID3D12Resource
 			for (unsigned i = 0; i < n; ++i)
 				if (seen[i] == res)
 					return;
-			if (n < 8)
-				seen[n++] = res;
+			// A FULL table stays silent. The first cut fell through here once eight distinct
+			// resources had been seen, and the pool rotates GBufferC through more than that -
+			// measured 2026-09-05 as 11 119 "about to view GBufferC" lines in a 12 000-frame
+			// session, one synchronous log write per frame on the render path.
+			if (n >= 8)
+				return;
+			seen[n++] = res;
 		}
 		const D3D12_RESOURCE_DESC d = res->GetDesc();
 		STRAY_LOG_INFO("gbuffer_resolve: about to view %s %p: fmt=%d %llux%u flags=0x%x",
