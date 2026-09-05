@@ -93,9 +93,11 @@ float3 EditBilateral(float2 pos_small, float lumaP)
 			wsum += w;
 		}
 	}
+	// Single exit: fxc's flow analysis treats a second return as an uninitialised value.
+	float3 edit = sum / max(wsum, 1e-4f);
 	if (wsum < 1e-4f)
-		return EditBilinear(pos_small / float2(gSmall));
-	return sum / wsum;
+		edit = EditBilinear(pos_small / float2(gSmall));
+	return edit;
 }
 
 // Mode 2: fit answer = a * shown + b over the 3x3 small texels around the sample, per channel,
