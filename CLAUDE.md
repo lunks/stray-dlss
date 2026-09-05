@@ -3746,9 +3746,28 @@ frame at that fraction of its size and lays only the model's **difference** back
 full-resolution frame (`src/core/nr_model_plan.hpp`, `src/nr_model.cpp`, `shaders/nr_downsample.hlsl`,
 `shaders/nr_resolve.hlsl`). OptiScaler_DLSSNR's "Model Resolution" with the "matched residual"
 transfer (hhkbble/Dagherbou, 2026-09), on our present stage. **MEASURED on the box:** model
-1920x1080 over the 3840x2160 back buffer, applied on every present, `fallbacks=0`, no errors,
-**12.5 ms median in gameplay against ~14 ms with NR at 4K**, and a clean in-game frame. At 0.5 the
-model's extent IS the guides' extent, so the ratio is 1.0 and nothing but colour is resampled.
+1920x1080 over the 3840x2160 back buffer, applied on every present, `fallbacks=0`, no errors, and
+a clean in-game frame. At 0.5 the model's extent IS the guides' extent, so the ratio is 1.0 and
+nothing but colour is resampled.
+
+> **AND IT BUYS NOTHING HERE — BENCHED 2026-09-05, and the number is the finding.** Two passes of
+> the reload+traverse bench (three cycles per arm, one process, thermal order reversed between
+> passes, foreign jobs 0): **NR off 82.3 fps; NR at full resolution 70.5; model 0.5 70.4; model
+> 0.25 (960x540) 70.3**; resolve modes 0/1/2 identical. NR costs **~2 ms a frame at ANY size**,
+> across a 16x change in pixels — a fixed per-evaluate term, not the network. Our CPU is not it
+> (`[perf]` puts NR at 0.45 ms, zero fence waits). The plausible mechanisms are the ones this
+> stack is built on: every NGX evaluate under vkd3d-proton hands the queue D3D12 -> CUDA -> D3D12
+> through NVAPI, and each handoff drains the pipeline; or the network is launch-bound (dozens of
+> small kernels whose fixed latency dominates). The D18 timings that scale with ratio were taken
+> natively on a 50-series card and do not contradict this. **Consequences:** `NgxNRModelScale=1.0`
+> is the better default until the fixed term is found (same cost, structure at native pixel size);
+> every idea that rested on per-pixel cost — pre-scale, SR-as-resolve, dynamic scale, residual
+> reprojection — is moot for the same reason; the only lever against a fixed per-evaluate cost is
+> evaluating LESS OFTEN (multi-frame generation; a static-frame skip). **Next is an instrument,
+> not a feature: GPU timestamp queries around the evaluate, the two small passes and the copies on
+> the present list**, so the 2 ms is placed inside or around the evaluate before anything else is
+> built on this branch. The earlier "12.5 vs ~14 ms median" comparison was two different scenes
+> at two different times and is retracted; the bench is the measurement.
 
 **Why this and not the two obvious alternatives, both closed the same day:**
 
