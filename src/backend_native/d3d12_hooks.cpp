@@ -512,6 +512,11 @@ void STDMETHODCALLTYPE hk_CopyDescriptors(ID3D12Device *self, UINT num_dst, cons
 	g_orig_CopyDescriptors(self, num_dst, dst_starts, dst_sizes, num_src, src_starts, src_sizes, type);
 	perf::Scope _ps(perf::kShadowCopy);
 	perf::count(perf::kCntCopyCalls);
+	// [STRAYDLSS] U0HookSkipWalk armed: the copy half is not recorded (descriptor_shadow.hpp).
+	// The call count above keeps counting so the `[perf]` line shows the calls still happening
+	// and the time no longer being spent on them.
+	if (!shadow::copy_recording())
+		return;
 	if (in_own_code() || !shadowed_heap_type(type) || dst_starts == nullptr || src_starts == nullptr)
 		return;
 	// D3D12's rule: destination ranges are filled in order from the source ranges in order;
@@ -550,6 +555,8 @@ void STDMETHODCALLTYPE hk_CopyDescriptorsSimple(ID3D12Device *self, UINT n, D3D1
 	perf::Scope _ps(perf::kShadowCopy);
 	perf::count(perf::kCntCopyCalls);
 	perf::count(perf::kCntCopyDescs, n);
+	if (!shadow::copy_recording()) // U0HookSkipWalk armed; see hk_CopyDescriptors
+		return;
 	if (in_own_code() || !shadowed_heap_type(type))
 		return;
 	const std::uint32_t inc = increment_for(self, type);

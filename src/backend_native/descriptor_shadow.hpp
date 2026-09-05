@@ -81,6 +81,20 @@ struct ViewEntry
 void set_shadow_graphics_heaps(bool on);
 bool shadow_graphics_heaps();
 
+// THE COPY HALF'S RECORDING SWITCH ([STRAYDLSS] U0HookSkipWalk, src/core/u0_authority.hpp).
+// Default ON. When OFF, CopyDescriptors(Simple) is forwarded and counted but note_copy_range is
+// not called, so the ONLINE heap's slots stop being shadowed - which is the measured
+// `shadow-copy 1.644ms` (CLAUDE.md §5). The WRITE half (note_view from Create*View) is
+// untouched: it records the OFFLINE handle the RHI objects hold, which is what the bind-stream
+// route cross-matches against, so it is level 3's dependency rather than its saving.
+//
+// ONE-WAY IN PRACTICE. The only caller turns it off and never back on within a session: once
+// recording has stopped, a slot the game rewrote meanwhile holds its OLD entry, and a table
+// bound after a resume would resolve to a live, wrong resource with no error (the §5 stale-map
+// class). The setter is symmetric only so the WARP lane can exercise both states.
+void set_copy_recording(bool on);
+bool copy_recording();
+
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry);
 // A null view: the slot now holds a known-null entry (see ViewEntry::is_null).
 void note_null_view(icept::DescriptorId cpu);

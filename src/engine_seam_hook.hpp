@@ -55,6 +55,12 @@ seam::Gate gate(bool announced);
 // exactly these counts (a near miss must still be counted).
 seam::PreGate pre_gate(std::uint32_t group_x, std::uint32_t group_y);
 
+// The same question WITHOUT the counter: is the seam authoritative and live, and does a pending
+// announcement expect exactly these group counts? U0Hook level 3 asks this to decide whether a
+// dispatch is worth resolving from the RHI bind stream (src/u0_rhi_hook.hpp) - a second
+// pre_gate() call would double-count `preSkipped`.
+bool announced_expects(std::uint32_t group_x, std::uint32_t group_y);
+
 // Frame boundary for the ledger. Called from taa_hook::note_present.
 void note_present(std::uint64_t frame);
 

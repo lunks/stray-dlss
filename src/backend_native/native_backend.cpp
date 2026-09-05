@@ -29,6 +29,9 @@ std::atomic<bool> g_use_sentinel{ true };
 char g_report[512] = "native backend: not installed";
 std::atomic<std::uint64_t> g_resolves{ 0 };
 std::atomic<std::uint64_t> g_resolves_no_layout{ 0 };
+// native_backend.hpp, set_descriptor_tables_shadowed. ON until level 3's skip arms.
+std::atomic<bool> g_tables_shadowed{ true };
+std::atomic<std::uint64_t> g_resolves_tables_skipped{ 0 };
 std::atomic<icept::Sink *> g_sink{ nullptr };
 std::atomic<std::uint64_t> g_drive_dispatches{ 0 };
 std::atomic<std::uint64_t> g_drive_suppressed{ 0 };
@@ -45,6 +48,28 @@ void count_drive_dispatch(bool suppressed)
 		g_drive_suppressed.fetch_add(1, std::memory_order_relaxed);
 }
 void count_drive_pipeline() { g_drive_pipelines.fetch_add(1, std::memory_order_relaxed); }
+
+void set_descriptor_tables_shadowed(bool on)
+{
+	const bool was = g_tables_shadowed.exchange(on, std::memory_order_acq_rel);
+	shadow::set_copy_recording(on);
+	if (was == on)
+		return;
+	if (!on)
+		STRAY_LOG_INFO("NATIVE SHADOW: descriptor TABLES are no longer shadowed ([STRAYDLSS] U0HookSkipWalk "
+			"armed). CopyDescriptors(Simple) is forwarded and counted but not recorded, and "
+			"resolve_compute_bindings skips its table walk; root CBVs, the root shadow and the "
+			"Create*View records (the bind stream's own cross-match keys) are unchanged. Read the "
+			"next `[perf] native hooks/frame` line: shadow-copy should fall towards 0 ms with the "
+			"call count unchanged, and `[perf]   resolve breakdown/frame` should read walk 0 / "
+			"slots 0 while root-cbv holds. This does not turn back on this session.");
+	else
+		STRAY_LOG_WARN("NATIVE SHADOW: descriptor tables shadowed again. Slots rewritten while recording was "
+			"off hold STALE entries until the game rewrites them; a table walk in this window can "
+			"name a live, wrong resource with no error. Only the WARP lane is expected to do this.");
+}
+
+bool descriptor_tables_shadowed() { return g_tables_shadowed.load(std::memory_order_relaxed); }
 
 Mode mode_from_string(const char *s)
 {
@@ -192,7 +217,15 @@ bool NativeBackend::resolve_compute_bindings(const icept::CommandContext &ctx, i
 	}
 	const std::uint32_t inc = hooks::descriptor_increment();
 
-	for (std::uint32_t param = 0; param < st.compute_tables.size(); ++param)
+	// [STRAYDLSS] U0HookSkipWalk armed (native_backend.hpp): the copy half is no longer
+	// recorded, so every table slot would come back `unresolved` (reason 1) and the walk would
+	// be pure cost. The bind stream supplies srvs/uavs for the TAA pass; root CBVs below still
+	// run because the View-CB search reads them.
+	const bool walk_tables = g_tables_shadowed.load(std::memory_order_relaxed);
+	if (!walk_tables)
+		g_resolves_tables_skipped.fetch_add(1, std::memory_order_relaxed);
+
+	for (std::uint32_t param = 0; walk_tables && param < st.compute_tables.size(); ++param)
 	{
 		const std::uint64_t base = st.compute_tables[param];
 		if (base == 0)
@@ -422,6 +455,7 @@ Stats stats()
 	s.unknown_copies = shadow::unknown_copies();
 	s.resolves = g_resolves.load(std::memory_order_relaxed);
 	s.resolves_no_layout = g_resolves_no_layout.load(std::memory_order_relaxed);
+	s.resolves_tables_skipped = g_resolves_tables_skipped.load(std::memory_order_relaxed);
 	s.root_signatures = hooks::root_signature_count();
 	s.pipelines_hashed = hooks::pipeline_count();
 	s.resources_live = registry::stats().live;
@@ -439,11 +473,12 @@ void log_stats(const char *when)
 {
 	const Stats s = stats();
 	const registry::Stats r = registry::stats();
-	STRAY_LOG_INFO("NATIVE SHADOW [%s] mode=%s patches=%u resolves=%llu (no-layout %llu) unknown-lookups=%llu "
+	STRAY_LOG_INFO("NATIVE SHADOW [%s] mode=%s patches=%u resolves=%llu (no-layout %llu, tables-skipped %llu) unknown-lookups=%llu "
 		"null-lookups=%llu dead-lookups=%llu unknown-copies=%llu root-signatures=%llu pipelines=%llu resources live=%llu (registered %llu, "
 		"destroyed %llu, sentinel-failures %llu, unarmed %llu) slots=%llu heaps=%llu",
 		when, mode_name(mode()), s.patches,
 		static_cast<unsigned long long>(s.resolves), static_cast<unsigned long long>(s.resolves_no_layout),
+		static_cast<unsigned long long>(s.resolves_tables_skipped),
 		static_cast<unsigned long long>(s.unknown_lookups), static_cast<unsigned long long>(s.null_lookups),
 		static_cast<unsigned long long>(s.dead_lookups), static_cast<unsigned long long>(s.unknown_copies),
 		static_cast<unsigned long long>(s.root_signatures), static_cast<unsigned long long>(s.pipelines_hashed),

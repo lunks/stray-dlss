@@ -53,6 +53,16 @@ const char *attach_report();
 void set_sink(icept::Sink *sink);
 icept::Sink *sink();
 
+// [STRAYDLSS] U0HookSkipWalk, armed by src/u0_rhi_hook.cpp once level 3 has answered
+// u0auth::kSkipArmClaims claimed TAA dispatches running (src/core/u0_authority.hpp). OFF
+// stops BOTH halves of what the bind stream replaced: the shadow's copy recording
+// (shadow::set_copy_recording) and the descriptor-TABLE half of resolve_compute_bindings
+// (`walk` + `slots` on the `[perf] resolve breakdown` line). The root-CBV half still runs -
+// the View-CB search reads it and it never touched the shadow - and so do the state snapshot
+// and every root-shadow consumer. One-way per session by its caller's rule; logs once.
+void set_descriptor_tables_shadowed(bool on);
+bool descriptor_tables_shadowed();
+
 // While held on this thread, every hook passes straight through: our own recording onto
 // the game's list (the resolve and the NGX evaluate) must not enter the shadow, or it would
 // replace the game's state with ours (assessment §8.3).
@@ -91,6 +101,7 @@ struct Stats
 	std::uint64_t unknown_copies = 0;
 	std::uint64_t resolves = 0;          // native resolve_compute_bindings calls
 	std::uint64_t resolves_no_layout = 0; // list had no root signature we deserialized
+	std::uint64_t resolves_tables_skipped = 0; // the table half was skipped (U0HookSkipWalk armed)
 	std::uint64_t root_signatures = 0;
 	std::uint64_t pipelines_hashed = 0;
 	std::uint64_t resources_live = 0;

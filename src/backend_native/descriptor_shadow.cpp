@@ -24,6 +24,8 @@ inline Mode current_mode() { return static_cast<Mode>(g_mode.load(std::memory_or
 // [STRAYDLSS] ShadowGraphicsHeaps (see the header). Read relaxed on the write hot path; set once
 // at init, before any hook can fire.
 std::atomic<bool> g_shadow_graphics{ false };
+// The copy half's recording switch (descriptor_shadow.hpp). ON until level 3's skip arms.
+std::atomic<bool> g_copy_recording{ true };
 
 // Counters shared by both implementations (the resolver drives them; the status file reads them).
 std::atomic<std::uint64_t> g_unknown_lookups{ 0 };
@@ -568,6 +570,9 @@ const char *mode_name() { return current_mode() == Mode::fast ? "fast (flat lock
 
 void set_shadow_graphics_heaps(bool on) { g_shadow_graphics.store(on, std::memory_order_relaxed); }
 bool shadow_graphics_heaps() { return g_shadow_graphics.load(std::memory_order_relaxed); }
+
+void set_copy_recording(bool on) { g_copy_recording.store(on, std::memory_order_relaxed); }
+bool copy_recording() { return g_copy_recording.load(std::memory_order_relaxed); }
 
 // -------- the public interface: dispatch on the mode --------
 void note_view(icept::DescriptorId cpu, const ViewEntry &entry)

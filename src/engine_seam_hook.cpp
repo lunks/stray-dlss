@@ -900,6 +900,15 @@ seam::PreGate pre_gate(std::uint32_t group_x, std::uint32_t group_y)
 	return verdict;
 }
 
+bool announced_expects(std::uint32_t group_x, std::uint32_t group_y)
+{
+	if (!g_hooked.load(std::memory_order_acquire))
+		return false;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	return g_mode == seam::Mode::authoritative && g_ledger.pending() != 0 &&
+		g_ledger.expects(group_x, group_y);
+}
+
 Verdict claim(std::uint32_t group_x, std::uint32_t group_y)
 {
 	Verdict v;
