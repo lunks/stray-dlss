@@ -34,6 +34,9 @@
 #include "engine_seam_hook.hpp"
 #include "view_params_hook.hpp"
 #include "u0_rhi_hook.hpp"
+#include "rhi_gfx_hook.hpp"
+#include "hudless.hpp"
+#include "backend_native/backbuffer_state.hpp"
 #include "pool_name_hook.hpp"
 
 #include <d3d12.h>
@@ -289,8 +292,11 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		// unloaded module is an address-0 crash on the next frame (facts §14).
 		seamhook::shutdown();
 		// The same rule for the RHI-context slots the u0 route patched: they live in the game's
-		// .rdata and must point back at the engine before this DLL can go.
+		// .rdata and must point back at the engine before this DLL can go - and the graphics
+		// seams' four slots on that same vtable first, since they came second.
+		rhigfx::shutdown();
 		u0hook::shutdown();
+		hudless::shutdown();
 		// And the inline trampoline the pool-name hook wrote into the game's own code. Same
 		// rule, one level worse: a detour into an unmapped module is an address-0 crash on the
 		// engine's next render-target allocation.
@@ -453,6 +459,40 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// src/u0_rhi_hook.hpp, src/core/u0_rhi_uav.hpp, src/core/u0_authority.hpp.
 	u0hook::configure(host::cfg::get_int("U0Hook", u0auth::kDefaultLevel),
 	                  host::cfg::get_bool("U0HookSkipWalk", false));
+
+	// FIND, DON'T SEARCH - the four engine seams for frame generation and neural rendering
+	// (src/core/frame_seams.hpp, src/core/reset_plan.hpp), each behind its own key with the
+	// seam's ladder (1 = discover + assert, image unchanged; 2 = the engine's answer is used),
+	// each shipped at 1 until the box has read a level-1 session:
+	//   EngineSeamBackBuffer      which back buffer the game rendered this frame, from the
+	//                             RHIBeginRenderPass the engine issues inside Slate's drawing-
+	//                             viewport bracket (GameIndexMirror becomes the assertion)
+	//   EngineSeamReset           DLSS's InReset from View.CameraCut | 1x1 when the View is the
+	//                             engine's own struct (jitter-equality becomes the assertion)
+	//   EngineSeamBackBufferState the back buffer's D3D12 state at Present from the engine's own
+	//                             ResourceBarrier stream, replayed in ExecuteCommandLists order
+	//                             (NgxNRStageBackBufferState becomes the assertion)
+	//   EngineSeamHudless         the HUD-less frame: the copy at Slate's LOAD pass on the back
+	//                             buffer, for DLSSG.HUDLess and DLSSNR.Color+Backbuffer
+	// The first, third and fourth stand on the vtable U0Hook discovers, so U0Hook >= 1 is their
+	// prerequisite; the second stands on EngineSeamViewParams=2's latch.
+	{
+		rhigfx::Config gc;
+		gc.backbuffer_level = host::cfg::get_int("EngineSeamBackBuffer", gc.backbuffer_level);
+		gc.hudless_level = host::cfg::get_int("EngineSeamHudless", gc.hudless_level);
+		gc.hudless_nr = host::cfg::get_bool("EngineSeamHudlessNR", gc.hudless_nr);
+		gc.log_passes = host::cfg::get_int("EngineSeamHudlessLogFrames", gc.log_passes);
+		rhigfx::configure(gc);
+		native::bbstate::configure(host::cfg::get_int("EngineSeamBackBufferState", 1));
+		taa_hook::set_reset_level(host::cfg::get_int("EngineSeamReset", resetplan::kDefaultLevel));
+		if (host::cfg::get_int("U0Hook", u0auth::kDefaultLevel) <= 0 &&
+			(gc.backbuffer_level > 0 || gc.hudless_level > 0))
+			STRAY_LOG_ERROR("EngineSeamBackBuffer=%d / EngineSeamHudless=%d need the FD3D12CommandContext vtable, "
+				"which only [STRAYDLSS] U0Hook >= 1 discovers, and U0Hook is 0. Both are INERT this session: "
+				"nothing is installed, no assertion runs.", gc.backbuffer_level, gc.hudless_level);
+		// The one-shot validation dump of the HUD-less copy rides NgxDumpInputs' own points.
+		hudless::set_dump(&input_dump::capture, &input_dump::wants);
+	}
 
 	// [STRAYDLSS] PoolNames, default 1 (discover). UE 4.27 passes every pooled render target's
 	// DEBUG NAME to FRenderTargetPool::FindFreeElement as a live `const TCHAR*` argument, in
@@ -1230,11 +1270,12 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		if (native::fg::enabled() && native::fg::config().mode == native::fg::Mode::ngx)
 		{
 			const ngxfg::Stats gs = ngxfg::stats();
-			STRAY_LOG_INFO("[fg/ngx] %s: created=%d publishes=%llu generates=%llu evaluate-failures=%llu | refused: no-publish=%llu not-ready=%llu warmup=%llu | %ux%u hdr=%d guides %ux%u | last evaluate 0x%08x",
+			STRAY_LOG_INFO("[fg/ngx] %s: created=%d publishes=%llu generates=%llu evaluate-failures=%llu | refused: no-publish=%llu not-ready=%llu warmup=%llu | %ux%u hdr=%d guides %ux%u | hudless bound=%llu absent=%llu | last evaluate 0x%08x",
 				when, gs.created ? 1 : 0, static_cast<unsigned long long>(gs.publishes), static_cast<unsigned long long>(gs.generates),
 				static_cast<unsigned long long>(gs.evaluate_failures), static_cast<unsigned long long>(gs.refused_no_publish),
 				static_cast<unsigned long long>(gs.refused_not_ready), static_cast<unsigned long long>(gs.refused_warmup),
-				gs.width, gs.height, gs.hdr, gs.render_width, gs.render_height, gs.last_evaluate_result);
+				gs.width, gs.height, gs.hdr, gs.render_width, gs.render_height,
+				static_cast<unsigned long long>(gs.hudless_bound), static_cast<unsigned long long>(gs.hudless_absent), gs.last_evaluate_result);
 		}
 	}
 
@@ -1253,6 +1294,24 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 		// The render-target pool's name map: the discovery verdict, the RR guide set by name,
 		// and the assertions against the routes that already answer for depth and velocity.
 		poolhook::log_report(when);
+		// The graphics seams: brackets, back-buffer pass classes, the frame shape, the identity
+		// assertions, the HUD-less copy counters ([rhigfx]); the barrier ledger ([bbstate]); the
+		// camera-cut reset plan ([reset]). Each line names what must stay 0.
+		rhigfx::log_report(when);
+		native::bbstate::log_report(when);
+		taa_hook::log_reset_report(when);
+		{
+			const nrhook::Counters hc = nrhook::counters();
+			const hudless::Stats hs = hudless::stats();
+			if (hs.copies != 0 || hc.hudless_used != 0 || hc.hudless_missing != 0)
+				STRAY_LOG_INFO("[hudless] %s: copies=%llu created=%llu retired=%llu released=%llu dumps=%llu notReady=%llu "
+					"%ux%u fmt=%u | NR used=%llu missing=%llu evaluates=%llu | (missing must stay near 0 while the HUD is drawn)",
+					when, static_cast<unsigned long long>(hs.copies), static_cast<unsigned long long>(hs.created),
+					static_cast<unsigned long long>(hs.retired), static_cast<unsigned long long>(hs.released),
+					static_cast<unsigned long long>(hs.dumps), static_cast<unsigned long long>(hs.not_ready),
+					hs.width, hs.height, hs.format, static_cast<unsigned long long>(hc.hudless_used),
+					static_cast<unsigned long long>(hc.hudless_missing), static_cast<unsigned long long>(nr::hudless_evaluates()));
+		}
 		// RAY RECONSTRUCTION, and it CANNOT be absent while NgxRR is non-zero. Three lines are
 		// possible and exactly one is printed: the totals with every refusal reason; "NOT ASKED"
 		// when no frame ever reached the evaluate; and the [rrprobe] line, always. Totals
@@ -1473,6 +1532,23 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				char poolline[2048] = {};
 				if (poolhook::format_report(poolline, sizeof(poolline)) > 0)
 					std::fprintf(f, "%s\n", poolline);
+				// The graphics seams, the barrier ledger and the reset plan, one line each.
+				char gfxline[1200] = {};
+				if (rhigfx::format_report(gfxline, sizeof(gfxline)) > 0)
+					std::fprintf(f, "%s\n", gfxline);
+				char bbline[640] = {};
+				if (native::bbstate::format_report(bbline, sizeof(bbline)) > 0)
+					std::fprintf(f, "%s\n", bbline);
+				char rline[512] = {};
+				if (taa_hook::format_reset_report(rline, sizeof(rline)) > 0)
+					std::fprintf(f, "%s\n", rline);
+				{
+					const hudless::Stats hs = hudless::stats();
+					const nrhook::Counters hc = nrhook::counters();
+					std::fprintf(f, "hudless_copies=%llu\n", (unsigned long long)hs.copies);
+					std::fprintf(f, "hudless_nr_used=%llu\n", (unsigned long long)hc.hudless_used);
+					std::fprintf(f, "hudless_nr_missing=%llu\n", (unsigned long long)hc.hudless_missing);
+				}
 			}
 			{
 				// Ray Reconstruction, one key per refusal reason. Written whenever RR has been
@@ -1546,6 +1622,8 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 				std::fprintf(f, "fg_ngx_refused_no_publish=%llu\n", (unsigned long long)gs.refused_no_publish);
 				std::fprintf(f, "fg_ngx_refused_not_ready=%llu\n", (unsigned long long)gs.refused_not_ready);
 				std::fprintf(f, "fg_ngx_refused_warmup=%llu\n", (unsigned long long)gs.refused_warmup);
+				std::fprintf(f, "fg_ngx_hudless_bound=%llu\n", (unsigned long long)gs.hudless_bound);
+				std::fprintf(f, "fg_ngx_hudless_absent=%llu\n", (unsigned long long)gs.hudless_absent);
 			}
 			std::fprintf(f, "shadow_mode=%s\n", native::shadow::mode() == native::shadow::Mode::fast ? "fast" : "debug");
 			std::fprintf(f, "ngx_attempted=%d\n",

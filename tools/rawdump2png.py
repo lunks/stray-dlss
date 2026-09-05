@@ -11,6 +11,8 @@ Usage: rawdump2png.py <file.bin> <width> <height> <fmt> [out.png]
                     engine-named G-buffer still had CONTENT when we read it
        rgba8        the RR albedo guides (straydlss_rr_diffuse_*.bin / _rr_specular_*.bin)
        r16f         the standalone RR roughness guide (straydlss_rr_roughness_*.bin)
+       rgb10a2      the HUD-less copy (straydlss_hudless_*.bin) - the swapchain's own format;
+                    the thing to check is that NO HUD element is in it
 
 Width, height, format and row pitch are all in the `input_dump: captured ...` log line beside
 each capture — read them off it rather than guessing.
@@ -135,6 +137,22 @@ def main():
             f"{out}: mean linear RGB = ({float(img[:, :, 0].mean()):.4f}, "
             f"{float(img[:, :, 1].mean()):.4f}, {float(img[:, :, 2].mean()):.4f}); "
             f"FLAT 0.5 (sky/unlit default) on {100.0 * float(flat.mean()):.2f}% of pixels"
+        )
+    elif fmt == "rgb10a2":
+        # THE HUD-LESS COPY (straydlss_hudless_*.bin) and anything else in the swapchain's own
+        # R10G10B10A2_UNORM (CLAUDE.md §2.1): display-referred already, so no tone curve is
+        # applied here. The one thing to LOOK for is the absence of the HUD: the copy is taken
+        # at Slate's LOAD pass before its first draw, so a HUD element in this image means the
+        # copy landed after a UI draw (a carrier arrived late) or the pass was not the UI's.
+        raw32 = rows_of(raw, w, h, 4).view(np.uint32).reshape(h, w)
+        r = ((raw32 >> 0) & 0x3FF).astype(np.float32) / 1023.0
+        g = ((raw32 >> 10) & 0x3FF).astype(np.float32) / 1023.0
+        b = ((raw32 >> 20) & 0x3FF).astype(np.float32) / 1023.0
+        rgb = np.stack([r, g, b], axis=2)
+        Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8), "RGB").save(out)
+        print(
+            f"{out}: mean RGB = ({float(r.mean()):.4f}, {float(g.mean()):.4f}, {float(b.mean()):.4f}); "
+            f"look for the HUD - it must NOT be in this image"
         )
     elif fmt == "r16f":
         img = rows_of(raw, w, h, 2).view(np.float16).reshape(h, w).astype(np.float32)

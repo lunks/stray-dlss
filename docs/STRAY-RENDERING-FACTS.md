@@ -3188,3 +3188,52 @@ to one of them once.
 **The general rule, and it is a sharpening of §0.2:** a gate that is *correct* to be silent about
 (the `[rr]` line under `NgxRR=1`) and a gate that is *broken* and silent look the same from
 outside. Say the absence out loud too. `[rr] NOT ASKED` now does.
+
+## §57 FG and NR engine seams: BUILT, nothing measured — the predictions the box must confirm (2026-09-05)
+
+Branch `fg-nr-engine-seams`. No number below is a measurement; every line is what a level-1
+session must print for the design to be right, so a wrong reading is attributable to one
+component. Source claims are HARD from `AlexMercer-MA/UnrealEngine-4.27 @ 306a7e9` unless marked.
+
+**The graphics half of the vtable (`RHI GFX SEAM FOUND`).** Slots 38..85 of the vtable U0Hook
+found must all be code; the eleven `{}` virtuals FD3D12CommandContext does not override
+(RHIContext.h:390, :410, :416, :447-462, :475, :593, :601, :606 against the override list in
+D3D12CommandContext.h:257-411) must begin with `ret` (either encoding; ICF folds them, so
+`ret_fold` near 11 is expected); exactly one of slots 43/44 (the reversed `RHICalibrateTimers`
+pair, :399/:404) must be `ret`. [derived] from the header under the MSVC ABI; the box makes it HARD.
+
+**One bracket per presented frame, and it is Slate's.** `[rhigfx] brackets(begin=, end=)` must
+equal the present count, and `shape: ok` must dominate: `bbScene >= 1` per frame (the tonemapper's
+pass onto the back buffer BEFORE the bracket) and `bbHud == 1` (the LOAD pass inside it). Read
+from SlateRHIRenderer.cpp:845-1153 and SceneViewport.cpp:1734-1772 (`FSceneViewport::
+BeginRenderFrame` rendering directly to the window calls no `RHIBeginDrawingViewport`), with
+`bRenderDirectlyToWindow` true for a game (GameEngine.cpp:198-225). A `noScenePass` reading
+means the scene renders to a separate target and the "HUD pass" would carry the scene too — the
+copy is refused by shape in that case.
+
+**Three routes to one back buffer.** `idVsMirror agree` must track presents and `disagree` stay
+0 (the render-pass resolve against `GameIndexMirror` / DXGI's index); `idVsBarrier agree` must
+track presents (the render-pass resolve against the engine's own PRESENT transition,
+D3D12Viewport.cpp:820-829). `notCandidate` must stay 0: an engine answer outside the registered
+swapchain-class set is refused and never used.
+
+**The barrier ledger.** `[bbstate] beforeMismatch` must stay 0 — UE tracks per-resource state
+itself (`TransitionResourceWithTracking`, D3D12RHIPrivate.h:785) and its `StateBefore` is
+compared with ours at every replayed transition. `verdict agree` must track the NR stage's
+`triggered`; `unknown` may read 1 per (re)registration; `disagree` must stay 0 — if it does not,
+`NgxNRStageBackBufferState` has been wrong on this stack and level 2 corrects it.
+
+**The HUD-less copy.** `markers ok` must track `copies` and `markers bad` stay 0 (the copy's
+RENDER_TARGET assumption, SlateRHIRenderer.cpp:847 + D3D12Commands.cpp:1851, judged at execute);
+`carrierLost` must stay 0 (UE's `ApplyState` sets the PSO before the first draw, D3D12StateCache.cpp);
+`[fg/ngx] hudless bound` must track generates while a HUD is drawn; the indicator's Hudless field
+must read Yes; `straydlss_hudless_*.bin` must show the scene with NO HUD.
+
+**The reset plan.** `[reset] planDisagree` must stay 0; `jitterOnly fired` is the number of resets
+the heuristic added at level 1, and the number to compare against the user's blip count.
+
+**Names.** `DLSSG.HUDLess` + `DLSSG.HUDLessSubrectBaseX/BaseY/Width/Height`: PRESENT in the 2.12.0
+snippet (§32.2); UNCONFIRMED in the box's SL 2.13 copy — run `tools/ngx_param_names.py <copy>
+--check DLSSG.HUDLess DLSSG.HUDLessSubrectBaseX DLSSG.HUDLessSubrectBaseY DLSSG.HUDLessSubrectWidth
+DLSSG.HUDLessSubrectHeight` first. `DLSSNR.Backbuffer` + its four subrects: in the 310.8.0 string
+table (RESEARCH-DLSSNR-STYLES §2), HARD.

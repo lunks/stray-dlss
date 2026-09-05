@@ -1294,6 +1294,20 @@ View.bCameraCut`, and the history-invalid case never reaches the View buffer. OR
 3. **the history or velocity SRV is a 1×1 texture** — most reliable, directly reflects
    `!InputHistory.IsValid()`.
 
+> **THE OR IS NOW A PLAN, AND THE HEURISTIC HALF IS COUNTED (2026-09-05, branch
+> `fg-nr-engine-seams`, `[STRAYDLSS] EngineSeamReset`, `src/core/reset_plan.hpp`).** With
+> `EngineSeamViewParams=2` the View is the engine's own `FViewInfo` struct, so signal 1 is a
+> STATED fact on every latched frame and signal 2 can only ADD resets — each one a whole-history
+> wipe in DLSS SR, DLSS-G and feature 18 at once, which is the shape of the flicker the user is
+> chasing. Level 1 (default) keeps the OR and counts all eight signal combinations per frame on
+> the `[reset]` line; **`jitterOnly fired=` is the number of resets the heuristic added on its
+> own.** Level 2 resets on `CameraCut | 1x1` when the View is the engine's and counts
+> jitter-equality as an assertion (`jitterOnly suppressed=`); when it is not, the OR decides and
+> `fellBack=` counts it. Signal 3 is kept at every level — it is the half of `bCameraCut` the
+> View cannot carry. `planDisagree` must stay 0. One decision feeds all three accumulators
+> (`ei.reset`, `fc.reset`, `note_guides`). **UNCONFIRMED on the box:** whether the suppressed
+> resets are the visible blips.
+
 ### 2.9 TAA history
 
 The resource at `u0` is extracted by UE 4.27 as the **next frame's `HistoryBuffer[0]`**.
@@ -2270,6 +2284,17 @@ was wrong; all of it was work the hook point created. **When a feature keeps gro
 to compensate for where it runs, the placement is the bug.** This project spent sessions
 diagnosing the codec, the exposure loop and the feedback node as properties of NR, and every one
 of them was a property of `u0`.
+
+### The NR stage's two assumptions are now ASSERTED against the engine (2026-09-05, UNCONFIRMED)
+
+Two things the present stage ASSUMED are now engine-stated at level 1 and engine-supplied at
+level 2 — see "FIND, DON'T SEARCH" below: the back buffer's state at Present
+(`EngineSeamBackBufferState`, the `[bbstate]` line) and, through the HUD-less seam
+(`EngineSeamHudless=2` + `EngineSeamHudlessNR=1`), a `DLSSNR.Color` that is the scene WITHOUT the
+HUD and a `DLSSNR.Backbuffer` that is the final frame. **The second changes NR's input contract**
+and its effect is UNCONFIRMED: RESEARCH-DLSSNR-STYLES §8.3 read the runtime substituting the
+Backbuffer for Color "where present" and left the pair's semantics open. A HUD missing from the
+NR'd frame is that input; `EngineSeamHudlessNR=0` removes it without touching DLSS-G's.
 
 ### The cat is unchanged under NR, and the fur is NOT a motion-vector hole (2026-09-03)
 
@@ -3863,6 +3888,62 @@ frames per checkpoint reload (no TAA dispatch, so no guides) and 0-3 per 600 oth
 fps and pacing number from these sessions is SUSPECT (host CPU contention) and the pacing
 histogram's BIMODAL flag is a known false positive under an irregular source; re-read both on
 a quiet host. HUD-less (stage 3) is deferred until the user has judged stage 2 in motion.
+
+### FIND, DON'T SEARCH: FG and NR take their facts from the RHI thread (2026-09-05, branch `fg-nr-engine-seams`, UNCONFIRMED on the box)
+
+U0Hook proved the technique — the engine names every fact we need on the RHI thread through
+`IRHICommandContext` virtuals, with the argument as the fact — and this branch applies it to the
+three MODELS frame generation and neural rendering still ran on. One discovery, two halves:
+`u0::discover_graphics_half` extends the vtable U0Hook found to `IRHICommandContext`'s own
+virtuals (RHIContext.h:361-748, slots 38..85 in declaration order, eleven predicted empty bodies
+required, the reversed `RHICalibrateTimers` pair as "exactly one is `ret`"), and
+`src/rhi_gfx_hook.cpp` stands in for four of them: `RHIBeginDrawingViewport` (47),
+`RHIEndDrawingViewport` (48), `RHIBeginRenderPass` (79), `RHIEndRenderPass` (80). Everything is
+forwarded; the image is byte-identical at level 1. All four keys ship at 1.
+
+**The three models, and the statement that replaces each — every one HARD from 4.27.2 source:**
+
+| Model (still the assertion) | The engine's statement | Key |
+|---|---|---|
+| `core::fg::GameIndexMirror` reproducing `CurrentBackBufferIndex_RHIThread` | `RHIBeginRenderPass` inside Slate's drawing-viewport bracket names the back-buffer texture as `ColorRenderTargets[0].RenderTarget`; `FRHITexture::GetNativeResource` (slot 7) on it resolves to THIS frame's `ID3D12Resource` — `FD3D12TextureBase::GetNativeResource` swaps a `TexCreate_Presentable` reference for `Viewport->GetBackBuffer_RHIThread()` (D3D12Texture.h:312-331, :566-583). A second engine witness: `FD3D12Viewport::Present` transitions that resource to PRESENT and flushes before `IDXGISwapChain::Present` (D3D12Viewport.cpp:820-829, :868) | `EngineSeamBackBuffer` |
+| `NgxNRStageBackBufferState`, the ASSUMED state at Present | every `ResourceBarrier` the engine issues on a swapchain-class resource, replayed in `ExecuteCommandLists` order — UE resolves a list's first transition onto a barrier list that executes FIRST (`AddPendingResourceBarrier`, D3D12CommandList.cpp:14), so recording order is not GPU order (`src/core/frame_seams.hpp`, `StateLedger`) | `EngineSeamBackBufferState` |
+| the three-way camera-cut OR | `View.CameraCut` from the engine's own struct (§2.8) | `EngineSeamReset` |
+
+**And the HUD-less seam, identified by ARGUMENT, not by name.** Slate draws the UMG HUD in one
+render pass, `FRHIRenderPassInfo(BackBuffer, Load_Store)` / `TEXT("SlateBatches")`
+(SlateRHIRenderer.cpp:850, :885), inside the frame's only drawing-viewport bracket (:845, :1153);
+the scene's own passes onto the back buffer run BEFORE that bracket, because
+`FSceneViewport::BeginRenderFrame` rendering directly to the window never opens one
+(SceneViewport.cpp:1734-1747). So **the first LOAD render pass onto the back buffer INSIDE the
+bracket is the HUD pass**, whatever it is called — the UTF-16 literal is UNCONFIRMED in this exe
+and is only ever printed, never matched. At `EngineSeamHudless=2`, once the frame shape has held
+8 presents and the texture is latched, `CopyResource(hudless <- back buffer)` is recorded on the
+GAME's own list at that pass, carried by the next hooked command on the thread (SetPipelineState,
+ResourceBarrier or a Draw — UE's `ApplyState` sets the PSO before the first draw), with the back
+buffer in RENDER_TARGET by the engine's own construction (:847 `Transition(... RTV)`;
+D3D12Commands.cpp:1851). The copy goes to DLSS-G as `DLSSG.HUDLess` (+ the four subrects; in the
+2.12.0 snippet's PRESENT set, facts §32.2, and UNCONFIRMED against the box's SL 2.13 copy until
+`tools/ngx_param_names.py` runs there) and to NR as `DLSSNR.Color` with `DLSSNR.Backbuffer` = the
+final frame (both in the 310.8.0 string table, RESEARCH-DLSSNR-STYLES §2/§8) — the first time
+`UICorrection` has had a Backbuffer to arm against (§8.5). A frame with no UI pass has no copy
+and both consumers write NULL, counted. `NgxDumpInputs=1` dumps `straydlss_hudless_*.bin`
+(`rawdump2png.py rgb10a2`): **the HUD must not be in it.**
+
+**What the box must confirm, in the order a wrong one would show.** (1) `RHI GFX SEAM FOUND`
+with all eleven `ret` predictions — the graphics half is [derived] from the header and MSVC's
+overload order; (2) `[rhigfx] brackets == presents` and `shape: ok` — the one-bracket-per-frame
+structure and "the scene draws directly into the back buffer" are read from the source, and a
+title using a separate render target would read `noScenePass`; (3) `idVsMirror disagree = 0` AND
+`idVsBarrier disagree = 0` — three routes to one identity; (4) `[bbstate] beforeMismatch = 0` —
+the ledger against UE's own per-resource tracking — and `verdict agree` tracking the NR stage's
+`triggered`; (5) `markers bad = 0` — the copy's RENDER_TARGET assumption judged at execute; (6)
+the dump. Then, and only then, level 2 of each — one key at a time.
+
+**What was WRONG in the task's premise, and it is worth keeping:** `RHIBeginDrawingViewport`'s
+`RenderTargetRHI` argument is NULL on every 4.27 caller (UnrealClient.cpp:1418,
+SlateRHIRenderer.cpp:845), and `RHIGetViewportBackBuffer` returns the render thread's DUMMY
+reference (D3D12Viewport.cpp:1161-1177), not the buffer. The identity is one `GetNativeResource`
+hop deeper, inside the render pass — and that hop is the engine's own.
 
 ## 6. Build, CI and testing
 

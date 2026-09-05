@@ -33,7 +33,7 @@ name: StrayDLSS plugin
 
 on:
   push:
-    branches: [ main, dlss-ue4ss, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui, u0-level3 ]
+    branches: [ main, dlss-ue4ss, nr-depth-inverted-type, drop-reshade, viewrectmin-tripwire2, main-integration, dlss-fg, engine-seam-l1, seam-l1-crash, view-cb-identity, drop-pass-finder, shadow-slot-read-bit, shadow-skip-graphics-heaps, colour-input-identity, fix-render-rect, fix-letterbox-continuity, drop-dead-describe-view, drop-fg-throttle-report, shadow-graphics-heaps-off, perf-resolve-split, perf-fg-bucket, perf-skip-unannounced, view-cb-cached-params, view-cb-cached-params-l2, u0-rhi-uav, rr-reflection-denoise, rr-guides-pool-names, dlss-tweak-ui, u0-level3, fg-nr-engine-seams ]
     tags: [ 'v*' ]
     paths:
       - 'mods/StrayDLSS/**'
@@ -145,7 +145,7 @@ jobs:
           # (it is MSVC-only there): a syntax pass under mingw's older d3d12.h.
           for f in backend_native/present_owner backend_native/fg_present backend_native/fg_reflex backend_native/native_backend backend_native/d3d12_hooks \
                    backend_native/resource_registry backend_native/descriptor_shadow backend_native/root_shadow \
-                   backend_native/vtable_patch engine_seam_hook view_params_hook u0_rhi_hook; do
+                   backend_native/vtable_patch backend_native/backbuffer_state engine_seam_hook view_params_hook u0_rhi_hook rhi_gfx_hook hudless; do
             echo "--- $f"
             x86_64-w64-mingw32-g++-posix -std=c++20 -Wall -Wextra -Werror -fsyntax-only \
               -DWIN32_LEAN_AND_MEAN -DNOMINMAX -I../../src "../../src/$f.cpp"
