@@ -66,6 +66,32 @@ TEST_CASE("transfer strength is clamped at zero from below and passed through ab
 	CHECK(plan(c, 3840, 2160, true, true).transfer_strength == 1.5f);
 }
 
+TEST_CASE("the resolve mode is clamped and carries the one parameter it uses")
+{
+	Config c;
+	c.scale = 0.5f;
+	c.guided = 7;
+	c.guided_sigma = 0.2f;
+	c.guided_epsilon = 0.005f;
+	Plan p = plan(c, 3840, 2160, true, true);
+	CHECK(p.guided == 2);
+	CHECK(p.guided_param == 0.005f);   // mode 2 carries epsilon
+	c.guided = 1;
+	p = plan(c, 3840, 2160, true, true);
+	CHECK(p.guided == 1);
+	CHECK(p.guided_param == 0.2f);     // mode 1 carries sigma
+	c.guided = -3;
+	p = plan(c, 3840, 2160, true, true);
+	CHECK(p.guided == 0);
+	// Degenerate parameters are floored, never zero: both divide by them in the shader.
+	c.guided = 2;
+	c.guided_epsilon = 0.0f;
+	CHECK(plan(c, 3840, 2160, true, true).guided_param > 0.0f);
+	c.guided = 1;
+	c.guided_sigma = -1.0f;
+	CHECK(plan(c, 3840, 2160, true, true).guided_param > 0.0f);
+}
+
 TEST_CASE("every result has a name")
 {
 	for (int i = 0; i < kResultCount; ++i)

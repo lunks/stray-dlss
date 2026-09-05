@@ -375,7 +375,8 @@ ID3D12Resource *shown()
 }
 
 bool record_resolve(ID3D12GraphicsCommandList *cmd, ID3D12Resource *full,
-	std::uint32_t full_width, std::uint32_t full_height, float transfer_strength)
+	std::uint32_t full_width, std::uint32_t full_height, float transfer_strength,
+	int guided, float guided_param)
 {
 	if (cmd == nullptr || full == nullptr)
 		return false;
@@ -397,6 +398,8 @@ bool record_resolve(ID3D12GraphicsCommandList *cmd, ID3D12Resource *full,
 	cmd->SetPipelineState(g_pso_resolve);
 	UINT constants[8] = { full_width, full_height, g_small.width, g_small.height, 0, 0, 0, 0 };
 	std::memcpy(&constants[4], &transfer_strength, sizeof(float));
+	constants[5] = static_cast<UINT>(guided < 0 ? 0 : (guided > 2 ? 2 : guided));
+	std::memcpy(&constants[6], &guided_param, sizeof(float));
 	cmd->SetComputeRoot32BitConstants(0, 8, constants, 0);
 	cmd->SetComputeRootDescriptorTable(1, gpu(heap, kSlotSrvShown));
 	cmd->SetComputeRootDescriptorTable(2, gpu(heap, kSlotUavFull));

@@ -746,6 +746,10 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 		nrmodel_plan::Config model;
 		model.scale = host::cfg::get_float("NgxNRModelScale", 0.5f);
 		model.transfer_strength = host::cfg::get_float("NgxNRModelTransfer", 1.0f);
+		// How the edit comes up: 0 bilinear, 1 joint bilateral (sigma), 2 local affine (eps).
+		model.guided = host::cfg::get_int("NgxNRModelGuided", 2);
+		model.guided_sigma = host::cfg::get_float("NgxNRModelGuidedSigma", 0.1f);
+		model.guided_epsilon = host::cfg::get_float("NgxNRModelGuidedEps", 0.01f);
 		nrhook::set_model(model);
 
 		// The mask's DXGI_FORMAT. A KNOB and not a constant because the runtime never inspects a

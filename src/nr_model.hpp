@@ -39,8 +39,11 @@ ID3D12Resource *shown();
 
 // Full staging <- full + upsample(model - shown), cube-scaled. Transitions the staging copy
 // 0x40 -> UAV -> 0x40 and the small textures 0x40 -> UAV (their rest state).
+// `guided` is the resolve mode (0 bilinear, 1 joint bilateral, 2 local affine) and
+// `guided_param` its one parameter (sigma or epsilon) - see shaders/nr_resolve.hlsl.
 bool record_resolve(ID3D12GraphicsCommandList *cmd, ID3D12Resource *full,
-	std::uint32_t full_width, std::uint32_t full_height, float transfer_strength);
+	std::uint32_t full_width, std::uint32_t full_height, float transfer_strength,
+	int guided, float guided_param);
 
 void collect(std::uint64_t frame);
 void shutdown();

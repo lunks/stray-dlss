@@ -321,11 +321,13 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 		{
 			s_model_logged = idx;
 			STRAY_LOG_WARN("NR MODEL RESOLUTION: %s (scale %.2f -> model %ux%u over a %ux%u "
-				"frame, typed UAV load=%d store=%d, transfer %.2f)",
+				"frame, typed UAV load=%d store=%d, transfer %.2f, guided=%d (%s) param=%.4f)",
 				nrmodel_plan::result_name(model_plan.result),
 				static_cast<double>(model_config().scale), model_plan.width, model_plan.height,
 				plan.width, plan.height, cd.typed_uav_load ? 1 : 0, cd.typed_uav_store ? 1 : 0,
-				static_cast<double>(model_plan.transfer_strength));
+				static_cast<double>(model_plan.transfer_strength), model_plan.guided,
+				model_plan.guided == 2 ? "local affine" : model_plan.guided == 1 ? "joint bilateral" : "bilinear",
+				static_cast<double>(model_plan.guided_param));
 		}
 	}
 	g_model_result.store(static_cast<int>(model_plan.result), std::memory_order_relaxed);
@@ -449,7 +451,7 @@ void on_present(const icept::PresentContext &pc, ID3D12Device *device)
 		if (applied)
 		{
 			applied = nrmodel::record_resolve(cmd, staging, plan.width, plan.height,
-				model_plan.transfer_strength);
+				model_plan.transfer_strength, model_plan.guided, model_plan.guided_param);
 			if (applied)
 				g_model_applied.fetch_add(1, std::memory_order_relaxed);
 		}

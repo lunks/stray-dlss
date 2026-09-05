@@ -27,6 +27,14 @@ struct Config
 	// [STRAYDLSS] NgxNRModelTransfer: how much of the model's difference lands. 0 = the frame
 	// comes back untouched (the honest A/B), 1 = the full edit, >1 exaggerates.
 	float transfer_strength = 1.0f;
+	// [STRAYDLSS] NgxNRModelGuided: how the edit comes up from the small extent
+	// (shaders/nr_resolve.hlsl). 0 bilinear, 1 joint bilateral (Kopf 2007), 2 local affine
+	// (guided filter / Bilateral Guided Upsampling). Anything else is clamped to 2.
+	int guided = 2;
+	// Mode 1: luminance range sigma in display units. Mode 2: the guided filter's epsilon,
+	// which regularises the fitted slope where the small patch is flat.
+	float guided_sigma = 0.1f;
+	float guided_epsilon = 0.01f;
 };
 
 enum class Result
@@ -45,6 +53,8 @@ struct Plan
 	std::uint32_t width = 0;   // the model's extent when ok
 	std::uint32_t height = 0;
 	float transfer_strength = 1.0f;
+	int guided = 2;              // the resolve mode, clamped to [0, 2]
+	float guided_param = 0.01f;  // sigma for mode 1, epsilon for mode 2, unused for 0
 };
 
 constexpr float kOffAbove = 0.999f;    // >= this is "full resolution", not a downsample
@@ -83,6 +93,10 @@ inline Plan plan(const Config &cfg, std::uint32_t full_width, std::uint32_t full
 {
 	Plan p;
 	p.transfer_strength = cfg.transfer_strength < 0.0f ? 0.0f : cfg.transfer_strength;
+	p.guided = cfg.guided < 0 ? 0 : (cfg.guided > 2 ? 2 : cfg.guided);
+	p.guided_param = p.guided == 1
+		? (cfg.guided_sigma > 1e-4f ? cfg.guided_sigma : 1e-4f)
+		: (cfg.guided_epsilon > 1e-6f ? cfg.guided_epsilon : 1e-6f);
 	if (!(cfg.scale < kOffAbove))
 	{
 		p.result = Result::off;
