@@ -3,6 +3,7 @@
 // verbatim; only the types at the seam changed. (Plan Task 7.)
 
 #include "app/dlss_app.hpp"
+#include <cctype>
 
 #include "app/diff_observer.hpp"
 #include "backend_native/descriptor_shadow.hpp"
@@ -554,6 +555,36 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// [STRAYDLSS] StallWatch (default ON): one [stall] line per present whose interval exceeds
 	// 3x the running median, attributing the frame (facts §32.13). Cheap (a few atomics/present).
 	perf::set_stall_watch(host::cfg::get_bool("StallWatch", true));
+
+	// [STRAYDLSS] Log (default 1) / LogLevel (off|error|warn|info|debug, default debug): THE MASTER
+	// SWITCH for the plugin's own log file. The user asked for a way to take the log out of the
+	// frame entirely, after correlating the flicker with the log line for line (log.cpp): Log=0
+	// or LogLevel=off refuses every line BEFORE it is formatted, ERRORs included, so a session with
+	// it set proves the point or disproves it. Everything already written before this line (the
+	// attach banner, the ini load) stays, which is how a log that stops here is read: the switch
+	// is on, not the plugin dead. The last line written says so.
+	{
+		char lvl[16] = {};
+		log::Threshold t = log::Threshold::debug;
+		if (host::cfg::get_string("LogLevel", lvl, sizeof(lvl)))
+		{
+			for (char *c = lvl; *c; ++c) *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+			if (std::strcmp(lvl, "off") == 0 || std::strcmp(lvl, "none") == 0 || std::strcmp(lvl, "0") == 0) t = log::Threshold::off;
+			else if (std::strcmp(lvl, "error") == 0) t = log::Threshold::error;
+			else if (std::strcmp(lvl, "warn") == 0 || std::strcmp(lvl, "warning") == 0) t = log::Threshold::warning;
+			else if (std::strcmp(lvl, "info") == 0) t = log::Threshold::info;
+			else if (std::strcmp(lvl, "debug") == 0) t = log::Threshold::debug;
+			else STRAY_LOG_WARN("[STRAYDLSS] LogLevel=%s is not one of off|error|warn|info|debug; keeping debug", lvl);
+		}
+		if (!host::cfg::get_bool("Log", true))
+			t = log::Threshold::off;
+		if (t != log::Threshold::debug)
+		{
+			STRAY_LOG_WARN("[STRAYDLSS] log threshold -> %s: this is the LAST line below that level; the file going quiet from here is the switch, not a crash",
+				t == log::Threshold::off ? "OFF (nothing at all, errors included)" : t == log::Threshold::error ? "error" : t == log::Threshold::warning ? "warn" : "info");
+		}
+		log::set_threshold(t);
+	}
 
 	// [STRAYDLSS] ShadowMode: fast (flat lock-free arrays), debug (sharded map with provenance),
 	// or absent = AUTO. Selected once, before the game creates any descriptor heap; logged and

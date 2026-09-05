@@ -3665,6 +3665,23 @@ cast) and `NgxNRTransferStrength` (0 is an EXACT bit-for-bit bypass, so it is th
 
 ### Gotchas ledger — hard-won, 2026-08-31, all measured
 
+**THE LOG WRITE WAS THE FLICKER (2026-09-05).** The user correlated the on-screen blink with the
+plugin log LINE FOR LINE: a small one each time the 600-present status block went out, a large one
+on every `[stall]` line. `log::write` was `fprintf` + `fflush` on the CALLING thread under one
+mutex, and the present thread is a caller; the stall detector's own buckets summed to ~2.6 ms of a
+40 ms frame and the write was the unmeasured rest. UE4SS's `Output::send` is the same shape
+(device loop on the caller, `WideCharToMultiByte` + `WriteFile` per line, no queue - read in
+`deps/first/DynamicOutput` and `File/WinFile.cpp`), so it was never the alternative. Fixed by an
+asynchronous writer thread in `src/log.cpp` (callers format and enqueue; an ERROR still reaches the
+disk before its caller continues; shutdown drains and DETACHES, never joins, because the mod
+destructor may run under the loader lock) and the same writer in `mods/StrayDualSense/src/Log.cpp`.
+`[perf] log:` reports `dropped` (must stay 0) and `caller max`. **The flicker got smaller, not
+gone**, so the log was a contributor and not the whole cause; `[STRAYDLSS] Log=0` / `LogLevel=off`
+(and `LogLevel = Off` in the DualSense ini) refuse every line BEFORE formatting, errors included,
+so one session can take the log out of the frame entirely. Also turned off on the box the same
+day: UE4SS's `GuiConsoleEnabled` (a hidden GUI console still registers an output device that every
+mod's line passes through under a mutex; UE4SS's own users report it as a stutter source).
+
 **TWO HOSTS, ONE INIT PATH: a config key can be advertised and inert (found 2026-09-04).**
 `shader_dump::initialise()` had exactly one caller — `src/backend_reshade/addon_entry.cpp`'s
 `DLL_PROCESS_ATTACH`. The **UE4SS plugin, which is the shipping host, has no such entry**, so

@@ -57,6 +57,7 @@ const char* LevelName(LogLevel level)
     case LogLevel::Info:  return "INFO ";
     case LogLevel::Warn:  return "WARN ";
     case LogLevel::Error: return "ERROR";
+    case LogLevel::Off:   return "OFF  "; // a threshold, never a line's own level
     }
     return "?????";
 }

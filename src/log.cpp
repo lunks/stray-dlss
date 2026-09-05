@@ -1,5 +1,6 @@
 #include "log.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -37,6 +38,7 @@ struct Writer
 };
 
 std::mutex g_mutex;
+std::atomic<int> g_threshold{static_cast<int>(Threshold::debug)};
 std::FILE *g_file = nullptr;
 ExternalSink g_external = nullptr;
 Writer *g_writer = nullptr;
@@ -247,8 +249,25 @@ Stats stats()
 	return s;
 }
 
+void set_threshold(Threshold t)
+{
+	g_threshold.store(static_cast<int>(t), std::memory_order_relaxed);
+}
+
+Threshold threshold()
+{
+	return static_cast<Threshold>(g_threshold.load(std::memory_order_relaxed));
+}
+
+bool enabled(Level level)
+{
+	return static_cast<int>(level) <= g_threshold.load(std::memory_order_relaxed);
+}
+
 void write(Level level, const char *message)
 {
+	if (!enabled(level))
+		return;
 	const std::uint64_t t0 = now_ns();
 	std::string line;
 	line.reserve(std::strlen(message) + 10);
@@ -298,6 +317,8 @@ void write(Level level, const char *message)
 
 void writef(Level level, const char *format, ...)
 {
+	if (!enabled(level))
+		return; // refused before the vsnprintf: an "off" logger costs one atomic load here
 	char buffer[2048];
 
 	va_list args;

@@ -109,15 +109,21 @@ local function find_pcm()
     end
     return false
 end
+-- MEASURED 2026-09-05: `pcm.ColorScale.X = k` writes into a COPY of the FVector that UE4SS hands
+-- back, so the read-back saw the old value every tick (139 "rewrites" in 140 s) and the picture
+-- did not move. The whole vector must be assigned in one statement.
 local function write_scale(k)
     local ok, err = pcall(function()
         pcm.bEnableColorScaling = true
-        pcm.ColorScale.X = k
-        pcm.ColorScale.Y = k
-        pcm.ColorScale.Z = k
+        pcm.ColorScale = { X = k, Y = k, Z = k }
     end)
     if not ok then say("colorScale: write failed: " .. tostring(err)); return false end
-    return true
+    local okR, en, x, y, z = pcall(function()
+        local v = pcm.ColorScale
+        return pcm.bEnableColorScaling, v.X, v.Y, v.Z
+    end)
+    say(string.format("colorScale: after write, reads enabled=%s (%.3f, %.3f, %.3f)", tostring(okR and en), okR and x or -1, okR and y or -1, okR and z or -1))
+    return okR and en == true and math.abs((x or 0) - k) < 0.001
 end
 local function apply_scale(k)
     if not valid(pcm) then
@@ -129,13 +135,24 @@ local function apply_scale(k)
         rewrites = rewrites + 1
         if not fight_logged then
             fight_logged = true
-            say(string.format("colorScale: the game REWROTE it (enabled=%s X=%.3f after we wrote %.3f); re-asserting every tick and counting", tostring(en), x or 0, applied_k))
+            say(string.format("colorScale: the value changed under us (enabled=%s X=%.3f after we wrote %.3f); re-asserting every tick and counting", tostring(en), x or 0, applied_k))
         end
         applied_k = nil
+        if rewrites > 30 then
+            say("colorScale: it keeps changing under us; stopping the re-assert (set the file to a new value to retry)")
+            applied_k = k
+        end
     end
     if applied_k == k then return end
     if write_scale(k) then
         say(string.format("colorScale: %.3f applied to %s (rewrites so far %d)", k, pcm_name or "?", rewrites))
+        applied_k = k
+    else
+        -- Do not retry every tick forever: one line, then only when the value or object changes.
+        if not fight_logged then
+            fight_logged = true
+            say("colorScale: the write did not stick (see the read-back above); giving up until the camera manager changes")
+        end
         applied_k = k
     end
 end

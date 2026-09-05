@@ -23,7 +23,9 @@
 
 namespace sds {
 
-enum class LogLevel : uint8_t { Debug = 0, Info = 1, Warn = 2, Error = 3 };
+// Off is a MinLevel only: nothing is written at all, ERRORs included (the user's switch for
+// proving the log is out of the frame). Never used as a line's own level.
+enum class LogLevel : uint8_t { Debug = 0, Info = 1, Warn = 2, Error = 3, Off = 4 };
 
 namespace Log {
 

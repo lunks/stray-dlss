@@ -86,6 +86,29 @@ TEST_CASE("async logger: every line from every thread reaches the file, per-thre
 	std::remove(path);
 }
 
+TEST_CASE("log threshold: off refuses everything before formatting, errors included; levels nest")
+{
+	const log::Stats before = log::stats();
+	log::set_threshold(log::Threshold::off);
+	CHECK_FALSE(log::enabled(log::Level::error));
+	STRAY_LOG_ERROR("must not count");
+	STRAY_LOG_INFO("must not count");
+	CHECK(log::stats().lines == before.lines);
+
+	log::set_threshold(log::Threshold::warning);
+	CHECK(log::enabled(log::Level::error));
+	CHECK(log::enabled(log::Level::warning));
+	CHECK_FALSE(log::enabled(log::Level::info));
+	CHECK_FALSE(log::enabled(log::Level::debug));
+	STRAY_LOG_INFO("refused");
+	STRAY_LOG_WARN("accepted");
+	CHECK(log::stats().lines == before.lines + 1);
+
+	log::set_threshold(log::Threshold::debug); // the default, restored for the other cases
+	CHECK(log::threshold() == log::Threshold::debug);
+	CHECK(log::enabled(log::Level::debug));
+}
+
 TEST_CASE("async logger: writes before init and after shutdown do not crash and are not lost to a queue")
 {
 	// Before init there is no file and no writer: the call is a no-op that still counts.

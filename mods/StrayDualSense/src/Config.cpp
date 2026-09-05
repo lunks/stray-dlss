@@ -56,6 +56,7 @@ LogLevel ParseLevel(const std::string& v, LogLevel fallback)
     if (l == "info")  return LogLevel::Info;
     if (l == "warn")  return LogLevel::Warn;
     if (l == "error") return LogLevel::Error;
+    if (l == "off" || l == "none" || l == "0") return LogLevel::Off;
     return fallback;
 }
 

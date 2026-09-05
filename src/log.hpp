@@ -65,6 +65,23 @@ struct Stats
 };
 Stats stats();
 
+// THE MASTER SWITCH ([STRAYDLSS] Log / LogLevel, 2026-09-05): lines below the level are refused
+// BEFORE they are formatted, so an "off" logger costs one atomic load per call site. `off` is
+// literally nothing, ERRORs included - the user asked for a way to prove the log is not in the
+// frame at all, and a switch that still wrote something would not prove it. Default: debug
+// (everything), which is what every session before this one wrote.
+enum class Threshold
+{
+	off = 0,
+	error = 1,
+	warning = 2,
+	info = 3,
+	debug = 4,
+};
+void set_threshold(Threshold t);
+Threshold threshold();
+bool enabled(Level level);
+
 void write(Level level, const char *message);
 
 // printf-style. ReShade's own add-on-facing log takes no format arguments, so we format

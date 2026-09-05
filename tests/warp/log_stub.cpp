@@ -13,6 +13,9 @@ void init_file_sink_path(const char *) {}
 void shutdown_file_sink() {}
 void set_external_sink(ExternalSink) {}
 Stats stats() { return Stats{}; }
+void set_threshold(Threshold) {}
+Threshold threshold() { return Threshold::debug; }
+bool enabled(Level) { return true; }
 
 void write(Level level, const char *message)
 {
