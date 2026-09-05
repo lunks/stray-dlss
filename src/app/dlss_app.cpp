@@ -444,9 +444,15 @@ void DlssApp::on_device(ID3D12Device *native, bool created)
 	// the window docs/RESEARCH-U0-IDENTITY.md checked only at both ends. 1 finds and validates
 	// the FD3D12CommandContext vtable from our Dispatch hook's return address and installs
 	// nothing; 2 installs forwarding thunks and ASSERTS the RHI-bound u0 against the descriptor
-	// walk's on every engine-announced dispatch (the walk stays authoritative). Level 3 is
-	// declared, not implemented. src/u0_rhi_hook.hpp, src/core/u0_rhi_uav.hpp.
-	u0hook::configure(host::cfg::get_int("U0Hook", 1));
+	// walk's on every engine-announced dispatch (the walk stays authoritative); 3 (BUILT
+	// 2026-09-05, UNCONFIRMED on the box) makes the bind stream SUPPLY u0 and t0..t5 for the
+	// announced dispatch, the walk being the counted per-frame fallback and the assertion's
+	// other side. [STRAYDLSS] U0HookSkipWalk (default 0) is the second key that lets level 3
+	// stop the shadow's copy half and the table walk once 600 claims ran clean - one-way.
+	// The default lives in u0auth::kDefaultLevel and is pinned by a test.
+	// src/u0_rhi_hook.hpp, src/core/u0_rhi_uav.hpp, src/core/u0_authority.hpp.
+	u0hook::configure(host::cfg::get_int("U0Hook", u0auth::kDefaultLevel),
+	                  host::cfg::get_bool("U0HookSkipWalk", false));
 
 	// [STRAYDLSS] PoolNames, default 1 (discover). UE 4.27 passes every pooled render target's
 	// DEBUG NAME to FRenderTargetPool::FindFreeElement as a live `const TCHAR*` argument, in
@@ -1459,7 +1465,7 @@ void DlssApp::on_present(const icept::PresentContext &pc)
 			{
 				// The u0 route ([STRAYDLSS] U0Hook): the assertion counters and the discovery
 				// verdict, so automation can read `disagree=` without the log.
-				char u0line[1024] = {};
+				char u0line[2048] = {};
 				if (u0hook::format_report(u0line, sizeof(u0line)) > 0)
 					std::fprintf(f, "%s\n", u0line);
 				// And the pool-name map beside it, so automation can read `assert:` and the

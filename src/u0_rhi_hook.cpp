@@ -1,9 +1,11 @@
 #include "u0_rhi_hook.hpp"
 
 #include "backend_native/descriptor_shadow.hpp"
+#include "backend_native/native_backend.hpp"
 #include "backend_native/resource_registry.hpp"
 #include "core/engine_seam.hpp"
 #include "core/taa_signature.hpp"
+#include "core/u0_authority.hpp"
 #include "core/u0_rhi_uav.hpp"
 #include "intercept/types.hpp"
 #include "log.hpp"
@@ -46,6 +48,7 @@ using SetComputeShaderFn = void (*)(void *self, void *shader);
 
 std::mutex g_mutex;
 int g_level = 0;
+bool g_skip_key = false; // [STRAYDLSS] U0HookSkipWalk, under g_mutex
 
 // ---- the module ----
 constexpr std::size_t kMaxSections = 96;
@@ -136,6 +139,25 @@ bool g_first_regs_logged = false;
 int g_no_bind_logged = 0;
 constexpr int kNoBindLogLimit = 3;
 
+// ---- level 3 (src/core/u0_authority.hpp) ----
+// `asked`/`from_bracket` count every candidate dispatch take_bindings ran on; the `claimed_*`
+// and `fallback` counters count only dispatches the engine went on to announce-and-claim, so
+// `fellBack:` on the [u0] line is "the TAA pass's frame went to the walk", not "a look-alike
+// had an incomplete bracket".
+std::atomic<std::uint64_t> g_l3_asked{ 0 };
+std::atomic<std::uint64_t> g_l3_from_bracket{ 0 };
+std::atomic<std::uint64_t> g_l3_claimed_bracket{ 0 };
+std::atomic<std::uint64_t> g_l3_claimed_walk{ 0 };
+std::atomic<std::uint64_t> g_l3_claimed_unasked{ 0 }; // claimed with no take_bindings decision on this thread
+std::atomic<std::uint64_t> g_l3_fallback[static_cast<std::size_t>(u0auth::Fallback::count)] = {};
+std::atomic<std::uint64_t> g_l3_fallback_reg_mask{ 0 }; // OR of t-registers that ever caused a tex_* fallback
+std::atomic<std::uint64_t> g_l3_no_walk{ 0 };           // fell back AFTER the skip armed: the frame is the engine's TAA
+std::atomic<std::uint64_t> g_l3_skip_streak{ 0 };       // consecutive claimed dispatches answered by the bracket
+std::atomic<bool> g_skip_armed{ false };
+bool g_l3_first_logged = false;                          // under g_mutex
+bool g_l3_fallback_logged[static_cast<std::size_t>(u0auth::Fallback::count)] = {}; // under g_mutex
+bool g_l3_no_walk_logged = false;                        // under g_mutex
+
 // ---- per-thread correlation ----
 // The RHI thread executes RHISetComputeShader, then the binds, then RHIDispatchComputeShader,
 // whose `CommandListHandle->Dispatch` is our hook — all on ONE thread for one context. So the
@@ -170,6 +192,14 @@ struct Tls
 {
 	Bracket pending;
 	Bracket for_dispatch;
+	// Level 3: take_bindings' verdict for `for_dispatch`, and the registers it resolved, so the
+	// claim's assertion counts the decision and reuses the resolves (one GetNativeResource per
+	// texture per dispatch, not two). Cleared when the next dispatch closes a bracket.
+	bool decision_valid = false;
+	u0auth::Decision decision;
+	bool resolved_valid = false;
+	std::uint64_t engine_t[u0::kMaxTexRegs] = {};
+	u0::DescFacts u0_desc;
 };
 thread_local Tls g_tls;
 
@@ -441,7 +471,9 @@ std::uint64_t resolve_rhi_texture(std::uint64_t rhi)
 }
 
 // The SRV twin of the UAV cross-match: scan (until latched) or read at the latched offset.
-std::uint64_t resolve_srv_object(std::uint64_t object)
+// Returns the whole ScanResult so level 3 can look the handle up for the VIEW's format (the
+// stencil SRV is X32_G8X24_UINT over a resource the registry describes as R32G8X24_TYPELESS).
+u0::ScanResult resolve_srv_scan(std::uint64_t object)
 {
 	bool latched = false;
 	unsigned offset = 0;
@@ -472,7 +504,32 @@ std::uint64_t resolve_srv_object(std::uint64_t object)
 				"differs from the UAV's offset by design).", r.offset, u0::kLatchAgreements);
 		}
 	}
-	return r.status == u0::ScanStatus::ok && r.kind == u0::HandleKind::srv ? r.resource : 0;
+	if (r.status == u0::ScanStatus::ok && r.kind != u0::HandleKind::srv)
+		r.status = u0::ScanStatus::no_hit; // a hit of the wrong kind is not an answer
+	return r;
+}
+
+// One texture register of the closed bracket -> (ID3D12Resource*, the view's TexFormat when the
+// bind was an SRV object). 0 when unresolved. Does NOT check liveness; the caller does.
+std::uint64_t resolve_register(const RegBind &rb, TexFormat *view_format)
+{
+	if (view_format != nullptr)
+		*view_format = TexFormat::unknown;
+	if (rb.object == 0)
+		return 0;
+	if (rb.slot == u0::kSlotSetShaderTexture)
+		return resolve_rhi_texture(rb.object);
+	if (rb.slot == u0::kSlotSetShaderResourceView)
+	{
+		const u0::ScanResult r = resolve_srv_scan(rb.object);
+		if (r.status != u0::ScanStatus::ok)
+			return 0;
+		native::shadow::ViewEntry e;
+		if (view_format != nullptr && native::shadow::lookup(static_cast<icept::DescriptorId>(r.handle), e))
+			*view_format = e.format;
+		return r.resource;
+	}
+	return 0;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -739,10 +796,14 @@ void install_hooks()
 		"sampler, the two RHISetUAVParameter overloads, SRV, uniform buffer). Every call is "
 		"forwarded with all its arguments, so the image is unchanged; the thunks record each "
 		"bracket's registers on its own thread and the engine-announced claim asserts them against "
-		"the descriptor walk. MODE=OBSERVE: the walk still names everything DLSS uses; this is an "
-		"oracle beside it.",
+		"the descriptor walk. %s",
 		installed, kPatchCount, static_cast<unsigned long long>(g_ctx.vtable_va),
-		u0::kSlotSetComputeShader, u0::kProbeFirstSlot, u0::kProbeLastSlot);
+		u0::kSlotSetComputeShader, u0::kProbeFirstSlot, u0::kProbeLastSlot,
+		g_level >= 3
+			? "MODE=AUTHORITATIVE: on a dispatch the engine announced, a COMPLETE bracket (u0 and "
+			  "t0..t5, all live) supplies DispatchBindings in place of the walk; anything less is "
+			  "the walk for that frame, counted as `fellBack:` on the [u0] line."
+			: "MODE=OBSERVE: the walk still names everything DLSS uses; this is an oracle beside it.");
 }
 
 void run_discovery()
@@ -839,20 +900,18 @@ void log_foreign_seed_once(const void *ret)
 // The API
 // ---------------------------------------------------------------------------------------
 
-void configure(int level)
+void configure(int level, bool skip_walk_key)
 {
-	if (level >= 3)
-	{
-		STRAY_LOG_WARN("U0 HOOK: U0Hook=%d requested. Level 3 (authoritative: the engine's bind stream "
-			"replaces the descriptor walk and the View-CB search) is DECLARED, NOT IMPLEMENTED - it "
-			"is a separate decision after the level-2 assertion has run clean across gameplay. "
-			"Treating as 2.", level);
-		level = 2;
-	}
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_level = level;
+		g_skip_key = skip_walk_key;
 	}
+	if (skip_walk_key && level < 3)
+		STRAY_LOG_WARN("U0 HOOK: [STRAYDLSS] U0HookSkipWalk=1 with U0Hook=%d is INERT. Nothing but the "
+			"level-3 bind stream can name the TAA registers without the descriptor walk, so the "
+			"walk keeps running and the shadow keeps recording. Set U0Hook=3 or unset the key.",
+			level);
 	if (level <= 0)
 	{
 		STRAY_LOG_INFO("U0 HOOK MODE: off ([STRAYDLSS] U0Hook=0). The descriptor walk names u0 alone.");
@@ -871,12 +930,25 @@ void configure(int level)
 		g_level = 0;
 		return;
 	}
-	STRAY_LOG_INFO("U0 HOOK MODE: %s ([STRAYDLSS] U0Hook=%d). Waiting for %u agreeing Dispatch return "
-		"addresses to seed the FD3D12CommandContext vtable search (module base %#llx, %zu sections, "
-		".pdata entries=%zu). Nothing is installed until the vtable is found and validated%s.",
-		level >= 2 ? "observe" : "discover", level, kSeedAgreements,
+	STRAY_LOG_INFO("U0 HOOK MODE: %s ([STRAYDLSS] U0Hook=%d, U0HookSkipWalk=%d). Waiting for %u agreeing "
+		"Dispatch return addresses to seed the FD3D12CommandContext vtable search (module base %#llx, "
+		"%zu sections, .pdata entries=%zu). Nothing is installed until the vtable is found and "
+		"validated%s.",
+		u0auth::mode_name(u0auth::mode_from_level(level)), level, skip_walk_key ? 1 : 0, kSeedAgreements,
 		static_cast<unsigned long long>(g_module_base), g_regions.size(), g_table.count,
 		level >= 2 ? "; then the forwarding thunks go in" : ", and at level 1 not even then");
+	if (level >= 3)
+		STRAY_LOG_INFO("U0 HOOK LEVEL 3 IS UNCONFIRMED ON THE BOX. What changes: for the dispatch the engine "
+			"announced, DispatchBindings::srvs/uavs come from the RHI bind stream when the bracket is "
+			"complete (u0 + t0..t5, all live), else from the descriptor walk for that frame - read "
+			"`l3:` on the [u0] line: fromBracket should track claimed and every `fellBack:` reason "
+			"should read 0. The walk %s. The assertion (`assert:`/`regs:`) keeps running against the "
+			"walk while it runs; `disagree` must still be 0.",
+			skip_walk_key
+				? "STOPS being recorded once 600 claimed dispatches ran from the bracket with no fallback "
+				  "(U0HookSkipWalk=1, one-way for the session; read `skip:` and the [perf] shadow-copy and "
+				  "resolve-breakdown lines)"
+				: "keeps running (U0HookSkipWalk=0), so this level costs nothing and saves nothing yet");
 }
 
 int level()
@@ -900,6 +972,8 @@ void note_dispatch(const void *return_address)
 	Tls &t = g_tls;
 	t.for_dispatch = t.pending;
 	t.pending = Bracket{};
+	t.decision_valid = false; // level 3: the previous dispatch's verdict does not carry over
+	t.resolved_valid = false;
 	if (g_hooked.load(std::memory_order_acquire) && !t.for_dispatch.set_cs_seen)
 		g_dispatch_no_set_cs.fetch_add(1, std::memory_order_relaxed);
 
@@ -963,34 +1037,284 @@ void note_dispatch(const void *return_address)
 	}
 }
 
+namespace {
+
+// The registry's description of a bracket register's resource, as the walk would have
+// reported it (to_bound in native_backend.cpp): the RESOURCE's extent and format. `view_format`
+// overrides the format when the bind was an SRV object whose view the shadow recorded — the
+// stencil's X32_G8X24_UINT over the typeless depth resource, which the matcher tells apart
+// from the depth view by format (taa_signature.cpp).
+bool describe_bound(std::uint64_t resource, unsigned reg, TexFormat view_format, BoundTexture &out)
+{
+	icept::ResourceInfo info;
+	if (!native::registry::is_live(static_cast<icept::ResourceId>(resource)) ||
+		!native::registry::describe(static_cast<icept::ResourceId>(resource), info))
+		return false;
+	out = BoundTexture{};
+	out.slot = reg;
+	out.resource = resource;
+	out.format = view_format != TexFormat::unknown ? view_format : (info.is_buffer ? TexFormat::unknown : info.format);
+	out.width = info.is_buffer ? 0 : info.width;
+	out.height = info.is_buffer ? 0 : info.height;
+	out.is_3d = info.is_3d;
+	return true;
+}
+
+u0::DescFacts desc_facts_for(std::uint64_t resource)
+{
+	u0::DescFacts d;
+	if (resource == 0)
+		return d;
+	d.live = native::registry::is_live(static_cast<icept::ResourceId>(resource));
+	icept::ResourceInfo info;
+	if (d.live && native::registry::describe(static_cast<icept::ResourceId>(resource), info))
+	{
+		d.is_buffer = info.is_buffer;
+		d.is_3d = info.is_3d;
+		d.allow_uav = info.allow_uav;
+		d.hdr_colour = is_hdr_colour(info.format);
+		d.width = info.width;
+		d.height = info.height;
+	}
+	return d;
+}
+
+// Level 3's per-CLAIM accounting and the skip latch. Called from assert_at_claim before
+// anything else, so a hook that never installed still has its fallback counted.
+void note_claim_decision(std::uint64_t pass_hash)
+{
+	int lvl = 0;
+	bool key = false;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		lvl = g_level;
+		key = g_skip_key;
+	}
+	const u0auth::Mode mode = u0auth::mode_from_level(lvl);
+	if (mode != u0auth::Mode::authoritative)
+		return;
+	Tls &t = g_tls;
+	if (!t.decision_valid)
+	{
+		// The claim ran with no take_bindings verdict on this thread: the caller did not ask
+		// (announced_expects said no at resolve time, and the ledger then claimed anyway). The
+		// walk supplied `b`; count it so the rate is visible.
+		g_l3_claimed_unasked.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const u0auth::Decision d = t.decision;
+	const bool armed_before = g_skip_armed.load(std::memory_order_acquire);
+	bool log_first = false;
+	bool log_fallback = false;
+	bool log_no_walk = false;
+	if (d.source == u0auth::Source::bracket)
+	{
+		g_l3_claimed_bracket.fetch_add(1, std::memory_order_relaxed);
+		g_l3_skip_streak.fetch_add(1, std::memory_order_relaxed);
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (!g_l3_first_logged)
+		{
+			g_l3_first_logged = true;
+			log_first = true;
+		}
+	}
+	else
+	{
+		g_l3_claimed_walk.fetch_add(1, std::memory_order_relaxed);
+		g_l3_fallback[static_cast<std::size_t>(d.fallback)].fetch_add(1, std::memory_order_relaxed);
+		if (d.fallback == u0auth::Fallback::tex_no_bind || d.fallback == u0auth::Fallback::tex_unresolved ||
+			d.fallback == u0auth::Fallback::tex_not_live)
+			g_l3_fallback_reg_mask.fetch_or(1ull << d.reg, std::memory_order_relaxed);
+		g_l3_skip_streak.store(0, std::memory_order_relaxed);
+		if (armed_before)
+			g_l3_no_walk.fetch_add(1, std::memory_order_relaxed);
+		std::lock_guard<std::mutex> lock(g_mutex);
+		bool &said = g_l3_fallback_logged[static_cast<std::size_t>(d.fallback)];
+		if (!said)
+		{
+			said = true;
+			log_fallback = true;
+		}
+		if (armed_before && !g_l3_no_walk_logged)
+		{
+			g_l3_no_walk_logged = true;
+			log_no_walk = true;
+		}
+	}
+	if (log_first)
+		STRAY_LOG_INFO("U0 HOOK LEVEL 3: first engine-announced pass (0x%016llx) whose DispatchBindings came "
+			"from the RHI bind stream rather than the descriptor walk - u0 and t0..t5, all resolved "
+			"through the engine's own objects and all live in our registry. From here `l3: claimed "
+			"bracket=` on the [u0] line should track the seam's `claimed`; any `fellBack:` reason "
+			"above 0 names a frame the walk had to supply.",
+			static_cast<unsigned long long>(pass_hash));
+	if (log_fallback)
+		STRAY_LOG_WARN("U0 HOOK LEVEL 3 FELL BACK on pass 0x%016llx: the bracket could not supply the TAA "
+			"registers (%s%s%u) and the descriptor walk's answer was used for this frame%s. Once per "
+			"reason; the rate is `fellBack:` on the [u0] line. A steady rate at one register says the "
+			"engine binds that register on a path the thunks do not see on this build; `noBracket` "
+			"says RHISetComputeShader did not precede the binds on this thread.",
+			static_cast<unsigned long long>(pass_hash), u0auth::fallback_name(d.fallback),
+			(d.fallback == u0auth::Fallback::tex_no_bind || d.fallback == u0auth::Fallback::tex_unresolved ||
+			 d.fallback == u0auth::Fallback::tex_not_live) ? " at t" : " reg=",
+			d.reg,
+			armed_before ? " - EXCEPT THAT THE WALK IS SKIPPED, so the frame had no answer and the engine's "
+			               "own TAA ran (see the ERROR that follows)" : "");
+	if (log_no_walk)
+		STRAY_LOG_ERROR("U0 HOOK LEVEL 3: a fallback (%s) arrived AFTER U0HookSkipWalk armed. The descriptor "
+			"walk is no longer recorded and does not resume this session (a resumed shadow can name a "
+			"live, wrong resource - src/core/u0_authority.hpp), so this frame - and every frame this "
+			"repeats on - is the engine's own TAA, not DLSS. Counted as `noWalk` on the [u0] line. If it "
+			"is more than a blip, unset U0HookSkipWalk and paste the [u0] line: the bracket is not yet "
+			"complete on every frame and the skip was armed too early.",
+			u0auth::fallback_name(d.fallback));
+
+	// The skip latch, driven per claim. Closes exactly once per session.
+	u0auth::SkipInputs in;
+	in.key = key;
+	in.mode = mode;
+	in.drive = native::mode() == native::Mode::drive;
+	in.hooked = g_hooked.load(std::memory_order_acquire);
+	in.faulted = g_disabled.load(std::memory_order_acquire);
+	in.already_armed = armed_before;
+	in.clean_streak = g_l3_skip_streak.load(std::memory_order_relaxed);
+	if (u0auth::skip_decide(in) == u0auth::Skip::armed && !armed_before &&
+		!g_skip_armed.exchange(true, std::memory_order_acq_rel))
+	{
+		STRAY_LOG_INFO("U0 HOOK SKIP ARMED: %llu consecutive engine-announced dispatches took their registers "
+			"from the RHI bind stream with no fallback, and [STRAYDLSS] U0HookSkipWalk=1, so the "
+			"descriptor shadow's COPY half and the resolve's table walk stop now - one-way for the "
+			"session. What to read next: `[perf] native hooks/frame` (shadow-copy towards 0 ms at an "
+			"unchanged call count), `[perf]   resolve breakdown/frame` (walk 0, slots 0, root-cbv "
+			"unchanged), and on the [u0] line `noWalk=` which must stay 0 and `assert:`/`regs:` which "
+			"now read walkAbsent by design.",
+			static_cast<unsigned long long>(in.clean_streak));
+		native::set_descriptor_tables_shadowed(false);
+	}
+}
+
+} // namespace
+
+u0auth::Decision take_bindings(icept::DispatchBindings &b)
+{
+	int lvl = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		lvl = g_level;
+	}
+	const u0auth::Mode mode = u0auth::mode_from_level(lvl);
+	Tls &t = g_tls;
+	u0auth::BracketFacts f;
+	f.hooked = g_hooked.load(std::memory_order_acquire);
+	f.faulted = g_disabled.load(std::memory_order_acquire);
+	const Bracket &br = t.for_dispatch;
+	f.bracket_open = br.set_cs_seen && br.binds != 0;
+
+	BoundTexture srvs[u0::kMaxTexRegs];
+	bool srv_ok[u0::kMaxTexRegs] = {};
+	BoundTexture uavs[u0::kMaxUavRegs];
+	bool uav_ok[u0::kMaxUavRegs] = {};
+
+	if (mode == u0auth::Mode::authoritative && f.hooked && !f.faulted && f.bracket_open)
+	{
+		g_l3_asked.fetch_add(1, std::memory_order_relaxed);
+
+		// u0..u3: resolved at the bind (on_probe); here only the registry is consulted.
+		for (unsigned u = 0; u < u0::kMaxUavRegs; ++u)
+		{
+			const UavBind &ub = br.u[u];
+			if (!ub.present || ub.status != u0::ScanStatus::ok || ub.resource == 0)
+				continue;
+			uav_ok[u] = describe_bound(ub.resource, u, TexFormat::unknown, uavs[u]);
+		}
+		const UavBind &ub0 = br.u[u0auth::kOutputUavReg];
+		if (!ub0.present)
+			f.u0 = u0auth::RegState::absent;
+		else if (ub0.status != u0::ScanStatus::ok || ub0.resource == 0)
+			f.u0 = u0auth::RegState::unresolved;
+		else if (!uav_ok[u0auth::kOutputUavReg])
+			f.u0 = u0auth::RegState::dead;
+		else
+		{
+			f.u0 = u0auth::RegState::ok;
+			t.u0_desc = desc_facts_for(ub0.resource);
+			f.u0_is_buffer = t.u0_desc.is_buffer;
+			f.u0_is_3d = t.u0_desc.is_3d;
+			f.u0_allow_uav = t.u0_desc.allow_uav;
+			f.u0_hdr_colour = t.u0_desc.hdr_colour;
+		}
+
+		// t0..t7: resolve every bound register now, once, and keep the answers for the claim's
+		// assertion. Only t0..t5 gate the decision (CLAUDE.md §2.3); t6/t7 ride along if present.
+		for (unsigned r = 0; r < u0::kMaxTexRegs; ++r)
+		{
+			const RegBind &rb = br.t[r];
+			TexFormat view_format = TexFormat::unknown;
+			const std::uint64_t res = resolve_register(rb, &view_format);
+			t.engine_t[r] = res;
+			u0auth::RegState state = u0auth::RegState::absent;
+			if (rb.object != 0)
+			{
+				if (res == 0)
+					state = u0auth::RegState::unresolved;
+				else if (!describe_bound(res, r, view_format, srvs[r]))
+				{
+					state = u0auth::RegState::dead;
+					t.engine_t[r] = 0; // a pointer nothing knows is not an answer (the assertion's rule)
+				}
+				else
+				{
+					state = u0auth::RegState::ok;
+					srv_ok[r] = true;
+				}
+			}
+			if (r < u0auth::kTaaTexRegs)
+				f.t[r] = state;
+		}
+		t.resolved_valid = true;
+		note_faults_and_latch();
+		f.faulted = g_disabled.load(std::memory_order_acquire); // a fault during THIS resolve refuses it
+	}
+
+	const u0auth::Decision d = u0auth::decide_source(mode, f);
+	if (d.source == u0auth::Source::bracket)
+	{
+		g_l3_from_bracket.fetch_add(1, std::memory_order_relaxed);
+		b.srvs.clear();
+		b.uavs.clear();
+		for (unsigned r = 0; r < u0::kMaxTexRegs; ++r)
+			if (srv_ok[r])
+				b.srvs.push_back(srvs[r]);
+		for (unsigned u = 0; u < u0::kMaxUavRegs; ++u)
+			if (uav_ok[u])
+				b.uavs.push_back(uavs[u]);
+	}
+	if (mode == u0auth::Mode::authoritative)
+	{
+		t.decision = d;
+		t.decision_valid = true;
+	}
+	return d;
+}
+
 void assert_at_claim(const WalkAnswer &walk, std::uint32_t out_width, std::uint32_t out_height,
                      std::uint64_t pass_hash)
 {
+	note_claim_decision(pass_hash);
 	if (!g_hooked.load(std::memory_order_acquire))
 	{
 		g_assert_hook_off.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	const Bracket &br = g_tls.for_dispatch;
+	Tls &t = g_tls;
+	const Bracket &br = t.for_dispatch;
 	const bool disabled = g_disabled.load(std::memory_order_acquire);
 
 	// ---- u0 ----
 	const UavBind &b = br.u[0];
 	u0::DescFacts d;
 	if (b.present && b.status == u0::ScanStatus::ok && b.resource != 0)
-	{
-		d.live = native::registry::is_live(static_cast<icept::ResourceId>(b.resource));
-		icept::ResourceInfo info;
-		if (d.live && native::registry::describe(static_cast<icept::ResourceId>(b.resource), info))
-		{
-			d.is_buffer = info.is_buffer;
-			d.is_3d = info.is_3d;
-			d.allow_uav = info.allow_uav;
-			d.hdr_colour = is_hdr_colour(info.format);
-			d.width = info.width;
-			d.height = info.height;
-		}
-	}
+		d = t.resolved_valid && t.u0_desc.live ? t.u0_desc : desc_facts_for(b.resource);
 	const u0::Judgement j = u0::judge(b.present, b.status, b.resource, walk.u0, d, out_width, out_height);
 	g_verdicts[static_cast<std::size_t>(j.verdict)].fetch_add(1, std::memory_order_relaxed);
 	if ((j.verdict == u0::Verdict::agree || j.verdict == u0::Verdict::disagree) && !j.extent_equal)
@@ -1005,12 +1329,15 @@ void assert_at_claim(const WalkAnswer &walk, std::uint32_t out_width, std::uint3
 	for (unsigned r = 0; r < u0::kMaxTexRegs; ++r)
 	{
 		const RegBind &rb = br.t[r];
-		if (rb.object != 0 && !disabled)
+		if (t.resolved_valid)
 		{
-			if (rb.slot == u0::kSlotSetShaderTexture)
-				engine_t[r] = resolve_rhi_texture(rb.object);
-			else if (rb.slot == u0::kSlotSetShaderResourceView)
-				engine_t[r] = resolve_srv_object(rb.object);
+			// Level 3 already resolved this bracket in take_bindings, on this thread, for this
+			// dispatch; the engine is not asked twice.
+			engine_t[r] = t.engine_t[r];
+		}
+		else if (rb.object != 0 && !disabled)
+		{
+			engine_t[r] = resolve_register(rb, nullptr);
 			if (engine_t[r] != 0 &&
 				!native::registry::is_live(static_cast<icept::ResourceId>(engine_t[r])))
 				engine_t[r] = 0; // a pointer nothing knows is not an answer
@@ -1133,6 +1460,7 @@ int format_report(char *buffer, std::size_t size)
 	if (buffer == nullptr || size == 0)
 		return 0;
 	int lvl = 0;
+	bool skip_key = false;
 	u0::CtxDiscovery ctx;
 	bool uav_latched = false;
 	unsigned uav_offset = 0;
@@ -1141,6 +1469,7 @@ int format_report(char *buffer, std::size_t size)
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		lvl = g_level;
+		skip_key = g_skip_key;
 		ctx = g_ctx;
 		uav_latched = g_uav_latch.latched();
 		uav_offset = g_uav_latch.offset();
@@ -1177,6 +1506,41 @@ int format_report(char *buffer, std::size_t size)
 	const auto vv = [](u0::ViewRegVerdict x) {
 		return static_cast<unsigned long long>(g_view_verdicts[static_cast<std::size_t>(x)].load(std::memory_order_relaxed));
 	};
+	const auto fb = [](u0auth::Fallback x) {
+		return static_cast<unsigned long long>(g_l3_fallback[static_cast<std::size_t>(x)].load(std::memory_order_relaxed));
+	};
+	// Level 3's group. `claimed bracket=` should track the seam's `claimed`; every `fellBack:`
+	// reason should read 0; `noWalk` must be 0. The skip state is the pure verdict recomputed
+	// here from the same inputs the latch used, so the line and the latch cannot disagree.
+	u0auth::SkipInputs sk;
+	sk.key = skip_key;
+	sk.mode = u0auth::mode_from_level(lvl);
+	sk.drive = native::mode() == native::Mode::drive;
+	sk.hooked = hooked();
+	sk.faulted = g_disabled.load(std::memory_order_relaxed);
+	sk.already_armed = g_skip_armed.load(std::memory_order_relaxed);
+	sk.clean_streak = g_l3_skip_streak.load(std::memory_order_relaxed);
+	char l3[512] = {};
+	if (lvl >= 3)
+		std::snprintf(l3, sizeof(l3),
+			" | l3: asked=%llu fromBracket=%llu claimed(bracket=%llu walk=%llu unasked=%llu) fellBack: "
+			"hookOff=%llu faulted=%llu noBracket=%llu u0NoBind=%llu u0Unresolved=%llu u0NotLive=%llu "
+			"u0Desc=%llu texNoBind=%llu texUnresolved=%llu texNotLive=%llu regMask=%#llx noWalk=%llu "
+			"| skip: %s streak=%llu/%llu key=%d",
+			static_cast<unsigned long long>(g_l3_asked.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_l3_from_bracket.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_l3_claimed_bracket.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_l3_claimed_walk.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_l3_claimed_unasked.load(std::memory_order_relaxed)),
+			fb(u0auth::Fallback::hook_off), fb(u0auth::Fallback::faulted), fb(u0auth::Fallback::no_bracket),
+			fb(u0auth::Fallback::u0_no_bind), fb(u0auth::Fallback::u0_unresolved), fb(u0auth::Fallback::u0_not_live),
+			fb(u0auth::Fallback::u0_desc_mismatch), fb(u0auth::Fallback::tex_no_bind),
+			fb(u0auth::Fallback::tex_unresolved), fb(u0auth::Fallback::tex_not_live),
+			static_cast<unsigned long long>(g_l3_fallback_reg_mask.load(std::memory_order_relaxed)),
+			static_cast<unsigned long long>(g_l3_no_walk.load(std::memory_order_relaxed)),
+			u0auth::skip_name(u0auth::skip_decide(sk)),
+			static_cast<unsigned long long>(sk.clean_streak),
+			static_cast<unsigned long long>(u0auth::kSkipArmClaims), skip_key ? 1 : 0);
 	return std::snprintf(buffer, size,
 		"u0hook=%s vtable=%s at=%#llx seed=%#llx hits=%u survivors=%u ms=%.1f seedSamples=%llu foreign=%llu "
 		"unresolved=%llu changed=%llu hooked=%d | slots: setCS=%llu noSetCS=%llu%s | latch: uav=%s+%u srv=%s+%u "
@@ -1185,8 +1549,8 @@ int format_report(char *buffer, std::size_t size)
 		"disagree=%llu noBind=%llu unresolved=%llu notLive=%llu walkAbsent=%llu descMismatch=%llu "
 		"extentNe=%llu shaderMismatch=%llu hookOff=%llu | regs: agree=%llu disagree=%llu "
 		"engineAbsent=%llu walkAbsent=%llu unresolved=%llu disagreeMask=%#llx | viewReg: agree=%llu "
-		"disagree=%llu noneBound=%llu multipleBound=%llu walkAbsent=%llu | faults=%llu off=%d",
-		lvl <= 0 ? "off" : lvl == 1 ? "discover" : "observe",
+		"disagree=%llu noneBound=%llu multipleBound=%llu walkAbsent=%llu | faults=%llu off=%d%s",
+		u0auth::mode_name(u0auth::mode_from_level(lvl)),
 		!settled ? "pending" : ctx.status == u0::CtxStatus::ok ? "found" : u0::ctx_status_text(ctx.status),
 		static_cast<unsigned long long>(ctx.vtable_va), static_cast<unsigned long long>(ctx.seed),
 		ctx.qword_hits, ctx.survivors, g_discovery_ms,
@@ -1221,17 +1585,22 @@ int format_report(char *buffer, std::size_t size)
 		vv(u0::ViewRegVerdict::agree), vv(u0::ViewRegVerdict::disagree), vv(u0::ViewRegVerdict::none_bound),
 		vv(u0::ViewRegVerdict::multiple_bound), vv(u0::ViewRegVerdict::walk_absent),
 		static_cast<unsigned long long>(g_faults.load(std::memory_order_relaxed)),
-		g_disabled.load(std::memory_order_relaxed) ? 1 : 0);
+		g_disabled.load(std::memory_order_relaxed) ? 1 : 0, l3);
 }
 
 void log_report(const char *when)
 {
-	if (level() <= 0)
+	const int lvl = level();
+	if (lvl <= 0)
 		return;
-	char line[1280] = {};
+	char line[2048] = {};
 	format_report(line, sizeof(line));
 	STRAY_LOG_INFO("[u0] %s: %s%s", when != nullptr ? when : "", line,
-		hooked() ? "  (assert/regs/viewReg disagree must stay 0; noBind means the UAV slot is wrong)" : "");
+		!hooked() ? ""
+		: lvl >= 3 ? "  (l3: every fellBack reason and noWalk must stay 0, claimed bracket= must track the seam's "
+		             "claimed; assert/regs disagree must stay 0 while the walk runs and read walkAbsent once "
+		             "skip is ARMED)"
+		: "  (assert/regs/viewReg disagree must stay 0; noBind means the UAV slot is wrong)");
 }
 
 void shutdown()

@@ -1022,6 +1022,28 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		return false;
 	}
 
+	// [STRAYDLSS] U0Hook=3: THE BIND STREAM SUPPLIES THE REGISTERS. On a dispatch a pending
+	// announcement expects (the same ledger question the pre-gate asks, without its counter),
+	// the RHI thunks' closed bracket - u0 and t0..t5 with the engine's own objects, bound on
+	// this thread a moment ago - replaces `b.srvs`/`b.uavs` when it is COMPLETE, so the matcher,
+	// the colour pick (t1), the output UAV (u0), the eye-adaptation SRV (t0) and the history
+	// round-trip (t5) below all read the engine's answer unchanged. Anything short of complete
+	// leaves the walk's answer in place for this frame and is counted by reason (`fellBack:` on
+	// the [u0] line), never silent. The walk's own answer is kept so the level-2 assertion at the
+	// claim still compares two routes; the View CB is untouched here (root CBVs, not the shadow;
+	// EngineSeamViewParams owns it). src/core/u0_authority.hpp, src/u0_rhi_hook.hpp.
+	DispatchBindings walk_b;
+	u0auth::Decision l3;
+	bool l3_asked = false;
+	if (u0hook::level() >= 3 && seamhook::announced_expects(x, y))
+	{
+		walk_b.srvs = b.srvs;
+		walk_b.uavs = b.uavs;
+		l3 = u0hook::take_bindings(b);
+		l3_asked = true;
+	}
+	const bool l3_substituted = l3_asked && l3.source == u0auth::Source::bracket;
+
 	// Try every bound constant buffer and keep the first that decodes to a plausible View.
 	// Guessing a register would be fragile: b3, b4 and b5 have all been observed carrying it
 	// on different passes.
@@ -1253,14 +1275,16 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 			// dispatch; the descriptor walk resolved `u0` from the bound table. Compare them on
 			// every engine-announced dispatch and count the verdict (src/u0_rhi_hook.hpp). The
 			// walk stays authoritative here; a disagreement is one WARN per pass and the first
-			// line to read if the image is wrong.
+			// line to read if the image is wrong. Under U0Hook=3 `b` may already BE the bracket's
+			// answer, so the assertion reads the WALK's copy kept above - two routes, still.
 			u0hook::WalkAnswer walk;
-			for (const auto &u : b.uavs)
+			const DispatchBindings &wb = l3_substituted ? walk_b : b;
+			for (const auto &u : wb.uavs)
 			{
 				if (u.slot == m.output_uav && icept::backend()->is_resource_live(u.resource))
 					walk.u0 = u.resource;
 			}
-			for (const auto &t : b.srvs)
+			for (const auto &t : wb.srvs)
 			{
 				if (t.slot < u0::kMaxTexRegs && icept::backend()->is_resource_live(t.resource))
 					walk.t[t.slot] = t.resource;
