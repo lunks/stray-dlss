@@ -117,6 +117,9 @@ bool ensure_ring()
 			return false;
 		}
 		g_ring[i].list->Close();
+		// Ours, not the engine's: the back-buffer state ledger must not read our transitions as
+		// FD3D12Viewport::Present's (backbuffer_state.hpp, mark_own_list).
+		bbstate::mark_own_list(g_ring[i].list.Get());
 	}
 	if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
 	{

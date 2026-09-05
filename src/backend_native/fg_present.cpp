@@ -104,6 +104,10 @@ struct ListRing
 				FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.allocator.Get(), nullptr, IID_PPV_ARGS(&s.list))))
 				return false;
 			s.list->Close();
+			// Ours, not the engine's: FG's own PRESENT transitions of the real ring and the
+			// generated targets must not become the state ledger's "last PRESENT witness"
+			// (backbuffer_state.hpp, mark_own_list).
+			bbstate::mark_own_list(s.list.Get());
 		}
 		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
 			return false;

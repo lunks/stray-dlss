@@ -7,15 +7,26 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <unordered_set>
 
 namespace stray_dlss::native::bbstate {
 namespace {
 
 std::mutex g_mutex;
+std::unordered_set<std::uint64_t> g_own_lists; // present owner + FG lists: not the engine (hpp)
 fseam::Level g_level = fseam::Level::off;
 fseam::Candidates g_candidates;
 fseam::StateLedger g_ledger;
 Stats g_stats;
+
+// g_mutex held. True (and counted) when `list` was registered by mark_own_list.
+bool is_own_list_locked(const void *list)
+{
+	if (g_own_lists.empty() || g_own_lists.count(reinterpret_cast<std::uint64_t>(list)) == 0)
+		return false;
+	++g_stats.own_skipped;
+	return true;
+}
 bool g_disagree_logged = false;
 bool g_unknown_logged = false;
 bool g_not_tracked_logged = false;
@@ -85,6 +96,8 @@ void on_barriers(ID3D12GraphicsCommandList *list, unsigned n, const D3D12_RESOUR
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_level == fseam::Level::off || g_candidates.count == 0)
 		return;
+	if (is_own_list_locked(list))
+		return;
 	const auto lid = reinterpret_cast<std::uint64_t>(list);
 	for (unsigned i = 0; i < n; ++i)
 	{
@@ -107,7 +120,18 @@ void on_list_reset(ID3D12GraphicsCommandList *list)
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_level == fseam::Level::off)
 		return;
+	if (is_own_list_locked(list))
+		return;
 	g_ledger.on_reset(reinterpret_cast<std::uint64_t>(list));
+}
+
+void mark_own_list(ID3D12GraphicsCommandList *list)
+{
+	if (list == nullptr)
+		return;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (g_own_lists.insert(reinterpret_cast<std::uint64_t>(list)).second)
+		g_stats.own_lists = static_cast<unsigned>(g_own_lists.size());
 }
 
 void on_execute(unsigned n, ID3D12CommandList *const *lists)
@@ -123,6 +147,8 @@ void on_execute(unsigned n, ID3D12CommandList *const *lists)
 	for (unsigned i = 0; i < n; ++i)
 	{
 		if (lists[i] == nullptr)
+			continue;
+		if (is_own_list_locked(lists[i]))
 			continue;
 		++g_stats.lists_executed;
 		const fseam::ExecuteResult r = g_ledger.on_execute(reinterpret_cast<std::uint64_t>(lists[i]));
@@ -153,6 +179,8 @@ void on_marker(ID3D12GraphicsCommandList *list, std::uint64_t res, std::uint32_t
 		return;
 	std::lock_guard<std::mutex> lock(g_mutex);
 	if (g_level == fseam::Level::off)
+		return;
+	if (is_own_list_locked(list))
 		return;
 	g_ledger.on_marker(reinterpret_cast<std::uint64_t>(list), res, assumed);
 }
@@ -238,7 +266,7 @@ int format_report(char *buffer, std::size_t size)
 	return std::snprintf(buffer, size,
 		"bbstate=%s candidates=%u epoch=%llu barriers=%llu executes=%llu lists=%llu applied=%llu beforeMismatch=%llu "
 		"presentSeen=%llu markers(ok=%llu bad=%llu) | verdict agree=%llu disagree=%llu unknown=%llu notTracked=%llu "
-		"| usedRecorded=%llu usedAssumed=%llu",
+		"| usedRecorded=%llu usedAssumed=%llu | ownLists=%u ownSkipped=%llu",
 		fseam::level_name(lvl), s.candidates, static_cast<unsigned long long>(s.candidate_epoch),
 		static_cast<unsigned long long>(s.barriers_seen), static_cast<unsigned long long>(s.executes),
 		static_cast<unsigned long long>(s.lists_executed), static_cast<unsigned long long>(s.applied),
@@ -246,7 +274,8 @@ int format_report(char *buffer, std::size_t size)
 		static_cast<unsigned long long>(s.markers_ok), static_cast<unsigned long long>(s.markers_bad),
 		v(fseam::StateVerdict::agree), v(fseam::StateVerdict::disagree), v(fseam::StateVerdict::unknown),
 		v(fseam::StateVerdict::not_tracked), static_cast<unsigned long long>(s.used_recorded),
-		static_cast<unsigned long long>(s.used_assumed));
+		static_cast<unsigned long long>(s.used_assumed), s.own_lists,
+		static_cast<unsigned long long>(s.own_skipped));
 }
 
 void log_report(const char *when)

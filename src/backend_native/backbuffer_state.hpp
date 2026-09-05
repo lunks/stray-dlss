@@ -60,6 +60,15 @@ fseam::Candidates candidates();
 bool is_candidate(std::uint64_t res);
 
 // ---- from the native hooks, for GAME calls only (never under OwnCodeScope) ----
+// OUR OWN LISTS ARE NOT THE ENGINE. The present owner and the FG present-twice path record
+// their own transitions of the swapchain-class buffers (real ring and generated targets into and
+// out of PRESENT) on lists created through the same hooked device, so without this the ledger's
+// "last PRESENT witness" is as often FG's own copy as the engine's FD3D12Viewport::Present -
+// measured 2026-09-05 as `idVsBarrier disagree=260` of 1011 against a mirror that agreed 1011/1011.
+// Each creator registers its lists once; barriers, resets, executes and markers on them are
+// skipped and counted (`ownSkipped=` on the [bbstate] line). UNCONFIRMED that this alone takes
+// the witness to 0 disagreements; that is what the next box read decides.
+void mark_own_list(ID3D12GraphicsCommandList *list);
 void on_barriers(ID3D12GraphicsCommandList *list, unsigned n, const D3D12_RESOURCE_BARRIER *barriers);
 void on_list_reset(ID3D12GraphicsCommandList *list);
 void on_execute(unsigned n, ID3D12CommandList *const *lists);
@@ -89,6 +98,8 @@ struct Stats
 	std::uint64_t verdict[static_cast<int>(fseam::StateVerdict::count)] = {};
 	std::uint64_t used_recorded = 0;      // present_state() answered with the ledger (level 2)
 	std::uint64_t used_assumed = 0;
+	unsigned own_lists = 0;               // lists registered by mark_own_list (present owner + FG)
+	std::uint64_t own_skipped = 0;        // barrier/reset/execute/marker calls ignored because the list is ours
 	unsigned candidates = 0;
 	std::uint64_t candidate_epoch = 0;
 };
