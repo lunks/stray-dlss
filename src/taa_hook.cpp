@@ -2,6 +2,7 @@
 
 #include "core/exposure_plan.hpp"
 #include "core/feature_recreate.hpp"
+#include "core/reset_plan.hpp"
 #include "engine_seam_hook.hpp"
 #include "view_params_hook.hpp"
 #include "pool_name_hook.hpp"
@@ -726,6 +727,13 @@ void report(std::uint64_t hash, const DispatchBindings &b, const MatchResult &m,
 	STRAY_LOG_INFO("========================================================");
 }
 
+// [STRAYDLSS] EngineSeamReset (src/core/reset_plan.hpp).
+std::atomic<resetplan::Mode> g_reset_mode{ resetplan::Mode::observe };
+std::mutex g_reset_mutex;
+resetplan::Counters g_reset_counters;            // under g_reset_mutex
+bool g_reset_jitter_only_logged = false;         // under g_reset_mutex
+std::atomic<std::uint64_t> g_reset_plan_disagree{ 0 }; // the OR and the plan differed on a frame that was not jitter-only (must stay 0)
+
 } // namespace
 
 bool owns_temporal_history(std::uint64_t hash)
@@ -1185,6 +1193,9 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 	seamhook::Verdict seam_verdict;
 	seamhook::EngineInputs engine_inputs;
 	seam::Gate seam_gate = seam::Gate::heuristic;
+	// True when EngineSeamViewParams=2 SUPPLIED the View from FViewInfo's own struct - read by the
+	// reset plan far below, so it lives at this scope.
+	bool view_from_engine = false;
 	// THE `unclaimed` INSTRUMENT. A dispatch the matcher refused never reaches claim(), so an
 	// announcement it should have claimed retires as `unclaimed` with no cause recorded. Ask the
 	// ledger whether a pending announcement expected exactly these group counts: if one did, the
@@ -1219,7 +1230,6 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 		// once latched - it SUPPLIES the View. A stale ring copy on a lower root parameter is
 		// then the search disagreeing with the engine, counted as disagree=, never the reverse.
 		// Below level 2, or before the latch, nothing here changes what DLSS sees.
-		bool view_from_engine = false;
 		if (seam_gate == seam::Gate::engine)
 		{
 			const vphook::ViewSource vs = vphook::resolve_at_claim(seam_verdict, view_ok,
@@ -2200,9 +2210,43 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 							ei.jitter_y = view.temporal_aa_params.w;
 							ei.render_width = render_w;
 							ei.render_height = render_h;
-							// The three signals ORed inside is_camera_cut: View.CameraCut,
-							// TemporalAAJitter.zw == .xy, and a 1x1 history/velocity dummy.
-							ei.reset = ue4::is_camera_cut(view, m.camera_cut_dummies);
+							// The three signals of CLAUDE.md §2.8 - View.CameraCut, TemporalAAJitter.zw
+							// == .xy, and a 1x1 history/velocity dummy - through the reset plan
+							// ([STRAYDLSS] EngineSeamReset, src/core/reset_plan.hpp): the OR below level
+							// 2; at level 2, when the View is the engine's own struct, CameraCut | 1x1
+							// decides and jitter-equality is an assertion. Every combination is
+							// counted. The result travels to DLSS SR here, to DLSS-G (fc.reset) and
+							// to the NR stage (note_guides) below - one decision, three accumulators.
+							{
+								resetplan::Signals rs;
+								rs.camera_cut = view.camera_cut != 0.0f;
+								rs.jitter_equal = ue4::jitter_indicates_camera_cut(
+									ue4::Float2{ view.temporal_aa_jitter.x, view.temporal_aa_jitter.y },
+									ue4::Float2{ view.temporal_aa_jitter.z, view.temporal_aa_jitter.w });
+								rs.history_1x1 = m.camera_cut_dummies;
+								rs.engine_view = view_from_engine;
+								const resetplan::Decision rd = resetplan::decide(g_reset_mode.load(std::memory_order_relaxed), rs);
+								ei.reset = rd.reset;
+								{
+									std::lock_guard<std::mutex> lock(g_reset_mutex);
+									g_reset_counters.note(rs, rd);
+									if (rd.jitter_only && !g_reset_jitter_only_logged)
+									{
+										g_reset_jitter_only_logged = true;
+										STRAY_LOG_INFO("RESET PLAN: first frame where ONLY the jitter-equality heuristic fired "
+											"(CameraCut=0, no 1x1 dummy, View %s the engine's) - %s. Once per session; "
+											"the rate is `jitterOnly` on the [reset] line, split into fired/suppressed.",
+											view_from_engine ? "IS" : "is NOT",
+											rd.reset ? "the OR RESET all three temporal accumulators for it"
+											         : "level 2 declined the reset on the engine's word");
+									}
+								}
+								// The pre-plan OR is asserted beside the decision: at any level the two
+								// may only differ on a jitter-only frame at level 2.
+								const bool legacy = ue4::is_camera_cut(view, m.camera_cut_dummies);
+								if (legacy != rd.reset && !rd.jitter_only)
+									g_reset_plan_disagree.fetch_add(1, std::memory_order_relaxed);
+							}
 							ei.pre_exposure = view.pre_exposure;
 							// The row-135 self-check, at the SR site. The NR path has always
 							// gated this row (below) while SR forwarded it blind, so a misread
@@ -2653,6 +2697,60 @@ void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &
 std::uint64_t view_cb_read_count()
 {
 	return g_view_cb_reads.load(std::memory_order_relaxed);
+}
+
+void set_reset_level(int level)
+{
+	const resetplan::Mode m = resetplan::mode_from_level(level);
+	g_reset_mode.store(m, std::memory_order_relaxed);
+	STRAY_LOG_INFO("RESET PLAN MODE: %s ([STRAYDLSS] EngineSeamReset=%d). %s", resetplan::mode_name(m), level,
+		m == resetplan::Mode::off ? "The three-way OR decides, uncounted."
+		: m == resetplan::Mode::observe
+			? "The three-way OR decides; every combination of CameraCut / jitter-equality / 1x1 is counted on the "
+			  "[reset] line, and `jitterOnly fired=` is the number of whole-history wipes the heuristic added."
+			: "When the View is the engine's struct, CameraCut | 1x1 decides and jitter-equality is an assertion "
+			  "(`jitterOnly suppressed=`); otherwise the OR, counted as `fellBack=`. UNCONFIRMED on the box.");
+}
+
+resetplan::Mode reset_mode() { return g_reset_mode.load(std::memory_order_relaxed); }
+
+void reset_counters(resetplan::Counters &out, std::uint64_t *plan_disagree)
+{
+	std::lock_guard<std::mutex> lock(g_reset_mutex);
+	out = g_reset_counters;
+	if (plan_disagree != nullptr)
+		*plan_disagree = g_reset_plan_disagree.load(std::memory_order_relaxed);
+}
+
+int format_reset_report(char *buffer, std::size_t size)
+{
+	if (buffer == nullptr || size == 0)
+		return 0;
+	resetplan::Counters c;
+	std::uint64_t disagree = 0;
+	reset_counters(c, &disagree);
+	return std::snprintf(buffer, size,
+		"reset=%s frames=%llu resets=%llu fromEngine=%llu fellBack=%llu jitterOnly=%llu (fired=%llu suppressed=%llu) "
+		"planDisagree=%llu | combos: none=%llu cut=%llu jitter=%llu cut+jitter=%llu 1x1=%llu cut+1x1=%llu jitter+1x1=%llu all=%llu",
+		resetplan::mode_name(reset_mode()), static_cast<unsigned long long>(c.frames),
+		static_cast<unsigned long long>(c.resets), static_cast<unsigned long long>(c.from_engine),
+		static_cast<unsigned long long>(c.fell_back), static_cast<unsigned long long>(c.jitter_only),
+		static_cast<unsigned long long>(c.jitter_only_fired), static_cast<unsigned long long>(c.jitter_only_suppressed),
+		static_cast<unsigned long long>(disagree),
+		static_cast<unsigned long long>(c.combo[0]), static_cast<unsigned long long>(c.combo[1]),
+		static_cast<unsigned long long>(c.combo[2]), static_cast<unsigned long long>(c.combo[3]),
+		static_cast<unsigned long long>(c.combo[4]), static_cast<unsigned long long>(c.combo[5]),
+		static_cast<unsigned long long>(c.combo[6]), static_cast<unsigned long long>(c.combo[7]));
+}
+
+void log_reset_report(const char *when)
+{
+	if (reset_mode() == resetplan::Mode::off)
+		return;
+	char line[512] = {};
+	format_reset_report(line, sizeof(line));
+	STRAY_LOG_INFO("[reset] %s: %s  (planDisagree must stay 0; at level 2 fellBack should stay near 0 once the View latches)",
+		when != nullptr ? when : "", line);
 }
 
 } // namespace stray_dlss::taa_hook

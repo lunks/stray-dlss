@@ -4,6 +4,7 @@
 // TAA still runs and nothing about the image changes.
 #pragma once
 
+#include "core/reset_plan.hpp"
 #include "core/rr_guides.hpp"
 #include "core/taa_signature.hpp"
 #include "core/view_params.hpp"
@@ -155,6 +156,14 @@ void set_letterbox_hold(bool on);
 // non-zero count there means this title does NOT anchor its shrinking rect at the top left and
 // the whole mechanism is wrong for it.
 void hold_counters(std::uint64_t &held, std::uint64_t *refused_by_reason, std::size_t count);
+
+// [STRAYDLSS] EngineSeamReset (src/core/reset_plan.hpp): which of CLAUDE.md §2.8's three signals
+// decides InReset - and DLSSG.Reset / DLSSNR.Reset with it. Default resetplan::kDefaultLevel.
+void set_reset_level(int level);
+resetplan::Mode reset_mode();
+void reset_counters(resetplan::Counters &out, std::uint64_t *plan_disagree);
+int format_reset_report(char *buffer, std::size_t size);
+void log_reset_report(const char *when);
 
 void view_row135_counters(std::uint64_t &ok, std::uint64_t &bad, std::uint64_t &wrong_view,
                           std::uint64_t &suspect_small, std::uint64_t &amb_claimed,
