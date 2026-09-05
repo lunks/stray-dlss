@@ -74,9 +74,25 @@ struct Args
 	explicit Args(UFunction *f) : fn(f)
 	{
 		std::size_t size = 0;
+		// DIAGNOSTIC: a clean null from Create with every operand present is what a WRONG
+		// LAYOUT looks like - three writes landing on one offset leaves the context null and
+		// Create returns null without a crash. Print the layout once so the log settles it.
+		static int dumped = 0;
+		const bool dump = dumped < 6;
+		if (dump) ++dumped;
+		if (dump)
+			STRAY_LOG_WARN("dlss-menu: layout of %S:", fn ? fn->GetName().c_str() : STR("<null>"));
 		for (FProperty *p : TFieldRange<FProperty>(fn, EFieldIterationFlags::None))
 		{
-			if (p == nullptr || !p->HasAnyPropertyFlags(CPF_Parm))
+			if (p == nullptr)
+				continue;
+			if (dump)
+				STRAY_LOG_WARN("dlss-menu:   %S off=%d size=%d parm=%d out=%d ret=%d",
+					p->GetName().c_str(), p->GetOffset_Internal(), p->GetSize(),
+					p->HasAnyPropertyFlags(CPF_Parm) ? 1 : 0,
+					p->HasAnyPropertyFlags(CPF_OutParm) ? 1 : 0,
+					p->HasAnyPropertyFlags(CPF_ReturnParm) ? 1 : 0);
+			if (!p->HasAnyPropertyFlags(CPF_Parm))
 				continue;
 			const std::size_t end =
 				static_cast<std::size_t>(p->GetOffset_Internal()) + static_cast<std::size_t>(p->GetSize());
@@ -84,6 +100,8 @@ struct Args
 				size = end;
 		}
 		buf.assign(size, 0);
+		if (dump)
+			STRAY_LOG_WARN("dlss-menu:   buffer=%zu bytes", size);
 	}
 
 	// Write a pointer-sized argument by parameter NAME. Names come from the engine, so a typo
@@ -348,10 +366,41 @@ void do_toggle()
 			g_failed = true;
 			return;
 		}
+		// Is the class a UUserWidget child at all? ValidateUserWidgetClass (UserWidget.cpp:2021)
+		// returns null for anything else, and "HKTextBlock" could as easily be a UTextBlock
+		// subclass. IsA on its CDO answers without any unverified accessor.
+		{
+			UClass *uw = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr,
+				STR("/Script/UMG.UserWidget"));
+			UObject *tcdo = UObjectGlobals::StaticFindObject<UObject *>(nullptr, nullptr,
+				STR("/Game/GUI/Widgets/BP_HKTextBlock.Default__BP_HKTextBlock_C"));
+			STRAY_LOG_WARN("dlss-menu: BP_HKTextBlock_C cdo=%p userWidgetClass=%p isUserWidget=%d",
+				static_cast<void *>(tcdo), static_cast<void *>(uw),
+				(tcdo != nullptr && uw != nullptr && tcdo->IsA(uw)) ? 1 : 0);
+		}
+		// CONTROL: UMG_DebugMenu_C created and rendered from Lua through this same library
+		// call. If it comes back null too, the fault is the call, not the class.
+		{
+			UClass *dbg = UObjectGlobals::StaticFindObject<UClass *>(nullptr, nullptr,
+				STR("/Game/GUI/HUD/UMG_DebugMenu.UMG_DebugMenu_C"));
+			if (dbg != nullptr)
+			{
+				Args c(create);
+				c.set_ptr(STR("WorldContextObject"), ctx);
+				c.set_ptr(STR("WidgetType"), dbg);
+				c.set_ptr(STR("OwningPlayer"), ctx);
+				cdo->ProcessEvent(create, c.buf.data());
+				UObject *w = static_cast<UObject *>(c.ret_ptr());
+				STRAY_LOG_WARN("dlss-menu: CONTROL UMG_DebugMenu_C -> %p %S", static_cast<void *>(w),
+					w ? w->GetFullName().c_str() : STR("(null)"));
+			}
+			else
+				STRAY_LOG_WARN("dlss-menu: CONTROL UMG_DebugMenu_C not resident");
+		}
 		Args a(create);
 		a.set_ptr(STR("WorldContextObject"), ctx);
 		a.set_ptr(STR("WidgetType"), cls);
-		a.set_ptr(STR("OwningPlayer"), nullptr);
+		a.set_ptr(STR("OwningPlayer"), ctx);   // the Lua call passed the controller here too
 		cdo->ProcessEvent(create, a.buf.data());
 		g_widget = static_cast<UObject *>(a.ret_ptr());
 		if (g_widget == nullptr)
