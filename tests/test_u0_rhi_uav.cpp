@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 using namespace stray_dlss::u0;
@@ -594,4 +595,137 @@ TEST_CASE("judge_view_register: exactly one bound uniform buffer names the View 
 	// The measured bug (facts §36.18): the search took b3, the engine bound View at b4.
 	CHECK(judge_view_register(1u << 4, true, 3) == ViewRegVerdict::disagree);
 	CHECK(judge_view_register(1u << 1, true, 1) == ViewRegVerdict::agree);
+}
+
+// ---------------------------------------------------------------------------------------
+// The graphics half (IRHICommandContext, RHIContext.h:361-748)
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+// Lays every slot of BOTH halves as the predictions say: the compute half exactly as
+// build_vtable does, then slots 38..85 with the graphics expectations, the reversed
+// RHICalibrateTimers pair as (43 code, 44 ret) unless told otherwise.
+void build_gfx_vtable(FakeModule &m, unsigned calibrate_ret_slot = kGfxSlotCalibrateTimersB)
+{
+	m.build_vtable();
+	for (unsigned s = kSlotsChecked; s < kGfxSlotsChecked; ++s)
+	{
+		bool is_ret = s == calibrate_ret_slot;
+		for (const SlotExpectation &e : kGfxSlotExpectations)
+			if (e.slot == s && e.expect == Expect::ret)
+				is_ret = true;
+		if (is_ret)
+			m.write_ret(s);
+		else
+			m.write_code(s);
+		m.put_u64(FakeModule::kVtable + 8u * s, m.fn_va(s));
+	}
+}
+
+} // namespace
+
+TEST_CASE("the graphics slot map matches RHIContext.h's declaration order and brackets the four seams with predicted empty bodies")
+{
+	// New virtuals of IRHICommandContext start right after the compute half.
+	CHECK(kGfxSlotSetMultipleViewports == kSlotsChecked);
+	// The viewport pair is preceded by two `{}` (PollOcclusionQueries, DiscardRenderTargets) and
+	// followed by four code slots then four `{}` (the MultiFrameResource quartet).
+	CHECK(kGfxSlotBeginDrawingViewport == kGfxSlotDiscardRenderTargets + 1);
+	CHECK(kGfxSlotEndDrawingViewport == kGfxSlotBeginDrawingViewport + 1);
+	CHECK(kGfxSlotBeginUpdateMultiFrameTex == kGfxSlotEndScene + 1);
+	// The render-pass pair is followed by three `{}` (Begin/EndLateLatching, NextSubpass).
+	CHECK(kGfxSlotEndRenderPass == kGfxSlotBeginRenderPass + 1);
+	CHECK(kGfxSlotBeginLateLatching == kGfxSlotEndRenderPass + 1);
+	CHECK(kGfxSlotNextSubpass == kGfxSlotEndLateLatching + 1);
+	CHECK(kGfxSlotsChecked == 86);
+	// Every expectation names a slot inside the checked range and above the compute half.
+	for (const SlotExpectation &e : kGfxSlotExpectations)
+	{
+		CHECK(e.slot >= kSlotsChecked);
+		CHECK(e.slot < kGfxSlotsChecked);
+		CHECK(e.expect == Expect::ret);
+		CHECK(e.required);
+	}
+	CHECK(kGfxSlotExpectationCount == 11);
+}
+
+TEST_CASE("discover_graphics_half: the predicted arrangement is accepted and names the CalibrateTimers empty body")
+{
+	FakeModule m;
+	build_gfx_vtable(m);
+	const CtxDiscovery c = discover_context_vtable(m.image(), m.seed());
+	REQUIRE(c.status == CtxStatus::ok);
+	const GfxDiscovery g = discover_graphics_half(m.image(), c);
+	CHECK(g.status == GfxStatus::ok);
+	CHECK(g.vtable_va == m.vtable_va());
+	CHECK(g.calibrate_ret_slot == kGfxSlotCalibrateTimersB);
+	CHECK(g.expectation_mask == (1u << kGfxSlotExpectationCount) - 1u);
+	CHECK(g.slot[kGfxSlotBeginRenderPass] == m.fn_va(kGfxSlotBeginRenderPass));
+	CHECK(g.slot[kGfxSlotBeginDrawingViewport] == m.fn_va(kGfxSlotBeginDrawingViewport));
+	CHECK(g.ret_fold == 1); // unfolded: only slot 40 equals itself
+	// The other order of the reversed pair is equally acceptable, and reported as such.
+	FakeModule m2;
+	build_gfx_vtable(m2, kGfxSlotCalibrateTimersA);
+	const GfxDiscovery g2 = discover_graphics_half(m2.image(), discover_context_vtable(m2.image(), m2.seed()));
+	CHECK(g2.status == GfxStatus::ok);
+	CHECK(g2.calibrate_ret_slot == kGfxSlotCalibrateTimersA);
+}
+
+TEST_CASE("discover_graphics_half: a failed compute discovery, a slot outside code, a required empty body that is not, and a wrong CalibrateTimers pair all refuse")
+{
+	FakeModule m;
+	build_gfx_vtable(m);
+	CtxDiscovery bad;
+	bad.status = CtxStatus::no_vtable;
+	CHECK(discover_graphics_half(m.image(), bad).status == GfxStatus::no_vtable);
+
+	const CtxDiscovery c = discover_context_vtable(m.image(), m.seed());
+	REQUIRE(c.status == CtxStatus::ok);
+	{
+		FakeModule x;
+		build_gfx_vtable(x);
+		x.put_u64(FakeModule::kVtable + 8u * kGfxSlotDrawPrimitive, FakeModule::kDataVa + 0x10); // .rdata, not code
+		const GfxDiscovery g = discover_graphics_half(x.image(), discover_context_vtable(x.image(), x.seed()));
+		CHECK(g.status == GfxStatus::slot_not_code);
+		CHECK(g.failed_slot == kGfxSlotDrawPrimitive);
+	}
+	{
+		FakeModule x;
+		build_gfx_vtable(x);
+		x.write_code(kGfxSlotNextSubpass); // predicted `{}`, given a body
+		const GfxDiscovery g = discover_graphics_half(x.image(), discover_context_vtable(x.image(), x.seed()));
+		CHECK(g.status == GfxStatus::prediction_failed);
+		CHECK(g.failed_slot == kGfxSlotNextSubpass);
+	}
+	{
+		FakeModule x;
+		build_gfx_vtable(x);
+		x.write_ret(kGfxSlotCalibrateTimersA); // now BOTH are empty
+		const GfxDiscovery g = discover_graphics_half(x.image(), discover_context_vtable(x.image(), x.seed()));
+		CHECK(g.status == GfxStatus::calibrate_pair);
+	}
+	{
+		FakeModule x;
+		build_gfx_vtable(x);
+		x.write_code(kGfxSlotCalibrateTimersB); // now NEITHER is empty
+		const GfxDiscovery g = discover_graphics_half(x.image(), discover_context_vtable(x.image(), x.seed()));
+		CHECK(g.status == GfxStatus::calibrate_pair);
+	}
+	CHECK(std::string(gfx_status_text(GfxStatus::calibrate_pair)).find("CalibrateTimers") != std::string::npos);
+}
+
+TEST_CASE("discover_graphics_half: the compute half's ICF-folded ret and MSVC's `ret 0` are accepted in the graphics half too")
+{
+	FakeModule m;
+	build_gfx_vtable(m);
+	// Fold every graphics `{}` onto slot 40's address, and give slot 40 the `ret 0` encoding.
+	m.text[m.fn(kGfxSlotResummarizeHTile)] = 0xC2;
+	m.text[m.fn(kGfxSlotResummarizeHTile) + 1] = 0x00;
+	m.text[m.fn(kGfxSlotResummarizeHTile) + 2] = 0x00;
+	for (const SlotExpectation &e : kGfxSlotExpectations)
+		m.put_u64(FakeModule::kVtable + 8u * e.slot, m.fn_va(kGfxSlotResummarizeHTile));
+	const GfxDiscovery g = discover_graphics_half(m.image(), discover_context_vtable(m.image(), m.seed()));
+	CHECK(g.status == GfxStatus::ok);
+	CHECK(g.ret_fold == kGfxSlotExpectationCount);
 }

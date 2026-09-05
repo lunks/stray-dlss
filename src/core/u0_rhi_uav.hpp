@@ -225,6 +225,145 @@ struct CtxDiscovery
 CtxDiscovery discover_context_vtable(const seam::Image &image, std::uint64_t seed);
 
 // ---------------------------------------------------------------------------------------
+// The GRAPHICS half: IRHICommandContext's own virtuals, RHIContext.h:361-748
+// ---------------------------------------------------------------------------------------
+//
+// `class IRHICommandContext : public IRHIComputeContext` (RHIContext.h:361) — single
+// inheritance, so its NEW virtuals are appended to the same vtable after IRHIComputeContext's
+// 38, in declaration order. A re-declaration of a base virtual (the dtor at :364,
+// RHIDispatchComputeShader at :368, the compute overloads of SetShaderTexture / SetShaderSampler
+// / SetUAVParameter / SetShaderResourceViewParameter / SetShaderUniformBuffer / SetShaderParameter
+// at :492/:500/:525/:534/:536/:542/:546, RHIBuildAccelerationStructure(s) at :656-670) is an
+// OVERRIDE and takes no new slot. `FD3D12CommandContextBase : public IRHICommandContext, public
+// FD3D12AdapterChild` (D3D12CommandContext.h:32) and `FD3D12CommandContext :
+// FD3D12CommandContextBase, FD3D12DeviceChild` (:69) keep IRHICommandContext as the PRIMARY
+// base, so this is the very vtable the compute discovery found — one discovery, two halves.
+//
+// The two seams this half is built for, all HARD from the source:
+//   RHIBeginDrawingViewport / RHIEndDrawingViewport (:419/:422) — `final override` on
+//     FD3D12CommandContextBase (D3D12CommandContext.h:38-39), bodies D3D12Viewport.cpp:980/1014.
+//     Slate's FSlateRHIRenderer::DrawWindow_RenderThread brackets its whole UI draw with them
+//     (SlateRHIRenderer.cpp:845, :1153), and the SCENE never opens one of its own on this path:
+//     FSceneViewport::BeginRenderFrame / EndRenderFrame, rendering directly to the window,
+//     only fetch and release the back-buffer reference (SceneViewport.cpp:1734-1772). ONE
+//     bracket per presented frame, and it is the UI's.
+//   RHIBeginRenderPass / RHIEndRenderPass (:584/:586) — virtual on FD3D12CommandContext
+//     (D3D12CommandContext.h:322/:336, not final; the redirector's override is not in the path
+//     on one GPU). Every RDG raster pass reaches it (RenderGraphBuilder.cpp:1562) and so does
+//     Slate (SlateRHIRenderer.cpp:885), each with `const FRHIRenderPassInfo&` whose
+//     ColorRenderTargets[0].RenderTarget is the FRHITexture* and .Action the load/store pair
+//     (RHIResources.h:2565-2575) — the two facts src/core/frame_seams.hpp decodes.
+//
+// Predictions in the same discipline as the compute half: every slot up to kGfxSlotsChecked must
+// be code, and the virtuals whose only body on FD3D12CommandContext is the base's empty one must
+// begin with `ret`. Checked against D3D12CommandContext.h's override list (:257-411): none of
+// RHIResummarizeHTile, RHIPollOcclusionQueries, RHIDiscardRenderTargets, the four
+// RHIBegin/EndUpdateMultiFrameResource, RHISetStereoViewport, RHIBegin/EndLateLatching or
+// RHINextSubpass is overridden. RHISetStencilRef / RHISetBlendFactor ARE (:302-303) though the
+// base is `{}`, so they are predicted code, not ret.
+//
+// ONE OVERLOAD PAIR IS ADJACENT AND REVERSED: RHICalibrateTimers() (:399, `{}`, not overridden)
+// and RHICalibrateTimers(FRHITimestampCalibrationQuery*) (:404, overridden at
+// D3D12CommandContext.h:288). MSVC lays consecutive overloads out in reverse declaration order,
+// so slots 43/44 hold them in an order this file does not assume: the required prediction is
+// "exactly one of the two begins with ret", reported per slot.
+
+constexpr unsigned kGfxSlotSetMultipleViewports = 38;           // RHIContext.h:375
+constexpr unsigned kGfxSlotCopyToResolveTarget = 39;            // :384
+constexpr unsigned kGfxSlotResummarizeHTile = 40;               // :390 `{}`
+constexpr unsigned kGfxSlotBeginRenderQuery = 41;               // :395
+constexpr unsigned kGfxSlotEndRenderQuery = 42;                 // :397
+constexpr unsigned kGfxSlotCalibrateTimersA = 43;               // :399 / :404 — one of the pair
+constexpr unsigned kGfxSlotCalibrateTimersB = 44;               // the other (MSVC reverses)
+constexpr unsigned kGfxSlotPollOcclusionQueries = 45;           // :410 `{}`
+constexpr unsigned kGfxSlotDiscardRenderTargets = 46;           // :416 `{}`
+constexpr unsigned kGfxSlotBeginDrawingViewport = 47;           // :419 — A SEAM
+constexpr unsigned kGfxSlotEndDrawingViewport = 48;             // :422 — A SEAM
+constexpr unsigned kGfxSlotBeginFrame = 49;                     // :425
+constexpr unsigned kGfxSlotEndFrame = 50;                       // :428
+constexpr unsigned kGfxSlotBeginScene = 51;                     // :436
+constexpr unsigned kGfxSlotEndScene = 52;                       // :442
+constexpr unsigned kGfxSlotBeginUpdateMultiFrameTex = 53;       // :447 `{}`
+constexpr unsigned kGfxSlotEndUpdateMultiFrameTex = 54;         // :452 `{}`
+constexpr unsigned kGfxSlotBeginUpdateMultiFrameUav = 55;       // :457 `{}`
+constexpr unsigned kGfxSlotEndUpdateMultiFrameUav = 56;         // :462 `{}`
+constexpr unsigned kGfxSlotSetStreamSource = 57;                // :467
+constexpr unsigned kGfxSlotSetViewport = 58;                    // :473
+constexpr unsigned kGfxSlotSetStereoViewport = 59;              // :475 `{}`
+constexpr unsigned kGfxSlotSetScissorRect = 60;                 // :484
+constexpr unsigned kGfxSlotSetGraphicsPipelineState = 61;       // :486
+constexpr unsigned kGfxSlotSetShaderTextureGfx = 62;            // :489 (the compute one at :492 overrides slot 14)
+constexpr unsigned kGfxSlotSetShaderSamplerGfx = 63;            // :508
+constexpr unsigned kGfxSlotSetUAVParameterPixel = 64;           // :516
+constexpr unsigned kGfxSlotSetShaderResourceViewGfx = 65;       // :538
+constexpr unsigned kGfxSlotSetShaderUniformBufferGfx = 66;      // :540
+constexpr unsigned kGfxSlotSetShaderParameterGfx = 67;          // :544
+constexpr unsigned kGfxSlotSetStencilRef = 68;                  // :548 `{}` in the base, overridden by D3D12 (:302)
+constexpr unsigned kGfxSlotSetBlendFactor = 69;                 // :550 `{}` in the base, overridden by D3D12 (:303)
+constexpr unsigned kGfxSlotDrawPrimitive = 70;                  // :552
+constexpr unsigned kGfxSlotDrawPrimitiveIndirect = 71;          // :554
+constexpr unsigned kGfxSlotDrawIndexedIndirect = 72;            // :556
+constexpr unsigned kGfxSlotDrawIndexedPrimitive = 73;           // :559
+constexpr unsigned kGfxSlotDrawIndexedPrimitiveIndirect = 74;   // :561
+constexpr unsigned kGfxSlotSetDepthBounds = 75;                 // :569
+constexpr unsigned kGfxSlotSetShadingRate = 76;                 // :571, overridden (D3D12CommandContext.h:312)
+constexpr unsigned kGfxSlotSetShadingRateImage = 77;            // :577, overridden (:313)
+constexpr unsigned kGfxSlotUpdateTextureReference = 78;         // :582
+constexpr unsigned kGfxSlotBeginRenderPass = 79;                // :584 — A SEAM
+constexpr unsigned kGfxSlotEndRenderPass = 80;                  // :586 — A SEAM
+constexpr unsigned kGfxSlotBeginLateLatching = 81;              // :593 `{}`
+constexpr unsigned kGfxSlotEndLateLatching = 82;                // :601 `{}`
+constexpr unsigned kGfxSlotNextSubpass = 83;                    // :606 `{}`
+constexpr unsigned kGfxSlotCopyTexture = 84;                    // :610, overridden (:283)
+constexpr unsigned kGfxSlotCopyBufferRegion = 85;               // :639, overridden (:376)
+constexpr unsigned kGfxSlotsChecked = 86;                       // every slot in [kSlotsChecked, this) must be code
+// Beyond 85 the declarations are conditional (`#if RHI_RAYTRACING` at :644, two platform
+// defines at :732/:739), so nothing past kGfxSlotsChecked is predicted or read.
+
+// In slot order. Every slot in [kSlotsChecked, kGfxSlotsChecked) is implicitly required to be
+// code. The CalibrateTimers pair is handled by discover_graphics_half's own rule, not here.
+constexpr SlotExpectation kGfxSlotExpectations[] = {
+	{ kGfxSlotResummarizeHTile, Expect::ret, true },
+	{ kGfxSlotPollOcclusionQueries, Expect::ret, true },
+	{ kGfxSlotDiscardRenderTargets, Expect::ret, true },
+	{ kGfxSlotBeginUpdateMultiFrameTex, Expect::ret, true },
+	{ kGfxSlotEndUpdateMultiFrameTex, Expect::ret, true },
+	{ kGfxSlotBeginUpdateMultiFrameUav, Expect::ret, true },
+	{ kGfxSlotEndUpdateMultiFrameUav, Expect::ret, true },
+	{ kGfxSlotSetStereoViewport, Expect::ret, true },
+	{ kGfxSlotBeginLateLatching, Expect::ret, true },
+	{ kGfxSlotEndLateLatching, Expect::ret, true },
+	{ kGfxSlotNextSubpass, Expect::ret, true },
+};
+constexpr std::size_t kGfxSlotExpectationCount = sizeof(kGfxSlotExpectations) / sizeof(kGfxSlotExpectations[0]);
+
+enum class GfxStatus : std::uint8_t
+{
+	ok = 0,
+	no_vtable,          // the compute discovery did not succeed, so there is nothing to extend
+	slot_not_code,      // a slot in [38, 86) does not point into code
+	prediction_failed,  // a required `ret` slot is not an empty body
+	calibrate_pair,     // neither or both of slots 43/44 is an empty body
+	count
+};
+const char *gfx_status_text(GfxStatus s);
+
+struct GfxDiscovery
+{
+	GfxStatus status = GfxStatus::no_vtable;
+	std::uint64_t vtable_va = 0;
+	std::uint64_t slot[kGfxSlotsChecked] = {}; // the whole table, both halves
+	std::uint32_t failed_slot = 0;
+	std::uint32_t expectation_mask = 0; // bit i = kGfxSlotExpectations[i] held
+	unsigned calibrate_ret_slot = 0;    // which of 43/44 is the `{}` body (0 until ok)
+	std::uint32_t ret_fold = 0;         // how many of the 11 required rets share slot 40's address
+};
+
+// Extends a successful compute discovery to the graphics half: reads slots [38, 86) of the
+// same vtable and holds them to the predictions above. Executes nothing.
+GfxDiscovery discover_graphics_half(const seam::Image &image, const CtxDiscovery &ctx);
+
+// ---------------------------------------------------------------------------------------
 // The object scan: FRHIUnorderedAccessView* -> a CPU descriptor handle our shadow knows
 // ---------------------------------------------------------------------------------------
 

@@ -80,6 +80,10 @@ add_library(stray_dlss_core STATIC
     src/core/u0_rhi_uav.hpp
     src/core/u0_authority.cpp
     src/core/u0_authority.hpp
+    src/core/frame_seams.cpp
+    src/core/frame_seams.hpp
+    src/core/reset_plan.cpp
+    src/core/reset_plan.hpp
     src/core/pool_locator.cpp
     src/core/pool_locator.hpp
     src/core/rr_guides.cpp
@@ -404,6 +408,8 @@ if(STRAY_DLSS_BUILD_TESTS)
         tests/test_view_cached.cpp
         tests/test_u0_rhi_uav.cpp
         tests/test_u0_authority.cpp
+        tests/test_frame_seams.cpp
+        tests/test_reset_plan.cpp
         tests/test_pool_locator.cpp
         tests/test_rr_guides.cpp
         tests/test_envbrdf.cpp

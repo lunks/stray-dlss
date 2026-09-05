@@ -231,6 +231,81 @@ CtxDiscovery discover_context_vtable(const seam::Image &image, std::uint64_t see
 }
 
 // ---------------------------------------------------------------------------------------
+// The graphics half
+// ---------------------------------------------------------------------------------------
+
+const char *gfx_status_text(GfxStatus s)
+{
+	switch (s)
+	{
+	case GfxStatus::ok: return "ok";
+	case GfxStatus::no_vtable: return "no vtable (the compute-half discovery did not succeed)";
+	case GfxStatus::slot_not_code: return "a graphics-half slot does not point into code";
+	case GfxStatus::prediction_failed: return "a graphics-half slot predicted to be an empty body is not one";
+	case GfxStatus::calibrate_pair: return "neither or both RHICalibrateTimers overloads is an empty body";
+	default: return "?";
+	}
+}
+
+GfxDiscovery discover_graphics_half(const seam::Image &image, const CtxDiscovery &ctx)
+{
+	GfxDiscovery g;
+	if (ctx.status != CtxStatus::ok || ctx.vtable_va == 0)
+	{
+		g.status = GfxStatus::no_vtable;
+		return g;
+	}
+	g.vtable_va = ctx.vtable_va;
+	if (!image.read(ctx.vtable_va, g.slot, sizeof(g.slot)))
+	{
+		g.status = GfxStatus::slot_not_code;
+		g.failed_slot = kSlotsChecked;
+		return g;
+	}
+	for (unsigned s = kSlotsChecked; s < kGfxSlotsChecked; ++s)
+	{
+		if (!image.is_code(g.slot[s]))
+		{
+			g.status = GfxStatus::slot_not_code;
+			g.failed_slot = s;
+			return g;
+		}
+	}
+	// Every predicted empty body, required. The compute half's seed is irrelevant here (no
+	// Expect::seed entries), so 0 is passed for it.
+	for (std::size_t k = 0; k < kGfxSlotExpectationCount; ++k)
+	{
+		const SlotExpectation &e = kGfxSlotExpectations[k];
+		const bool held = expectation_holds(image, g.slot, 0, e);
+		if (held)
+			g.expectation_mask |= 1u << k;
+		else if (e.required)
+		{
+			g.status = GfxStatus::prediction_failed;
+			g.failed_slot = e.slot;
+			return g;
+		}
+	}
+	// The reversed CalibrateTimers pair: exactly one `{}`.
+	const SlotExpectation a{ kGfxSlotCalibrateTimersA, Expect::ret, false };
+	const SlotExpectation b{ kGfxSlotCalibrateTimersB, Expect::ret, false };
+	const bool a_ret = expectation_holds(image, g.slot, 0, a);
+	const bool b_ret = expectation_holds(image, g.slot, 0, b);
+	if (a_ret == b_ret)
+	{
+		g.status = GfxStatus::calibrate_pair;
+		g.failed_slot = a_ret ? kGfxSlotCalibrateTimersA : kGfxSlotCalibrateTimersB;
+		return g;
+	}
+	g.calibrate_ret_slot = a_ret ? kGfxSlotCalibrateTimersA : kGfxSlotCalibrateTimersB;
+	for (std::size_t k = 0; k < kGfxSlotExpectationCount; ++k)
+		if (kGfxSlotExpectations[k].required && g.slot[kGfxSlotExpectations[k].slot] == g.slot[kGfxSlotResummarizeHTile])
+			++g.ret_fold;
+	g.status = GfxStatus::ok;
+	return g;
+}
+
+// ---------------------------------------------------------------------------------------
 // The object scan
 // ---------------------------------------------------------------------------------------
 
