@@ -1324,8 +1324,35 @@ alone.
 > own `CreateUnorderedAccessView` hook recorded, two bookkeepers agreeing on one 64-bit value;
 > `t0..t5` resolve through `FRHITexture::GetNativeResource` (slot 7, HARD since L1). Level 2
 > ASSERTS all of it against the descriptor walk (`[u0]` line: `assert:`, `regs:`, `viewReg:`
-> disagree must stay 0); level 3 (the walk and the View-CB search replaced) is declared, not built.
-> Windows-portable throughout: PE, the game's `.rdata`, opaque handle keys, real device hooks.
+> disagree must stay 0). Windows-portable throughout: PE, the game's `.rdata`, opaque handle
+> keys, real device hooks.
+>
+> **LEVEL 3 IS BUILT (2026-09-05, branch `u0-level3`) AND UNCONFIRMED ON THE BOX.** `U0Hook=3`
+> makes the bracket SUPPLY `DispatchBindings::srvs`/`::uavs` for the dispatch a pending
+> announcement expects (`seamhook::announced_expects`, the pre-gate's question without its
+> counter) — u0 and t0..t5 with the engine's own objects, each checked live in our registry and
+> described from it, the stencil's view format from the shadow's record of its offline handle —
+> so the matcher, the colour pick (t1), the output UAV, the eye-adaptation SRV and the history
+> round-trip read the engine's answer unchanged. **Only a COMPLETE bracket answers**
+> (`u0auth::decide_source`, `src/core/u0_authority.hpp`, CI-tested): every cooked
+> `FTAAStandaloneCS` permutation declares all seven registers (§5), so anything short is the
+> WALK for that frame, counted by reason and register as `fellBack:` in the `[u0]` line's `l3:`
+> group, one WARN per reason. The walk keeps running and the level-2 assertion keeps comparing
+> the two routes (the caller keeps the walk's copy). **Not replaced by this level: the View CB**
+> — it comes from root CBVs, never touched the shadow, and `EngineSeamViewParams` owns it.
+> `[STRAYDLSS] U0HookSkipWalk=1` (default 0) is the second key: after `u0auth::kSkipArmClaims`
+> = 600 consecutive claimed dispatches answered by the bracket, it stops the shadow's COPY half
+> and the resolve's table walk — **one-way for the session**, because a resumed shadow can name
+> a live, wrong slot (§5's stale-map class; whether UE 4.27's descriptor cache re-copies every
+> table after a gap is SOFT, unverified), so a later fallback costs the frame loudly (`noWalk`,
+> one ERROR) rather than trusting it. **The task brief's "skip shadow-write + shadow-copy" was
+> wrong by half: shadow-WRITE is the bind-stream hop's own cross-match key (discovery 2 in
+> `u0_rhi_uav.hpp`) and must keep recording; only the copy half (1.644 ms of the 1.694) is the
+> saving.** Read, in order: `l3: claimed(bracket=` tracking the `[seam]` line's `claimed=`,
+> every `fellBack:` reason 0, `assert:`/`regs:` `disagree=0`; then, with the key, `skip: ARMED`,
+> `noWalk=0`, and `[perf] native hooks/frame` shadow-copy towards 0 ms at an unchanged call
+> count with `[perf]   resolve breakdown/frame` reading walk 0 / slots 0. The default stays 1
+> (`u0auth::kDefaultLevel`, pinned by a test). Nothing of this has run on the box.
 
 ### 2.10 Stability observations
 
@@ -1637,6 +1664,16 @@ will not. Three separate mechanisms get called "the shadow" and their consumers 
   > but its job is no longer irreducible: every answer the walk gives for the TAA pass now has
   > an engine-sourced twin, counted on the `[u0]` line. Deleting the walk is level 3, a separate
   > decision after the assertion has run clean across GAMEPLAY (facts §37).
+  >
+  > **LEVEL 3 IS BUILT, 2026-09-05, UNCONFIRMED ON THE BOX (§2.9).** `U0Hook=3` feeds
+  > `DispatchBindings` from the bracket for the announced dispatch, with the walk as the counted
+  > per-frame fallback; `U0HookSkipWalk=1` then stops the COPY half (`shadow-copy`, 1.644 ms)
+  > and the resolve's `walk` + `slots` (0.115 + 0.550 ms on the `[perf]   resolve breakdown`
+  > line) once 600 claims ran clean, one-way. **Shadow-WRITE (0.050 ms) is NOT deletable by this
+  > route and never was**: the bind-stream hop scans the RHI object for a CPU handle our
+  > `Create*View` hook recorded — the write half is level 3's dependency. What the skip leaves
+  > running: shadow-write, heap-bind, the root shadow (the restore's), the root-CBV half of the
+  > resolve (the View-CB search's). Expected saving if the box confirms: ~2.3 of the 2.913 ms.
 * **And the SR path cannot move to our own command list the way the NR stage did.** Present is the
   wrong point in the frame (post, tonemap and next frame's SSR all read `u0` before it), and a
   mid-frame `ExecuteCommandLists` of our own list would run BEFORE the game's still-unsubmitted

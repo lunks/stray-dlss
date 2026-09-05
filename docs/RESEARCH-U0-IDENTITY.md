@@ -722,7 +722,7 @@ consumer (the RHI context) is an abstract interface.
 
 `src/core/u0_rhi_uav.hpp` (pure, CI-tested) and `src/u0_rhi_hook.cpp` (live), behind
 `[STRAYDLSS] U0Hook`, the seam's ladder verbatim: 1 discovers and installs nothing; 2 installs
-FORWARDING thunks and asserts; 3 is declared and not built.
+FORWARDING thunks and asserts; 3 was declared here and is now built — §10.8.
 
 **Discovery of the vtable has no name literal to anchor on, so the seed is a return address.** Our
 `Dispatch` hook's `_ReturnAddress()` is inside `RHIDispatchComputeShader` (§10.1 item 7); the exe's
@@ -815,3 +815,75 @@ delete is the root shadow, which the state restore needs and D3D12 offers no get
 
 **Measured results are in `docs/STRAY-RENDERING-FACTS.md` §37.** Nothing in this section is
 evidence that it works; it is the design and the reasons a wrong answer cannot be used.
+
+### 10.8 Level 3, built (2026-09-05, branch `u0-level3`) — UNCONFIRMED on the box
+
+§10.7 said level 3 "could feed `DispatchBindings` from the bracket instead". That is exactly
+what is built, and nothing else: `src/core/u0_authority.hpp` (pure, `tests/test_u0_authority.cpp`)
+decides, `u0hook::take_bindings` (`src/u0_rhi_hook.cpp`) executes, `taa_hook.cpp` calls it once,
+directly after the descriptor walk and before the View-CB search and the matcher.
+
+**Where it runs.** On a dispatch for which `seamhook::announced_expects(x, y)` is true — the
+seam authoritative and live, and a pending announcement expecting exactly these group counts.
+That is the pre-gate's question (`seam::pre_gate_decide`) asked again without its `preSkipped`
+counter, so the bracket is resolved on roughly one dispatch per frame, the same set level 2
+already asserted on, and never on the two look-alikes that dispatch every frame.
+
+**What the bracket must contain.** u0 (from `RHISetUAVParameter`, resolved at the bind by the
+handle cross-match of §10.4) and t0..t5 (`RHISetShaderTexture` -> `FRHITexture::GetNativeResource`
+for t0-t3/t5; `RHISetShaderResourceViewParameter` -> the SRV cross-match for t4), each live in
+the resource registry, each described from it (`BoundTexture`: the resource's extent and
+`TexFormat`, exactly what the walk's `to_bound` reported — the registry maps
+`R32G8X24_TYPELESS` to the same `TexFormat` the depth view carries, and the stencil's
+`X32_G8X24_UINT` comes from the shadow's record of the SRV's offline handle). u1..u3 ride along
+when bound. **Anything short of the seven is the walk for that frame** (`u0auth::decide_source`,
+reason and register named): every cooked `FTAAStandaloneCS` permutation declares t0..t5 and u0
+(CLAUDE.md §5, 27 permutations), and UE binds every declared parameter, so an incomplete bracket
+is not this pass or not this build's pass. A partial substitution would fail the matcher on "no
+depth+stencil SRV pair" with the blame on the wrong component.
+
+**What is NOT replaced.** The View constant buffer: it comes from the root CBVs
+(`DispatchBindings::constant_buffers`, `registry::buffer_for_va`), never touched the descriptor
+shadow, and is `EngineSeamViewParams`' job (§2 of the replan). Depth and velocity: L1 already
+substitutes the engine's at the claim; the bracket's t2/t3 are the same objects and the L1
+disagreement assertion still runs against them. The root shadow the state restore needs.
+
+**The assertion stays live.** `taa_hook.cpp` keeps a copy of the walk's `srvs`/`uavs` from before
+the substitution and hands THAT to `assert_at_claim`, so `assert:`/`regs:`/`viewReg:` keep
+comparing two routes under level 3; the resolves are reused from `take_bindings` rather than
+calling `GetNativeResource` twice per dispatch. Counting is per CLAIM (`note_claim_decision`):
+`l3: asked=` and `fromBracket=` count candidate dispatches, `claimed(bracket= walk= unasked=)`
+and every `fellBack:` reason count only dispatches the engine went on to claim, so a fallback
+rate is "the TAA pass's frame went to the walk", not "a look-alike had an incomplete bracket".
+
+**The second key, `[STRAYDLSS] U0HookSkipWalk` (default 0).** `u0auth::skip_decide` arms only
+when: the key is set, level 3, the native backend in `drive`, thunks installed, no fault, and
+`kSkipArmClaims` = 600 CONSECUTIVE claimed dispatches answered by the bracket. Arming calls
+`native::set_descriptor_tables_shadowed(false)`: `CopyDescriptors(Simple)` is forwarded and
+counted but `note_copy_range` is not called (the measured `shadow-copy 1.644ms`), and
+`resolve_compute_bindings` skips its table half (`walk` 0.115 + `slots` 0.550 ms) while the
+root-CBV half and the state snapshot still run. **It is one-way per session**, and the reason is
+the §5 stale-map class: a slot rewritten while recording was off keeps its OLD entry, and a table
+bound after a resume would resolve to a live, wrong resource with no error. Whether
+`FD3D12DescriptorCache` re-copies every table after such a gap is SOFT — not verified against
+4.27.2 — so the design does not depend on it: a fallback after arming is counted as `noWalk`,
+logged once at ERROR, and that frame is the engine's own TAA.
+
+**Two corrections to the brief this was built from.** (1) "Make shadow-write + shadow-copy
+skippable" is wrong by half: shadow-WRITE records the OFFLINE handle from `Create*View`, and the
+bind-stream hop is a cross-match against exactly those records (§10.4, "two bookkeepers"), so
+the write half is level 3's dependency and only the copy half is its saving. (2) The `[perf]`
+figures the brief quotes (`state 0.056 / walk 0.115 / slots 0.550`, `shadow-write+copy 1.694`)
+are the level-2-era measurements; the skip leaves `state`, `root-cbv`, `shadow-write`,
+`heap-bind` and `root-bind` untouched, so the expected saving is ~2.3 of the 2.913 ms, not all
+of it.
+
+**Windows-portability is unchanged** (§10.6): the new path adds registry lookups and one
+`shadow::lookup` of a handle already validated by the scan; nothing consults vkd3d.
+
+**What a box run must show, in order.** `l3: claimed(bracket=` equal to the `[seam]` line's
+`claimed=`, every `fellBack:` reason 0 and `unasked=0`, `assert: disagree=0 regs: disagree=0`
+(the image is then bit-identical to level 2's by construction, since both routes agree on every
+register). Only then, with the key: `skip: ARMED`, `noWalk=0` for the rest of the session, and
+the two `[perf]` lines moving as predicted with the frame rate to match. **None of this has
+run.**
