@@ -2389,7 +2389,7 @@ bool intercept_dispatch(const icept::CommandContext &ctx, uint32_t x, uint32_t y
 								if (nr::enabled() && nrhook::prescale())
 								{
 									perf::Scope perf_nr(perf::kNgxNr);
-									nrhook::apply_prescale(native_device, native, ei.colour,
+									nrhook::apply_prescale(native_device, native, ei.color,
 										ei.depth, ei.motion_vectors, ei.render_width,
 										ei.render_height, ei.reset);
 								}
