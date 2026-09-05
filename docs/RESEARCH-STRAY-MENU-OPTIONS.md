@@ -1,5 +1,12 @@
 # Adding stray-dlss options to Stray's own settings menu — feasibility
 
+> **OUTCOME 2026-09-04: every route below into the game's OWN settings page was tried on the
+> box and closed by measurement, and the menu was built instead as a separate C++ widget — on
+> screen, applying, two launches. The ledger of the closed routes, the nine Lua crashes and the
+> six-run C++ build is `docs/RESEARCH-STRAY-MENU-CPP.md`. This document is kept as the
+> feasibility study it was; read it for how the settings page is built, not for what to do.**
+
+
 Read-only investigation, 2026-09-02. Same conventions as `CLAUDE.md`: **HARD** = read out of the
 game's own reflection data or measured, **SOFT** = general UE4SS/Unreal knowledge not measured
 against this game, **UNCONFIRMED** = a real gap, with a one-run experiment that closes it.

@@ -108,3 +108,7 @@ licence and never committed here.
 
 Unofficial fan project. Not affiliated with or endorsed by BlueTwelve Studio, Annapurna
 Interactive, or NVIDIA.
+
+## In-game DLSS menu
+
+Press **F10** for a DLSS quality menu (PERFORMANCE / BALANCED / QUALITY), **LEFT/RIGHT** to choose, **F10** again to apply. It changes `r.ScreenPercentage` live and DLSS recreates its feature. `[STRAYDLSS] DlssMenu=0` disables it. Why it is C++ and how it was built: `docs/RESEARCH-STRAY-MENU-CPP.md`.

@@ -3739,6 +3739,34 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
 * **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
   mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
+### The in-game DLSS menu is C++ and ONLY C++ (2026-09-04, on screen, two launches)
+
+`mods/StrayDLSS/src/DlssMenu.{hpp,cpp}`, `[STRAYDLSS] DlssMenu` (default 1). F10 opens
+PERFORMANCE / BALANCED / QUALITY in the game's own font, LEFT/RIGHT choose, F10 applies through
+`r.ScreenPercentage` and NGX recreates the feature. Full ledger: `docs/RESEARCH-STRAY-MENU-CPP.md`; the earlier feasibility study of the game's own page is `docs/RESEARCH-STRAY-MENU-OPTIONS.md`.
+Four facts make it work and **none is expressible from Lua**, which is why nine Lua attempts each
+rendered once and crashed:
+
+1. **Root with `UObject::SetRootSet()`** (UEPseudo `UObject.hpp:290`). `SetFlags(RF_MarkAsRootSet)`
+   on a live object is INERT — UE 4.27 `UObjectBase.cpp:181-185` consumes it once at `AddObject`
+   and clears it. That version compiled clean and was caught before it ran.
+2. **Key callbacks run on UE4SS's event-loop thread**, never the game thread. The handler queues;
+   a `Hook::RegisterProcessEventPreCallback` runs the action once `Unreal::IsInGameThread()` —
+   the same trampoline UE4SS uses for Lua's `ExecuteInGameThread` (`LuaMod.cpp:4094`).
+3. **`WidgetBlueprintLibrary::Create` refuses non-`UUserWidget` classes** (`UserWidget.cpp:2021`)
+   and dispatches on the context's TYPE (`WidgetBlueprintLibrary.cpp:37-62`). `BP_HKTextBlock_C`
+   is a `TextBlock` subclass (`isUserWidget=0`, measured). Container: the game's `UMG_DebugMenu_C`
+   (transparent, `CanvasPanel` root). Row: `BP_HKTextBlock_C` via `StaticConstructObject`, added
+   with `CanvasPanel:AddChildToCanvas`, anchors 0, position (200,200), size 900x70.
+4. **Inherited properties need `GetValuePtrByPropertyNameInChain`.** The plain lookup searches the
+   object's own class only (`UObject.cpp:685`) and read `WidgetTree` as 0 on a BP subclass.
+
+**Do not reopen the game's own resolution row.** Six routes into it were closed by measurement
+(the option `TSet` at +0x580 is rebuilt from elsewhere on reopen, the native index navigation
+skips foreign widgets, and no reflected apply path fires on a gamepad change). And the box
+launcher must run INSIDE the container as a pushed script: `bash -c '…'` through
+`tools/stray-box.sh` silently mangles quotes and two "launches" this session never launched.
+
 ### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02; MEASURED on the box the same day, facts §32.7-32.10)
 
 Facts in `docs/STRAY-RENDERING-FACTS.md` §32. The parts that decide everything:
