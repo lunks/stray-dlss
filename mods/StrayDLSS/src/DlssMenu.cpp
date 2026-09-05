@@ -290,12 +290,22 @@ void build_row()
 	STRAY_LOG_WARN("dlss-menu: row constructed: %S rootSet=%d", g_row->GetFullName().c_str(),
 		g_row->IsRootSet() ? 1 : 0);
 
-	UObject **tree = g_widget->GetValuePtrByPropertyName<UObject *>(STR("WidgetTree"));
-	UObject **root = (tree && *tree) ? (*tree)->GetValuePtrByPropertyName<UObject *>(STR("RootWidget")) : nullptr;
+	// InChain, not the plain lookup: GetValuePtrByPropertyName resolves through
+	// GetPropertyByName, which searches the object's OWN class only (UEPseudo UObject.cpp:685),
+	// and WidgetTree is declared on the parent UserWidget - so run 5 read it as "not found"
+	// and printed the same 0 a null value would have. The two cases are told apart below.
+	UObject **tree = g_widget->GetValuePtrByPropertyNameInChain<UObject *>(STR("WidgetTree"));
+	if (tree == nullptr || *tree == nullptr)
+	{
+		STRAY_LOG_ERROR("dlss-menu: row: WidgetTree %s on %S", tree ? "is null" : "NOT FOUND",
+			g_widget->GetFullName().c_str());
+		return;
+	}
+	UObject **root = (*tree)->GetValuePtrByPropertyNameInChain<UObject *>(STR("RootWidget"));
 	if (root == nullptr || *root == nullptr)
 	{
-		STRAY_LOG_ERROR("dlss-menu: row: container has no WidgetTree/RootWidget (tree=%p)",
-			tree ? static_cast<void *>(*tree) : nullptr);
+		STRAY_LOG_ERROR("dlss-menu: row: RootWidget %s on %S", root ? "is null" : "NOT FOUND",
+			(*tree)->GetFullName().c_str());
 		return;
 	}
 	STRAY_LOG_WARN("dlss-menu: row: container root is %S", (*root)->GetFullName().c_str());
