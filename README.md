@@ -108,3 +108,7 @@ licence and never committed here.
 
 Unofficial fan project. Not affiliated with or endorsed by BlueTwelve Studio, Annapurna
 Interactive, or NVIDIA.
+
+## Neural Rendering at model resolution
+
+`NgxNRModelScale=0.5` runs DLSS Neural Rendering on an exact area-average of the frame at half size and lays only the model's difference back on the full-resolution frame (a matched residual, cube-scaled). About a quarter of NR's cost, guides at a 1.0 ratio. `NgxNRModelGuided` picks how the edit comes up: 0 bilinear, 1 joint bilateral, 2 local affine (default). `NgxNRModelTransfer=0` is the untouched frame. The reasoning and measurements are in CLAUDE.md, "NR at MODEL RESOLUTION".

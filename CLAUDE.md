@@ -3739,6 +3739,53 @@ Facts in `docs/STRAY-RENDERING-FACTS.md` §11-§15; the plan in
 * **The UE4SS plugin cannot be BUILT without a `UEPSEUDO_PAT`** at UE4SS SHA 68caddcf: the public
   mirror of the Epic-gated `UEPseudo` tree is two headers behind.
 
+### NR at MODEL RESOLUTION: the cost lever that works, and the two that did not (2026-09-05)
+
+`[STRAYDLSS] NgxNRModelScale` (default **0.5**) runs feature 18 on an **exact area-average** of the
+frame at that fraction of its size and lays only the model's **difference** back on the untouched
+full-resolution frame (`src/core/nr_model_plan.hpp`, `src/nr_model.cpp`, `shaders/nr_downsample.hlsl`,
+`shaders/nr_resolve.hlsl`). OptiScaler_DLSSNR's "Model Resolution" with the "matched residual"
+transfer (hhkbble/Dagherbou, 2026-09), on our present stage. **MEASURED on the box:** model
+1920x1080 over the 3840x2160 back buffer, applied on every present, `fallbacks=0`, no errors,
+**12.5 ms median in gameplay against ~14 ms with NR at 4K**, and a clean in-game frame. At 0.5 the
+model's extent IS the guides' extent, so the ratio is 1.0 and nothing but colour is resampled.
+
+**Why this and not the two obvious alternatives, both closed the same day:**
+
+* **Feature 18 cannot upscale** — `DLSSNR.ScalingRatio` is clobbered to 1.0 at BOTH `CreateFeature`
+  and `Evaluate` (`docs/RESEARCH-DLSSNR-PARAM-AUDIT.md`), and no `Upscaling`/`OutputWidth` name exists
+  in the binary. "Run NR at 1080p and let it upscale" is not available with this DLL.
+* **NR before RR on the raw 1080p scene colour (branch `nr-prescale`, no codec) is out of domain**:
+  mottled grunge over the menu, lifted blacks and haze in gameplay — the same reading Kim2091's
+  Remix fork documents for a gamma-domain input. And every shipping integration (that fork,
+  RenoDX, OptiScaler_DLSSNR) plus NVIDIA's own description runs NR AFTER the upscaler on the
+  display-encoded frame. The codec was ported back to that branch and it was scrapped by the
+  user before it ran: the model-resolution route gets the same cost saving with none of the
+  domain, jitter or feedback problems. `nr-prescale` stays pushed as the record.
+* **"NR takes the same G-buffer inputs as RR" is a wrong assumption.** The closed input list of
+  310.8.0 has no albedo, normal or roughness name of any kind; NVIDIA's abstract conditions the
+  model at inference on the rendered frame, motion vectors, temporal state and artistic values,
+  with renderer-derived attributes used only as training-time supervision.
+
+**The matched residual is the load-bearing detail.** Compose the model's SMALL picture against the
+full frame and the downsample's blur reads as headroom the model never saw — OptiScaler's measured
+colour shift at 50%. Compare the two small pictures (shown, answered) and only the edit comes up.
+The residual is **cube-scaled** (pulled back along its own direction until every channel is in
+[0,1]) so saturated pixels cannot rotate hue. No codec: the back buffer is display-encoded, so the
+frame is its own proxy. `NgxNRModelTransfer=0` returns the untouched frame — the honest A/B.
+
+**How the edit comes up, `NgxNRModelGuided`** (default 2; 0 restores the bilinear tap): 1 is
+**joint bilateral upsampling** (Kopf et al. 2007 — the four texels reweighted by luminance
+similarity to the full-res pixel; cannot express a contrast change), 2 is the **local affine /
+guided filter** (He et al. 2010; Chen, Adams, Wadhwa, Hasinoff, SIGGRAPH Asia 2016 "Bilateral
+Guided Upsampling" — fit `answer ~= a*shown + b` over 3x3 small texels and apply it to the
+full-res pixel, so tone and contrast edits act on the frame's own detail). Measured with 2: same
+counters, same 12.6 ms median, clean frame. **What no transform can do is invent structure finer
+than the model's grid** — BGU's own paper says so — which is why the next steps are a full 3x4
+colour matrix (hue shifts) and a low/high frequency split (NR's added structure), and why a
+dynamic scale still matters. Refusals (`bad-scale`, `no-typed-uav`, `too-small`) run the
+full-resolution path and are counted on the `[frame N] NR MODEL:` line.
+
 ### DLSS Frame Generation without Streamline: the present-twice design (2026-09-02; MEASURED on the box the same day, facts §32.7-32.10)
 
 Facts in `docs/STRAY-RENDERING-FACTS.md` §32. The parts that decide everything:
