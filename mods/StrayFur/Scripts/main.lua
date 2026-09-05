@@ -201,7 +201,11 @@ local function applyDensity(gfur)
         tostring(num(get(gfur, "ShellBias"))), tostring(num(get(gfur, "MinScreenSize"))), nlod))
 end
 
-local function applyTo(pawn)
+-- `route` names the trigger that got here ("notify" or "poll"), so one session's log settles
+-- whether NotifyOnNewObject fires for this nativized class and the poll can be retired
+-- (staged 2026-09-05; the poll is the only timer in the enabled mods that does game-thread
+-- work on a schedule).
+local function applyTo(pawn, route)
     if not pawn or not pawn:IsValid() then return end
     local key = pawn:GetFullName()
     if done[key] then return end
@@ -213,7 +217,7 @@ local function applyTo(pawn)
         return
     end
     done[key] = true
-    log("applying to " .. key)
+    log("applying to " .. key .. " (route: " .. tostring(route) .. ")")
     if TIER1 then applyMaterial(gfur) end
     if TIER2 then applyDensity(gfur) end
     if DUMP_MATERIALS then
@@ -234,15 +238,17 @@ end
 -- thread, so FindFirstOf / applyTo touched UObjects while the game thread was tearing
 -- the checkpoint state down. Every engine call now goes through ExecuteInGameThread,
 -- which is what let mods/StrayProbe survive the same reloads.
-local function applyOnGameThread(pawn)
-    pcall(function() ExecuteInGameThread(function() pcall(applyTo, pawn) end) end)
+local function applyOnGameThread(pawn, route)
+    pcall(function() ExecuteInGameThread(function() pcall(applyTo, pawn, route) end) end)
 end
 
 pcall(function()
     NotifyOnNewObject("/Game/Character/Cat/BP_CatPawn.BP_CatPawn_C", function(obj)
+        -- This line alone answers the UNCONFIRMED above: the notification resolved the class.
+        log("notify fired for a new BP_CatPawn_C")
         -- Components may not be registered inside the constructor; defer, then hop to
         -- the game thread.
-        ExecuteWithDelay(500, function() applyOnGameThread(obj) end)
+        ExecuteWithDelay(500, function() applyOnGameThread(obj, "notify") end)
     end)
     log("registered NotifyOnNewObject for BP_CatPawn_C")
 end)
@@ -262,7 +268,7 @@ if POLL_ENABLED then
         pcall(function()
             ExecuteInGameThread(function()
                 local ok, pawn = pcall(function() return FindFirstOf("BP_CatPawn_C") end)
-                if ok and pawn and pawn:IsValid() then pcall(applyTo, pawn) end
+                if ok and pawn and pawn:IsValid() then pcall(applyTo, pawn, "poll") end
             end)
         end)
         return false   -- keep looping; level loads recreate the pawn
