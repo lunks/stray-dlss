@@ -7,6 +7,7 @@
 #include <d3d12.h>
 
 #include <cstdio>
+#include <cwchar>
 #include <mutex>
 #include <vector>
 
