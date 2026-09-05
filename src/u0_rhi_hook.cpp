@@ -158,6 +158,7 @@ std::atomic<bool> g_skip_armed{ false };
 bool g_l3_first_logged = false;                          // under g_mutex
 bool g_l3_fallback_logged[static_cast<std::size_t>(u0auth::Fallback::count)] = {}; // under g_mutex
 bool g_l3_no_walk_logged = false;                        // under g_mutex
+bool g_l3_warmup_logged = false;                         // under g_mutex; the once-per-session warm-up INFO
 
 // ---- per-thread correlation ----
 // The RHI thread executes RHISetComputeShader, then the binds, then RHIDispatchComputeShader,
@@ -1111,6 +1112,7 @@ void note_claim_decision(std::uint64_t pass_hash)
 	bool log_first = false;
 	bool log_fallback = false;
 	bool log_no_walk = false;
+	bool log_warmup = false;
 	if (d.source == u0auth::Source::bracket)
 	{
 		g_l3_claimed_bracket.fetch_add(1, std::memory_order_relaxed);
@@ -1132,9 +1134,22 @@ void note_claim_decision(std::uint64_t pass_hash)
 		g_l3_skip_streak.store(0, std::memory_order_relaxed);
 		if (armed_before)
 			g_l3_no_walk.fetch_add(1, std::memory_order_relaxed);
+		// Before the bracket has ever answered, a fallback is the session's warm-up (the SRV latch
+		// forming; measured ~270-400 dispatches at t4 in four sessions) and is announced ONCE as
+		// INFO without consuming the WARN's once-per-reason flag - so a fallback after the first
+		// bracket answer still WARNs once, as a fallback that names a real gap should.
+		const bool warmup = g_l3_from_bracket.load(std::memory_order_relaxed) == 0;
 		std::lock_guard<std::mutex> lock(g_mutex);
 		bool &said = g_l3_fallback_logged[static_cast<std::size_t>(d.fallback)];
-		if (!said)
+		if (warmup)
+		{
+			if (!g_l3_warmup_logged)
+			{
+				g_l3_warmup_logged = true;
+				log_warmup = true;
+			}
+		}
+		else if (!said)
 		{
 			said = true;
 			log_fallback = true;
@@ -1156,7 +1171,7 @@ void note_claim_decision(std::uint64_t pass_hash)
 	// sessions running as ~270-290 dispatches at t4 (the stencil SRV) while the SRV latch forms,
 	// then a clean streak to the end - and reads as INFO. A fallback AFTER the first success is the
 	// WARN below: that one names a register the thunks are not seeing on this build.
-	if (log_fallback && g_l3_from_bracket.load(std::memory_order_relaxed) == 0)
+	if (log_warmup)
 	{
 		STRAY_LOG_INFO("U0 HOOK LEVEL 3 warm-up on pass 0x%016llx: the bracket could not yet supply the TAA "
 			"registers (%s%s%u) and the descriptor walk answered this frame. Expected for the first few "
@@ -1167,9 +1182,6 @@ void note_claim_decision(std::uint64_t pass_hash)
 			(d.fallback == u0auth::Fallback::tex_no_bind || d.fallback == u0auth::Fallback::tex_unresolved ||
 			 d.fallback == u0auth::Fallback::tex_not_live) ? " at t" : " reg=",
 			d.reg);
-		log_fallback = false;
-		std::lock_guard<std::mutex> lock(g_mutex);
-		g_l3_fallback_logged[static_cast<std::size_t>(d.fallback)] = false; // the WARN may still fire later
 	}
 	if (log_fallback)
 		STRAY_LOG_WARN("U0 HOOK LEVEL 3 FELL BACK on pass 0x%016llx: the bracket could not supply the TAA "
